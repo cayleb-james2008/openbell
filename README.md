@@ -8,9 +8,10 @@ the measuring machine the compounding stands on:
 
 - **Venue-truth home screen** — balance, open positions, day P&L come from
   the venue record or are shown as **unavailable**. Nothing is fabricated.
-  Account reads are read-only and only attempted when a credential is
-  already present in the environment (`KALSHI_API_KEY_ID` /
-  `KALSHI_PRIVATE_KEY_PATH`); this build never hunts for one.
+  In v1, signed account reads are not enabled: the app checks only whether
+  a credential is already present in the environment (`KALSHI_API_KEY_ID` /
+  `KALSHI_PRIVATE_KEY_PATH`) and shows account figures as unavailable
+  either way, rather than guessing. This build never hunts for a credential.
 - **Forward collector** — polls Kalshi's *public* market data (no auth) for
   the 15-minute crypto markets the desk trades and records snapshots to
   disk (`snapshots.jsonl`).
