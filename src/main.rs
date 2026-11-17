@@ -399,7 +399,14 @@ fn daily_report(data_dir: &Path, strategies_dir: &Path) -> String {
     let snapshots = load_snapshots(&data_dir.join("snapshots.jsonl"));
     let tickers: std::collections::HashSet<&str> =
         snapshots.iter().map(|s| s.ticker.as_str()).collect();
-    let settled = snapshots.iter().filter(|s| !s.result.is_empty()).count();
+    // Distinct settled windows — snapshot rows repeat across collector
+    // passes, so counting rows would overstate the tape.
+    let settled = snapshots
+        .iter()
+        .filter(|s| !s.result.is_empty())
+        .map(|s| s.ticker.as_str())
+        .collect::<std::collections::HashSet<&str>>()
+        .len();
     let mut lines = vec![
         "OpenBell daily report".to_string(),
         pnl_line,
@@ -412,7 +419,7 @@ fn daily_report(data_dir: &Path, strategies_dir: &Path) -> String {
         ),
         format!("Open positions (venue): {}", account.open_positions.len()),
         format!(
-            "Forward collector: {} snapshots on disk across {} markets; {} settled-window records.",
+            "Forward collector: {} snapshots on disk across {} markets; {} distinct settled windows.",
             snapshots.len(),
             tickers.len(),
             settled
