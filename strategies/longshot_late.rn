@@ -1,0 +1,15 @@
+// Slot shape: the cheap NO, late in the window.
+// Buy NO when it is priced as a longshot (ask at or under 0.40) inside the
+// last five minutes. Kept in the book as a control: the promotion standard
+// exists to kill shapes like this on forward evidence, not on opinion.
+pub fn name() {
+    "longshot-late"
+}
+
+pub fn side() {
+    "no"
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    no_ask <= 0.40 && secs_to_close <= 300 && secs_to_close >= 61
+}

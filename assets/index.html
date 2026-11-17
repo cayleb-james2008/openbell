@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OpenBell — venue truth</title>
+<style>
+  body { margin: 0; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; background: #0f1115; color: #e6e6e6; }
+  main { max-width: 960px; margin: 0 auto; padding: 22px 18px 40px; }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  .mode { color: #e8b89d; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+  .cards { display: flex; gap: 12px; margin: 18px 0; flex-wrap: wrap; }
+  .card { background: #15181f; border: 1px solid #262a33; border-radius: 8px; padding: 14px 16px; min-width: 180px; flex: 1; }
+  .card .k { font-size: 11px; color: #8a8f98; text-transform: uppercase; letter-spacing: .06em; }
+  .card .v { font-size: 20px; margin-top: 6px; }
+  .unavailable { color: #8a8f98; font-style: italic; }
+  h2 { font-size: 14px; margin: 26px 0 8px; text-transform: uppercase; letter-spacing: .05em; color: #b9bec7; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid #1d2027; }
+  th { color: #8a8f98; font-weight: 500; font-size: 11px; text-transform: uppercase; }
+  pre { background: #15181f; border: 1px solid #262a33; border-radius: 6px; padding: 14px; font-size: 13px; white-space: pre-wrap; }
+  .note { color: #8a8f98; font-size: 12px; }
+  button { background: #2563eb; color: #fff; border: 0; border-radius: 6px; padding: 7px 13px; cursor: pointer; font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>OpenBell</h1>
+  <div class="mode">Shadow mode — this build never places orders</div>
+
+  <div class="cards">
+    <div class="card"><div class="k">Balance (venue)</div><div class="v" id="balance">…</div></div>
+    <div class="card"><div class="k">Day P&amp;L (venue)</div><div class="v" id="pnl">…</div></div>
+    <div class="card"><div class="k">Open positions</div><div class="v" id="positions">…</div></div>
+    <div class="card"><div class="k">Capital at risk</div><div class="v" id="risk">…</div></div>
+  </div>
+  <p class="note" id="account-note"></p>
+
+  <h2>Markets — public venue data, collected forward</h2>
+  <button onclick="collect()">Collect now</button>
+  <table>
+    <thead><tr><th>Market</th><th>Closes</th><th>Yes bid/ask</th><th>No bid/ask</th><th>Last</th><th>Result</th></tr></thead>
+    <tbody id="markets"></tbody>
+  </table>
+
+  <h2>Shadow strategies — paper only, promotion standard as code</h2>
+  <table>
+    <thead><tr><th>Strategy</th><th>Side</th><th>Windows traded</th><th>Mean ¢/contract</th><th>Verdict</th></tr></thead>
+    <tbody id="strategies"></tbody>
+  </table>
+
+  <h2>Daily report</h2>
+  <pre id="report">…</pre>
+</main>
+<script>
+const fmt = (v) => v === null || v === undefined ? '<span class="unavailable">unavailable</span>' : v;
+async function load() {
+  const home = await (await fetch('/api/home')).json();
+  const a = home.account;
+  document.getElementById('balance').innerHTML = a.balance === null ? fmt(null) : '$' + a.balance.toFixed(2);
+  document.getElementById('pnl').innerHTML = a.day_pnl === null ? fmt(null) : '$' + a.day_pnl.toFixed(2);
+  document.getElementById('positions').textContent = a.open_positions.length;
+  document.getElementById('risk').innerHTML = a.open_positions.length === 0 ? '$0.00 (no open positions)' : 'see positions';
+  document.getElementById('account-note').textContent = a.note;
+
+  const markets = await (await fetch('/api/markets')).json();
+  const tb = document.getElementById('markets');
+  tb.innerHTML = '';
+  for (const m of markets.slice(0, 40)) {
+    const tr = document.createElement('tr');
+    const cells = [m.ticker, m.close_time.replace('T', ' ').replace('Z', ' UTC'),
+      `${m.yes_bid ?? '—'} / ${m.yes_ask ?? '—'}`, `${m.no_bid ?? '—'} / ${m.no_ask ?? '—'}`,
+      m.last_price ?? '—', m.result || '—'];
+    for (const c of cells) { const td = document.createElement('td'); td.textContent = c; tr.appendChild(td); }
+    tb.appendChild(tr);
+  }
+  if (!markets.length) tb.innerHTML = '<tr><td colspan="6" class="unavailable">no snapshots collected yet</td></tr>';
+
+  const strats = await (await fetch('/api/strategies')).json();
+  const sb = document.getElementById('strategies');
+  sb.innerHTML = '';
+  for (const s of strats) {
+    const tr = document.createElement('tr');
+    const cells = [s.strategy, s.side, String(s.windows_traded),
+      s.mean_cents_per_contract === null ? '—' : s.mean_cents_per_contract.toFixed(2), s.verdict];
+    for (const c of cells) { const td = document.createElement('td'); td.textContent = c; tr.appendChild(td); }
+    sb.appendChild(tr);
+  }
+
+  const report = await (await fetch('/api/report')).json();
+  document.getElementById('report').textContent = report.report;
+}
+async function collect() { await fetch('/api/collect', { method: 'POST' }); load(); }
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>
