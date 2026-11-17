@@ -1,0 +1,15 @@
+// Slot shape: the favourite, late in the window.
+// Buy YES only when the market is already leaning hard (ask at or under
+// 0.85) and the window is inside its last five minutes but not its final
+// minute. Scored on paper by the shadow scorer — this file places nothing.
+pub fn name() {
+    "favourite-late"
+}
+
+pub fn side() {
+    "yes"
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    yes_ask <= 0.85 && secs_to_close <= 300 && secs_to_close >= 61
+}
