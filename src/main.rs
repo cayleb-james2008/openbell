@@ -2024,7 +2024,62 @@ fn html_response(body: &str) -> String {
 /// aborted this process, collector and all, before this cap).
 const MAX_BODY_BYTES: usize = 1_000_000;
 
-fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String)> {
+/// The hostname of a Host or Origin authority: "[::1]" for an IPv6
+/// literal, otherwise the part before the port.
+fn authority_host(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        authority.split_inclusive(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    }
+}
+
+/// The same-site rule, shared with Fleet. Every request must name a
+/// local Host unless OPENBELL_ALLOWED_HOSTS lists it. A state-changing
+/// request (anything but GET or HEAD) is refused when a browser says
+/// it came from another site, when its Origin names another authority
+/// than its Host, or when it carries a body that is not JSON. Returns
+/// the status and message of the refusal, or None to serve it.
+fn refuse_request(
+    method: &str,
+    headers: &[(String, String)],
+    body_len: usize,
+    allowed: &[String],
+) -> Option<(u16, &'static str)> {
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    };
+    let host = header("host").to_ascii_lowercase();
+    let host_name = authority_host(&host);
+    let host_ok = matches!(host_name, "localhost" | "127.0.0.1" | "[::1]")
+        || allowed.iter().any(|a| a == host_name);
+    if !host_ok {
+        return Some((403, "this desk answers only on localhost unless OPENBELL_ALLOWED_HOSTS names this host"));
+    }
+    if matches!(method, "GET" | "HEAD") {
+        return None;
+    }
+    if header("sec-fetch-site") == "cross-site" {
+        return Some((403, "cross-site requests are refused"));
+    }
+    let origin = header("origin");
+    if !origin.is_empty() {
+        let origin_authority = origin.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
+        if !origin_authority.eq_ignore_ascii_case(&host) {
+            return Some((403, "cross-origin requests are refused"));
+        }
+    }
+    if body_len > 0 && !header("content-type").to_ascii_lowercase().starts_with("application/json") {
+        return Some((415, "requests with a body must be Content-Type: application/json"));
+    }
+    None
+}
+
+fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String, Vec<(String, String)>)> {
     // One deadline for the whole request: a per-read timeout alone
     // is defeated by a client dripping a byte just under it.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -2055,17 +2110,28 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, Str
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
     let mut content_length = 0usize;
+    let mut headers: Vec<(String, String)> = Vec::new();
     loop {
         let line = read_line_by_byte(&mut reader)?;
         if line == "\r\n" || line.is_empty() {
             break;
         }
-        if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
-            content_length = v.trim().parse().unwrap_or(0);
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            if name == "content-length" {
+                content_length = value.parse().unwrap_or(0);
+            }
+            headers.push((name, value));
         }
     }
     if content_length > MAX_BODY_BYTES {
-        return Some(("__too_large__".to_string(), String::new(), String::new()));
+        return Some((
+            "__too_large__".to_string(),
+            String::new(),
+            String::new(),
+            Vec::new(),
+        ));
     }
     let mut body: Vec<u8> = Vec::with_capacity(content_length);
     if content_length > 0 {
@@ -2082,7 +2148,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, Str
             }
         }
     }
-    Some((method, path, String::from_utf8_lossy(&body).to_string()))
+    Some((method, path, String::from_utf8_lossy(&body).to_string(), headers))
 }
 
 fn latest_markets(app: &App) -> Vec<Snapshot> {
@@ -2299,21 +2365,33 @@ fn main() {
         paper_pot,
         collect_secs,
     });
+    let allowed_hosts: Vec<String> = std::env::var("OPENBELL_ALLOWED_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect();
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind failed");
     println!("openbell-rs listening on http://127.0.0.1:{port} (shadow mode — no order path exists)");
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
                 let app = app.clone();
+                let allowed_hosts = allowed_hosts.clone();
                 std::thread::spawn(move || {
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
-                    if let Some((method, path, _body)) = read_request(&mut stream) {
+                    if let Some((method, path, body, headers)) = read_request(&mut stream) {
                         if method == "__too_large__" {
                             let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\n\r\n{\"error\":\"request body too large\"}";
                             let _ = stream.write_all(resp.as_bytes());
                             return;
                         }
-                        let response = handle(&app, &method, &path);
+                        let response = match refuse_request(&method, &headers, body.len(), &allowed_hosts) {
+                            Some((status, message)) => {
+                                json_response(status, &serde_json::json!({ "error": message }).to_string())
+                            }
+                            None => handle(&app, &method, &path),
+                        };
                         let _ = stream.write_all(response.as_bytes());
                     }
                 });
@@ -2949,6 +3027,48 @@ mod tests {
         assert_eq!(tickers, ["A", "B", "C"], "the pass must not be lost inside the torn line");
         assert_eq!(view.total_lines, 4, "the torn fragment is its own counted line");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn same_site_rule_refuses_foreign_writes() {
+        let headers = |host: &str, extra: &[(&str, &str)]| {
+            let mut h = vec![("host".to_string(), host.to_string())];
+            h.extend(extra.iter().map(|(n, v)| (n.to_string(), v.to_string())));
+            h
+        };
+        let json_foreign = [("content-type", "application/json"), ("origin", "http://evil.example")];
+        let json_same = [("content-type", "application/json"), ("origin", "http://127.0.0.1:9820")];
+        // A foreign page's POST is refused; the same origin is served.
+        assert_eq!(
+            refuse_request("POST", &headers("127.0.0.1:9820", &json_foreign), 2, &[]).map(|r| r.0),
+            Some(403),
+            "foreign Origin refused"
+        );
+        assert_eq!(refuse_request("POST", &headers("127.0.0.1:9820", &json_same), 2, &[]), None);
+        // A shell POST without a body is served; a text/plain body is not.
+        assert_eq!(refuse_request("POST", &headers("localhost:9820", &[]), 0, &[]), None);
+        assert_eq!(
+            refuse_request("POST", &headers("127.0.0.1:9820", &[("content-type", "text/plain")]), 20, &[])
+                .map(|r| r.0),
+            Some(415),
+            "text/plain POST refused"
+        );
+        assert_eq!(
+            refuse_request("POST", &headers("127.0.0.1:9820", &[("sec-fetch-site", "cross-site")]), 0, &[])
+                .map(|r| r.0),
+            Some(403)
+        );
+        // A foreign Host is refused on every method unless allowed; reads stay open locally.
+        assert_eq!(
+            refuse_request("GET", &headers("openbell.example", &[]), 0, &[]).map(|r| r.0),
+            Some(403),
+            "foreign Host refused"
+        );
+        assert_eq!(
+            refuse_request("GET", &headers("openbell.example", &[]), 0, &["openbell.example".to_string()]),
+            None
+        );
+        assert_eq!(refuse_request("GET", &headers("127.0.0.1:9820", &json_foreign), 0, &[]), None);
     }
 }
 
