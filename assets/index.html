@@ -51,6 +51,11 @@
     <tbody id="markets"></tbody>
   </table>
 
+  <h2>Shadow equity — paper only</h2>
+  <div id="chart"></div>
+  <p class="note" id="chart-note"></p>
+  <div id="legend" class="note"></div>
+
   <h2>Shadow strategies — paper only, promotion standard as code</h2>
   <table>
     <thead><tr><th>Strategy</th><th>Side</th><th>Windows traded</th><th>Mean ¢/contract</th><th>Verdict</th></tr></thead>
@@ -94,6 +99,41 @@ async function load() {
     tb.appendChild(tr);
   }
   if (!markets.length) tb.innerHTML = '<tr><td colspan="6" class="unavailable">no snapshots collected yet</td></tr>';
+
+  // Equity chart: the pot curve is the headline; each strategy's
+  // cumulative paper P&L rides along thinner. Inline SVG, no libraries.
+  const eq = await (await fetch('/api/equity')).json();
+  const chartEl = document.getElementById('chart');
+  const allSeries = [{ strategy: 'paper pot', points: eq.pot, headline: true },
+    ...eq.series.filter(s => s.points.length)];
+  const flat = allSeries.flatMap(s => s.points);
+  if (flat.length > 1) {
+    const W = 920, H = 190, PAD = 8;
+    const xs = flat.map(p => p[0]), ys = flat.map(p => p[1]);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs);
+    const y0 = Math.min(...ys, 0), y1 = Math.max(...ys, 0);
+    const X = (x) => PAD + (x - x0) / Math.max(1, x1 - x0) * (W - 2 * PAD);
+    const Y = (y) => H - PAD - (y - y0) / Math.max(1e-9, y1 - y0) * (H - 2 * PAD);
+    const palette = ['#7fb069', '#5e8ce6', '#b565d8', '#d8a24a', '#4fb3bf'];
+    let paths = '';
+    allSeries.forEach((s, i) => {
+      if (s.points.length < 2) return;
+      const d = s.points.map((p, j) => `${j ? 'L' : 'M'}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(' ');
+      const color = s.headline ? '#e8b89d' : palette[(i - 1) % palette.length];
+      paths += `<path d="${d}" fill="none" stroke="${color}" stroke-width="${s.headline ? 2.2 : 1.1}"/>`;
+    });
+    const zeroY = Y(0);
+    chartEl.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Paper equity curves">
+      <line x1="${PAD}" y1="${zeroY}" x2="${W - PAD}" y2="${zeroY}" stroke="#262a33"/>
+      ${paths}</svg>`;
+    document.getElementById('chart-note').textContent =
+      `Paper simulation over the collected tape, starting pot $${eq.paper_pot_start.toFixed(2)} split evenly across the slots each window. The heavy line is the pot; thin lines are each strategy's cumulative paper P&L. Paper only — not venue money.`;
+    document.getElementById('legend').textContent = allSeries
+      .map(s => `${s.strategy}: ${s.points.length ? '$' + s.points[s.points.length - 1][1].toFixed(2) : 'no trades'}`)
+      .join(' · ');
+  } else {
+    chartEl.innerHTML = '<p class="unavailable">not enough collected tape to draw the equity curve yet</p>';
+  }
 
   const strats = await (await fetch('/api/strategies')).json();
   const sb = document.getElementById('strategies');

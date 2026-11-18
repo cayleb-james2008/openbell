@@ -44,4 +44,12 @@ for ds in fixture slot; do
   ' >/dev/null || { echo "FAIL [$ds]: pot curve does not end at the simulation's paper equity"; exit 1; }
 done
 
-echo "EQUITY OK: curves are chronological and reconcile with the slot simulation on both tapes"
+# The page draws the curves: it fetches /api/equity, builds an inline
+# SVG (no external chart library), and labels the figures paper.
+page=$(curl -s "http://127.0.0.1:$PORT/")
+echo "$page" | grep -q '/api/equity' || { echo "FAIL: the page never fetches /api/equity"; exit 1; }
+echo "$page" | grep -q '<svg' || { echo "FAIL: the page builds no SVG chart"; exit 1; }
+echo "$page" | grep -qi 'paper' || { echo "FAIL: the chart is not labelled paper"; exit 1; }
+if echo "$page" | grep -q 'cdn\|http://\|https://' ; then echo "FAIL: the page pulls an external resource"; exit 1; fi
+
+echo "EQUITY OK: curves are chronological and reconcile with the slot simulation on both tapes; the page draws them as labelled paper SVG"
