@@ -116,24 +116,29 @@
   }
   .jump a:hover { color: var(--ink); background: var(--surface); }
   main { max-width: 1280px; margin: 0 auto; padding: 16px 16px 40px; display: grid; gap: 16px; }
-  .row { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
-  /* the .row-2 wrappers dissolve: each card is a child of main, placed by grid order */
-  .row-2 { display: contents; }
+  /* placement: one 12-column grid; mobile order is the base, desktop overrides it */
+  .dash-top, .dash-l, .dash-r { display: contents; }
   #report-card { order: 1; }
   #pot { order: 2; }
   #tape { order: 3; }
-  #slots-card { order: 4; }
-  #account { order: 5; }
-  #strategies { order: 6; }
-  #markets-card { order: 7; }
+  #report-body { order: 4; }
+  #chart-card { order: 5; }
+  #slots-card { order: 6; }
+  #account { order: 7; }
+  #strategies { order: 8; }
+  #markets-card { order: 9; }
   @media (min-width: 900px) {
-    main { grid-template-columns: repeat(12, minmax(0, 1fr)); }
+    main { grid-template-columns: repeat(12, minmax(0, 1fr)); align-items: start; }
     main > * { grid-column: 1 / -1; }
-    #report-card { grid-column: span 8; }
-    #account { grid-column: span 4; order: 2; }
-    #pot { grid-column: span 7; order: 3; }
-    #tape { grid-column: span 5; order: 4; }
-    #slots-card { grid-column: 1 / -1; order: 5; }
+    .dash-top { display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: 16px; align-items: start; order: 1; }
+    .dash-l, .dash-r { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+    #pot { grid-column: span 4; order: 2; }
+    #chart-card { grid-column: span 8; order: 2; }
+    #tape { order: 3; }
+    #tape .stats { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+    #slots-card { order: 4; }
+    #strategies { order: 5; }
+    #markets-card { order: 6; }
   }
   section.card {
     background: var(--surface); border: 1px solid var(--hairline); border-radius: 12px; padding: 16px;
@@ -165,6 +170,13 @@
 
   /* report */
   .report-head { font-size: 22px; line-height: 1.3; font-weight: 500; margin: 0 0 12px; text-wrap: balance; overflow-wrap: break-word; min-width: 0; }
+  .report-wrap { position: relative; }
+  .report-wrap.capped::after {
+    content: ""; position: absolute; left: 1px; right: 1px; bottom: 1px; height: 56px; border-radius: 0 0 8px 8px;
+    background: linear-gradient(to bottom, transparent, var(--canvas)); pointer-events: none;
+  }
+  .report-body.capped { max-height: calc(9.6em + 24px); overflow: hidden; }
+  .toggle-report { width: 100%; justify-content: center; margin-top: 12px; background: var(--raised); color: var(--ink); border: 1px solid var(--hairline); }
   .report-body {
     font-size: 13px; line-height: 1.6; color: var(--ink-2); white-space: pre-wrap; margin: 0;
     overflow-wrap: anywhere; background: var(--canvas); border: 1px solid var(--hairline); border-radius: 8px; padding: 12px 16px;
@@ -195,14 +207,12 @@
 
   /* stat rows */
   .stats { display: grid; gap: 12px 16px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  @media (min-width: 720px) { .stats.six { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
   .stat { min-width: 0; border-left: 1px solid var(--hairline); padding-left: 12px; }
   .stat .k { font-size: 13px; color: var(--ink-2); }
   .stat .v { font-family: var(--font-mono); font-size: 20px; font-weight: 500; font-variant-numeric: tabular-nums; margin-top: 4px; overflow-wrap: anywhere; min-width: 0; }
   .stat .v small { font-size: 13px; color: var(--ink-2); font-weight: 400; }
   .stat .src { margin-top: 8px; }
-  .state-line { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; color: var(--ink-2); margin-top: 16px; }
-  .state-line .dot { margin-top: 8px; }
+  .state-line { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); margin: 0 0 16px; padding: 8px 12px; width: max-content; max-width: 100%; border: 1px solid var(--hairline); border-radius: 8px; }
   .why { font-size: 13px; color: var(--ink-2); margin: 12px 0 0; }
 
   /* slots */
@@ -335,57 +345,90 @@
     <button id="retryBtn" type="button" class="btn-quiet">Retry</button>
   </div>
 
+  <div class="dash-top">
+    <div class="dash-l">
   <section class="card" id="report-card" aria-labelledby="report-title">
     <div class="card-head">
       <h2 class="card-title" id="report-title">Daily report</h2>
       <span class="tags"><span class="tag tag-venue">venue</span><span class="tag tag-tape">tape</span></span>
     </div>
     <p class="report-head" id="report-head"><span class="sk" style="display:block;width:70%;height:24px"></span></p>
-    <pre class="report-body" id="report"><span class="sk" style="display:block;height:120px"></span></pre>
   </section>
 
-  <div class="row-2">
-    <section class="card" id="pot" aria-labelledby="pot-title">
-      <div class="card-head">
-        <h2 class="card-title" id="pot-title">Paper pot</h2>
-        <span class="tags"><span class="tag tag-paper">paper</span></span>
-      </div>
-      <div class="pot-top">
-        <div>
-          <div class="pot-figure" id="pot-figure" aria-live="polite"><span class="sk" style="display:inline-block;width:160px;height:36px"></span></div>
-          <div class="pot-change" id="pot-change">&nbsp;</div>
-        </div>
-      </div>
-      <div id="chart" role="img" aria-label="Paper equity curves"><div class="sk" style="height:150px"></div></div>
-      <p class="note" id="chart-note"></p>
-      <div id="legend" class="series-legend"></div>
-      <div class="stage">
-        <div class="track" role="progressbar" id="stage-track" aria-label="Stage one target progress, paper" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-          <div class="fill" id="stage-fill"></div>
-        </div>
-        <div class="stage-line" id="stage-line">Stage target (paper): loading</div>
-      </div>
-    </section>
+  <section class="card" id="report-body" aria-labelledby="report-body-title">
+    <div class="card-head">
+      <h2 class="card-title" id="report-body-title">The rest of the report, verbatim</h2>
+    </div>
+    <div class="report-wrap" id="report-wrap">
+      <pre class="report-body" id="report"><span class="sk" style="display:block;height:120px"></span></pre>
+    </div>
+    <button type="button" class="toggle-report" id="report-toggle" aria-expanded="false" aria-controls="report">Show full report</button>
+  </section>
 
-    <section class="card" id="tape" aria-labelledby="tape-title">
-      <div class="card-head">
-        <h2 class="card-title" id="tape-title">Collector, the forward tape</h2>
-        <span class="tags"><span class="tag tag-tape">tape</span></span>
-      </div>
-      <div class="stats six">
-        <div class="stat"><div class="k">Tape lines</div><div class="v" id="c-snaps">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
-        <div class="stat"><div class="k">Markets seen</div><div class="v" id="c-markets">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
-        <div class="stat"><div class="k">Settled windows</div><div class="v" id="c-settled">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
-        <div class="stat"><div class="k">Dropped lines</div><div class="v" id="c-dropped">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
-        <div class="stat"><div class="k">Conflicting settlements</div><div class="v" id="c-conflicts">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
-        <div class="stat"><div class="k">Newest snapshot</div><div class="v" id="c-age">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
-      </div>
-      <div class="state-line"><span class="dot" id="c-dot" aria-hidden="true"></span><span id="c-note">Checking the tape.</span></div>
-    </section>
+    </div>
+    <div class="dash-r">
+  <section class="card" id="account" aria-labelledby="account-title">
+    <div class="card-head">
+      <h2 class="card-title" id="account-title">Venue account</h2>
+      <span class="tags"><span class="tag tag-venue">venue</span></span>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="k">Balance</div><div class="v" id="balance">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
+      <div class="stat"><div class="k">Day P&amp;L</div><div class="v" id="pnl">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
+      <div class="stat"><div class="k">Open positions</div><div class="v" id="positions">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
+      <div class="stat"><div class="k">Capital at risk</div><div class="v" id="risk">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
+    </div>
+    <p class="why" id="account-note"></p>
+  </section>
+
+    </div>
   </div>
+  <section class="card" id="pot" aria-labelledby="pot-title">
+    <div class="card-head">
+      <h2 class="card-title" id="pot-title">Paper pot</h2>
+      <span class="tags"><span class="tag tag-paper">paper</span></span>
+    </div>
+    <div class="pot-top">
+      <div>
+        <div class="pot-figure" id="pot-figure" aria-live="polite"><span class="sk" style="display:inline-block;width:160px;height:36px"></span></div>
+        <div class="pot-change" id="pot-change">&nbsp;</div>
+      </div>
+    </div>
+    <div class="stage">
+      <div class="track" role="progressbar" id="stage-track" aria-label="Stage one target progress, paper" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="fill" id="stage-fill"></div>
+      </div>
+      <div class="stage-line" id="stage-line">Stage target (paper): loading</div>
+    </div>
+  </section>
 
-  <div class="row-2">
-    <section class="card" id="slots-card" aria-labelledby="slots-title">
+  <section class="card" id="chart-card" aria-labelledby="chart-title">
+    <div class="card-head">
+      <h2 class="card-title" id="chart-title">Paper equity over the collected tape</h2>
+      <span class="tags"><span class="tag tag-paper">paper</span></span>
+    </div>
+    <div id="chart" role="img" aria-label="Paper equity curves"><div class="sk" style="height:150px"></div></div>
+    <p class="note" id="chart-note"></p>
+    <div id="legend" class="series-legend"></div>
+  </section>
+
+  <section class="card" id="tape" aria-labelledby="tape-title">
+    <div class="card-head">
+      <h2 class="card-title" id="tape-title">Collector, the forward tape</h2>
+      <span class="tags"><span class="tag tag-tape">tape</span></span>
+    </div>
+    <div class="state-line"><span class="dot" id="c-dot" aria-hidden="true"></span><span id="c-note">Checking the tape.</span></div>
+    <div class="stats">
+      <div class="stat"><div class="k">Tape lines</div><div class="v" id="c-snaps">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
+      <div class="stat"><div class="k">Markets seen</div><div class="v" id="c-markets">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
+      <div class="stat"><div class="k">Settled windows</div><div class="v" id="c-settled">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
+      <div class="stat"><div class="k">Dropped lines</div><div class="v" id="c-dropped">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
+      <div class="stat"><div class="k">Conflicting settlements</div><div class="v" id="c-conflicts">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
+      <div class="stat"><div class="k">Newest snapshot</div><div class="v" id="c-age">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
+    </div>
+  </section>
+
+  <section class="card" id="slots-card" aria-labelledby="slots-title">
       <div class="card-head">
         <h2 class="card-title" id="slots-title">Slots, paper only</h2>
         <span class="tags"><span class="tag tag-paper">paper</span></span>
@@ -394,22 +437,7 @@
       <p class="note" id="slots-note"></p>
     </section>
 
-    <section class="card" id="account" aria-labelledby="account-title">
-      <div class="card-head">
-        <h2 class="card-title" id="account-title">Venue account</h2>
-        <span class="tags"><span class="tag tag-venue">venue</span></span>
-      </div>
-      <div class="stats">
-        <div class="stat"><div class="k">Balance</div><div class="v" id="balance">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
-        <div class="stat"><div class="k">Day P&amp;L</div><div class="v" id="pnl">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
-        <div class="stat"><div class="k">Open positions</div><div class="v" id="positions">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
-        <div class="stat"><div class="k">Capital at risk</div><div class="v" id="risk">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
-      </div>
-      <p class="why" id="account-note"></p>
-    </section>
-  </div>
-
-  <section class="card" id="strategies" aria-labelledby="strategies-title">
+    <section class="card" id="strategies" aria-labelledby="strategies-title">
     <div class="card-head">
       <h2 class="card-title" id="strategies-title">Strategies against the promotion standard</h2>
       <span class="tags"><span class="tag tag-paper">paper</span></span>
@@ -486,6 +514,7 @@ function ageWords(age) {
 const dayLabel = (x) => new Date(x * 1000).toISOString().slice(0, 10);
 let dataset = new URLSearchParams(location.search).get('dataset') === 'fixture' ? 'fixture' : 'live';
 let everLoaded = false;
+let reportExpanded = false;
 const dsQuery = () => dataset === 'fixture' ? '?dataset=fixture' : '';
 
 async function getJson(url, opts) {
@@ -518,6 +547,16 @@ function renderAccount(a) {
   $('account-note').textContent = a.note;
 }
 
+function applyReport() {
+  const expanded = reportExpanded;
+  $('report').classList.toggle('capped', !expanded);
+  $('report-wrap').classList.toggle('capped', !expanded);
+  const btn = $('report-toggle');
+  btn.setAttribute('aria-expanded', String(expanded));
+  btn.textContent = expanded ? 'Collapse report' : 'Show full report';
+}
+$('report-toggle').addEventListener('click', () => { reportExpanded = !reportExpanded; applyReport(); });
+
 function renderTape(c) {
   setValue('c-snaps', c.snapshots_on_disk);
   setValue('c-markets', c.markets_seen);
@@ -527,7 +566,9 @@ function renderTape(c) {
   setValue('c-age', ageWords(c.newest_snapshot_age_secs));
   const healthy = c.collecting && c.dropped_lines === 0 && c.conflicting_settlements === 0;
   $('c-dot').className = 'dot ' + (c.collecting ? (healthy ? 'ok' : 'warn') : 'err');
-  $('c-note').textContent = !c.collecting
+  $('c-note').textContent = c.snapshots_on_disk === 0
+    ? 'Empty: no tape has been written yet, so nothing is scored. The collector writes its first pass on start, or when you press Collect now in Collected markets. Windows cannot be backfilled.'
+    : !c.collecting
     ? 'Stale: the newest snapshot is older than two collect intervals, so the collector is not collecting. Uncollected windows cannot be backfilled.'
     : healthy
       ? 'Healthy: collecting, a pass lands every ' + c.collect_interval_secs + 's. The tape is the forward record, and windows are scored from what was collected before they settled.'
@@ -724,6 +765,7 @@ async function loadAll() {
   const lines = report.report.split('\n');
   $('report-head').textContent = lines[0];
   $('report').textContent = lines.slice(1).join('\n');
+  applyReport();
 }
 
 async function collect() {
@@ -763,6 +805,7 @@ $('themeBtn').addEventListener('click', () => {
   load();
 });
 syncThemeButton();
+applyReport();
 setDataset(dataset);
 setInterval(load, 30000);
 </script>
