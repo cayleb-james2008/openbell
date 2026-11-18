@@ -40,6 +40,13 @@ case "$first" in
 esac
 echo "$report" | grep -q 'Balance (venue): unavailable' \
   || { echo "FAIL: balance is not honestly unavailable in this environment"; echo "$report"; exit 1; }
+# Unknown is not zero: with no venue read, the position count is
+# unavailable — never a fabricated 0, on the report or the home cards.
+echo "$report" | grep -q 'Open positions (venue): unavailable' \
+  || { echo "FAIL: open positions are not honestly unavailable (a fabricated 0 states a venue fact never obtained)"; echo "$report"; exit 1; }
+home=$(curl -s "http://127.0.0.1:$PORT/api/home")
+echo "$home" | jq -e '.account.open_positions == null' >/dev/null \
+  || { echo "FAIL: /api/home open_positions is not null (unavailable): $(echo "$home" | jq -c .account)"; exit 1; }
 if echo "$report" | grep -Eq 'Balance \(venue\): \$[0-9]'; then
   echo "FAIL: the report invents a venue balance"; echo "$report"; exit 1
 fi

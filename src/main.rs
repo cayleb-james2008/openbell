@@ -616,7 +616,9 @@ fn load_strategies(dir: &Path) -> Vec<Strategy> {
 struct AccountState {
     status: String,
     balance: Option<f64>,
-    open_positions: Vec<serde_json::Value>,
+    /// None = the venue has not told us: unknown is unavailable,
+    /// never an empty list that renders as a fabricated zero.
+    open_positions: Option<Vec<serde_json::Value>>,
     day_pnl: Option<f64>,
     note: String,
 }
@@ -628,7 +630,7 @@ fn account_state() -> AccountState {
         (Some(_), Some(p)) if Path::new(&p).exists() => AccountState {
             status: "unavailable".to_string(),
             balance: None,
-            open_positions: Vec::new(),
+            open_positions: None,
             day_pnl: None,
             note: "A credential is present in the environment, but signed venue reads are not enabled in this build — figures are shown as unavailable rather than guessed."
                 .to_string(),
@@ -636,7 +638,7 @@ fn account_state() -> AccountState {
         _ => AccountState {
             status: "unavailable".to_string(),
             balance: None,
-            open_positions: Vec::new(),
+            open_positions: None,
             day_pnl: None,
             note: "No venue credential in the environment — account figures are unavailable. Market data below is public venue data and needs no credential."
                 .to_string(),
@@ -675,7 +677,10 @@ fn daily_report(app: &App) -> String {
                 .balance
                 .map(|b| format!("${b:.2}"))
                 .unwrap_or_else(|| "unavailable".to_string()),
-            account.open_positions.len()
+            match &account.open_positions {
+                Some(v) => v.len().to_string(),
+                None => "unavailable".to_string(),
+            }
         ),
         format!(
             "Collector: {} — {} snapshots on disk across {} markets, {} distinct settled windows; newest snapshot {}.",
