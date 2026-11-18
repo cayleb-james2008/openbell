@@ -2,8 +2,8 @@
 
 | id | what is wrong / unmet | reproduce | severity | status |
 |---|---|---|---|---|
-| B1 | The shadow scorer scores strategies in isolation — there is no slot system: no per-slot state, no strikes, no retirement/replacement, no shared pot. Bar C3. | Score the fixture tape: output is per-strategy means only; nothing carries strikes or a slot status. | high | open |
-| B2 | Paper results are cents-per-contract only — no equity-split sizing, no paper pot, no dollar P&L. Bar C4. | Read ScoreReport: no contracts, no dollars, no pot. | high | open |
+| B1 | The shadow scorer scores strategies in isolation — there is no slot system: no per-slot state, no strikes, no retirement/replacement, no shared pot. Bar C3. | Score the fixture tape: output is per-strategy means only; nothing carries strikes or a slot status. | high | kept |
+| B2 | Paper results are cents-per-contract only — no equity-split sizing, no paper pot, no dollar P&L. Bar C4. | Read ScoreReport: no contracts, no dollars, no pot. | high | kept |
 | B3 | Strategy library is two Rune scripts. The desk's book needs a richer library for slots to rotate through. Bar C5. | `ls strategies/` → favourite_late.rn, longshot_late.rn only. | medium | open |
 | B4 | Collector health is invisible: nothing on the home screen says whether the tape is fresh, how big it is, or how many windows have settled. Bar C6. | GET /api/home: account + series only. | medium | open |
 | B5 | No chart over the tape: paper performance has no equity curve, only summary numbers. Bar C7. | No /api/equity route exists. | medium | open |
