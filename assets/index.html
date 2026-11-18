@@ -175,7 +175,6 @@
     content: ""; position: absolute; left: 1px; right: 1px; bottom: 1px; height: 56px; border-radius: 0 0 8px 8px;
     background: linear-gradient(to bottom, transparent, var(--canvas)); pointer-events: none;
   }
-  .report-body.capped { max-height: calc(9.6em + 24px); overflow: hidden; }
   .toggle-report { width: 100%; justify-content: center; margin-top: 12px; background: var(--raised); color: var(--ink); border: 1px solid var(--hairline); }
   .report-body {
     font-size: 13px; line-height: 1.6; color: var(--ink-2); white-space: pre-wrap; margin: 0;
@@ -290,6 +289,16 @@
     .pot-figure { font-size: 30px; }
     .col-last { display: none; }
     th, td { padding: 8px; }
+    #strategies thead { display: none; }
+    #strategies table, #strategies tbody, #strategies tr { display: block; width: 100%; }
+    #strategies tr { border-bottom: 1px solid var(--hairline); padding: 8px 0; }
+    #strategies tr:hover td { background: transparent; }
+    #strategies td { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 0; padding: 4px 0; min-width: 0; }
+    #strategies td::before { content: attr(data-label); color: var(--ink-2); font-size: 13px; flex: none; }
+    #strategies td[data-label="Strategy"]::before, #strategies td.empty-row::before { content: none; }
+    #strategies td .bar-cell { min-width: 0; flex: 1; justify-content: flex-end; }
+    #strategies td .pill { white-space: normal; text-align: right; }
+    #strategies td.empty-row { display: block; }
     button { min-height: 44px; }
   }
 </style>
@@ -516,6 +525,8 @@ const dayLabel = (x) => new Date(x * 1000).toISOString().slice(0, 10);
 let dataset = new URLSearchParams(location.search).get('dataset') === 'fixture' ? 'fixture' : 'live';
 let everLoaded = false;
 let reportExpanded = false;
+let reportBody = null;
+const REPORT_PREVIEW_LINES = 6;
 const dsQuery = () => dataset === 'fixture' ? '?dataset=fixture' : '';
 
 async function getJson(url, opts) {
@@ -549,12 +560,19 @@ function renderAccount(a) {
 }
 
 function applyReport() {
-  const expanded = reportExpanded;
-  $('report').classList.toggle('capped', !expanded);
-  $('report-wrap').classList.toggle('capped', !expanded);
+  if (reportBody === null) return;
+  // Collapsed shows the first lines only; the rest is left out of the layout (not clipped),
+  // so nothing hidden sits under the button or the card head.
+  const lines = reportBody.split('\n');
+  const more = lines.length > REPORT_PREVIEW_LINES;
+  const expanded = reportExpanded || !more;
+  $('report').textContent = expanded ? reportBody : lines.slice(0, REPORT_PREVIEW_LINES).join('\n');
+  $('report').classList.toggle('capped', more && !expanded);
+  $('report-wrap').classList.toggle('capped', more && !expanded);
   const btn = $('report-toggle');
-  btn.setAttribute('aria-expanded', String(expanded));
-  btn.textContent = expanded ? 'Collapse report' : 'Show full report';
+  btn.hidden = !more;
+  btn.setAttribute('aria-expanded', String(reportExpanded));
+  btn.textContent = reportExpanded ? 'Collapse report' : 'Show full report';
 }
 $('report-toggle').addEventListener('click', () => { reportExpanded = !reportExpanded; applyReport(); });
 
@@ -603,7 +621,7 @@ function renderPot(slots, eq, home) {
   const flat = allSeries.flatMap(s => s.points);
   const traded = slots.slots.reduce((n, s) => n + s.windows_traded, 0) + slots.retired.reduce((n, s) => n + s.windows_traded, 0);
   if (flat.length > 1 && eq.pot.length > 1) {
-    const W = 640, H = 170, PADL = 52, PADR = 8, PADT = 8, PADB = 22;
+    const W = Math.max(300, Math.round(chart.clientWidth || 640)), H = 170, PADL = 52, PADR = 8, PADT = 8, PADB = 22;
     const xs = flat.map(p => p[0]), ys = flat.map(p => p[1]);
     const x0 = Math.min(...xs), x1 = Math.max(...xs);
     const y0 = Math.min(...ys, start), y1 = Math.max(...ys, start);
@@ -740,9 +758,12 @@ function renderStrategies(strats) {
   for (const s of strats) {
     const tr = document.createElement('tr');
     tr.append(el('td', 'mono', s.strategy), el('td', 'mono', s.side));
+    tr.children[0].dataset.label = 'Strategy';
+    tr.children[1].dataset.label = 'Side';
     const need = s.standard ? s.standard.min_windows : 100;
     const frac = Math.min(1, s.windows_traded / need);
     const cellBar = el('td');
+    cellBar.dataset.label = 'Windows traded, of 100';
     const wrap = el('div', 'bar-cell');
     const trk = el('div', 'track'); trk.setAttribute('role', 'progressbar');
     trk.setAttribute('aria-valuemin', '0'); trk.setAttribute('aria-valuemax', String(need)); trk.setAttribute('aria-valuenow', String(s.windows_traded));
@@ -752,7 +773,9 @@ function renderStrategies(strats) {
     cellBar.append(wrap);
     tr.append(cellBar);
     tr.append(el('td', 'mono', s.mean_cents_per_contract === null ? '-' : s.mean_cents_per_contract.toFixed(2)));
+    tr.children[3].dataset.label = 'Mean cents per contract';
     const vtd = el('td');
+    vtd.dataset.label = 'Verdict';
     vtd.append(el('span', pillFor(s.verdict), s.verdict));
     tr.append(vtd);
     sb.append(tr);
@@ -782,7 +805,7 @@ async function loadAll() {
   renderMarkets(markets);
   const lines = report.report.split('\n');
   $('report-head').textContent = lines[0];
-  $('report').textContent = lines.slice(1).join('\n');
+  reportBody = lines.slice(1).join('\n');
   applyReport();
 }
 
