@@ -3,23 +3,40 @@
 <head>
 <meta charset="utf-8">
 <title>OpenBell — venue truth</title>
+<script>
+  // Theme: dark by default, light available; the toggle lives in
+  // Settings at the foot of the page. Set before first paint.
+  document.documentElement.dataset.theme = localStorage.getItem('openbell-theme') || 'dark';
+</script>
 <style>
-  body { margin: 0; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; background: #0f1115; color: #e6e6e6; }
+  :root {
+    --bg: #0f1115; --panel: #15181f; --border: #262a33; --text: #e6e6e6;
+    --dim: #8a8f98; --heading: #b9bec7; --accent: #e8b89d; --rowline: #1d2027;
+  }
+  [data-theme="light"] {
+    --bg: #f6f4ef; --panel: #fffdf8; --border: #ddd5c2; --text: #20242c;
+    --dim: #6b7280; --heading: #4a4f58; --accent: #b06a35; --rowline: #e7e1d2;
+  }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); }
   main { max-width: 960px; margin: 0 auto; padding: 22px 18px 40px; }
   h1 { font-size: 20px; margin: 0 0 2px; }
-  .mode { color: #e8b89d; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+  .mode { color: var(--accent); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
   .cards { display: flex; gap: 12px; margin: 18px 0; flex-wrap: wrap; }
-  .card { background: #15181f; border: 1px solid #262a33; border-radius: 8px; padding: 14px 16px; min-width: 180px; flex: 1; }
-  .card .k { font-size: 11px; color: #8a8f98; text-transform: uppercase; letter-spacing: .06em; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; min-width: 180px; flex: 1; }
+  .card .k { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; }
   .card .v { font-size: 20px; margin-top: 6px; }
-  .unavailable { color: #8a8f98; font-style: italic; }
-  h2 { font-size: 14px; margin: 26px 0 8px; text-transform: uppercase; letter-spacing: .05em; color: #b9bec7; }
+  .unavailable { color: var(--dim); font-style: italic; }
+  h2 { font-size: 14px; margin: 26px 0 8px; text-transform: uppercase; letter-spacing: .05em; color: var(--heading); }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid #1d2027; }
-  th { color: #8a8f98; font-weight: 500; font-size: 11px; text-transform: uppercase; }
-  pre { background: #15181f; border: 1px solid #262a33; border-radius: 6px; padding: 14px; font-size: 13px; white-space: pre-wrap; }
-  .note { color: #8a8f98; font-size: 12px; }
+  th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--rowline); }
+  th { color: var(--dim); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+  pre { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 14px; font-size: 13px; white-space: pre-wrap; }
+  .note { color: var(--dim); font-size: 12px; }
   button { background: #2563eb; color: #fff; border: 0; border-radius: 6px; padding: 7px 13px; cursor: pointer; font-size: 13px; }
+  footer { margin-top: 34px; border-top: 1px solid var(--border); padding-top: 14px; }
+  footer .k { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 8px; }
+  #themeBtn { background: var(--panel); color: var(--text); border: 1px solid var(--border); display: inline-flex; align-items: center; gap: 8px; }
+  .ic { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 </style>
 </head>
 <body>
@@ -64,7 +81,26 @@
 
   <h2>Daily report</h2>
   <pre id="report">…</pre>
+
+  <footer id="settings">
+    <div class="k">Settings</div>
+    <button id="themeBtn" type="button">
+      <svg class="ic" aria-hidden="true"><use id="themeUse" href="#i-moon"/></svg>
+      <span id="themeLabel">Appearance: Dark</span>
+    </button>
+  </footer>
 </main>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-sun" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="4"/>
+      <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>
+    </symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24">
+      <path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/>
+    </symbol>
+  </defs>
+</svg>
 <script>
 const fmt = (v) => v === null || v === undefined ? '<span class="unavailable">unavailable</span>' : v;
 async function load() {
@@ -115,16 +151,19 @@ async function load() {
     const X = (x) => PAD + (x - x0) / Math.max(1, x1 - x0) * (W - 2 * PAD);
     const Y = (y) => H - PAD - (y - y0) / Math.max(1e-9, y1 - y0) * (H - 2 * PAD);
     const palette = ['#7fb069', '#5e8ce6', '#b565d8', '#d8a24a', '#4fb3bf'];
+    const css = getComputedStyle(document.documentElement);
+    const accent = css.getPropertyValue('--accent').trim() || '#e8b89d';
+    const line = css.getPropertyValue('--border').trim() || '#262a33';
     let paths = '';
     allSeries.forEach((s, i) => {
       if (s.points.length < 2) return;
       const d = s.points.map((p, j) => `${j ? 'L' : 'M'}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(' ');
-      const color = s.headline ? '#e8b89d' : palette[(i - 1) % palette.length];
+      const color = s.headline ? accent : palette[(i - 1) % palette.length];
       paths += `<path d="${d}" fill="none" stroke="${color}" stroke-width="${s.headline ? 2.2 : 1.1}"/>`;
     });
     const zeroY = Y(0);
     chartEl.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Paper equity curves">
-      <line x1="${PAD}" y1="${zeroY}" x2="${W - PAD}" y2="${zeroY}" stroke="#262a33"/>
+      <line x1="${PAD}" y1="${zeroY}" x2="${W - PAD}" y2="${zeroY}" stroke="${line}"/>
       ${paths}</svg>`;
     document.getElementById('chart-note').textContent =
       `Paper simulation over the collected tape, starting pot $${eq.paper_pot_start.toFixed(2)} split evenly across the slots each window. The heavy line is the pot; thin lines are each strategy's cumulative paper P&L. Paper only — not venue money.`;
@@ -150,6 +189,20 @@ async function load() {
   document.getElementById('report').textContent = report.report;
 }
 async function collect() { await fetch('/api/collect', { method: 'POST' }); load(); }
+
+function syncThemeButton() {
+  const t = document.documentElement.dataset.theme;
+  document.getElementById('themeUse').setAttribute('href', t === 'dark' ? '#i-moon' : '#i-sun');
+  document.getElementById('themeLabel').textContent = 'Appearance: ' + (t === 'dark' ? 'Dark' : 'Light');
+}
+document.getElementById('themeBtn').addEventListener('click', () => {
+  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem('openbell-theme', next);
+  syncThemeButton();
+  load();
+});
+syncThemeButton();
 load();
 setInterval(load, 30000);
 </script>
