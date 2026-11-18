@@ -12,7 +12,7 @@ cleanup() { for p in $PIDS; do kill -9 $p 2>/dev/null; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 export PATH="$HOME/.rust/bin:$PATH"
-[ -x ./target/debug/openbell-rs ] || cargo build >/dev/null 2>&1
+cargo build >/dev/null 2>&1 || { echo "FAIL: cargo build failed"; exit 1; }
 mkdir -p "$WORK/data"
 python3 gen_slot_fixture.py "$WORK/data/slot-snapshots.jsonl" >/dev/null
 
@@ -46,5 +46,13 @@ echo "$slots" | jq -e '.retired[] | select(.strategy=="favourite-late") | select
   || { echo "FAIL: favourite-late's retirement does not record the true successor: $slots"; exit 1; }
 echo "$slots" | jq -e '.slots | all(has("status") and has("stint_windows") and has("stint_pnl_dollars"))' >/dev/null \
   || { echo "FAIL: slot reports lack status or per-stint fields: $slots"; exit 1; }
+
+# C4 at the API level: the first trade in the ledger stakes exactly
+# floor((pot/N) / price) — N is the library size (5), pot starts 100.
+echo "$slots" | jq -e '
+  (.trades | length) > 0
+  and (.trades[0].contracts == ((100 / (.slots | length) / .trades[0].price) | floor))
+  and (.trades_truncated == false)' >/dev/null \
+  || { echo "FAIL: the first trade's stake is not the equity-split amount: $(echo "$slots" | jq -c '.trades[0]')"; exit 1; }
 
 echo "SLOTS OK: strikes accumulate, three in a row retires and rotates, equities reconcile"
