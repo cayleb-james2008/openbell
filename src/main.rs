@@ -648,44 +648,90 @@ fn account_state() -> AccountState {
 // Daily report — plain words, venue truth, signed P&L in line one
 // ---------------------------------------------------------------------------
 
-fn daily_report(data_dir: &Path, strategies_dir: &Path) -> String {
+fn daily_report(app: &App) -> String {
     let account = account_state();
+    // DIRECTION's signature: line 1 is the day's venue truth — the
+    // signed P&L, or the honest unavailable line. Never a title, never
+    // an invented figure.
     let pnl_line = match account.day_pnl {
         Some(p) => format!("Day P&L (venue): {}${:.2}", if p < 0.0 { "-" } else { "+" }, p.abs()),
         None => "Day P&L (venue): unavailable — no venue credential in the environment; nothing below invents one.".to_string(),
     };
-    let snapshots = load_snapshots(&data_dir.join("snapshots.jsonl"));
-    let tickers: std::collections::HashSet<&str> =
-        snapshots.iter().map(|s| s.ticker.as_str()).collect();
-    // Distinct settled windows — snapshot rows repeat across collector
-    // passes, so counting rows would overstate the tape.
-    let settled = snapshots
-        .iter()
-        .filter(|s| !s.result.is_empty())
-        .map(|s| s.ticker.as_str())
-        .collect::<std::collections::HashSet<&str>>()
-        .len();
+    let snapshots = load_snapshots(&app.data_dir.join("snapshots.jsonl"));
+    let health = collector_health(app);
+    let collecting = health["collecting"].as_bool().unwrap_or(false);
+    let age = health["newest_snapshot_age_secs"].as_i64();
+    let age_text = match age {
+        Some(a) if a < 90 => format!("{a}s old"),
+        Some(a) if a < 5400 => format!("{}m old", a / 60),
+        Some(a) => format!("{:.1}h old", a as f64 / 3600.0),
+        None => "no snapshots yet".to_string(),
+    };
     let mut lines = vec![
-        "OpenBell daily report".to_string(),
         pnl_line,
         format!(
-            "Balance (venue): {}",
+            "Balance (venue): {} · Open positions (venue): {}",
             account
                 .balance
                 .map(|b| format!("${b:.2}"))
-                .unwrap_or_else(|| "unavailable".to_string())
+                .unwrap_or_else(|| "unavailable".to_string()),
+            account.open_positions.len()
         ),
-        format!("Open positions (venue): {}", account.open_positions.len()),
         format!(
-            "Forward collector: {} snapshots on disk across {} markets; {} distinct settled windows.",
-            snapshots.len(),
-            tickers.len(),
-            settled
+            "Collector: {} — {} snapshots on disk across {} markets, {} distinct settled windows; newest snapshot {}.",
+            if collecting { "collecting" } else { "NOT collecting" },
+            health["snapshots_on_disk"],
+            health["markets_seen"],
+            health["settled_windows"],
+            age_text
         ),
-        "Shadow scoring (paper only — this build cannot place orders):".to_string(),
     ];
-    for strat in load_strategies(strategies_dir) {
-        let report = score_strategy(&strat, &snapshots, Standard::default());
+    if !collecting {
+        lines.push("  Uncollected windows cannot be backfilled — a stopped collector is lost evidence.".to_string());
+    }
+    // The slot system over the tape, on paper.
+    let strategies = load_strategies(&app.strategies_dir);
+    let sim = simulate_slots(&strategies, &snapshots, app.paper_pot);
+    lines.push(format!(
+        "Slots (paper — starting pot ${:.2}, re-split evenly across slots each window):",
+        sim.paper_pot_start
+    ));
+    for slot in &sim.slots {
+        lines.push(format!(
+            "  Slot {}: {} — ${:.2} paper equity, {} windows, strikes {}/{}",
+            slot.slot + 1,
+            slot.strategy,
+            slot.equity_dollars,
+            slot.windows_traded,
+            slot.strikes,
+            STRIKE_LIMIT
+        ));
+    }
+    for r in &sim.retired {
+        let now_running = sim
+            .slots
+            .get(r.slot)
+            .map(|s| s.strategy.as_str())
+            .unwrap_or("—");
+        lines.push(format!(
+            "  Retired: {} from slot {} after {} consecutive losses ({} windows) — slot rotated to {}",
+            r.strategy,
+            r.slot + 1,
+            r.strikes,
+            r.windows_traded,
+            now_running
+        ));
+    }
+    lines.push(format!(
+        "Paper pot: ${:.2} (started ${:.2}) — paper only, not venue money.",
+        sim.paper_equity_dollars, sim.paper_pot_start
+    ));
+    lines.push(
+        "Strategy verdicts (paper, forward tape; promotion needs 100+ windows, both halves positive, +3.5c/contract after fees):"
+            .to_string(),
+    );
+    for strat in &strategies {
+        let report = score_strategy(strat, &snapshots, Standard::default());
         lines.push(format!(
             "  {} ({}): {} windows traded, verdict — {}",
             report.strategy, report.side, report.windows_traded, report.verdict
@@ -874,7 +920,7 @@ fn handle(app: &App, method: &str, path: &str) -> String {
             json_response(200, &body.to_string())
         }
         ("GET", "/api/report") => {
-            let report = daily_report(&app.data_dir, &app.strategies_dir);
+            let report = daily_report(app);
             json_response(200, &serde_json::json!({ "report": report }).to_string())
         }
         _ => json_response(404, "{\"error\":\"not found\"}"),
