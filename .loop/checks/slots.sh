@@ -37,5 +37,14 @@ echo "$slots" | jq -e '([.slots[].equity_dollars] | add) as $sum | ($sum - .pape
   || { echo "FAIL: slot equities do not sum to the paper equity: $slots"; exit 1; }
 echo "$slots" | jq -e '.paper_pot_start == 100' >/dev/null \
   || { echo "FAIL: paper pot is not the stated default: $slots"; exit 1; }
+# The retirement records the successor chosen at that moment: on this
+# tape favourite-floor's slot retires first (same window) and takes
+# favourite-late as a fallback, freeing favourite-floor — so when
+# favourite-late's own slot retires it, the free strategy is
+# favourite-floor, not the next in blind order (longshot-late).
+echo "$slots" | jq -e '.retired[] | select(.strategy=="favourite-late") | select(.rotated_to=="favourite-floor")' >/dev/null \
+  || { echo "FAIL: favourite-late's retirement does not record the true successor: $slots"; exit 1; }
+echo "$slots" | jq -e '.slots | all(has("status") and has("stint_windows") and has("stint_pnl_dollars"))' >/dev/null \
+  || { echo "FAIL: slot reports lack status or per-stint fields: $slots"; exit 1; }
 
 echo "SLOTS OK: strikes accumulate, three in a row retires and rotates, equities reconcile"

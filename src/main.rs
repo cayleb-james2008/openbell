@@ -381,11 +381,21 @@ struct Trade {
 struct SlotReport {
     slot: usize,
     strategy: String,
+    /// A slot is always running a strategy (rotation is instant);
+    /// retired occupants live in the simulation's retired list.
+    status: String,
     strikes: i64,
+    /// Cumulative across every occupant of this slot.
     windows_traded: usize,
     rotations: usize,
+    /// Cumulative across every occupant of this slot.
     paper_pnl_dollars: f64,
     equity_dollars: f64,
+    /// The current occupant's own record since it took the slot —
+    /// a slot line must never credit a strategy with a
+    /// predecessor's windows or money.
+    stint_windows: usize,
+    stint_pnl_dollars: f64,
 }
 
 #[derive(Serialize)]
@@ -395,6 +405,9 @@ struct RetiredReport {
     strikes: i64,
     windows_traded: usize,
     paper_pnl_dollars: f64,
+    /// The strategy that actually took the slot at that moment —
+    /// not whatever the slot happens to run at the end.
+    rotated_to: String,
 }
 
 #[derive(Serialize)]
@@ -411,6 +424,9 @@ struct SlotSimulation {
     slots: Vec<SlotReport>,
     retired: Vec<RetiredReport>,
     strategy_totals: Vec<StrategyTotal>,
+    /// Disclosures the surfaces must not bury — e.g. a strategy
+    /// running in several slots at once (its pot weight multiplies).
+    notes: Vec<String>,
     #[serde(skip)]
     trades: Vec<Trade>,
 }
@@ -424,6 +440,7 @@ fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f6
             slots: Vec::new(),
             retired: Vec::new(),
             strategy_totals: Vec::new(),
+            notes: Vec::new(),
             trades: Vec::new(),
         };
     }
@@ -514,14 +531,38 @@ fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f6
                 slot_strikes[slot] = 0;
             }
             if slot_strikes[slot] >= STRIKE_LIMIT {
+                // Successor: the next library strategy in order that
+                // is not currently running in another slot — a blind
+                // next-in-order can stack one strategy across slots
+                // and silently multiply its weight in the pot. Only
+                // when every other strategy is already running (slots
+                // == library size) does the next in order take it,
+                // and the end-state notes disclose the duplication.
+                let mut chosen = (si + 1) % n;
+                if n > 1 {
+                    let running: std::collections::HashSet<usize> = slot_strat
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| *idx != slot)
+                        .map(|(_, s)| *s)
+                        .collect();
+                    for k in 1..n {
+                        let cand = (si + k) % n;
+                        if cand != si && !running.contains(&cand) {
+                            chosen = cand;
+                            break;
+                        }
+                    }
+                }
                 retired.push(RetiredReport {
                     slot,
                     strategy: strat.name.clone(),
                     strikes: slot_strikes[slot],
                     windows_traded: strat_traded[slot],
                     paper_pnl_dollars: strat_pnl[slot],
+                    rotated_to: strategies[chosen].name.clone(),
                 });
-                slot_strat[slot] = (si + 1) % n;
+                slot_strat[slot] = chosen;
                 slot_strikes[slot] = 0;
                 strat_traded[slot] = 0;
                 strat_pnl[slot] = 0.0;
@@ -530,6 +571,18 @@ fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f6
         }
     }
 
+    // End-state disclosures: a strategy running in several slots at
+    // once stakes several shares on the same windows — say so.
+    let mut notes: Vec<String> = Vec::new();
+    for (i, s) in strategies.iter().enumerate() {
+        let count = slot_strat.iter().filter(|si| **si == i).count();
+        if count > 1 {
+            notes.push(format!(
+                "{} is running in {} slots at once — its weight in the pot is multiplied accordingly",
+                s.name, count
+            ));
+        }
+    }
     SlotSimulation {
         paper_pot_start: paper_pot,
         paper_equity_dollars: total_equity,
@@ -537,11 +590,14 @@ fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f6
             .map(|slot| SlotReport {
                 slot,
                 strategy: strategies[slot_strat[slot]].name.clone(),
+                status: "active".to_string(),
                 strikes: slot_strikes[slot],
                 windows_traded: slot_traded[slot],
                 rotations: rotations[slot],
                 paper_pnl_dollars: slot_pnl[slot],
                 equity_dollars: paper_pot / n as f64 + slot_pnl[slot],
+                stint_windows: strat_traded[slot],
+                stint_pnl_dollars: strat_pnl[slot],
             })
             .collect(),
         retired,
@@ -554,6 +610,7 @@ fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f6
                 paper_pnl_dollars: totals[i].1,
             })
             .collect(),
+        notes,
         trades,
     }
 }
@@ -650,6 +707,15 @@ fn account_state() -> AccountState {
 // Daily report — plain words, venue truth, signed P&L in line one
 // ---------------------------------------------------------------------------
 
+/// Money as a reader expects it: -$42.46, not $-42.46.
+fn fmt_money(v: f64) -> String {
+    if v < 0.0 {
+        format!("-${:.2}", v.abs())
+    } else {
+        format!("${:.2}", v)
+    }
+}
+
 fn daily_report(app: &App) -> String {
     let account = account_state();
     // DIRECTION's signature: line 1 is the day's venue truth — the
@@ -703,33 +769,37 @@ fn daily_report(app: &App) -> String {
     ));
     for slot in &sim.slots {
         lines.push(format!(
-            "  Slot {}: {} — ${:.2} paper equity, {} windows, strikes {}/{}",
+            "  Slot {}: {} ({}) — strikes {}/{} · this stint: {} windows, P&L {} · slot total: {} windows, P&L {}, equity {}",
             slot.slot + 1,
             slot.strategy,
-            slot.equity_dollars,
-            slot.windows_traded,
+            slot.status,
             slot.strikes,
-            STRIKE_LIMIT
+            STRIKE_LIMIT,
+            slot.stint_windows,
+            fmt_money(slot.stint_pnl_dollars),
+            slot.windows_traded,
+            fmt_money(slot.paper_pnl_dollars),
+            fmt_money(slot.equity_dollars)
         ));
     }
     for r in &sim.retired {
-        let now_running = sim
-            .slots
-            .get(r.slot)
-            .map(|s| s.strategy.as_str())
-            .unwrap_or("—");
         lines.push(format!(
-            "  Retired: {} from slot {} after {} consecutive losses ({} windows) — slot rotated to {}",
+            "  Retired: {} from slot {} after {} consecutive losses ({} windows, P&L {}) — slot rotated to {}",
             r.strategy,
             r.slot + 1,
             r.strikes,
             r.windows_traded,
-            now_running
+            fmt_money(r.paper_pnl_dollars),
+            r.rotated_to
         ));
     }
+    for note in &sim.notes {
+        lines.push(format!("  Note: {note}"));
+    }
     lines.push(format!(
-        "Paper pot: ${:.2} (started ${:.2}) — paper only, not venue money.",
-        sim.paper_equity_dollars, sim.paper_pot_start
+        "Paper pot: {} (started {}) — paper only, not venue money.",
+        fmt_money(sim.paper_equity_dollars),
+        fmt_money(sim.paper_pot_start)
     ));
     lines.push(
         "Strategy verdicts (paper, forward tape; promotion needs 100+ windows, both halves positive, +3.5c/contract after fees):"
@@ -1081,7 +1151,9 @@ mod tests {
             .expect("library holds favourite-late");
         // YES loses every window: favourite-late (buys YES at 0.70)
         // strikes on windows 1-3 and must be retired from its slot.
-        let snaps = losing_windows(6, &["no", "no", "no", "no", "no", "no"]);
+        // Exactly three windows: enough to retire, not enough for the
+        // book to cycle a strategy back into the slot.
+        let snaps = losing_windows(3, &["no", "no", "no"]);
         let sim = simulate_slots(&strategies, &snaps, 100.0);
         let retired = sim
             .retired
@@ -1091,7 +1163,11 @@ mod tests {
         assert_eq!(retired.slot, fav_idx);
         assert_eq!(retired.strikes, 3);
         assert_eq!(retired.windows_traded, 3);
-        assert_ne!(sim.slots[fav_idx].strategy, "favourite-late");
+        // The successor is the strategy freed when favourite-floor's
+        // slot retired moments earlier in the same window — recorded
+        // on the retirement itself, not read off the end state.
+        assert_eq!(retired.rotated_to, "favourite-floor");
+        assert_eq!(sim.slots[fav_idx].strategy, "favourite-floor");
         assert_eq!(sim.slots[fav_idx].rotations, 1);
     }
 
