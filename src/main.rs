@@ -249,17 +249,45 @@ struct ScoreReport {
     verdict: String,
 }
 
-fn score_strategy(strat: &Strategy, snapshots: &[Snapshot], standard: Standard) -> ScoreReport {
-    // Group snapshots into market windows.
+/// The entry a strategy would have taken in one window: the ask on its
+/// side at the first snapshot (in fetch order) where its Rune
+/// `allow_entry` says yes. None when it never enters.
+fn window_entry(strat: &Strategy, snaps: &[Snapshot]) -> Option<f64> {
+    for snap in snaps {
+        let (Some(ya), Some(na)) = (snap.yes_ask, snap.no_ask) else {
+            continue;
+        };
+        let Some(close) = parse_iso_z(&snap.close_time) else {
+            continue;
+        };
+        let secs_to_close = close - snap.fetched_at;
+        if strat.allow_entry(ya, na, secs_to_close) {
+            return Some(if strat.side == "yes" { ya } else { na });
+        }
+    }
+    None
+}
+
+/// Group snapshots into market windows keyed by ticker, each window's
+/// snapshots in fetch order.
+fn group_windows(snapshots: &[Snapshot]) -> BTreeMap<String, Vec<Snapshot>> {
     let mut windows: BTreeMap<String, Vec<Snapshot>> = BTreeMap::new();
     for snap in snapshots {
         windows.entry(snap.ticker.clone()).or_default().push(snap.clone());
     }
+    for snaps in windows.values_mut() {
+        snaps.sort_by_key(|s| s.fetched_at);
+    }
+    windows
+}
+
+fn score_strategy(strat: &Strategy, snapshots: &[Snapshot], standard: Standard) -> ScoreReport {
+    // Group snapshots into market windows.
+    let windows = group_windows(snapshots);
     // (close_epoch, pnl per contract) for every settled window we entered.
     let mut trades: Vec<(i64, f64)> = Vec::new();
     let mut settled = 0usize;
-    for (_ticker, mut snaps) in windows {
-        snaps.sort_by_key(|s| s.fetched_at);
+    for (_ticker, snaps) in windows {
         let result = snaps
             .iter()
             .rev()
@@ -267,21 +295,9 @@ fn score_strategy(strat: &Strategy, snapshots: &[Snapshot], standard: Standard) 
             .map(|s| s.result.clone());
         let Some(result) = result else { continue };
         settled += 1;
-        let mut entry_price: Option<f64> = None;
-        for snap in &snaps {
-            let (Some(ya), Some(na)) = (snap.yes_ask, snap.no_ask) else {
-                continue;
-            };
-            let Some(close) = parse_iso_z(&snap.close_time) else {
-                continue;
-            };
-            let secs_to_close = close - snap.fetched_at;
-            if strat.allow_entry(ya, na, secs_to_close) {
-                entry_price = Some(if strat.side == "yes" { ya } else { na });
-                break;
-            }
-        }
-        let Some(price) = entry_price else { continue };
+        let Some(price) = window_entry(strat, &snaps) else {
+            continue;
+        };
         if price <= 0.0 || price >= 1.0 {
             continue;
         }
@@ -329,6 +345,248 @@ fn score_strategy(strat: &Strategy, snapshots: &[Snapshot], standard: Standard) 
         standard,
         verdict,
     }
+}
+
+// ---------------------------------------------------------------------------
+// The slot system, on paper — per-slot state, strikes, equity-split sizing
+// ---------------------------------------------------------------------------
+//
+// The desk the goal describes, expressed over the forward tape. There is
+// one slot per strategy in the library; each slot starts with its own
+// strategy. Before each window the paper pot is notionally re-split
+// evenly across the slots — the split uses 100% of the pot, no reserve —
+// and each slot stakes its full current share on a window its strategy
+// enters (contracts = floor(share / price), fees charged on top). A
+// losing window is a strike against the strategy running in that slot, a
+// winning window clears the strikes, and three consecutive strikes
+// retire the strategy — the next one in the library takes the slot. A
+// slot's reported equity is its attributed equity: its starting share
+// plus its own cumulative paper P&L. All of it is paper: the only thing
+// at risk is the simulation's own arithmetic.
+
+/// Consecutive losing windows that retire a strategy from its slot.
+const STRIKE_LIMIT: i64 = 3;
+
+#[derive(Serialize)]
+struct Trade {
+    close_epoch: i64,
+    slot: usize,
+    strategy: String,
+    price: f64,
+    contracts: i64,
+    pnl_dollars: f64,
+}
+
+#[derive(Serialize)]
+struct SlotReport {
+    slot: usize,
+    strategy: String,
+    strikes: i64,
+    windows_traded: usize,
+    rotations: usize,
+    paper_pnl_dollars: f64,
+    equity_dollars: f64,
+}
+
+#[derive(Serialize)]
+struct RetiredReport {
+    slot: usize,
+    strategy: String,
+    strikes: i64,
+    windows_traded: usize,
+    paper_pnl_dollars: f64,
+}
+
+#[derive(Serialize)]
+struct StrategyTotal {
+    strategy: String,
+    windows_traded: usize,
+    paper_pnl_dollars: f64,
+}
+
+#[derive(Serialize)]
+struct SlotSimulation {
+    paper_pot_start: f64,
+    paper_equity_dollars: f64,
+    slots: Vec<SlotReport>,
+    retired: Vec<RetiredReport>,
+    strategy_totals: Vec<StrategyTotal>,
+    #[serde(skip)]
+    trades: Vec<Trade>,
+}
+
+fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f64) -> SlotSimulation {
+    let n = strategies.len();
+    if n == 0 {
+        return SlotSimulation {
+            paper_pot_start: paper_pot,
+            paper_equity_dollars: paper_pot,
+            slots: Vec::new(),
+            retired: Vec::new(),
+            strategy_totals: Vec::new(),
+            trades: Vec::new(),
+        };
+    }
+    // Settled windows in chronological order, with every strategy's
+    // entry price precomputed.
+    struct Window {
+        close_epoch: i64,
+        result: String,
+        entries: Vec<Option<f64>>,
+    }
+    let mut windows: Vec<Window> = Vec::new();
+    for (_ticker, snaps) in group_windows(snapshots) {
+        let Some(result) = snaps
+            .iter()
+            .rev()
+            .find(|s| !s.result.is_empty())
+            .map(|s| s.result.clone())
+        else {
+            continue;
+        };
+        let close_epoch = parse_iso_z(&snaps[0].close_time).unwrap_or(0);
+        let entries = strategies.iter().map(|s| window_entry(s, &snaps)).collect();
+        windows.push(Window {
+            close_epoch,
+            result,
+            entries,
+        });
+    }
+    windows.sort_by_key(|w| w.close_epoch);
+
+    let mut total_equity = paper_pot;
+    let mut slot_strat: Vec<usize> = (0..n).collect();
+    let mut slot_strikes = vec![0i64; n];
+    let mut strat_traded = vec![0usize; n]; // by the strategy currently in the slot
+    let mut strat_pnl = vec![0.0f64; n];
+    let mut slot_traded = vec![0usize; n];
+    let mut slot_pnl = vec![0.0f64; n];
+    let mut rotations = vec![0usize; n];
+    let mut retired: Vec<RetiredReport> = Vec::new();
+    let mut totals: Vec<(usize, f64)> = vec![(0, 0.0); n]; // per library strategy
+    let mut trades: Vec<Trade> = Vec::new();
+
+    for window in &windows {
+        // The split for this window is taken from the pot as it stands
+        // at the window's start; every slot in the window uses it.
+        let share = if total_equity > 0.0 {
+            total_equity / n as f64
+        } else {
+            0.0
+        };
+        for slot in 0..n {
+            let si = slot_strat[slot];
+            let strat = &strategies[si];
+            let Some(price) = window.entries[si] else {
+                continue;
+            };
+            if price <= 0.0 || price >= 1.0 {
+                continue;
+            }
+            let contracts = (share / price).floor() as i64;
+            if contracts <= 0 {
+                continue;
+            }
+            let payoff = if window.result == strat.side {
+                contracts as f64
+            } else {
+                0.0
+            };
+            let pnl = payoff - contracts as f64 * price - contracts as f64 * fee(price);
+            total_equity += pnl;
+            slot_pnl[slot] += pnl;
+            slot_traded[slot] += 1;
+            strat_traded[slot] += 1;
+            strat_pnl[slot] += pnl;
+            totals[si].0 += 1;
+            totals[si].1 += pnl;
+            trades.push(Trade {
+                close_epoch: window.close_epoch,
+                slot,
+                strategy: strat.name.clone(),
+                price,
+                contracts,
+                pnl_dollars: pnl,
+            });
+            if pnl < 0.0 {
+                slot_strikes[slot] += 1;
+            } else {
+                slot_strikes[slot] = 0;
+            }
+            if slot_strikes[slot] >= STRIKE_LIMIT {
+                retired.push(RetiredReport {
+                    slot,
+                    strategy: strat.name.clone(),
+                    strikes: slot_strikes[slot],
+                    windows_traded: strat_traded[slot],
+                    paper_pnl_dollars: strat_pnl[slot],
+                });
+                slot_strat[slot] = (si + 1) % n;
+                slot_strikes[slot] = 0;
+                strat_traded[slot] = 0;
+                strat_pnl[slot] = 0.0;
+                rotations[slot] += 1;
+            }
+        }
+    }
+
+    SlotSimulation {
+        paper_pot_start: paper_pot,
+        paper_equity_dollars: total_equity,
+        slots: (0..n)
+            .map(|slot| SlotReport {
+                slot,
+                strategy: strategies[slot_strat[slot]].name.clone(),
+                strikes: slot_strikes[slot],
+                windows_traded: slot_traded[slot],
+                rotations: rotations[slot],
+                paper_pnl_dollars: slot_pnl[slot],
+                equity_dollars: paper_pot / n as f64 + slot_pnl[slot],
+            })
+            .collect(),
+        retired,
+        strategy_totals: strategies
+            .iter()
+            .enumerate()
+            .map(|(i, s)| StrategyTotal {
+                strategy: s.name.clone(),
+                windows_traded: totals[i].0,
+                paper_pnl_dollars: totals[i].1,
+            })
+            .collect(),
+        trades,
+    }
+}
+
+/// Cumulative paper P&L per strategy over time, plus the whole pot's
+/// equity curve — the data behind the chart. Points are (epoch, value)
+/// in chronological order; each strategy series starts at 0 and the pot
+/// series starts at the paper pot.
+fn equity_curves(sim: &SlotSimulation) -> (Vec<(i64, f64)>, Vec<(String, Vec<(i64, f64)>)>) {
+    let mut pot: Vec<(i64, f64)> = Vec::new();
+    let mut per: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
+    let mut pot_now = sim.paper_pot_start;
+    let mut cum: BTreeMap<String, f64> = BTreeMap::new();
+    // Trades at the same close epoch land together on the pot curve.
+    let mut trades: Vec<&Trade> = sim.trades.iter().collect();
+    trades.sort_by_key(|t| t.close_epoch);
+    let mut i = 0;
+    while i < trades.len() {
+        let epoch = trades[i].close_epoch;
+        let mut epoch_pnl: BTreeMap<String, f64> = BTreeMap::new();
+        while i < trades.len() && trades[i].close_epoch == epoch {
+            pot_now += trades[i].pnl_dollars;
+            *epoch_pnl.entry(trades[i].strategy.clone()).or_default() += trades[i].pnl_dollars;
+            i += 1;
+        }
+        pot.push((epoch, pot_now));
+        for (name, pnl) in epoch_pnl {
+            let c = cum.entry(name.clone()).or_default();
+            *c += pnl;
+            per.entry(name).or_default().push((epoch, *c));
+        }
+    }
+    (pot, per.into_iter().collect())
 }
 
 fn load_strategies(dir: &Path) -> Vec<Strategy> {
@@ -443,6 +701,27 @@ fn daily_report(data_dir: &Path, strategies_dir: &Path) -> String {
 struct App {
     data_dir: PathBuf,
     strategies_dir: PathBuf,
+    /// The paper pot the slot simulation splits across slots. A
+    /// simulation parameter, stated on every surface that shows it —
+    /// never a venue figure.
+    paper_pot: f64,
+}
+
+/// Resolve the `dataset=` query parameter to a tape file in the data
+/// dir. Names are restricted to [a-z0-9-] so the parameter can never
+/// walk out of the data dir. No parameter means the live collected tape.
+fn dataset_path(app: &App, query: &str) -> PathBuf {
+    if let Some(pos) = query.find("dataset=") {
+        let raw = &query[pos + "dataset=".len()..];
+        let name: String = raw
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        if !name.is_empty() {
+            return app.data_dir.join(format!("{name}-snapshots.jsonl"));
+        }
+    }
+    app.data_dir.join("snapshots.jsonl")
 }
 
 fn json_response(status: u16, body: &str) -> String {
@@ -525,17 +804,42 @@ fn handle(app: &App, method: &str, path: &str) -> String {
             Err(e) => json_response(502, &format!("{{\"error\":\"{e}\"}}")),
         },
         ("GET", "/api/strategies") => {
-            let dataset = if query.contains("dataset=fixture") {
-                app.data_dir.join("fixture-snapshots.jsonl")
-            } else {
-                app.data_dir.join("snapshots.jsonl")
-            };
-            let snapshots = load_snapshots(&dataset);
+            let snapshots = load_snapshots(&dataset_path(app, query));
             let reports: Vec<ScoreReport> = load_strategies(&app.strategies_dir)
                 .iter()
                 .map(|s| score_strategy(s, &snapshots, Standard::default()))
                 .collect();
             json_response(200, &serde_json::to_string(&reports).unwrap())
+        }
+        ("GET", "/api/slots") => {
+            let snapshots = load_snapshots(&dataset_path(app, query));
+            let strategies = load_strategies(&app.strategies_dir);
+            let sim = simulate_slots(&strategies, &snapshots, app.paper_pot);
+            json_response(200, &serde_json::to_string(&sim).unwrap())
+        }
+        ("GET", "/api/equity") => {
+            let snapshots = load_snapshots(&dataset_path(app, query));
+            let strategies = load_strategies(&app.strategies_dir);
+            let sim = simulate_slots(&strategies, &snapshots, app.paper_pot);
+            let (pot, per) = equity_curves(&sim);
+            let mut series: Vec<serde_json::Value> = strategies
+                .iter()
+                .map(|s| {
+                    let points = per
+                        .iter()
+                        .find(|(name, _)| *name == s.name)
+                        .map(|(_, pts)| pts.clone())
+                        .unwrap_or_default();
+                    serde_json::json!({ "strategy": s.name, "points": points })
+                })
+                .collect();
+            series.sort_by(|a, b| a["strategy"].as_str().cmp(&b["strategy"].as_str()));
+            let body = serde_json::json!({
+                "paper_pot_start": sim.paper_pot_start,
+                "pot": pot,
+                "series": series,
+            });
+            json_response(200, &body.to_string())
         }
         ("GET", "/api/report") => {
             let report = daily_report(&app.data_dir, &app.strategies_dir);
@@ -556,6 +860,11 @@ fn main() {
     let strategies_dir = std::env::var("OPENBELL_STRATEGIES")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./strategies"));
+    let paper_pot: f64 = std::env::var("OPENBELL_PAPER_POT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .filter(|p: &f64| *p > 0.0)
+        .unwrap_or(100.0);
     let _ = std::fs::create_dir_all(&data_dir);
 
     // Forward collector: one pass now, then on an interval.
@@ -577,6 +886,7 @@ fn main() {
     let app = Arc::new(App {
         data_dir,
         strategies_dir,
+        paper_pot,
     });
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind failed");
     println!("openbell-rs listening on http://127.0.0.1:{port} (shadow mode — no order path exists)");
@@ -663,5 +973,116 @@ mod tests {
         let report = score_strategy(&long, &snaps, standard);
         assert_eq!(report.windows_traded, 6);
         assert!(report.verdict.contains("NOT PROVEN"), "verdict: {}", report.verdict);
+    }
+
+    fn losing_windows(n: usize, results: &[&str]) -> Vec<Snapshot> {
+        // Windows with a tradeable snapshot 240s before close
+        // (yes_ask 0.70 / no_ask 0.32), settled per `results`.
+        let mut snaps = Vec::new();
+        for i in 0..n {
+            let close = format!("2026-11-17T{:02}:00:00Z", 10 + i);
+            let close_epoch = parse_iso_z(&close).unwrap();
+            snaps.push(snap(&format!("W{i}"), close_epoch - 240, &close, "", Some(0.70), Some(0.32)));
+            snaps.push(snap(&format!("W{i}"), close_epoch + 60, &close, results[i], None, None));
+        }
+        snaps
+    }
+
+    #[test]
+    fn slot_rotates_after_three_consecutive_strikes() {
+        let strategies = load_strategies(Path::new("strategies"));
+        let fav_idx = strategies
+            .iter()
+            .position(|s| s.name == "favourite-late")
+            .expect("library holds favourite-late");
+        // YES loses every window: favourite-late (buys YES at 0.70)
+        // strikes on windows 1-3 and must be retired from its slot.
+        let snaps = losing_windows(6, &["no", "no", "no", "no", "no", "no"]);
+        let sim = simulate_slots(&strategies, &snaps, 100.0);
+        let retired = sim
+            .retired
+            .iter()
+            .find(|r| r.strategy == "favourite-late")
+            .expect("favourite-late was retired");
+        assert_eq!(retired.slot, fav_idx);
+        assert_eq!(retired.strikes, 3);
+        assert_eq!(retired.windows_traded, 3);
+        assert_ne!(sim.slots[fav_idx].strategy, "favourite-late");
+        assert_eq!(sim.slots[fav_idx].rotations, 1);
+    }
+
+    #[test]
+    fn strikes_are_consecutive_a_win_clears_them() {
+        let strategies = load_strategies(Path::new("strategies"));
+        let fav_idx = strategies
+            .iter()
+            .position(|s| s.name == "favourite-late")
+            .expect("library holds favourite-late");
+        // YES record L L W L L — favourite-late never takes three
+        // strikes in a row, so it is not retired and ends on 2 strikes.
+        let snaps = losing_windows(5, &["no", "no", "yes", "no", "no"]);
+        let sim = simulate_slots(&strategies, &snaps, 100.0);
+        assert!(
+            !sim.retired.iter().any(|r| r.strategy == "favourite-late"),
+            "favourite-late must not be retired"
+        );
+        assert_eq!(sim.slots[fav_idx].strategy, "favourite-late");
+        assert_eq!(sim.slots[fav_idx].strikes, 2);
+        assert_eq!(sim.slots[fav_idx].windows_traded, 5);
+    }
+
+    #[test]
+    fn paper_sizing_is_equity_split_and_recomputes() {
+        let fav = Strategy::load(Path::new("strategies/favourite_late.rn")).unwrap();
+        // One slot, $100 pot: the slot stakes its full share.
+        // contracts = floor(100 / 0.70) = 142; a win pays 142 back
+        // against 142*0.70 cost and 142*fee(0.70) fees.
+        let snaps = losing_windows(1, &["yes"]);
+        let sim = simulate_slots(&[fav], &snaps, 100.0);
+        assert_eq!(sim.trades.len(), 1);
+        let t = &sim.trades[0];
+        assert_eq!(t.contracts, 142);
+        let expected = 142.0 - 142.0 * 0.70 - 142.0 * fee(0.70);
+        assert!((t.pnl_dollars - expected).abs() < 1e-9, "pnl {} vs {expected}", t.pnl_dollars);
+        assert!((sim.paper_equity_dollars - (100.0 + expected)).abs() < 1e-9);
+        // Two strategies -> two slots -> $50 share each:
+        // contracts = floor(50 / 0.70) = 71 for the favourite's slot.
+        let strategies = load_strategies(Path::new("strategies"));
+        let two: Vec<Strategy> = strategies
+            .into_iter()
+            .filter(|s| s.name == "favourite-late" || s.name == "longshot-late")
+            .collect();
+        assert_eq!(two.len(), 2);
+        let sim = simulate_slots(&two, &snaps, 100.0);
+        let fav_trade = sim
+            .trades
+            .iter()
+            .find(|t| t.strategy == "favourite-late")
+            .expect("favourite traded");
+        assert_eq!(fav_trade.contracts, 71);
+    }
+
+    #[test]
+    fn equity_curve_final_points_match_strategy_totals() {
+        let strategies = load_strategies(Path::new("strategies"));
+        let snaps = losing_windows(6, &["no", "yes", "no", "yes", "no", "yes"]);
+        let sim = simulate_slots(&strategies, &snaps, 100.0);
+        let (pot, per) = equity_curves(&sim);
+        // Pot curve ends at the simulation's final paper equity.
+        assert!((pot.last().unwrap().1 - sim.paper_equity_dollars).abs() < 1e-9);
+        // Each strategy's curve ends at its strategy total.
+        for (name, points) in &per {
+            let total = sim
+                .strategy_totals
+                .iter()
+                .find(|t| &t.strategy == name)
+                .unwrap();
+            assert!(
+                (points.last().unwrap().1 - total.paper_pnl_dollars).abs() < 1e-9,
+                "{name}: curve {} vs total {}",
+                points.last().unwrap().1,
+                total.paper_pnl_dollars
+            );
+        }
     }
 }
