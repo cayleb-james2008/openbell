@@ -108,8 +108,11 @@ async function load() {
   const a = home.account;
   document.getElementById('balance').innerHTML = a.balance === null ? fmt(null) : '$' + a.balance.toFixed(2);
   document.getElementById('pnl').innerHTML = a.day_pnl === null ? fmt(null) : '$' + a.day_pnl.toFixed(2);
-  document.getElementById('positions').textContent = a.open_positions.length;
-  document.getElementById('risk').innerHTML = a.open_positions.length === 0 ? '$0.00 (no open positions)' : 'see positions';
+  // Unknown is unavailable, never zero: a null here means the venue
+  // has not told us, and the cards must say so.
+  document.getElementById('positions').innerHTML = a.open_positions === null ? fmt(null) : a.open_positions.length;
+  document.getElementById('risk').innerHTML = a.open_positions === null ? fmt(null)
+    : a.open_positions.length === 0 ? '$0.00 (no open positions)' : 'see positions';
   document.getElementById('account-note').textContent = a.note;
 
   const c = home.collector;
