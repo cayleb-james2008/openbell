@@ -35,6 +35,15 @@
   </div>
   <p class="note" id="account-note"></p>
 
+  <h2>Collector — the forward tape</h2>
+  <div class="cards">
+    <div class="card"><div class="k">Snapshots on disk</div><div class="v" id="c-snaps">…</div></div>
+    <div class="card"><div class="k">Markets seen</div><div class="v" id="c-markets">…</div></div>
+    <div class="card"><div class="k">Settled windows</div><div class="v" id="c-settled">…</div></div>
+    <div class="card"><div class="k">Newest snapshot</div><div class="v" id="c-age">…</div></div>
+  </div>
+  <p class="note" id="c-note"></p>
+
   <h2>Markets — public venue data, collected forward</h2>
   <button onclick="collect()">Collect now</button>
   <table>
@@ -61,6 +70,17 @@ async function load() {
   document.getElementById('positions').textContent = a.open_positions.length;
   document.getElementById('risk').innerHTML = a.open_positions.length === 0 ? '$0.00 (no open positions)' : 'see positions';
   document.getElementById('account-note').textContent = a.note;
+
+  const c = home.collector;
+  document.getElementById('c-snaps').textContent = c.snapshots_on_disk;
+  document.getElementById('c-markets').textContent = c.markets_seen;
+  document.getElementById('c-settled').textContent = c.settled_windows;
+  const age = c.newest_snapshot_age_secs;
+  document.getElementById('c-age').textContent =
+    age === null ? 'none yet' : age < 90 ? age + 's ago' : age < 5400 ? Math.round(age / 60) + 'm ago' : (age / 3600).toFixed(1) + 'h ago';
+  document.getElementById('c-note').textContent = c.collecting
+    ? `Collecting — a pass lands every ${c.collect_interval_secs}s. The tape is the forward record: windows are scored from what was collected before they settled.`
+    : 'Not collecting — the newest snapshot is older than two collect intervals. Uncollected windows cannot be backfilled.';
 
   const markets = await (await fetch('/api/markets')).json();
   const tb = document.getElementById('markets');

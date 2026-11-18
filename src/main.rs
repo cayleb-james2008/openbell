@@ -705,6 +705,37 @@ struct App {
     /// simulation parameter, stated on every surface that shows it —
     /// never a venue figure.
     paper_pot: f64,
+    /// The collector's pass interval (seconds), so the home screen can
+    /// say honestly whether the tape is fresh: a newest snapshot older
+    /// than two intervals means collection has stopped, and
+    /// uncollected windows cannot be backfilled.
+    collect_secs: u64,
+}
+
+/// Collector health, computed from the tape itself — the same numbers
+/// an independent count of the file gives.
+fn collector_health(app: &App) -> serde_json::Value {
+    let snapshots = load_snapshots(&app.data_dir.join("snapshots.jsonl"));
+    let mut markets: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut settled: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut newest: Option<i64> = None;
+    for s in &snapshots {
+        markets.insert(s.ticker.as_str());
+        if !s.result.is_empty() {
+            settled.insert(s.ticker.as_str());
+        }
+        newest = Some(newest.map_or(s.fetched_at, |n| n.max(s.fetched_at)));
+    }
+    let age = newest.map(|n| (now_unix() - n).max(0));
+    let collecting = age.map_or(false, |a| a <= (app.collect_secs.max(60) * 2) as i64);
+    serde_json::json!({
+        "snapshots_on_disk": snapshots.len(),
+        "markets_seen": markets.len(),
+        "settled_windows": settled.len(),
+        "newest_snapshot_age_secs": age,
+        "collect_interval_secs": app.collect_secs,
+        "collecting": collecting,
+    })
 }
 
 /// Resolve the `dataset=` query parameter to a tape file in the data
@@ -791,6 +822,7 @@ fn handle(app: &App, method: &str, path: &str) -> String {
         ("GET", "/api/home") => {
             let home = serde_json::json!({
                 "account": account_state(),
+                "collector": collector_health(app),
                 "mode": "shadow — this build never places orders",
                 "series": SERIES,
             });
@@ -887,6 +919,7 @@ fn main() {
         data_dir,
         strategies_dir,
         paper_pot,
+        collect_secs,
     });
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind failed");
     println!("openbell-rs listening on http://127.0.0.1:{port} (shadow mode — no order path exists)");
