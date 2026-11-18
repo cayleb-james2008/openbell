@@ -564,7 +564,9 @@ function renderTape(c) {
   setValue('c-dropped', c.dropped_lines);
   setValue('c-conflicts', c.conflicting_settlements);
   setValue('c-age', ageWords(c.newest_snapshot_age_secs));
-  const healthy = c.collecting && c.dropped_lines === 0 && c.conflicting_settlements === 0;
+  const failed = c.series_failed_last_pass;
+  const failNote = failed + ' of ' + c.series_total + ' series failed on the last pass';
+  const healthy = c.collecting && c.dropped_lines === 0 && c.conflicting_settlements === 0 && !failed;
   $('c-dot').className = 'dot ' + (c.collecting ? (healthy ? 'ok' : 'warn') : 'err');
   $('c-note').textContent = c.snapshots_on_disk === 0
     ? 'Empty: no tape has been written yet, so nothing is scored. The collector writes its first pass on start, or when you press Collect now in Collected markets. Windows cannot be backfilled.'
@@ -572,9 +574,9 @@ function renderTape(c) {
     ? 'Stale: the newest snapshot is older than two collect intervals, so the collector is not collecting. Uncollected windows cannot be backfilled.'
     : healthy
       ? 'Healthy: collecting, a pass lands every ' + c.collect_interval_secs + 's. The tape is the forward record, and windows are scored from what was collected before they settled.'
-      : 'Collecting, with ' + (c.dropped_lines ? c.dropped_lines + ' dropped line(s)' : '') + (c.dropped_lines && c.conflicting_settlements ? ' and ' : '') + (c.conflicting_settlements ? c.conflicting_settlements + ' window(s) with conflicting settlements, which are not scored' : '') + '.';
+      : 'Collecting, with ' + (c.dropped_lines ? c.dropped_lines + ' dropped line(s)' : '') + (c.dropped_lines && c.conflicting_settlements ? ' and ' : '') + (c.conflicting_settlements ? c.conflicting_settlements + ' window(s) with conflicting settlements, which are not scored' : '') + (failed ? ((c.dropped_lines || c.conflicting_settlements) ? ' and ' : '') + failNote : '') + '.';
   $('chip-dot').className = 'dot ' + (c.collecting ? (healthy ? 'ok' : 'warn') : 'err');
-  $('chip-text').textContent = c.collecting ? 'Collecting, newest ' + ageWords(c.newest_snapshot_age_secs) : 'Not collecting';
+  $('chip-text').textContent = c.collecting ? 'Collecting, newest ' + ageWords(c.newest_snapshot_age_secs) + (failed ? ' · ' + failNote : '') : 'Not collecting';
 }
 
 function renderPot(slots, eq, home) {

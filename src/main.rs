@@ -183,6 +183,11 @@ fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize), S
 /// spliced, unparseable tape lines.
 static COLLECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Series fetches that failed on the most recent pass: the count the
+/// pass logs as "series failed", stated on the health block and report.
+static SERIES_FAILED_LAST_PASS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Run one pass. Ok carries (snapshots written, per-series errors);
 /// a pass that wrote nothing BECAUSE everything failed is Err, so
 /// the API can say so instead of returning a cheerful 200 with 0.
@@ -218,6 +223,7 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
             }
         }
     }
+    SERIES_FAILED_LAST_PASS.store(errors.len(), std::sync::atomic::Ordering::Relaxed);
     if written == 0 {
         return Err(if errors.is_empty() {
             "collection wrote nothing — every series returned empty".to_string()
@@ -1509,12 +1515,19 @@ fn daily_report(app: &App) -> String {
             }
         ),
         format!(
-            "Collector: {} — {} snapshots on disk across {} markets, {} distinct settled windows; newest snapshot {}.",
+            "Collector: {} — {} snapshots on disk across {} markets, {} distinct settled windows; newest snapshot {}.{}",
             if collecting { "collecting" } else { "NOT collecting" },
             health["snapshots_on_disk"],
             health["markets_seen"],
             health["settled_windows"],
-            age_text
+            age_text,
+            match health["series_failed_last_pass"].as_u64() {
+                Some(n) if n > 0 => format!(
+                    " {n} of {} series failed on the last pass.",
+                    health["series_total"]
+                ),
+                _ => String::new(),
+            }
         ),
     ];
     if !collecting {
@@ -1968,6 +1981,8 @@ fn collector_health(app: &App) -> serde_json::Value {
         "newest_snapshot_age_secs": age,
         "collect_interval_secs": app.collect_secs,
         "collecting": collecting,
+        "series_failed_last_pass": SERIES_FAILED_LAST_PASS.load(std::sync::atomic::Ordering::Relaxed),
+        "series_total": SERIES.len() * 2,
     })
 }
 
@@ -3070,5 +3085,28 @@ mod tests {
         );
         assert_eq!(refuse_request("GET", &headers("127.0.0.1:9820", &json_foreign), 0, &[]), None);
     }
-}
 
+    #[test]
+    fn failed_series_on_the_last_pass_are_stated() {
+        let dir = std::env::temp_dir().join(format!("ob-series-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: dir.clone(),
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        SERIES_FAILED_LAST_PASS.store(3, std::sync::atomic::Ordering::Relaxed);
+        let health = collector_health(&app);
+        assert_eq!(health["series_failed_last_pass"], 3);
+        assert_eq!(health["series_total"], 10);
+        assert!(
+            daily_report(&app).contains("3 of 10 series failed on the last pass"),
+            "report must say a partial pass plainly"
+        );
+        SERIES_FAILED_LAST_PASS.store(0, std::sync::atomic::Ordering::Relaxed);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
