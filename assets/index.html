@@ -170,8 +170,9 @@ async function load() {
       ${paths}</svg>`;
     document.getElementById('chart-note').textContent =
       `Paper simulation over the collected tape, starting pot $${eq.paper_pot_start.toFixed(2)} split evenly across the slots each window. The heavy line is the pot; thin lines are each strategy's cumulative paper P&L. Paper only — not venue money.`;
+    const money = (v) => v < 0 ? '-$' + Math.abs(v).toFixed(2) : '$' + v.toFixed(2);
     document.getElementById('legend').textContent = allSeries
-      .map(s => `${s.strategy}: ${s.points.length ? '$' + s.points[s.points.length - 1][1].toFixed(2) : 'no trades'}`)
+      .map(s => `${s.strategy}: ${s.points.length ? money(s.points[s.points.length - 1][1]) : 'no trades'}`)
       .join(' · ');
   } else {
     chartEl.innerHTML = '<p class="unavailable">not enough collected tape to draw the equity curve yet</p>';

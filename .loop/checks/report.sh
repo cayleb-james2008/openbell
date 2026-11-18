@@ -64,8 +64,18 @@ echo "$report" | grep -q "$cs snapshots on disk across $cm markets, $cw distinct
 nlib=$(ls strategies/*.rn | wc -l)
 nslots=$(echo "$report" | grep -c '^  Slot [0-9]*:')
 [ "$nslots" = "$nlib" ] || { echo "FAIL: report has $nslots slot lines for a $nlib-strategy library"; echo "$report"; exit 1; }
-echo "$report" | grep -Eq 'Paper pot: \$[0-9]|[Pp]aper pot: \$' \
+echo "$report" | grep -Eq 'Paper pot: -?\$[0-9]' \
   || { echo "FAIL: no paper pot line"; echo "$report"; exit 1; }
+# Attribution honesty: a retired line names the successor chosen at
+# retirement, and slot lines separate the current stint from the
+# slot's cumulative record.
+echo "$report" | grep -Eq 'Retired: .* — slot rotated to ' \
+  || { echo "FAIL: no retirement records its successor"; echo "$report"; exit 1; }
+echo "$report" | grep -q 'this stint:' \
+  || { echo "FAIL: slot lines do not separate the current stint from the slot total"; echo "$report"; exit 1; }
+if echo "$report" | grep -q '\$-'; then
+  echo "FAIL: money is formatted \$-x instead of -\$x"; echo "$report"; exit 1
+fi
 echo "$report" | grep -q 'paper only, not venue money' \
   || { echo "FAIL: the paper pot is not labelled as paper, not venue money"; echo "$report"; exit 1; }
 echo "$report" | grep -q 'favourite-late' \
