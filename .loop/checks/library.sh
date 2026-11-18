@@ -12,7 +12,7 @@ cleanup() { for p in $PIDS; do kill -9 $p 2>/dev/null; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 export PATH="$HOME/.rust/bin:$PATH"
-[ -x ./target/debug/openbell-rs ] || cargo build >/dev/null 2>&1
+cargo build >/dev/null 2>&1 || { echo "FAIL: cargo build failed"; exit 1; }
 mkdir -p "$WORK/data" "$WORK/strats"
 cp strategies/*.rn "$WORK/strats/"
 python3 gen_fixture.py "$WORK/data/fixture-snapshots.jsonl" >/dev/null

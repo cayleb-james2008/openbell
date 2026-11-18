@@ -7,7 +7,7 @@
 set -u
 cd "$(dirname "$0")/../.."
 export PATH="$HOME/.rust/bin:$PATH"
-[ -x ./target/debug/openbell-rs ] || cargo build >/dev/null 2>&1
+cargo build >/dev/null 2>&1 || { echo "FAIL: cargo build failed"; exit 1; }
 
 fail=0
 hits=$(grep -rn '/orders\|place_order\|create_order\|submit_order\|signed_order\|order_id' src/ strategies/ assets/ 2>/dev/null)
@@ -30,8 +30,21 @@ fi
 if strings target/debug/openbell-rs | grep -q '/orders'; then
   echo "FAIL: '/orders' string present in the built binary"; fail=1
 fi
-if strings target/debug/openbell-rs | grep -q 'place_order\|create_order'; then
-  echo "FAIL: order-placement identifier present in the built binary"; fail=1
+for ident in place_order create_order submit_order signed_order order_id; do
+  if strings target/debug/openbell-rs | grep -q "$ident"; then
+    echo "FAIL: '$ident' present in the built binary"; fail=1
+  fi
+done
+# Exactly one process call site may exist in the whole program — the
+# collector's curl. A second Command::new is where any other network
+# or signing tool would have to enter.
+ncmd=$(grep -c 'Command::new' src/main.rs)
+[ "$ncmd" = "1" ] || { echo "FAIL: src/main.rs has $ncmd Command::new call sites, expected exactly 1 (the collector's curl)"; fail=1; }
+# Direct dependencies are whitelisted: no networking, HTTP, or
+# signing crate may be added quietly. (Transitive deps of rune are
+# not the app's choice; direct ones are.)
+if grep -Eq 'reqwest|hyper|tokio|openssl|ring|rsa|hmac|sha2|websocket|tungstenite|ureq|curl' Cargo.toml; then
+  echo "FAIL: a networking/signing crate appears in Cargo.toml dependencies"; fail=1
 fi
 [ $fail -eq 0 ] && echo "FENCE OK: no order-placement surface in source or binary; venue traffic is the collector's public GET only"
 exit $fail

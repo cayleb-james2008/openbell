@@ -76,4 +76,21 @@ echo "$report" | grep -q 'paper only, not venue money' \
 echo "$report" | grep -q 'favourite-late' \
   || { echo "FAIL: strategy verdicts missing from the report"; echo "$report"; exit 1; }
 
+# With a credential PRESENT (but signed reads not enabled), line 1
+# must not claim there is no credential — the reason must be the
+# true one, and the figures must stay unavailable.
+touch "$WORK/fake-key.pem"
+OPENBELL_DATA="$WORK/data" OPENBELL_STRATEGIES="$PWD/strategies" \
+OPENBELL_COLLECT_SECS=3600 PORT=8497 \
+KALSHI_API_KEY_ID=dummy-id KALSHI_PRIVATE_KEY_PATH="$WORK/fake-key.pem" \
+  ./target/debug/openbell-rs > "$WORK/server2.log" 2>&1 &
+PIDS="$PIDS $!"
+for i in $(seq 1 20); do curl -s "http://127.0.0.1:8497/api/report" >/dev/null 2>&1 && break; sleep 0.5; done
+report2=$(curl -s "http://127.0.0.1:8497/api/report" | jq -r '.report')
+line1=$(echo "$report2" | head -1)
+echo "$line1" | grep -q 'credential is present' \
+  || { echo "FAIL: with a credential present, line 1 does not give the true reason: $line1"; exit 1; }
+echo "$report2" | grep -q 'Balance (venue): unavailable' \
+  || { echo "FAIL: with a dummy credential, the balance is not honestly unavailable"; echo "$report2"; exit 1; }
+
 echo "REPORT OK: line 1 is the venue truth, slots and collector are stated, paper is labelled paper"

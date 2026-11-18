@@ -12,7 +12,7 @@ cleanup() { for p in $PIDS; do kill -9 $p 2>/dev/null; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 export PATH="$HOME/.rust/bin:$PATH"
-[ -x ./target/debug/openbell-rs ] || cargo build >/dev/null 2>&1
+cargo build >/dev/null 2>&1 || { echo "FAIL: cargo build failed"; exit 1; }
 mkdir -p "$WORK/data"
 python3 gen_fixture.py "$WORK/data/fixture-snapshots.jsonl" >/dev/null
 python3 gen_slot_fixture.py "$WORK/data/slot-snapshots.jsonl" >/dev/null
@@ -51,5 +51,36 @@ echo "$page" | grep -q '/api/equity' || { echo "FAIL: the page never fetches /ap
 echo "$page" | grep -q '<svg' || { echo "FAIL: the page builds no SVG chart"; exit 1; }
 echo "$page" | grep -qi 'paper' || { echo "FAIL: the chart is not labelled paper"; exit 1; }
 if echo "$page" | grep -q 'cdn\|http://\|https://' ; then echo "FAIL: the page pulls an external resource"; exit 1; fi
+
+# Interior points: recompute favourite-late's whole curve from the
+# trade ledger the slots endpoint exposes, and compare every point.
+slots_fx=$(curl -s "http://127.0.0.1:$PORT/api/slots?dataset=fixture")
+echo "$slots_fx" > "$WORK/slots.json"
+curl -s "http://127.0.0.1:$PORT/api/equity?dataset=fixture" > "$WORK/eq.json"
+python3 - "$WORK/slots.json" "$WORK/eq.json" <<'PYEOF2'
+import json, sys
+slots = json.load(open(sys.argv[1]))
+eq = json.load(open(sys.argv[2]))
+name = "favourite-late"
+by_epoch = {}
+for t in slots["trades"]:
+    if t["strategy"] == name:
+        by_epoch[t["close_epoch"]] = by_epoch.get(t["close_epoch"], 0.0) + t["pnl_dollars"]
+run, expected = 0.0, []
+for epoch in sorted(by_epoch):
+    run += by_epoch[epoch]
+    expected.append([epoch, run])
+series = [s for s in eq["series"] if s["strategy"] == name]
+assert series, "favourite-late missing from the equity series"
+points = series[0]["points"]
+# points[0] is the disclosed starting point (first epoch, 0.0).
+assert points[0][1] == 0.0 and points[0][0] == expected[0][0], f"bad start point {points[0]}"
+actual = points[1:]
+assert len(actual) == len(expected), f"curve has {len(actual)} traded points, ledger says {len(expected)}"
+for (e_epoch, e_val), (a_epoch, a_val) in zip(expected, actual):
+    assert e_epoch == a_epoch and abs(e_val - a_val) < 1e-6, f"curve point mismatch: ledger {(e_epoch, e_val)} vs curve {(a_epoch, a_val)}"
+print(f"interior points verified: {len(actual)}")
+PYEOF2
+[ $? -eq 0 ] || { echo "FAIL: a strategy curve disagrees with the trade ledger at an interior point"; exit 1; }
 
 echo "EQUITY OK: curves are chronological and reconcile with the slot simulation on both tapes; the page draws them as labelled paper SVG"

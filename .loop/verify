@@ -10,6 +10,7 @@ export PATH="$HOME/.rust/bin:$PATH"
 LABEL="${1:-run}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/.loop/runs/$LABEL"
+rm -rf "$OUT"
 mkdir -p "$OUT"
 cd "$ROOT"
 
@@ -33,7 +34,11 @@ run_check build 600 cargo build
 run_check test 600 cargo test
 for f in .loop/checks/*.sh; do
   [ -e "$f" ] || continue
-  run_check "$(basename "$f" .sh)" 300 bash "$f"
+  tmo=300
+  # robust.sh's collection phase is bound by venue latency (three
+  # serialized real passes), not by the app.
+  [ "$(basename "$f")" = "robust.sh" ] && tmo=1200
+  run_check "$(basename "$f" .sh)" $tmo bash "$f"
 done
 run_check proof 300 bash proof.sh
 

@@ -43,4 +43,28 @@ api /api/strategies | jq '.[] | {strategy, windows_traded, verdict}'
 
 echo "== daily report =="
 api /api/report | jq -r .report
+echo "== assertions =="
+fail=0
+# The collected tape exists, is non-empty, and every line parses.
+api /api/home >/dev/null
+tape="$WORK/data/snapshots.jsonl"
+[ -s "$tape" ] || { echo "FAIL: the collected tape is empty"; fail=1; }
+jq -s 'length > 100' "$tape" >/dev/null || { echo "FAIL: collected tape does not parse end to end"; fail=1; }
+# The account block is honestly unavailable in this environment.
+api /api/home | jq -e '.account.status == "unavailable" and .account.balance == null' >/dev/null \
+  || { echo "FAIL: account block is not honestly unavailable"; fail=1; }
+# The fixture verdicts discriminate: at least one strategy clears
+# the bar's stated standard on the favourable fixture, and the rest
+# do not all clear it.
+api '/api/strategies?dataset=fixture' | jq -e '
+  (map(select(.verdict | startswith("PROVEN"))) | length) >= 1
+  and (map(select(.verdict | startswith("PROVEN"))) | length) < length' >/dev/null \
+  || { echo "FAIL: fixture verdicts do not discriminate"; api '/api/strategies?dataset=fixture' | jq -c '.[].verdict'; fail=1; }
+# The young live tape earns no promotion — its verdicts say so.
+api /api/strategies | jq -e 'all(.verdict | startswith("PROVEN") | not)' >/dev/null \
+  || { echo "FAIL: the young live tape claims a promotion it cannot have earned"; fail=1; }
+# Report line 1 is the venue line.
+api /api/report | jq -e -r '.report | split("\n")[0] | startswith("Day P&L (venue):")' >/dev/null \
+  || { echo "FAIL: report line 1 is not the venue day P&L line"; fail=1; }
+[ $fail -eq 0 ] || { echo "PROOF FAILED"; exit 1; }
 echo "PROOF DONE"
