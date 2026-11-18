@@ -94,10 +94,16 @@ fn fetch_markets(series: &str, status: &str) -> Result<Vec<Snapshot>, String> {
     let body: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(|e| format!("venue returned non-JSON: {e}"))?;
     let fetched_at = now_unix();
-    let mut snaps = Vec::new();
+    let mut snaps: Vec<Snapshot> = Vec::new();
     if let Some(markets) = body.get("markets").and_then(|m| m.as_array()) {
         for m in markets {
             let get = |k: &str| m.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            // A record without a ticker or a close time is not a
+            // market snapshot; writing it to the permanent tape
+            // would mint evidence out of a malformed response.
+            if get("ticker").is_empty() || get("close_time").is_empty() {
+                continue;
+            }
             snaps.push(Snapshot {
                 fetched_at,
                 ticker: get("ticker"),
@@ -120,7 +126,17 @@ fn fetch_markets(series: &str, status: &str) -> Result<Vec<Snapshot>, String> {
 /// One collector pass over every series the desk trades: open markets (the
 /// forward tape) plus settled markets (so windows get their results).
 /// Appends JSONL snapshots to disk. Returns how many snapshots were written.
-fn collect_once(data_dir: &Path) -> Result<usize, String> {
+/// One collection pass at a time, across every caller (the
+/// background loop and POST /api/collect): concurrent passes each
+/// hold their own append handle, and their writes interleave into
+/// spliced, unparseable tape lines.
+static COLLECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run one pass. Ok carries (snapshots written, per-series errors);
+/// a pass that wrote nothing BECAUSE everything failed is Err, so
+/// the API can say so instead of returning a cheerful 200 with 0.
+fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
+    let _guard = COLLECT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let _ = std::fs::create_dir_all(data_dir);
     let path = data_dir.join("snapshots.jsonl");
     // Build the whole pass in memory and append it in one write: a
@@ -128,6 +144,7 @@ fn collect_once(data_dir: &Path) -> Result<usize, String> {
     // pass whole or not at all, never a torn half-pass.
     let mut buf = String::new();
     let mut written = 0;
+    let mut errors: Vec<String> = Vec::new();
     for series in SERIES {
         for status in ["open", "settled"] {
             match fetch_markets(series, status) {
@@ -138,9 +155,18 @@ fn collect_once(data_dir: &Path) -> Result<usize, String> {
                         written += 1;
                     }
                 }
-                Err(e) => eprintln!("collect {series}/{status}: {e}"),
+                Err(e) => {
+                    eprintln!("collect {series}/{status}: {e}");
+                    errors.push(format!("{series}/{status}: {e}"));
+                }
             }
         }
+    }
+    if written == 0 && !errors.is_empty() {
+        return Err(format!(
+            "collection failed on every series: {}",
+            errors.join("; ")
+        ));
     }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -149,7 +175,7 @@ fn collect_once(data_dir: &Path) -> Result<usize, String> {
         .map_err(|e| e.to_string())?;
     use std::io::Write;
     file.write_all(buf.as_bytes()).map_err(|e| e.to_string())?;
-    Ok(written)
+    Ok((written, errors))
 }
 
 fn load_snapshots(path: &Path) -> Vec<Snapshot> {
@@ -226,16 +252,32 @@ impl Strategy {
         rune::Vm::new(self.runtime.clone(), self.unit.clone())
     }
 
+    /// Every strategy call runs under an instruction budget. A
+    /// strategy is a small predicate over three numbers; a million
+    /// VM instructions is generous headroom for any honest shape,
+    /// and a script that never terminates (a while loop in
+    /// allow_entry) burns the budget and errors — degrading to
+    /// no-entry like any other failed call — instead of wedging
+    /// every scoring surface forever.
+    fn call_budgeted(
+        &self,
+        name: &str,
+        args: (f64, f64, i64),
+    ) -> Result<rune::Value, rune::runtime::VmError> {
+        let mut vm = self.vm();
+        rune::runtime::budget::with(STRATEGY_BUDGET, move || vm.call([name], args)).call()
+    }
+
     fn call_string(&self, name: &str) -> Result<String, String> {
-        let value = self
-            .vm()
-            .call([name], ())
+        let mut vm = self.vm();
+        let value = rune::runtime::budget::with(STRATEGY_BUDGET, move || vm.call([name], ()))
+            .call()
             .map_err(|e| format!("strategy call {name} failed: {e}"))?;
         rune::from_value::<String>(value).map_err(|e| e.to_string())
     }
 
     fn allow_entry(&self, yes_ask: f64, no_ask: f64, secs_to_close: i64) -> bool {
-        match self.vm().call(["allow_entry"], (yes_ask, no_ask, secs_to_close)) {
+        match self.call_budgeted("allow_entry", (yes_ask, no_ask, secs_to_close)) {
             Ok(value) => rune::from_value::<bool>(value).unwrap_or(false),
             Err(_) => false,
         }
@@ -580,6 +622,12 @@ fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f6
     // End-state disclosures: a strategy running in several slots at
     // once stakes several shares on the same windows — say so.
     let mut notes: Vec<String> = Vec::new();
+    if total_equity <= 0.0 {
+        notes.push(
+            "the paper pot is exhausted — at zero or below, no slot can stake, so the simulation cannot trade again on this tape"
+                .to_string(),
+        );
+    }
     for (i, s) in strategies.iter().enumerate() {
         let count = slot_strat.iter().filter(|si| **si == i).count();
         if count > 1 {
@@ -649,11 +697,33 @@ fn equity_curves(sim: &SlotSimulation) -> (Vec<(i64, f64)>, Vec<(String, Vec<(i6
             per.entry(name).or_default().push((epoch, *c));
         }
     }
+    // The starting points the doc comment promises: the pot series
+    // opens at the paper pot and each strategy series at 0, at the
+    // first traded epoch.
+    if let Some((first_epoch, _)) = pot.first().copied() {
+        pot.insert(0, (first_epoch, sim.paper_pot_start));
+    }
+    for series in per.values_mut() {
+        if let Some((first_epoch, _)) = series.first().copied() {
+            series.insert(0, (first_epoch, 0.0));
+        }
+    }
     (pot, per.into_iter().collect())
 }
 
+/// VM instruction budget per strategy call (see call_budgeted).
+const STRATEGY_BUDGET: usize = 1_000_000;
+
 fn load_strategies(dir: &Path) -> Vec<Strategy> {
+    load_strategies_with_errors(dir).0
+}
+
+/// Load the library, keeping the failures: a broken .rn file must
+/// be visible on the surfaces, not silently dropped while every
+/// surface presents the surviving subset as the whole library.
+fn load_strategies_with_errors(dir: &Path) -> (Vec<Strategy>, Vec<(String, String)>) {
     let mut out = Vec::new();
+    let mut errors = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         let mut paths: Vec<PathBuf> = entries
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -663,11 +733,19 @@ fn load_strategies(dir: &Path) -> Vec<Strategy> {
         for path in paths {
             match Strategy::load(&path) {
                 Ok(s) => out.push(s),
-                Err(e) => eprintln!("strategy load failed: {e}"),
+                Err(e) => {
+                    eprintln!("strategy load failed: {e}");
+                    errors.push((
+                        path.file_name()
+                            .map(|f| f.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        e,
+                    ));
+                }
             }
         }
     }
-    out
+    (out, errors)
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +856,18 @@ fn daily_report(app: &App) -> String {
         "Slots (paper — starting pot ${:.2}, re-split evenly across slots each window):",
         sim.paper_pot_start
     ));
+    let (_, lib_errors) = load_strategies_with_errors(&app.strategies_dir);
+    if !lib_errors.is_empty() {
+        let named: Vec<String> = lib_errors
+            .iter()
+            .map(|(f, e)| format!("{f}: {e}"))
+            .collect();
+        lines.push(format!(
+            "Strategy library: {} file(s) failed to load and are NOT being scored — {}",
+            lib_errors.len(),
+            named.join("; ")
+        ));
+    }
     for slot in &sim.slots {
         lines.push(format!(
             "  Slot {}: {} ({}) — strikes {}/{} · this stint: {} windows, P&L {} · slot total: {} windows, P&L {}, equity {}",
@@ -847,7 +937,11 @@ struct App {
 /// Collector health, computed from the tape itself — the same numbers
 /// an independent count of the file gives.
 fn collector_health(app: &App) -> serde_json::Value {
-    let snapshots = load_snapshots(&app.data_dir.join("snapshots.jsonl"));
+    let tape_path = app.data_dir.join("snapshots.jsonl");
+    let total_lines = std::fs::File::open(&tape_path)
+        .map(|f| std::io::BufReader::new(f).lines().count())
+        .unwrap_or(0);
+    let snapshots = load_snapshots(&tape_path);
     let mut markets: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut settled: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut newest: Option<i64> = None;
@@ -861,7 +955,8 @@ fn collector_health(app: &App) -> serde_json::Value {
     let age = newest.map(|n| (now_unix() - n).max(0));
     let collecting = age.map_or(false, |a| a <= (app.collect_secs.max(60) * 2) as i64);
     serde_json::json!({
-        "snapshots_on_disk": snapshots.len(),
+        "snapshots_on_disk": total_lines,
+        "dropped_lines": total_lines.saturating_sub(snapshots.len()),
         "markets_seen": markets.len(),
         "settled_windows": settled.len(),
         "newest_snapshot_age_secs": age,
@@ -901,6 +996,11 @@ fn html_response(body: &str) -> String {
     )
 }
 
+/// Declared-body cap. Anything larger is refused without being
+/// read: the allocation itself is the attack (a 1TB Content-Length
+/// aborted this process, collector and all, before this cap).
+const MAX_BODY_BYTES: usize = 1_000_000;
+
 fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String)> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
     let mut request_line = String::new();
@@ -918,6 +1018,9 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, Str
         if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
         }
+    }
+    if content_length > MAX_BODY_BYTES {
+        return Some(("__too_large__".to_string(), String::new(), String::new()));
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
@@ -955,6 +1058,11 @@ fn handle(app: &App, method: &str, path: &str) -> String {
             let home = serde_json::json!({
                 "account": account_state(),
                 "collector": collector_health(app),
+                "library_errors": load_strategies_with_errors(&app.strategies_dir)
+                    .1
+                    .iter()
+                    .map(|(file, error)| serde_json::json!({ "file": file, "error": error }))
+                    .collect::<Vec<_>>(),
                 "mode": "shadow — this build never places orders",
                 "series": SERIES,
             });
@@ -964,8 +1072,13 @@ fn handle(app: &App, method: &str, path: &str) -> String {
             json_response(200, &serde_json::to_string(&latest_markets(&app.data_dir)).unwrap())
         }
         ("POST", "/api/collect") => match collect_once(&app.data_dir) {
-            Ok(n) => json_response(200, &format!("{{\"snapshots_written\":{n}}}")),
-            Err(e) => json_response(502, &format!("{{\"error\":\"{e}\"}}")),
+            Ok((n, _errors)) => {
+                json_response(200, &format!("{{\"snapshots_written\":{n}}}"))
+            }
+            Err(e) => json_response(
+                502,
+                &serde_json::json!({ "error": e }).to_string(),
+            ),
         },
         ("GET", "/api/strategies") => {
             let snapshots = load_snapshots(&dataset_path(app, query));
@@ -979,7 +1092,13 @@ fn handle(app: &App, method: &str, path: &str) -> String {
             let snapshots = load_snapshots(&dataset_path(app, query));
             let strategies = load_strategies(&app.strategies_dir);
             let sim = simulate_slots(&strategies, &snapshots, app.paper_pot);
-            json_response(200, &serde_json::to_string(&sim).unwrap())
+            let mut body = serde_json::to_value(&sim).unwrap();
+            let total = sim.trades.len();
+            let shown: Vec<&Trade> =
+                sim.trades.iter().skip(total.saturating_sub(5000)).collect();
+            body["trades"] = serde_json::to_value(&shown).unwrap();
+            body["trades_truncated"] = serde_json::json!(total > 5000);
+            json_response(200, &body.to_string())
         }
         ("GET", "/api/equity") => {
             let snapshots = load_snapshots(&dataset_path(app, query));
@@ -1027,7 +1146,7 @@ fn main() {
     let paper_pot: f64 = std::env::var("OPENBELL_PAPER_POT")
         .ok()
         .and_then(|p| p.parse().ok())
-        .filter(|p: &f64| *p > 0.0)
+        .filter(|p: &f64| *p > 0.0 && p.is_finite())
         .unwrap_or(100.0);
     let _ = std::fs::create_dir_all(&data_dir);
 
@@ -1036,11 +1155,28 @@ fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(60);
+    let collect_secs = if collect_secs == 0 {
+        eprintln!(
+            "OPENBELL_COLLECT_SECS=0 would busy-loop the collector against the venue; using 5s"
+        );
+        5
+    } else {
+        collect_secs
+    };
     {
         let data_dir = data_dir.clone();
         std::thread::spawn(move || loop {
             match collect_once(&data_dir) {
-                Ok(n) => println!("collector: {n} snapshots written"),
+                Ok((n, errors)) => {
+                    if errors.is_empty() {
+                        println!("collector: {n} snapshots written");
+                    } else {
+                        println!(
+                            "collector: {n} snapshots written, {} series failed",
+                            errors.len()
+                        );
+                    }
+                }
                 Err(e) => eprintln!("collector: {e}"),
             }
             std::thread::sleep(std::time::Duration::from_secs(collect_secs));
@@ -1060,7 +1196,13 @@ fn main() {
             Ok(mut stream) => {
                 let app = app.clone();
                 std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
                     if let Some((method, path, _body)) = read_request(&mut stream) {
+                        if method == "__too_large__" {
+                            let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\n\r\n{\"error\":\"request body too large\"}";
+                            let _ = stream.write_all(resp.as_bytes());
+                            return;
+                        }
                         let response = handle(&app, &method, &path);
                         let _ = stream.write_all(response.as_bytes());
                     }
