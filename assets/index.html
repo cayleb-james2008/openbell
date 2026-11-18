@@ -449,6 +449,7 @@
         <tbody id="strategies-body"><tr class="empty-row"><td colspan="5"><span class="sk" style="display:block;height:60px"></span></td></tr></tbody>
       </table>
     </div>
+    <div id="library-errors"></div>
   </section>
 
   <section class="card" id="markets-card" aria-labelledby="markets-title">
@@ -719,6 +720,20 @@ function renderMarkets(markets) {
   $('markets-note').textContent = markets.length > 40 ? 'Showing the first 40 of ' + markets.length + ' collected markets.' : '';
 }
 
+// A strategy file that did not load: named, with its plain error. The
+// server's text only ever goes in as textContent.
+function renderLibraryErrors(errors) {
+  const box = $('library-errors');
+  box.replaceChildren();
+  for (const e of errors || []) {
+    const body = el('div');
+    body.append(el('strong', null, e.file), document.createTextNode(' did not load, so it is not scored. ' + e.error));
+    const row = el('div', 'banner');
+    row.append(body);
+    box.append(row);
+  }
+}
+
 function renderStrategies(strats) {
   const sb = $('strategies-body');
   sb.replaceChildren();
@@ -763,6 +778,7 @@ async function loadAll() {
   renderPot(slots, eq, home);
   renderSlots(slots);
   renderStrategies(strats);
+  renderLibraryErrors(home.library_errors);
   renderMarkets(markets);
   const lines = report.report.split('\n');
   $('report-head').textContent = lines[0];

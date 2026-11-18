@@ -408,7 +408,13 @@ impl Strategy {
             .with_context(&context)
             .with_diagnostics(&mut diagnostics)
             .build()
-            .map_err(|e| format!("strategy {} failed to build: {e}", path.display()))?;
+            .map_err(|e| {
+                format!(
+                    "strategy {} failed to build: {}",
+                    path.display(),
+                    e.to_string().replace(" (see diagnostics for details)", "")
+                )
+            })?;
         let unit = Arc::new(unit);
         let mut strat = Strategy {
             name: String::new(),
@@ -3157,6 +3163,22 @@ mod tests {
         assert_eq!(scan("KXCENT-ODD", 0.4567), None, "0.4567 is not a whole cent");
         assert_eq!(scan("KXCENT-SUB", 0.004), None, "0.004 is sub-cent");
         assert_eq!(scan("KXCENT-OK", 0.45), Some(0.45), "0.45 trades at its price");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn broken_strategy_file_is_named_without_a_dangling_pointer() {
+        // The app keeps no diagnostics output, so the error must not
+        // point the reader at any.
+        let dir = std::env::temp_dir().join(format!("ob-broken-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("broken.rn"), "pub fn name() {\n").unwrap();
+        let (strats, errors) = load_strategies_with_errors(&dir);
+        assert!(strats.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, "broken.rn");
+        assert!(errors[0].1.contains("failed to build"), "error: {}", errors[0].1);
+        assert!(!errors[0].1.contains("diagnostics"), "error: {}", errors[0].1);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
