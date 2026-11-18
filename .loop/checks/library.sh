@@ -39,7 +39,17 @@ stop_server
 # stop trading entirely; every other strategy must be untouched.
 sed -i 's/yes_ask <= 0.85/yes_ask <= 0.50/' "$WORK/strats/favourite_late.rn"
 start_server
-after=$(curl -s "http://127.0.0.1:$PORT/api/strategies?dataset=fixture")
+# Wait until the mutated server actually answers with strategies —
+# under load a bare readiness probe can pass against a dying or
+# not-yet-bound instance and the assertions read an empty response.
+after=""
+for i in $(seq 1 40); do
+  after=$(curl -s "http://127.0.0.1:$PORT/api/strategies?dataset=fixture")
+  echo "$after" | jq -e 'length >= 4' >/dev/null 2>&1 && break
+  sleep 0.5
+done
+echo "$after" | jq -e 'length >= 4' >/dev/null \
+  || { echo "FAIL: mutated server never returned the strategy list: $after"; exit 1; }
 fav=$(echo "$after" | jq '[.[] | select(.strategy == "favourite-late")][0].windows_traded')
 [ "$fav" = "0" ] || { echo "FAIL: mutated favourite-late still trades $fav windows — the scorer is not executing the file"; exit 1; }
 diffcount=$(jq -n --argjson a "$before" --argjson b "$after" '

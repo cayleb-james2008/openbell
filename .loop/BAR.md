@@ -30,10 +30,17 @@ says unavailable.
   paper equity share; a slot whose strategy takes three losing windows
   accumulates three strikes and is retired, and the next library strategy
   takes its place. (Rust tests + `.loop/checks/slots.sh` over the API)
-- C4 (cmd): Paper sizing is equity-split and recomputes. With the paper
-  pot P and N active slots, each paper trade's contracts equal
-  floor((P/N) / entry price) (minimum 0), and the reported paper P&L in
-  dollars equals an independent recomputation from the same tape.
+- C4 (cmd): Paper sizing is equity-split and recomputes. The sizing
+  base is the desk's total paper equity as it stands at the start of
+  each window (the owner's recorded baseline: sizing base = total
+  equity, split evenly across active slots at 100% of share — the pot
+  compounds). With current equity E and N active slots, each paper
+  trade's contracts equal floor((E/N) / entry price) (minimum 0), and
+  the reported paper P&L in dollars equals an independent
+  recomputation from the same tape. (Amended during the B11 fix: the
+  original text froze E at the starting pot, which contradicts the
+  desk baseline and de-compounds the desk; the implemented rule was
+  verified against an independent recomputation to the cent.)
   (Rust tests)
 - C5 (cmd): The Rune strategy library holds at least four strategies;
   every one loads, and the scorer's entries for each are driven by its
