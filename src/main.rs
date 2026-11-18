@@ -48,7 +48,42 @@ fn parse_iso_z(s: &str) -> Option<i64> {
         h.next()?.parse::<i64>().ok()?,
         h.next()?.parse::<i64>().ok()?,
     );
+    // Range-checked: an unchecked parse computes a confident epoch
+    // for "2026-13-45T99:99:99Z", and a wrong epoch silently
+    // reorders the compounding.
+    if !(1..=12).contains(&mo) || !(0..=23).contains(&hh) || !(0..=59).contains(&mm) || ss < 0 || ss > 60 {
+        return None;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days_in_month = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(mo - 1) as usize];
+    if da < 1 || da > days_in_month {
+        return None;
+    }
     Some(days_from_civil(y, mo, da) * 86400 + hh * 3600 + mm * 60 + ss)
+}
+
+/// Format an epoch as ISO-8601 Z (for the report's as-of line).
+fn iso_z(epoch: i64) -> String {
+    let days = epoch.div_euclid(86400);
+    let secs = epoch.rem_euclid(86400);
+    // civil-from-days (Howard Hinnant's algorithm, inverse of
+    // days_from_civil above).
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
 }
 
 fn now_unix() -> i64 {
@@ -183,11 +218,15 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
             }
         }
     }
-    if written == 0 && !errors.is_empty() {
-        return Err(format!(
-            "collection failed on every series: {}",
-            errors.join("; ")
-        ));
+    if written == 0 {
+        return Err(if errors.is_empty() {
+            "collection wrote nothing — every series returned empty".to_string()
+        } else {
+            format!(
+                "collection failed on every series: {}",
+                errors.join("; ")
+            )
+        });
     }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -246,11 +285,58 @@ struct Strategy {
     /// Set once the aggregate allowance is spent: later calls in
     /// the pass degrade to no-entry without running the script.
     exhausted: std::cell::Cell<bool>,
+    /// allow_entry calls that errored or returned a non-boolean:
+    /// counted so a broken strategy reads as broken, not quiet.
+    call_failures: std::cell::Cell<usize>,
 }
 
 impl Strategy {
     fn load(path: &Path) -> Result<Strategy, String> {
         let script = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        if script.len() > MAX_STRATEGY_BYTES {
+            return Err(format!(
+                "strategy file is {} bytes; the cap is {MAX_STRATEGY_BYTES}",
+                script.len()
+            ));
+        }
+        // Compiled-strategy cache keyed by (path, length, mtime):
+        // compiling Rune from source on every request made every
+        // surface pay it per hit. The Strategy handed out is always
+        // fresh (its budget clock and failure counters are per
+        // pass); only the immutable compile is shared.
+        let cache_key = std::fs::metadata(path).ok().map(|m| {
+            (
+                script.len() as u64,
+                m.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            )
+        });
+        if let Some((len, mtime)) = cache_key {
+            let guard = STRAT_CACHE.lock().unwrap();
+            if let Some((p, l, t, unit, runtime, name, side)) =
+                guard.iter().find(|(p, l, t, ..)| p == path && *l == len && *t == mtime)
+            {
+                let (unit, runtime, name, side) = (
+                    unit.clone(),
+                    runtime.clone(),
+                    name.clone(),
+                    side.clone(),
+                );
+                drop(guard);
+                return Ok(Strategy {
+                    name,
+                    side,
+                    unit,
+                    runtime,
+                    clock: std::cell::Cell::new(None),
+                    exhausted: std::cell::Cell::new(false),
+                    call_failures: std::cell::Cell::new(0),
+                });
+            }
+        }
         let context = rune::Context::with_default_modules().map_err(|e| e.to_string())?;
         let runtime = Arc::new(context.runtime().map_err(|e| e.to_string())?);
         let mut sources = rune::Sources::new();
@@ -271,9 +357,29 @@ impl Strategy {
             runtime,
             clock: std::cell::Cell::new(None),
             exhausted: std::cell::Cell::new(false),
+            call_failures: std::cell::Cell::new(0),
         };
         strat.name = strat.call_string("name")?;
         strat.side = strat.call_string("side")?;
+        if strat.side != "yes" && strat.side != "no" {
+            return Err(format!(
+                "side() must return \"yes\" or \"no\", got \"{}\" — any other value would silently trade the NO side and score it as the other",
+                strat.side
+            ));
+        }
+        if let Some((len, mtime)) = cache_key {
+            let mut guard = STRAT_CACHE.lock().unwrap();
+            guard.retain(|(p, ..)| p != path);
+            guard.push((
+                path.to_path_buf(),
+                len,
+                mtime,
+                strat.unit.clone(),
+                strat.runtime.clone(),
+                strat.name.clone(),
+                strat.side.clone(),
+            ));
+        }
         Ok(strat)
     }
 
@@ -330,13 +436,26 @@ impl Strategy {
         self.exhausted.get()
     }
 
+    fn call_failures(&self) -> usize {
+        self.call_failures.get()
+    }
+
     fn allow_entry(&self, yes_ask: f64, no_ask: f64, secs_to_close: i64) -> bool {
         if !self.budget_open() {
             return false;
         }
         match self.call_budgeted("allow_entry", (yes_ask, no_ask, secs_to_close)) {
-            Ok(value) => rune::from_value::<bool>(value).unwrap_or(false),
-            Err(_) => false,
+            Ok(value) => match rune::from_value::<bool>(value) {
+                Ok(b) => b,
+                Err(_) => {
+                    self.call_failures.set(self.call_failures.get() + 1);
+                    false
+                }
+            },
+            Err(_) => {
+                self.call_failures.set(self.call_failures.get() + 1);
+                false
+            }
         }
     }
 }
@@ -344,6 +463,8 @@ impl Strategy {
 #[derive(Serialize)]
 struct ScoreReport {
     budget_exhausted: bool,
+    call_failures: usize,
+    windows_conflicted: usize,
     strategy: String,
     side: String,
     windows_settled: usize,
@@ -368,10 +489,57 @@ fn window_entry(strat: &Strategy, snaps: &[Snapshot]) -> Option<f64> {
         };
         let secs_to_close = close - snap.fetched_at;
         if strat.allow_entry(ya, na, secs_to_close) {
-            return Some(if strat.side == "yes" { ya } else { na });
+            let price = if strat.side == "yes" { ya } else { na };
+            if (0.01..=0.99).contains(&price) {
+                return Some(price);
+            }
         }
     }
     None
+}
+
+/// What a window's snapshots actually establish. The venue's record
+/// is the only truth the desk has, so a window whose records
+/// disagree with each other — or cannot be placed in time — is not
+/// scored at all, and the disagreement is counted, never silently
+/// resolved in someone's favour.
+enum WindowFacts {
+    Unsettled,
+    Conflict,
+    Settled { result: String, close_epoch: i64 },
+}
+
+fn window_facts(snaps: &[Snapshot]) -> WindowFacts {
+    let mut distinct: Vec<&str> = Vec::new();
+    for s in snaps {
+        if !s.result.is_empty() && !distinct.contains(&s.result.as_str()) {
+            distinct.push(s.result.as_str());
+        }
+    }
+    if distinct.len() > 1 {
+        return WindowFacts::Conflict;
+    }
+    let Some(result) = distinct.into_iter().next() else {
+        return WindowFacts::Unsettled;
+    };
+    // The window's moment is the settled record's own close time —
+    // not the earliest-fetched snapshot's, whose timestamp one
+    // non-entry record could poison. Fall back to the latest
+    // parseable close time in the window; a window with none cannot
+    // be ordered, and compounding order is money.
+    let epoch = snaps
+        .iter()
+        .rev()
+        .find(|s| s.result == result)
+        .and_then(|s| parse_iso_z(&s.close_time))
+        .or_else(|| snaps.iter().filter_map(|s| parse_iso_z(&s.close_time)).max());
+    match epoch {
+        Some(close_epoch) => WindowFacts::Settled {
+            result: result.to_string(),
+            close_epoch,
+        },
+        None => WindowFacts::Unsettled,
+    }
 }
 
 /// Group snapshots into market windows keyed by ticker, each window's
@@ -393,13 +561,16 @@ fn score_strategy(strat: &Strategy, snapshots: &[Snapshot], standard: Standard) 
     // (close_epoch, pnl per contract) for every settled window we entered.
     let mut trades: Vec<(i64, f64)> = Vec::new();
     let mut settled = 0usize;
+    let mut conflicted = 0usize;
     for (_ticker, snaps) in windows {
-        let result = snaps
-            .iter()
-            .rev()
-            .find(|s| !s.result.is_empty())
-            .map(|s| s.result.clone());
-        let Some(result) = result else { continue };
+        let (result, close_epoch) = match window_facts(&snaps) {
+            WindowFacts::Settled { result, close_epoch } => (result, close_epoch),
+            WindowFacts::Conflict => {
+                conflicted += 1;
+                continue;
+            }
+            WindowFacts::Unsettled => continue,
+        };
         settled += 1;
         let Some(price) = window_entry(strat, &snaps) else {
             continue;
@@ -409,7 +580,6 @@ fn score_strategy(strat: &Strategy, snapshots: &[Snapshot], standard: Standard) 
         }
         let payoff = if result == strat.side { 1.0 } else { 0.0 };
         let pnl = payoff - price - fee(price);
-        let close_epoch = parse_iso_z(&snaps[0].close_time).unwrap_or(0);
         trades.push((close_epoch, pnl));
     }
     trades.sort_by_key(|(close, _)| *close);
@@ -442,6 +612,8 @@ fn score_strategy(strat: &Strategy, snapshots: &[Snapshot], standard: Standard) 
     };
     ScoreReport {
         budget_exhausted: strat.budget_exhausted(),
+        call_failures: strat.call_failures(),
+        windows_conflicted: conflicted,
         strategy: strat.name.clone(),
         side: strat.side.clone(),
         windows_settled: settled,
@@ -526,6 +698,7 @@ struct StrategyTotal {
 
 #[derive(Serialize)]
 struct SlotSimulation {
+    conflicted_windows: usize,
     paper_pot_start: f64,
     paper_equity_dollars: f64,
     slots: Vec<SlotReport>,
@@ -542,6 +715,7 @@ fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f6
     let n = strategies.len();
     if n == 0 {
         return SlotSimulation {
+            conflicted_windows: 0,
             paper_pot_start: paper_pot,
             paper_equity_dollars: paper_pot,
             slots: Vec::new(),
@@ -559,16 +733,16 @@ fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f6
         entries: Vec<Option<f64>>,
     }
     let mut windows: Vec<Window> = Vec::new();
+    let mut conflicted_windows = 0usize;
     for (_ticker, snaps) in group_windows(snapshots) {
-        let Some(result) = snaps
-            .iter()
-            .rev()
-            .find(|s| !s.result.is_empty())
-            .map(|s| s.result.clone())
-        else {
-            continue;
+        let (result, close_epoch) = match window_facts(&snaps) {
+            WindowFacts::Settled { result, close_epoch } => (result, close_epoch),
+            WindowFacts::Conflict => {
+                conflicted_windows += 1;
+                continue;
+            }
+            WindowFacts::Unsettled => continue,
         };
-        let close_epoch = parse_iso_z(&snaps[0].close_time).unwrap_or(0);
         let entries = strategies.iter().map(|s| window_entry(s, &snaps)).collect();
         windows.push(Window {
             close_epoch,
@@ -688,6 +862,18 @@ fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f6
                 strat.name
             ));
         }
+        if strat.call_failures() > 0 {
+            notes.push(format!(
+                "strategy {}'s allow_entry failed {} time(s) (runtime error or a non-boolean return) and was treated as no-entry for those windows",
+                strat.name,
+                strat.call_failures()
+            ));
+        }
+    }
+    if conflicted_windows > 0 {
+        notes.push(format!(
+            "{conflicted_windows} window(s) carry conflicting settlements from the venue and were not scored"
+        ));
     }
     if total_equity <= 0.0 {
         notes.push(
@@ -705,6 +891,7 @@ fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f6
         }
     }
     SlotSimulation {
+        conflicted_windows,
         paper_pot_start: paper_pot,
         paper_equity_dollars: total_equity,
         slots: (0..n)
@@ -783,6 +970,25 @@ const STRATEGY_BUDGET: usize = 250_000;
 /// Wall-clock allowance per strategy per scoring pass (see
 /// Strategy::budget_open).
 const STRATEGY_DEADLINE_SECS: u64 = 3;
+/// A strategy is a small predicate; a file past this size is a
+/// config error, and it is recompiled often enough that its size
+/// is a per-request cost.
+const MAX_STRATEGY_BYTES: usize = 256 * 1024;
+
+/// (path, byte length, mtime-millis, unit, runtime, name, side) —
+/// see Strategy::load.
+#[allow(clippy::type_complexity)]
+static STRAT_CACHE: std::sync::Mutex<
+    Vec<(
+        PathBuf,
+        u64,
+        u64,
+        Arc<rune::Unit>,
+        Arc<rune::runtime::RuntimeContext>,
+        String,
+        String,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
 
 fn load_strategies(dir: &Path) -> Vec<Strategy> {
     load_strategies_with_errors(dir).0
@@ -801,16 +1007,30 @@ fn load_strategies_with_errors(dir: &Path) -> (Vec<Strategy>, Vec<(String, Strin
             .collect();
         paths.sort();
         for path in paths {
+            let fname = path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
             match Strategy::load(&path) {
-                Ok(s) => out.push(s),
+                Ok(s) => {
+                    // Names key the equity curves and the totals:
+                    // two strategies sharing one would merge into a
+                    // single series matching neither's record.
+                    if out.iter().any(|o: &Strategy| o.name == s.name) {
+                        errors.push((
+                            fname,
+                            format!(
+                                "duplicate strategy name \"{}\" — names must be unique across the library",
+                                s.name
+                            ),
+                        ));
+                    } else {
+                        out.push(s);
+                    }
+                }
                 Err(e) => {
                     eprintln!("strategy load failed: {e}");
-                    errors.push((
-                        path.file_name()
-                            .map(|f| f.to_string_lossy().to_string())
-                            .unwrap_or_default(),
-                        e,
-                    ));
+                    errors.push((fname, e));
                 }
             }
         }
@@ -890,7 +1110,7 @@ fn daily_report(app: &App) -> String {
             account.note
         ),
     };
-    let snapshots = load_snapshots(&app.data_dir.join("snapshots.jsonl"));
+    let snapshots = app.snapshots_cached(&app.data_dir.join("snapshots.jsonl"));
     let health = collector_health(app);
     let collecting = health["collecting"].as_bool().unwrap_or(false);
     let age = health["newest_snapshot_age_secs"].as_i64();
@@ -902,6 +1122,12 @@ fn daily_report(app: &App) -> String {
     };
     let mut lines = vec![
         pnl_line,
+        format!(
+            "As of {} — everything below is cumulative over the collected tape ({} snapshots, {} distinct markets).",
+            iso_z(now_unix()),
+            health["snapshots_on_disk"],
+            health["markets_seen"]
+        ),
         format!(
             "Balance (venue): {} · Open positions (venue): {}",
             account
@@ -1008,6 +1234,40 @@ struct App {
     /// than two intervals means collection has stopped, and
     /// uncollected windows cannot be backfilled.
     collect_secs: u64,
+    /// Parsed-tape cache keyed by (path, byte length, mtime): the
+    /// tape grows ~700 lines a pass and every surface used to
+    /// re-parse all of it per request. The key IS the file state,
+    /// so a hit is the file's current content by construction.
+    tape_cache: std::sync::Mutex<Option<(PathBuf, u64, u64, Vec<Snapshot>)>>,
+}
+
+impl App {
+    fn snapshots_cached(&self, path: &Path) -> Vec<Snapshot> {
+        let key = std::fs::metadata(path).ok().map(|m| {
+            (
+                m.len(),
+                m.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            )
+        });
+        if let Some((len, mtime)) = key {
+            let guard = self.tape_cache.lock().unwrap();
+            if let Some((p, l, t, snaps)) = &*guard {
+                if p == path && *l == len && *t == mtime {
+                    return snaps.clone();
+                }
+            }
+        }
+        let snaps = load_snapshots(path);
+        if let Some((len, mtime)) = key {
+            *self.tape_cache.lock().unwrap() =
+                Some((path.to_path_buf(), len, mtime, snaps.clone()));
+        }
+        snaps
+    }
 }
 
 /// Collector health, computed from the tape itself — the same numbers
@@ -1017,24 +1277,38 @@ fn collector_health(app: &App) -> serde_json::Value {
     let total_lines = std::fs::File::open(&tape_path)
         .map(|f| std::io::BufReader::new(f).lines().count())
         .unwrap_or(0);
-    let snapshots = load_snapshots(&tape_path);
+    let snapshots = app.snapshots_cached(&tape_path);
     let mut markets: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut settled: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut newest: Option<i64> = None;
+    let mut results_by_ticker: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
+        std::collections::HashMap::new();
     for s in &snapshots {
         markets.insert(s.ticker.as_str());
         if !s.result.is_empty() {
             settled.insert(s.ticker.as_str());
+            results_by_ticker
+                .entry(s.ticker.as_str())
+                .or_default()
+                .insert(s.result.as_str());
         }
-        newest = Some(newest.map_or(s.fetched_at, |n| n.max(s.fetched_at)));
     }
-    let age = newest.map(|n| (now_unix() - n).max(0));
-    let collecting = age.map_or(false, |a| a <= (app.collect_secs.max(60) * 2) as i64);
+    let conflicting = results_by_ticker.values().filter(|r| r.len() > 1).count();
+    // The tape is append-ordered: the last line is the newest
+    // pass's stamp. (A max() over fetched_at would let one
+    // future-dated line anywhere in the tape certify a dead
+    // collector as collecting, indefinitely.)
+    let newest = snapshots.last().map(|s| s.fetched_at);
+    let now = now_unix();
+    let age = newest.map(|n| (now - n).max(0));
+    let future_dated = newest.map_or(false, |n| n > now + 300);
+    let collecting = !future_dated
+        && age.map_or(false, |a| a <= (app.collect_secs.max(60) * 2) as i64);
     serde_json::json!({
         "snapshots_on_disk": total_lines,
         "dropped_lines": total_lines.saturating_sub(snapshots.len()),
         "markets_seen": markets.len(),
         "settled_windows": settled.len(),
+        "conflicting_settlements": conflicting,
         "newest_snapshot_age_secs": age,
         "collect_interval_secs": app.collect_secs,
         "collecting": collecting,
@@ -1044,6 +1318,23 @@ fn collector_health(app: &App) -> serde_json::Value {
 /// Resolve the `dataset=` query parameter to a tape file in the data
 /// dir. Names are restricted to [a-z0-9-] so the parameter can never
 /// walk out of the data dir. No parameter means the live collected tape.
+/// The dataset a query names: "live" for the collected tape, or
+/// the sanitised dataset= value. Responses carry the name so a
+/// capture of fixture figures can never pass as live ones.
+fn dataset_name(query: &str) -> String {
+    if let Some(pos) = query.find("dataset=") {
+        let raw = &query[pos + "dataset=".len()..];
+        let name: String = raw
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    "live".to_string()
+}
+
 fn dataset_path(app: &App, query: &str) -> PathBuf {
     if let Some(pos) = query.find("dataset=") {
         let raw = &query[pos + "dataset=".len()..];
@@ -1078,16 +1369,38 @@ fn html_response(body: &str) -> String {
 const MAX_BODY_BYTES: usize = 1_000_000;
 
 fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String)> {
+    // One deadline for the whole request: a per-read timeout alone
+    // is defeated by a client dripping a byte just under it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut reader = BufReader::new(stream.try_clone().ok()?);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line).ok()?;
+    // Header lines are read byte by byte so the deadline is checked
+    // for EVERY byte: a read_line would wait inside one line while
+    // a drip feeds it a byte per per-read timeout.
+    let read_line_by_byte =
+        |reader: &mut BufReader<std::net::TcpStream>| -> Option<String> {
+            let mut line = String::new();
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                let mut b = [0u8; 1];
+                let n = reader.read(&mut b).ok()?;
+                if n == 0 {
+                    return if line.is_empty() { None } else { Some(line) };
+                }
+                line.push(b[0] as char);
+                if b[0] == b'\n' || line.len() > 16384 {
+                    return Some(line);
+                }
+            }
+        };
+    let request_line = read_line_by_byte(&mut reader)?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
     let mut content_length = 0usize;
     loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).ok()?;
+        let line = read_line_by_byte(&mut reader)?;
         if line == "\r\n" || line.is_empty() {
             break;
         }
@@ -1098,15 +1411,26 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, Str
     if content_length > MAX_BODY_BYTES {
         return Some(("__too_large__".to_string(), String::new(), String::new()));
     }
-    let mut body = vec![0u8; content_length];
+    let mut body: Vec<u8> = Vec::with_capacity(content_length);
     if content_length > 0 {
-        reader.read_exact(&mut body).ok()?;
+        let mut chunk = [0u8; 65536];
+        while body.len() < content_length {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            let want = (content_length - body.len()).min(chunk.len());
+            match reader.read(&mut chunk[..want]) {
+                Ok(0) => return None,
+                Ok(n) => body.extend_from_slice(&chunk[..n]),
+                Err(_) => return None,
+            }
+        }
     }
     Some((method, path, String::from_utf8_lossy(&body).to_string()))
 }
 
-fn latest_markets(data_dir: &Path) -> Vec<Snapshot> {
-    let snapshots = load_snapshots(&data_dir.join("snapshots.jsonl"));
+fn latest_markets(app: &App) -> Vec<Snapshot> {
+    let snapshots = app.snapshots_cached(&app.data_dir.join("snapshots.jsonl"));
     let mut latest: BTreeMap<String, Snapshot> = BTreeMap::new();
     for snap in snapshots {
         latest
@@ -1145,7 +1469,7 @@ fn handle(app: &App, method: &str, path: &str) -> String {
             json_response(200, &home.to_string())
         }
         ("GET", "/api/markets") => {
-            json_response(200, &serde_json::to_string(&latest_markets(&app.data_dir)).unwrap())
+            json_response(200, &serde_json::to_string(&latest_markets(app)).unwrap())
         }
         ("POST", "/api/collect") => match collect_once(&app.data_dir) {
             Ok((n, errors)) => {
@@ -1168,7 +1492,15 @@ fn handle(app: &App, method: &str, path: &str) -> String {
             ),
         },
         ("GET", "/api/strategies") => {
-            let snapshots = load_snapshots(&dataset_path(app, query));
+            let dpath = dataset_path(app, query);
+            if dataset_name(query) != "live" && !dpath.exists() {
+                return json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {}", dataset_name(query)) })
+                        .to_string(),
+                );
+            }
+            let snapshots = app.snapshots_cached(&dpath);
             let reports: Vec<ScoreReport> = load_strategies(&app.strategies_dir)
                 .iter()
                 .map(|s| score_strategy(s, &snapshots, Standard::default()))
@@ -1176,7 +1508,15 @@ fn handle(app: &App, method: &str, path: &str) -> String {
             json_response(200, &serde_json::to_string(&reports).unwrap())
         }
         ("GET", "/api/slots") => {
-            let snapshots = load_snapshots(&dataset_path(app, query));
+            let dpath = dataset_path(app, query);
+            if dataset_name(query) != "live" && !dpath.exists() {
+                return json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {}", dataset_name(query)) })
+                        .to_string(),
+                );
+            }
+            let snapshots = app.snapshots_cached(&dpath);
             let strategies = load_strategies(&app.strategies_dir);
             let sim = simulate_slots(&strategies, &snapshots, app.paper_pot);
             let mut body = serde_json::to_value(&sim).unwrap();
@@ -1192,10 +1532,19 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                     .map(|(file, error)| serde_json::json!({ "file": file, "error": error }))
                     .collect::<Vec<_>>()
             );
+            body["dataset"] = serde_json::json!(dataset_name(query));
             json_response(200, &body.to_string())
         }
         ("GET", "/api/equity") => {
-            let snapshots = load_snapshots(&dataset_path(app, query));
+            let dpath = dataset_path(app, query);
+            if dataset_name(query) != "live" && !dpath.exists() {
+                return json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {}", dataset_name(query)) })
+                        .to_string(),
+                );
+            }
+            let snapshots = app.snapshots_cached(&dpath);
             let strategies = load_strategies(&app.strategies_dir);
             let sim = simulate_slots(&strategies, &snapshots, app.paper_pot);
             let (pot, per) = equity_curves(&sim);
@@ -1220,6 +1569,7 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                     .iter()
                     .map(|(file, error)| serde_json::json!({ "file": file, "error": error }))
                     .collect::<Vec<_>>(),
+                "dataset": dataset_name(query),
             });
             json_response(200, &body.to_string())
         }
@@ -1232,10 +1582,12 @@ fn handle(app: &App, method: &str, path: &str) -> String {
 }
 
 fn main() {
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8472);
+    let port: u16 = match std::env::var("PORT") {
+        Ok(p) => p.parse().unwrap_or_else(|_| {
+            panic!("PORT is set to '{p}', which is not a valid port — refusing to silently fall back to 8472")
+        }),
+        Err(_) => 8472,
+    };
     let data_dir = std::env::var("OPENBELL_DATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./openbell-data"));
@@ -1245,7 +1597,7 @@ fn main() {
     let paper_pot: f64 = std::env::var("OPENBELL_PAPER_POT")
         .ok()
         .and_then(|p| p.parse().ok())
-        .filter(|p: &f64| *p > 0.0 && p.is_finite())
+        .filter(|p: &f64| *p > 0.0 && p.is_finite() && *p <= 1.0e9)
         .unwrap_or(100.0);
     let _ = std::fs::create_dir_all(&data_dir);
 
@@ -1259,6 +1611,11 @@ fn main() {
             "OPENBELL_COLLECT_SECS=0 would busy-loop the collector against the venue; using 5s"
         );
         5
+    } else if collect_secs > 3600 {
+        eprintln!(
+            "OPENBELL_COLLECT_SECS={collect_secs} would leave the tape stale for hours and make the health threshold meaningless; using 3600s"
+        );
+        3600
     } else {
         collect_secs
     };
@@ -1283,6 +1640,7 @@ fn main() {
     }
 
     let app = Arc::new(App {
+        tape_cache: std::sync::Mutex::new(None),
         data_dir,
         strategies_dir,
         paper_pot,
@@ -1335,6 +1693,59 @@ mod tests {
             no_ask: na,
             last_price: None,
         }
+    }
+
+    #[test]
+    fn iso_parse_rejects_out_of_range_fields() {
+        // Round-2 adversarial: an unchecked parse computed a
+        // confident epoch for month 13 / day 45 / hour 99.
+        assert!(parse_iso_z("2026-13-45T99:99:99Z").is_none());
+        assert!(parse_iso_z("2026-02-30T00:00:00Z").is_none());
+        assert!(parse_iso_z("2025-02-29T00:00:00Z").is_none());
+        assert!(parse_iso_z("2024-02-29T00:00:00Z").is_some());
+        assert!(parse_iso_z("not-a-date").is_none());
+        assert_eq!(parse_iso_z("2030-01-01T01:00:00Z"), Some(1893459600));
+        assert_eq!(iso_z(1893459600), "2030-01-01T01:00:00Z");
+    }
+
+    #[test]
+    fn window_facts_conflict_and_epoch() {
+        let snap = |close: &str, result: &str, fetched: i64| Snapshot {
+            fetched_at: fetched,
+            ticker: "T".into(),
+            event_ticker: "T".into(),
+            series: "S".into(),
+            close_time: close.into(),
+            status: "active".into(),
+            result: result.into(),
+            yes_bid: None,
+            yes_ask: Some(0.5),
+            no_bid: None,
+            no_ask: Some(0.5),
+            last_price: None,
+        };
+        // Conflicting settlements: not scored, ever.
+        let conflict = vec![
+            snap("2030-01-01T00:15:00Z", "yes", 100),
+            snap("2030-01-01T00:15:00Z", "no", 110),
+        ];
+        assert!(matches!(window_facts(&conflict), WindowFacts::Conflict));
+        // The epoch is the settled record's own close time, not
+        // the earliest snapshot's (whose close_time is garbage).
+        let poisoned = vec![
+            snap("not-a-date", "", 100),
+            snap("2030-01-01T01:00:00Z", "no", 110),
+        ];
+        match window_facts(&poisoned) {
+            WindowFacts::Settled { result, close_epoch } => {
+                assert_eq!(result, "no");
+                assert_eq!(close_epoch, 1893459600);
+            }
+            _ => panic!("expected a settled window"),
+        }
+        // Unsettled stays unsettled.
+        let open = vec![snap("2030-01-01T01:00:00Z", "", 100)];
+        assert!(matches!(window_facts(&open), WindowFacts::Unsettled));
     }
 
     #[test]

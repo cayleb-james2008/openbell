@@ -40,11 +40,21 @@ done
 # or signing tool would have to enter.
 ncmd=$(grep -c 'Command::new' src/main.rs)
 [ "$ncmd" = "1" ] || { echo "FAIL: src/main.rs has $ncmd Command::new call sites, expected exactly 1 (the collector's curl)"; fail=1; }
-# Direct dependencies are whitelisted: no networking, HTTP, or
-# signing crate may be added quietly. (Transitive deps of rune are
-# not the app's choice; direct ones are.)
-if grep -Eq 'reqwest|hyper|tokio|openssl|ring|rsa|hmac|sha2|websocket|tungstenite|ureq|curl' Cargo.toml; then
-  echo "FAIL: a networking/signing crate appears in Cargo.toml dependencies"; fail=1
+# Direct dependencies are ALLOWLISTED, not denylisted (round-2
+# adversarial: a denylist waved socket2 + ed25519-dalek straight
+# through — an unlisted crate is exactly the hole). The app's
+# direct deps are rune + serde + serde_json, nothing else, ever.
+deps=$(awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f && /^[a-z]/ {split($0,a,"="); gsub(/ /,"",a[1]); print a[1]}' Cargo.toml | sort | tr '\n' ' ')
+if [ "$deps" != "rune serde serde_json " ]; then
+  echo "FAIL: Cargo.toml direct dependencies are [$deps], expected exactly [rune serde serde_json]"; fail=1
 fi
+# The process surface is pinned to this file's exact shape: the
+# plain import line, and exactly two Command tokens in the whole
+# source (the import + the collector's call). An aliased import
+# (Command as Proc) adds a token and trips this — round 2 proved
+# the substring count alone could not see it.
+[ "$(grep -c 'use std::process::Command;' src/main.rs)" = "1" ] || { echo "FAIL: the Command import line is not the plain one"; fail=1; }
+ntok=$(grep -o 'Command' src/main.rs | wc -l)
+[ "$ntok" = "2" ] || { echo "FAIL: src/main.rs has $ntok Command tokens, expected exactly 2 (import + collector call)"; fail=1; }
 [ $fail -eq 0 ] && echo "FENCE OK: no order-placement surface in source or binary; venue traffic is the collector's public GET only"
 exit $fail

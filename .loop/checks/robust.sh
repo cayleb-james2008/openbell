@@ -128,4 +128,115 @@ for i in $(seq 1 20); do curl -s "http://127.0.0.1:8492/api/report" >/dev/null 2
 curl -s "http://127.0.0.1:8492/api/report" | jq -r '.report' | head -1 | grep -q 'no private key path is set' \
   || { echo "FAIL: a credential ID without a key path does not get its true reason"; curl -s "http://127.0.0.1:8492/api/report" | jq -r '.report' | head -1; exit 1; }
 
-echo "ROBUST OK: oversized bodies refused, looping strategies degrade, concurrent collects cannot splice the tape, env values clamped"
+# --- B22: the strategy contract is enforced, and call failures are
+# named rather than read as quiet strategies (D8).
+mkdir -p "$WORK/data2" "$WORK/strats2"
+cp "$WORK/data/fixture-snapshots.jsonl" "$WORK/data2/snapshots.jsonl"
+cat > "$WORK/strats2/banana.rn" <<'RN'
+pub fn name() { "banana-side" }
+pub fn side() { "banana" }
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) { true }
+pub fn describe() { "side() returns neither yes nor no" }
+RN
+cat > "$WORK/strats2/dup-a.rn" <<'RN'
+pub fn name() { "same-name" }
+pub fn side() { "yes" }
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) { true }
+pub fn describe() { "first of two strategies sharing a name" }
+RN
+cat > "$WORK/strats2/dup-b.rn" <<'RN'
+pub fn name() { "same-name" }
+pub fn side() { "no" }
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) { true }
+pub fn describe() { "second of two strategies sharing a name" }
+RN
+cat > "$WORK/strats2/stringret.rn" <<'RN'
+pub fn name() { "string-return" }
+pub fn side() { "yes" }
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) { "yes please" }
+pub fn describe() { "allow_entry returns a string, not a bool" }
+RN
+cat > "$WORK/strats2/valid.rn" <<'RN'
+pub fn name() { "valid-one" }
+pub fn side() { "yes" }
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) { yes_ask <= 0.90 }
+pub fn describe() { "a well-formed strategy" }
+RN
+OPENBELL_DATA="$WORK/data2" OPENBELL_STRATEGIES="$WORK/strats2" \
+OPENBELL_COLLECT_SECS=3600 PORT=8491 \
+  ./target/debug/openbell-rs > "$WORK/server2.log" 2>&1 &
+PIDS="$PIDS $!"
+for i in $(seq 1 20); do curl -s "http://127.0.0.1:8491/api/home" >/dev/null 2>&1 && break; sleep 0.5; done
+curl -s "http://127.0.0.1:8491/api/home" > "$WORK/home2.json"
+jq -e '[.library_errors[].error] | any(test("side\\(\\) must return"))' "$WORK/home2.json" >/dev/null \
+  || { echo "FAIL: a side() of 'banana' is not rejected with its reason"; cat "$WORK/home2.json" | jq .library_errors; exit 1; }
+jq -e '[.library_errors[].error] | any(test("duplicate strategy name"))' "$WORK/home2.json" >/dev/null \
+  || { echo "FAIL: duplicate strategy names are not rejected"; exit 1; }
+curl -s "http://127.0.0.1:8491/api/strategies" > "$WORK/strats2.json"
+jq -e 'length == 3 and ([.[].strategy] | unique | length == 3)' "$WORK/strats2.json" >/dev/null \
+  || { echo "FAIL: expected the 3 loadable strategies (first same-name, string-return, valid-one) with unique names, got:"; cat "$WORK/strats2.json" | jq -r '.[].strategy'; exit 1; }
+jq -e '.[] | select(.strategy=="string-return") | .call_failures > 0' "$WORK/strats2.json" >/dev/null \
+  || { echo "FAIL: a non-boolean allow_entry is not counted as call failures"; cat "$WORK/strats2.json"; exit 1; }
+curl -s "http://127.0.0.1:8491/api/slots" | jq -e '.dataset == "live" and ([.notes[]] | any(test("allow_entry failed")))' >/dev/null \
+  || { echo "FAIL: slots do not name the string-return strategy's call failures, or the dataset is unlabelled"; exit 1; }
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8491/api/slots?dataset=nosuch")
+[ "$code" = "404" ] || { echo "FAIL: an unknown dataset got HTTP $code, not 404"; exit 1; }
+
+# --- B22: window truth — conflicts unscored, the settled record's
+# own close time orders the compounding, sub-cent prices never size
+# a trade (D4/D6/D7).
+mkdir -p "$WORK/data3" "$WORK/strats3"
+cat > "$WORK/data3/snapshots.jsonl" <<'JSON'
+{"series":"KXBTC15M","ticker":"KXBTC15M-C1","event_ticker":"KXBTC15M-C1","status":"active","close_time":"2030-01-01T00:15:00Z","yes_ask":0.5,"no_ask":0.5,"result":"yes","fetched_at":1893455000}
+{"series":"KXBTC15M","ticker":"KXBTC15M-C1","event_ticker":"KXBTC15M-C1","status":"active","close_time":"2030-01-01T00:15:00Z","yes_ask":0.5,"no_ask":0.5,"result":"no","fetched_at":1893455010}
+{"series":"KXBTC15M","ticker":"KXBTC15M-C2","event_ticker":"KXBTC15M-C2","status":"active","close_time":"not-a-date","yes_ask":0.5,"no_ask":0.5,"result":"","fetched_at":1893455020}
+{"series":"KXBTC15M","ticker":"KXBTC15M-C2","event_ticker":"KXBTC15M-C2","status":"active","close_time":"2030-01-01T01:00:00Z","yes_ask":0.5,"no_ask":0.5,"result":"no","fetched_at":1893455030}
+{"series":"KXBTC15M","ticker":"KXBTC15M-C3","event_ticker":"KXBTC15M-C3","status":"active","close_time":"2030-01-01T02:00:00Z","yes_ask":0.001,"no_ask":0.999,"result":"yes","fetched_at":1893455040}
+JSON
+cat > "$WORK/strats3/always.rn" <<'RN'
+pub fn name() { "always-yes" }
+pub fn side() { "yes" }
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) { yes_ask <= 0.99 }
+pub fn describe() { "enters every window on the yes side" }
+RN
+OPENBELL_DATA="$WORK/data3" OPENBELL_STRATEGIES="$WORK/strats3" \
+OPENBELL_COLLECT_SECS=3600 PORT=8490 \
+  ./target/debug/openbell-rs > "$WORK/server3.log" 2>&1 &
+PIDS="$PIDS $!"
+for i in $(seq 1 20); do curl -s "http://127.0.0.1:8490/api/home" >/dev/null 2>&1 && break; sleep 0.5; done
+curl -s "http://127.0.0.1:8490/api/home" | jq -e '.collector.conflicting_settlements == 1' >/dev/null \
+  || { echo "FAIL: home does not count the conflicting settlement"; exit 1; }
+curl -s "http://127.0.0.1:8490/api/slots" > "$WORK/slots3.json"
+jq -e '.conflicted_windows == 1' "$WORK/slots3.json" >/dev/null \
+  || { echo "FAIL: the slot sim does not report the conflicted window"; cat "$WORK/slots3.json"; exit 1; }
+jq -e '.trades | length == 1' "$WORK/slots3.json" >/dev/null \
+  || { echo "FAIL: expected exactly one trade (the honestly-dated window); the conflict and the sub-cent window must not trade"; cat "$WORK/slots3.json" | jq .trades; exit 1; }
+jq -e '.trades[0].close_epoch == 1893459600' "$WORK/slots3.json" >/dev/null \
+  || { echo "FAIL: the trade's epoch is not the settled record's own close time"; cat "$WORK/slots3.json" | jq .trades; exit 1; }
+
+# --- B22: one future-dated line mid-tape cannot make a dead
+# collector read alive (D9). The last line rules freshness.
+mkdir -p "$WORK/data4"
+NOW=$(date +%s)
+python3 - "$WORK/data4/snapshots.jsonl" "$NOW" <<'PY'
+import json, sys
+path, now = sys.argv[1], int(sys.argv[2])
+def line(fetched, result):
+    return json.dumps({"series":"KXBTC15M","ticker":"KXBTC15M-H1","event_ticker":"KXBTC15M-H1","status":"active","close_time":"2030-01-01T00:15:00Z","yes_ask":0.5,"no_ask":0.5,"result":result,"fetched_at":fetched})
+open(path, "w").write("\n".join([
+    line(now - 7200, "yes"),
+    line(now + 315360000, "yes"),
+    line(now - 7200, "yes"),
+]) + "\n")
+PY
+OPENBELL_DATA="$WORK/data4" OPENBELL_STRATEGIES="$WORK/strats3" \
+OPENBELL_COLLECT_SECS=60 PORT=8489 \
+  ./target/debug/openbell-rs > "$WORK/server4.log" 2>&1 &
+PIDS="$PIDS $!"
+for i in $(seq 1 20); do curl -s "http://127.0.0.1:8489/api/home" >/dev/null 2>&1 && break; sleep 0.5; done
+curl -s "http://127.0.0.1:8489/api/home" > "$WORK/home4.json"
+jq -e '.collector.collecting == false and .collector.newest_snapshot_age_secs > 7000' "$WORK/home4.json" >/dev/null \
+  || { echo "FAIL: a future-dated mid-tape line makes a stale tape read as collecting, or the age is not the last line's"; cat "$WORK/home4.json" | jq .collector; exit 1; }
+
+echo "ROBUST OK: oversized bodies refused, looping strategies degrade, concurrent collects cannot splice the tape, env values clamped, strategy contract enforced, window truth defended, freshness cannot be forged"
+
