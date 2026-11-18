@@ -123,19 +123,18 @@ fn fetch_markets(series: &str, status: &str) -> Result<Vec<Snapshot>, String> {
 fn collect_once(data_dir: &Path) -> Result<usize, String> {
     let _ = std::fs::create_dir_all(data_dir);
     let path = data_dir.join("snapshots.jsonl");
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| e.to_string())?;
+    // Build the whole pass in memory and append it in one write: a
+    // reader of the tape (the report, the health count) then sees the
+    // pass whole or not at all, never a torn half-pass.
+    let mut buf = String::new();
     let mut written = 0;
     for series in SERIES {
         for status in ["open", "settled"] {
             match fetch_markets(series, status) {
                 Ok(snaps) => {
                     for snap in &snaps {
-                        writeln!(file, "{}", serde_json::to_string(snap).unwrap())
-                            .map_err(|e| e.to_string())?;
+                        buf.push_str(&serde_json::to_string(snap).unwrap());
+                        buf.push('\n');
                         written += 1;
                     }
                 }
@@ -143,6 +142,13 @@ fn collect_once(data_dir: &Path) -> Result<usize, String> {
             }
         }
     }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    use std::io::Write;
+    file.write_all(buf.as_bytes()).map_err(|e| e.to_string())?;
     Ok(written)
 }
 
@@ -723,7 +729,12 @@ fn daily_report(app: &App) -> String {
     // an invented figure.
     let pnl_line = match account.day_pnl {
         Some(p) => format!("Day P&L (venue): {}${:.2}", if p < 0.0 { "-" } else { "+" }, p.abs()),
-        None => "Day P&L (venue): unavailable — no venue credential in the environment; nothing below invents one.".to_string(),
+        // The reason comes from account_state itself — the report must
+        // not claim "no credential" when one is present but unread.
+        None => format!(
+            "Day P&L (venue): unavailable — {} Nothing below invents one.",
+            account.note
+        ),
     };
     let snapshots = load_snapshots(&app.data_dir.join("snapshots.jsonl"));
     let health = collector_health(app);
@@ -1140,6 +1151,43 @@ mod tests {
             snaps.push(snap(&format!("W{i}"), close_epoch + 60, &close, results[i], None, None));
         }
         snaps
+    }
+
+    #[test]
+    #[test]
+    fn sizing_compounds_the_pot_across_windows() {
+        // One strategy in a scratch library, so N=1 and the arithmetic
+        // is checkable by hand. Two winning windows at yes 0.70:
+        //   W1: share = 100.00 -> 142 contracts; P&L = 142 - 99.40
+        //       - 142*fee(0.70) = +40.5126; equity 140.5126.
+        //   W2: share = 140.5126 (the COMPOUNDED equity, not the
+        //       starting pot) -> 200 contracts; P&L = +57.06.
+        // Under a fixed starting-pot rule W2 would repeat W1 and the
+        // total would be 81.03; compounding gives 97.57.
+        let dir = std::env::temp_dir().join(format!("openbell-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rn = std::fs::read_to_string("strategies/favourite_late.rn").unwrap();
+        std::fs::write(dir.join("favourite_late.rn"), rn).unwrap();
+        let strategies = load_strategies(&dir);
+        assert_eq!(strategies.len(), 1);
+        let mut snaps = Vec::new();
+        for i in 0..2 {
+            let close = format!("2026-11-17T1{}:00:00Z", i);
+            let close_epoch = parse_iso_z(&close).unwrap();
+            snaps.push(snap(&format!("W{i}"), close_epoch - 240, &close, "", Some(0.70), Some(0.32)));
+            snaps.push(snap(&format!("W{i}"), close_epoch + 60, &close, "yes", None, None));
+        }
+        let sim = simulate_slots(&strategies, &snaps, 100.0);
+        let total = &sim.strategy_totals[0];
+        assert_eq!(total.windows_traded, 2);
+        assert!(
+            (total.paper_pnl_dollars - 97.57).abs() < 0.01,
+            "compounded P&L should be ~97.57, got {}",
+            total.paper_pnl_dollars
+        );
+        assert!((sim.paper_equity_dollars - 197.57).abs() < 0.01);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

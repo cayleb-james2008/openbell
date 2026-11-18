@@ -16,21 +16,17 @@ export PATH="$HOME/.rust/bin:$PATH"
 cargo build >/dev/null 2>&1 || { echo "FAIL: cargo build"; exit 1; }
 mkdir -p "$WORK/data"
 python3 gen_fixture.py "$WORK/data/snapshots.jsonl" >/dev/null
+# The tape must be exactly the fixture for the count assertions: make
+# it read-only so the server's own startup collection pass cannot
+# append to it mid-check (a race that failed this check in both
+# directions during review).
+chmod 444 "$WORK/data/snapshots.jsonl"
 
 OPENBELL_DATA="$WORK/data" OPENBELL_STRATEGIES="$PWD/strategies" \
 OPENBELL_COLLECT_SECS=3600 PORT=$PORT \
   ./target/debug/openbell-rs > "$WORK/server.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s "http://127.0.0.1:$PORT/api/report" >/dev/null 2>&1 && break; sleep 0.5; done
-# The server's startup collection pass writes to the same tape for its
-# first seconds; wait until the file is stable so the report and the
-# independent count read the same tape.
-prev=-1
-for i in $(seq 1 30); do
-  cur=$(wc -l < "$WORK/data/snapshots.jsonl")
-  [ "$cur" = "$prev" ] && break
-  prev=$cur; sleep 2
-done
 
 report=$(curl -s "http://127.0.0.1:$PORT/api/report" | jq -r '.report')
 first=$(echo "$report" | head -1)
@@ -50,10 +46,9 @@ echo "$home" | jq -e '.account.open_positions == null' >/dev/null \
 if echo "$report" | grep -Eq 'Balance \(venue\): \$[0-9]'; then
   echo "FAIL: the report invents a venue balance"; echo "$report"; exit 1
 fi
-# The server's own startup pass adds a fresh snapshot to the tape, so
-# counts are checked against an independent count of the file as it
-# stands now, and the collector state word must be one of the two
-# honest states.
+# Counts are checked against an independent count of the fixture tape
+# (read-only, so it cannot have changed), and the collector state word
+# must be one of the two honest states.
 cs=$(jq -s 'length' "$WORK/data/snapshots.jsonl")
 cm=$(jq -s '[.[].ticker] | unique | length' "$WORK/data/snapshots.jsonl")
 cw=$(jq -s '[.[] | select(.result != "") | .ticker] | unique | length' "$WORK/data/snapshots.jsonl")
