@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenBell-rs forward data collector (Kalshi public market data, read-only)
+After=network-online.target
+
+[Service]
+EnvironmentFile=/etc/openbell-collector.env
+ExecStart=/home/hatch/workspace/restart-20261117/builds/openbell-rs/target/debug/openbell-rs
+WorkingDirectory=/home/hatch/workspace/restart-20261117/builds/openbell-rs
+Environment=OPENBELL_DATA=/home/hatch/workspace/restart-20261117/builds/openbell-rs/openbell-data
+Environment=OPENBELL_COLLECT_SECS=60
+Environment=PORT=8472
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
