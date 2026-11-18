@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -238,10 +238,7 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
     Ok((written, errors))
 }
 
-fn load_snapshots(path: &Path) -> Vec<Snapshot> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
+fn parse_tape_text(text: &str) -> Vec<Snapshot> {
     text.lines()
         .filter_map(|l| serde_json::from_str::<Snapshot>(l).ok())
         .collect()
@@ -277,6 +274,11 @@ fn fee(price: f64) -> f64 {
 struct Strategy {
     name: String,
     side: String,
+    /// Content hash of the strategy's source bytes. Two loads of the
+    /// same source share it; any edit changes it. The per-window
+    /// entry index (window_entry) keys on it, so a mutated strategy
+    /// can never inherit entries computed from different code.
+    fingerprint: u64,
     unit: Arc<rune::Unit>,
     runtime: Arc<rune::runtime::RuntimeContext>,
     /// Time this strategy's own calls have consumed this pass —
@@ -290,11 +292,29 @@ struct Strategy {
     /// allow_entry calls that errored or returned a non-boolean:
     /// counted so a broken strategy reads as broken, not quiet.
     call_failures: std::cell::Cell<usize>,
+    /// The strategy's virtual machine, reused across calls: a fresh
+    /// Vm per call pays a full stack allocation per call, and over
+    /// a full tape (~100k calls per strategy) that overhead — not
+    /// the scripts — is what pushes honest strategies into their
+    /// aggregate deadline and leaves their tail windows unscored.
+    /// One Vm executes every call this strategy makes; the budget
+    /// and memory limit wrap each call independently of it.
+    vm: std::cell::RefCell<Option<rune::Vm>>,
+    /// Consecutive calls that died on the instruction budget (see
+    /// budget_open): direct evidence a script does not terminate,
+    /// as opposed to a script that is merely slow.
+    budget_deaths: std::cell::Cell<usize>,
 }
 
 impl Strategy {
     fn load(path: &Path) -> Result<Strategy, String> {
         let script = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let fingerprint = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            script.hash(&mut h);
+            h.finish()
+        };
         if script.len() > MAX_STRATEGY_BYTES {
             return Err(format!(
                 "strategy file is {} bytes; the cap is {MAX_STRATEGY_BYTES}",
@@ -331,11 +351,14 @@ impl Strategy {
                 return Ok(Strategy {
                     name,
                     side,
+                    fingerprint,
                     unit,
                     runtime,
                     spent: std::cell::Cell::new(std::time::Duration::ZERO),
                     exhausted: std::cell::Cell::new(false),
                     call_failures: std::cell::Cell::new(0),
+                    vm: std::cell::RefCell::new(None),
+                    budget_deaths: std::cell::Cell::new(0),
                 });
             }
         }
@@ -355,11 +378,14 @@ impl Strategy {
         let mut strat = Strategy {
             name: String::new(),
             side: String::new(),
+            fingerprint,
             unit,
             runtime,
             spent: std::cell::Cell::new(std::time::Duration::ZERO),
             exhausted: std::cell::Cell::new(false),
             call_failures: std::cell::Cell::new(0),
+            vm: std::cell::RefCell::new(None),
+            budget_deaths: std::cell::Cell::new(0),
         };
         strat.name = strat.call_string("name")?;
         strat.side = strat.call_string("side")?;
@@ -385,49 +411,103 @@ impl Strategy {
         Ok(strat)
     }
 
-    fn vm(&self) -> rune::Vm {
-        rune::Vm::new(self.runtime.clone(), self.unit.clone())
+    /// Borrow the strategy's reusable Vm (see the field's note).
+    fn with_vm<R>(&self, f: impl FnOnce(&mut rune::Vm) -> R) -> R {
+        let mut slot = self.vm.borrow_mut();
+        let vm = slot
+            .get_or_insert_with(|| rune::Vm::new(self.runtime.clone(), self.unit.clone()));
+        f(vm)
     }
 
-    /// Every strategy call runs under an instruction budget. A
-    /// strategy is a small predicate over three numbers; a million
-    /// VM instructions is generous headroom for any honest shape,
-    /// and a script that never terminates (a while loop in
-    /// allow_entry) burns the budget and errors — degrading to
+    /// Every strategy call runs under an instruction budget AND a
+    /// memory limit. A strategy is a small predicate over three
+    /// numbers; the instruction budget is generous headroom for any
+    /// honest shape, and a script that never terminates (a while
+    /// loop in allow_entry) burns it and errors — degrading to
     /// no-entry like any other failed call — instead of wedging
-    /// every scoring surface forever.
+    /// every scoring surface forever. The instruction budget alone
+    /// cannot bound bytes: a single native call (a format! with a
+    /// huge width, a with_capacity reservation) allocates hundreds
+    /// of megabytes inside a handful of instructions, so every call
+    /// also runs under rune::alloc::limit — a hard cap on the bytes
+    /// the call may allocate through Rune's allocator. A breach
+    /// errors the call, degrading exactly like any other failure:
+    /// counted, noted, treated as no-entry.
     fn call_budgeted(
         &self,
         name: &str,
         args: (f64, f64, i64),
     ) -> Result<rune::Value, rune::runtime::VmError> {
-        let mut vm = self.vm();
         let t0 = std::time::Instant::now();
-        let out = rune::runtime::budget::with(STRATEGY_BUDGET, move || vm.call([name], args)).call();
+        let out = self.with_vm(|vm| {
+            rune::runtime::budget::with(
+                STRATEGY_BUDGET,
+                rune::alloc::limit::with(STRATEGY_MEMORY_BYTES, || vm.call([name], args)),
+            )
+            .call()
+        });
         self.spent.set(self.spent.get() + t0.elapsed());
+        match &out {
+            Ok(_) => self.budget_deaths.set(0),
+            Err(e) if is_budget_halt(e) => {
+                let deaths = self.budget_deaths.get() + 1;
+                self.budget_deaths.set(deaths);
+                if deaths >= BUDGET_DEATH_LIMIT {
+                    self.exhausted.set(true);
+                }
+            }
+            Err(_) => {}
+        }
         out
     }
 
     fn call_string(&self, name: &str) -> Result<String, String> {
-        let mut vm = self.vm();
-        let value = rune::runtime::budget::with(STRATEGY_BUDGET, move || vm.call([name], ()))
-            .call()
+        let value = self
+            .with_vm(|vm| {
+                rune::runtime::budget::with(
+                    STRATEGY_BUDGET,
+                    rune::alloc::limit::with(STRATEGY_MEMORY_BYTES, || vm.call([name], ())),
+                )
+                .call()
+            })
             .map_err(|e| format!("strategy call {name} failed: {e}"))?;
         rune::from_value::<String>(value).map_err(|e| e.to_string())
     }
 
     /// The aggregate bound: a strategy gets STRATEGY_DEADLINE_SECS
     /// of its OWN consumed call time per scoring pass (a pass
-    /// builds fresh Strategy objects). An honest predicate needs
-    /// microseconds per call; the allowance exists so a
-    /// pathological script's cost is bounded by seconds of its own
-    /// burn per surface, not by tape size — and never by a
-    /// neighbour's burn.
+    /// builds fresh Strategy objects). The allowance exists so a
+    /// pathological script's cost is bounded per surface, not by a
+    /// neighbour's burn. It is calibrated so an honest predicate
+    /// can always finish a full first computation over the whole
+    /// tape: at ~750 settled windows a strategy's first pass is
+    /// ~100–200k short calls, a few seconds of burn in the worst
+    /// case — the 3s this used to be was set on a 108k-line tape
+    /// and truncated honest strategies mid-tape, which also left
+    /// the per-window entry index permanently incomplete (a
+    /// truncated scan is never cached), so every recompute re-burned
+    /// the same allowance and the desk's verdicts were computed on
+    /// whatever prefix fit. Thirty seconds is ~10x the honest
+    /// need; a script that burns it is named in the pass's notes
+    /// and treated as no-entry for the rest of the pass, exactly
+    /// as before.
     fn budget_open(&self) -> bool {
         if self.exhausted.get() {
             return false;
         }
         if self.spent.get().as_secs() >= STRATEGY_DEADLINE_SECS {
+            self.exhausted.set(true);
+            return false;
+        }
+        // The second trigger is evidence, not elapsed time: a call
+        // that dies on the instruction budget is a script that did
+        // not terminate within 250k instructions for those inputs.
+        // One such death can be an outlier input; a run of them is
+        // a non-terminating script, and it is exhausted on the spot
+        // rather than after STRATEGY_DEADLINE_SECS of aggregate
+        // burn — on a small tape the clock alone would never name
+        // it, and the pass would pay full price for every window.
+        if self.budget_deaths.get() >= BUDGET_DEATH_LIMIT {
             self.exhausted.set(true);
             return false;
         }
@@ -462,7 +542,7 @@ impl Strategy {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ScoreReport {
     budget_exhausted: bool,
     call_failures: usize,
@@ -478,10 +558,127 @@ struct ScoreReport {
     verdict: String,
 }
 
+/// The per-window entry index. A window's entry for a strategy is a
+/// pure function of (the strategy's source, the window's snapshot
+/// sequence) — so it is cached under a fingerprint of exactly those
+/// inputs: the strategy's source hash and a hash over the snapshot
+/// fields window_entry reads (fetch order, asks, close time). The
+/// tape grows ~505 lines a minute, but appends only ever change the
+/// currently-open windows; every settled window's entry is computed
+/// once and then read from the index, so a re-score after a collect
+/// pass runs Rune only for the windows that actually changed.
+/// Results from a scan the aggregate deadline cut short are never
+/// cached — they are a function of the budget state, not of the
+/// window, and caching them would poison later passes.
+static ENTRY_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(u64, u64), Option<f64>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The scan-resume cache: for each (strategy, window) the longest
+/// prefix of the window's snapshots a completed scan has covered,
+/// that prefix's fingerprint, and the entry the scan found in it.
+/// Windows are append-only — a collect pass adds snapshots to the
+/// currently-open windows and never rewrites a settled one — so
+/// when a window grows, its old prefix is still there verbatim
+/// (proven by the prefix fingerprint) and the scan resumes where
+/// it stopped instead of re-asking the strategy about every old
+/// snapshot. Without this, every collect pass re-scanned every
+/// window it touched (~500 windows × ~300 snapshots × 5
+/// strategies of Rune calls per recompute). A scan the deadline
+/// cut short updates neither cache: its result is a function of
+/// the budget state, not of the window.
+static PREFIX_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<(u64, String), (usize, u64, Option<f64>)>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn window_fingerprint(snaps: &[Snapshot]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    snaps.len().hash(&mut h);
+    for s in snaps {
+        s.fetched_at.hash(&mut h);
+        s.yes_ask.map(f64::to_bits).hash(&mut h);
+        s.no_ask.map(f64::to_bits).hash(&mut h);
+        s.close_time.hash(&mut h);
+    }
+    h.finish()
+}
+
 /// The entry a strategy would have taken in one window: the ask on its
 /// side at the first snapshot (in fetch order) where its Rune
 /// `allow_entry` says yes. None when it never enters.
 fn window_entry(strat: &Strategy, snaps: &[Snapshot]) -> Option<f64> {
+    window_entry_keyed(strat, None, snaps, window_fingerprint(snaps))
+}
+
+fn window_entry_keyed(
+    strat: &Strategy,
+    ticker: Option<&str>,
+    snaps: &[Snapshot],
+    win_fp: u64,
+) -> Option<f64> {
+    // A strategy whose aggregate allowance is spent degrades to
+    // no-entry for the rest of the pass — from the index or not.
+    if !strat.budget_open() {
+        return None;
+    }
+    let key = (strat.fingerprint, win_fp);
+    if let Some(hit) = ENTRY_CACHE.lock().unwrap().get(&key) {
+        return *hit;
+    }
+    // Resume a previous scan of this window when its covered
+    // prefix is still the window's prefix verbatim.
+    let mut resume_from = 0usize;
+    if let Some(t) = ticker {
+        let prior = PREFIX_CACHE
+            .lock()
+            .unwrap()
+            .get(&(strat.fingerprint, t.to_string()))
+            .copied();
+        if let Some((scanned, prefix_fp, prior_entry)) = prior {
+            if scanned <= snaps.len()
+                && window_fingerprint(&snaps[..scanned]) == prefix_fp
+            {
+                if let Some(price) = prior_entry {
+                    // The entry sits inside the unchanged prefix;
+                    // the full-window result is already known.
+                    if !strat.budget_exhausted() {
+                        ENTRY_CACHE.lock().unwrap().insert(key, Some(price));
+                    }
+                    return Some(price);
+                }
+                resume_from = scanned;
+            }
+        }
+    }
+    let entry = window_entry_scan(strat, &snaps[resume_from..]);
+    if !strat.budget_exhausted() {
+        let mut guard = ENTRY_CACHE.lock().unwrap();
+        // Windows stop changing once settled, so the index stays
+        // small; the cap is insurance for a months-long process —
+        // a cleared index only costs recompute, never correctness.
+        if guard.len() > 250_000 {
+            guard.clear();
+        }
+        guard.insert(key, entry);
+        drop(guard);
+        if let Some(t) = ticker {
+            let mut guard = PREFIX_CACHE.lock().unwrap();
+            if guard.len() > 250_000 {
+                guard.clear();
+            }
+            guard.insert(
+                (strat.fingerprint, t.to_string()),
+                (snaps.len(), win_fp, entry),
+            );
+        }
+    }
+    entry
+}
+
+fn window_entry_scan(strat: &Strategy, snaps: &[Snapshot]) -> Option<f64> {
     for snap in snaps {
         let (Some(ya), Some(na)) = (snap.yes_ask, snap.no_ask) else {
             continue;
@@ -505,13 +702,51 @@ fn window_entry(strat: &Strategy, snaps: &[Snapshot]) -> Option<f64> {
 /// disagree with each other — or cannot be placed in time — is not
 /// scored at all, and the disagreement is counted, never silently
 /// resolved in someone's favour.
+#[derive(Clone)]
 enum WindowFacts {
     Unsettled,
     Conflict,
     Settled { result: String, close_epoch: i64 },
 }
 
+/// The window-facts cache. A window's facts are a pure function of
+/// its snapshot sequence (results and close times, in order), and
+/// every analysis derives them once per consumer — the simulation
+/// plus five scorings re-derived the same facts six times. Keyed by
+/// a fingerprint of exactly the fields window_facts reads.
+static FACTS_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, WindowFacts>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn facts_fingerprint(snaps: &[Snapshot]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    snaps.len().hash(&mut h);
+    for s in snaps {
+        s.result.hash(&mut h);
+        s.close_time.hash(&mut h);
+    }
+    h.finish()
+}
+
 fn window_facts(snaps: &[Snapshot]) -> WindowFacts {
+    window_facts_keyed(snaps, facts_fingerprint(snaps))
+}
+
+fn window_facts_keyed(snaps: &[Snapshot], key: u64) -> WindowFacts {
+    if let Some(hit) = FACTS_CACHE.lock().unwrap().get(&key) {
+        return hit.clone();
+    }
+    let facts = window_facts_scan(snaps);
+    let mut guard = FACTS_CACHE.lock().unwrap();
+    if guard.len() > 250_000 {
+        guard.clear();
+    }
+    guard.insert(key, facts.clone());
+    facts
+}
+
+fn window_facts_scan(snaps: &[Snapshot]) -> WindowFacts {
     let mut distinct: Vec<&str> = Vec::new();
     for s in snaps {
         if !s.result.is_empty() && !distinct.contains(&s.result.as_str()) {
@@ -558,14 +793,38 @@ fn group_windows(snapshots: &[Snapshot]) -> BTreeMap<String, Vec<Snapshot>> {
 }
 
 fn score_strategy(strat: &Strategy, snapshots: &[Snapshot], standard: Standard) -> ScoreReport {
-    // Group snapshots into market windows.
-    let windows = group_windows(snapshots);
+    score_strategy_windows(strat, &group_windows(snapshots), standard)
+}
+
+fn score_strategy_windows(
+    strat: &Strategy,
+    windows: &BTreeMap<String, Vec<Snapshot>>,
+    standard: Standard,
+) -> ScoreReport {
+    score_strategy_windows_fps(strat, windows, standard, None)
+}
+
+/// `fps`, when given, carries (facts fingerprint, entry
+/// fingerprint) per window in the map's iteration order — the
+/// analysis computes them once and shares them across the slot
+/// simulation and every strategy's score, instead of each pass
+/// re-hashing every snapshot of every window.
+fn score_strategy_windows_fps(
+    strat: &Strategy,
+    windows: &BTreeMap<String, Vec<Snapshot>>,
+    standard: Standard,
+    fps: Option<&[(u64, u64)]>,
+) -> ScoreReport {
     // (close_epoch, pnl per contract) for every settled window we entered.
     let mut trades: Vec<(i64, f64)> = Vec::new();
     let mut settled = 0usize;
     let mut conflicted = 0usize;
-    for (_ticker, snaps) in windows {
-        let (result, close_epoch) = match window_facts(&snaps) {
+    for (wi, (_ticker, snaps)) in windows.iter().enumerate() {
+        let (facts_fp, win_fp) = match fps {
+            Some(f) => f[wi],
+            None => (facts_fingerprint(snaps), window_fingerprint(snaps)),
+        };
+        let (result, close_epoch) = match window_facts_keyed(snaps, facts_fp) {
             WindowFacts::Settled { result, close_epoch } => (result, close_epoch),
             WindowFacts::Conflict => {
                 conflicted += 1;
@@ -574,7 +833,7 @@ fn score_strategy(strat: &Strategy, snapshots: &[Snapshot], standard: Standard) 
             WindowFacts::Unsettled => continue,
         };
         settled += 1;
-        let Some(price) = window_entry(strat, &snaps) else {
+        let Some(price) = window_entry_keyed(strat, Some(_ticker), snaps, win_fp) else {
             continue;
         };
         if price <= 0.0 || price >= 1.0 {
@@ -648,7 +907,41 @@ fn score_strategy(strat: &Strategy, snapshots: &[Snapshot], standard: Standard) 
 /// Consecutive losing windows that retire a strategy from its slot.
 const STRIKE_LIMIT: i64 = 3;
 
-#[derive(Serialize)]
+/// The desk's stage-one target: compound the pot to $1,000. Stage
+/// progress is measured from the paper simulation's own record and
+/// labelled paper everywhere it appears — it is a statement about
+/// the paper pot, never about venue money.
+const STAGE_TARGET_DOLLARS: f64 = 1000.0;
+
+/// Where the paper pot stands against the stage-one target,
+/// computed from the slot simulation over the collected tape.
+#[derive(Clone, Serialize)]
+struct StageProgress {
+    target_dollars: f64,
+    start_dollars: f64,
+    paper_equity_dollars: f64,
+    progress_pct: f64,
+    remaining_dollars: f64,
+    reached: bool,
+}
+
+fn stage_progress(sim: &SlotSimulation) -> StageProgress {
+    let equity = sim.paper_equity_dollars;
+    StageProgress {
+        target_dollars: STAGE_TARGET_DOLLARS,
+        start_dollars: sim.paper_pot_start,
+        paper_equity_dollars: equity,
+        progress_pct: equity / STAGE_TARGET_DOLLARS * 100.0,
+        remaining_dollars: if equity >= STAGE_TARGET_DOLLARS {
+            0.0
+        } else {
+            STAGE_TARGET_DOLLARS - equity
+        },
+        reached: equity >= STAGE_TARGET_DOLLARS,
+    }
+}
+
+#[derive(Clone, Serialize)]
 struct Trade {
     close_epoch: i64,
     slot: usize,
@@ -658,7 +951,7 @@ struct Trade {
     pnl_dollars: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SlotReport {
     slot: usize,
     strategy: String,
@@ -679,7 +972,7 @@ struct SlotReport {
     stint_pnl_dollars: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct RetiredReport {
     slot: usize,
     strategy: String,
@@ -691,14 +984,14 @@ struct RetiredReport {
     rotated_to: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct StrategyTotal {
     strategy: String,
     windows_traded: usize,
     paper_pnl_dollars: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SlotSimulation {
     conflicted_windows: usize,
     paper_pot_start: f64,
@@ -714,6 +1007,24 @@ struct SlotSimulation {
 }
 
 fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f64) -> SlotSimulation {
+    simulate_slots_windows(strategies, &group_windows(snapshots), paper_pot)
+}
+
+fn simulate_slots_windows(
+    strategies: &[Strategy],
+    grouped: &BTreeMap<String, Vec<Snapshot>>,
+    paper_pot: f64,
+) -> SlotSimulation {
+    simulate_slots_windows_fps(strategies, grouped, paper_pot, None)
+}
+
+/// `fps`: see score_strategy_windows_fps.
+fn simulate_slots_windows_fps(
+    strategies: &[Strategy],
+    grouped: &BTreeMap<String, Vec<Snapshot>>,
+    paper_pot: f64,
+    fps: Option<&[(u64, u64)]>,
+) -> SlotSimulation {
     let n = strategies.len();
     if n == 0 {
         return SlotSimulation {
@@ -736,8 +1047,12 @@ fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f6
     }
     let mut windows: Vec<Window> = Vec::new();
     let mut conflicted_windows = 0usize;
-    for (_ticker, snaps) in group_windows(snapshots) {
-        let (result, close_epoch) = match window_facts(&snaps) {
+    for (wi, (_ticker, snaps)) in grouped.iter().enumerate() {
+        let (facts_fp, win_fp) = match fps {
+            Some(f) => f[wi],
+            None => (facts_fingerprint(snaps), window_fingerprint(snaps)),
+        };
+        let (result, close_epoch) = match window_facts_keyed(snaps, facts_fp) {
             WindowFacts::Settled { result, close_epoch } => (result, close_epoch),
             WindowFacts::Conflict => {
                 conflicted_windows += 1;
@@ -745,7 +1060,12 @@ fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f6
             }
             WindowFacts::Unsettled => continue,
         };
-        let entries = strategies.iter().map(|s| window_entry(s, &snaps)).collect();
+        // One fingerprint per window serves every strategy's
+        // entry lookup in this window.
+        let entries = strategies
+            .iter()
+            .map(|s| window_entry_keyed(s, Some(_ticker), snaps, win_fp))
+            .collect();
         windows.push(Window {
             close_epoch,
             result,
@@ -969,9 +1289,28 @@ fn equity_curves(sim: &SlotSimulation) -> (Vec<(i64, f64)>, Vec<(String, Vec<(i6
 
 /// VM instruction budget per strategy call (see call_budgeted).
 const STRATEGY_BUDGET: usize = 250_000;
+/// Memory cap per strategy call, in bytes allocated through Rune's
+/// allocator (see call_budgeted). A predicate over three numbers
+/// needs kilobytes; 8 MiB is wide headroom for honest shapes and
+/// ~75x below the ~600 MB a single format!/with_capacity call can
+/// otherwise allocate inside a few instructions.
+const STRATEGY_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 /// Consumed-call-time allowance per strategy per scoring pass
-/// (see Strategy::budget_open).
-const STRATEGY_DEADLINE_SECS: u64 = 3;
+/// (see Strategy::budget_open for the calibration).
+const STRATEGY_DEADLINE_SECS: u64 = 30;
+
+/// Consecutive instruction-budget deaths that mark a strategy
+/// exhausted (see Strategy::budget_open).
+const BUDGET_DEATH_LIMIT: usize = 32;
+
+/// Whether a call error is the instruction budget halting the VM,
+/// as opposed to any other failure (a memory-limit breach reads
+/// "Failed to allocate …", a type error names itself). The wording
+/// is the pinned rune version's; the looper unit test fails loudly
+/// if a rune bump ever changes it.
+fn is_budget_halt(e: &rune::runtime::VmError) -> bool {
+    e.to_string().starts_with("Halted for unexpected reason `limited`")
+}
 /// A strategy is a small predicate; a file past this size is a
 /// config error, and it is recompiled often enough that its size
 /// is a per-request cost.
@@ -1112,7 +1451,6 @@ fn daily_report(app: &App) -> String {
             account.note
         ),
     };
-    let snapshots = app.snapshots_cached(&app.data_dir.join("snapshots.jsonl"));
     let health = collector_health(app);
     let collecting = health["collecting"].as_bool().unwrap_or(false);
     let age = health["newest_snapshot_age_secs"].as_i64();
@@ -1153,9 +1491,10 @@ fn daily_report(app: &App) -> String {
     if !collecting {
         lines.push("  Uncollected windows cannot be backfilled — a stopped collector is lost evidence.".to_string());
     }
-    // The slot system over the tape, on paper.
-    let strategies = load_strategies(&app.strategies_dir);
-    let sim = simulate_slots(&strategies, &snapshots, app.paper_pot);
+    // The slot system over the tape, on paper — from the analysis
+    // cache, so a report against an unchanged tape does not re-run
+    // the whole simulation and scoring per request.
+    let (sim, scores) = app.analysis(&app.data_dir.join("snapshots.jsonl"));
     lines.push(format!(
         "Slots (paper — starting pot ${:.2}, re-split evenly across slots each window):",
         sim.paper_pot_start
@@ -1206,12 +1545,27 @@ fn daily_report(app: &App) -> String {
         fmt_money(sim.paper_equity_dollars),
         fmt_money(sim.paper_pot_start)
     ));
+    let stage = stage_progress(&sim);
+    if stage.reached {
+        lines.push(format!(
+            "Stage target (paper): {} — the {} stage-one target is reached on paper. Paper only, not venue money.",
+            fmt_money(stage.paper_equity_dollars),
+            fmt_money(stage.target_dollars)
+        ));
+    } else {
+        lines.push(format!(
+            "Stage target (paper): {} of the {} stage-one target — {:.1}% of the way, {} to go. Paper only, not venue money.",
+            fmt_money(stage.paper_equity_dollars),
+            fmt_money(stage.target_dollars),
+            stage.progress_pct,
+            fmt_money(stage.remaining_dollars)
+        ));
+    }
     lines.push(
         "Strategy verdicts (paper, forward tape; promotion needs 100+ windows, both halves positive, +3.5c/contract after fees):"
             .to_string(),
     );
-    for strat in &strategies {
-        let report = score_strategy(strat, &snapshots, Standard::default());
+    for report in &scores {
         lines.push(format!(
             "  {} ({}): {} windows traded, verdict — {}",
             report.strategy, report.side, report.windows_traded, report.verdict
@@ -1223,6 +1577,95 @@ fn daily_report(app: &App) -> String {
 // ---------------------------------------------------------------------------
 // HTTP layer (std-only)
 // ---------------------------------------------------------------------------
+
+/// One parsed tape, held across requests. The collector only ever
+/// appends whole lines, so when the file has grown the new state is
+/// the old parse plus the tail — verified at the seam: the last line
+/// of the old parse must still sit at its recorded offset in the
+/// file, byte for byte, before any tail byte is trusted. A file
+/// that shrank, moved backwards, or fails the seam check is parsed
+/// whole. Nothing is ever keyed by less than the content it claims
+/// to summarise.
+struct TapeEntry {
+    path: PathBuf,
+    len: u64,
+    mtime: u64,
+    /// Shared: every surface reads the same parse, and a cache hit
+    /// must not clone a quarter-million snapshots per request.
+    snaps: Arc<Vec<Snapshot>>,
+    /// The same snapshots grouped into market windows (each in
+    /// fetch order) — the analysis's working shape. Grouping a
+    /// quarter-million snapshots per recompute cost seconds; here
+    /// it is built once per parse and folded incrementally over
+    /// appends, like everything else in this entry.
+    grouped: Arc<BTreeMap<String, Vec<Snapshot>>>,
+    /// Every line in the file, parseable or not — the health block's
+    /// dropped-line count is total minus parsed, so both numbers
+    /// must come from the same read.
+    total_lines: usize,
+    /// Collector-health aggregates over the parsed tape, folded in
+    /// as the tape is parsed (and folded incrementally over the
+    /// tail on append): the distinct markets, and each market's set
+    /// of non-empty results — settled windows and conflicting
+    /// settlements both derive from these. Computing them per
+    /// request instead made every surface pay a full-tape scan.
+    markets: std::collections::HashSet<String>,
+    results_by_ticker: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Byte offset at which the last line starts, and its raw text:
+    /// the seam an append must continue.
+    seam_offset: u64,
+    seam_line: String,
+}
+
+/// The seam an append must continue, plus the health aggregates:
+/// see TapeEntry.
+fn fold_health(
+    snaps: &[Snapshot],
+    markets: &mut std::collections::HashSet<String>,
+    results_by_ticker: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+) {
+    for s in snaps {
+        markets.insert(s.ticker.clone());
+        if !s.result.is_empty() {
+            results_by_ticker
+                .entry(s.ticker.clone())
+                .or_default()
+                .insert(s.result.clone());
+        }
+    }
+}
+
+/// One consistent read of a tape's current state: the parsed
+/// snapshots plus everything the health block states about them.
+struct TapeView {
+    snaps: Arc<Vec<Snapshot>>,
+    grouped: Arc<BTreeMap<String, Vec<Snapshot>>>,
+    total_lines: usize,
+    markets: usize,
+    settled_windows: usize,
+    conflicting_settlements: usize,
+    newest_fetched_at: Option<i64>,
+}
+/// (offset of the last line, its text) for a text whose first byte
+/// sits at `base` in the file.
+fn seam_of(text: &str, base: u64) -> (u64, String) {
+    let t = text.strip_suffix('\n').unwrap_or(text);
+    match t.rfind('\n') {
+        Some(i) => (base + i as u64 + 1, t[i + 1..].to_string()),
+        None => (base, t.to_string()),
+    }
+}
+
+struct AnalysisEntry {
+    path: PathBuf,
+    len: u64,
+    mtime: u64,
+    /// Hash of everything besides the tape that shapes the result:
+    /// the paper pot and each strategy's (name, source fingerprint).
+    key: u64,
+    sim: SlotSimulation,
+    scores: Vec<ScoreReport>,
+}
 
 struct App {
     data_dir: PathBuf,
@@ -1236,81 +1679,255 @@ struct App {
     /// than two intervals means collection has stopped, and
     /// uncollected windows cannot be backfilled.
     collect_secs: u64,
-    /// Parsed-tape cache keyed by (path, byte length, mtime): the
-    /// tape grows ~700 lines a pass and every surface used to
-    /// re-parse all of it per request. The key IS the file state,
-    /// so a hit is the file's current content by construction.
-    tape_cache: std::sync::Mutex<Option<(PathBuf, u64, u64, Vec<Snapshot>)>>,
+    tape_cache: std::sync::Mutex<Option<TapeEntry>>,
+    /// The computed analysis (slot simulation + per-strategy scores)
+    /// for one exact tape state. Scoring the full tape runs Rune over
+    /// every window; the result is a pure function of (tape state,
+    /// strategy sources, paper pot), so repeat requests against an
+    /// unchanged tape serve it directly, and a grown tape recomputes
+    /// with the per-window entry index doing the incremental work.
+    analysis_cache: std::sync::Mutex<Option<AnalysisEntry>>,
+}
+
+fn tape_stat(path: &Path) -> Option<(u64, u64)> {
+    std::fs::metadata(path).ok().map(|m| {
+        (
+            m.len(),
+            m.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        )
+    })
 }
 
 impl App {
-    fn snapshots_cached(&self, path: &Path) -> Vec<Snapshot> {
-        let key = std::fs::metadata(path).ok().map(|m| {
-            (
-                m.len(),
-                m.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0),
-            )
-        });
-        if let Some((len, mtime)) = key {
+    /// The tape's parsed snapshots and its total line count, from
+    /// one consistent read (see TapeEntry).
+    fn tape(&self, path: &Path) -> TapeView {
+        fn view(e: &TapeEntry) -> TapeView {
+            TapeView {
+                snaps: e.snaps.clone(),
+                grouped: e.grouped.clone(),
+                total_lines: e.total_lines,
+                markets: e.markets.len(),
+                settled_windows: e.results_by_ticker.len(),
+                conflicting_settlements: e
+                    .results_by_ticker
+                    .values()
+                    .filter(|r| r.len() > 1)
+                    .count(),
+                newest_fetched_at: e.snaps.last().map(|s| s.fetched_at),
+            }
+        }
+        let Some((len, mtime)) = tape_stat(path) else {
+            return TapeView {
+                snaps: Arc::new(Vec::new()),
+                grouped: Arc::new(BTreeMap::new()),
+                total_lines: 0,
+                markets: 0,
+                settled_windows: 0,
+                conflicting_settlements: 0,
+                newest_fetched_at: None,
+            };
+        };
+        {
             let guard = self.tape_cache.lock().unwrap();
-            if let Some((p, l, t, snaps)) = &*guard {
-                if p == path && *l == len && *t == mtime {
-                    return snaps.clone();
+            if let Some(e) = &*guard {
+                if e.path == path && e.len == len && e.mtime == mtime {
+                    return view(e);
                 }
             }
         }
-        let snaps = load_snapshots(path);
-        if let Some((len, mtime)) = key {
-            *self.tape_cache.lock().unwrap() =
-                Some((path.to_path_buf(), len, mtime, snaps.clone()));
+        // Incremental path: the file grew past a parse we hold, and
+        // the seam line is still exactly where the old parse left
+        // it — parse only the appended tail.
+        let prev = {
+            let mut guard = self.tape_cache.lock().unwrap();
+            match &*guard {
+                Some(e) if e.path == path && len > e.len && e.len > 0 => guard.take(),
+                _ => None,
+            }
+        };
+        if let Some(e) = prev {
+            if let Some(extended) = extend_tape(e, path, len, mtime) {
+                let out = view(&extended);
+                *self.tape_cache.lock().unwrap() = Some(extended);
+                return out;
+            }
+            // Seam check failed: the file was replaced, not appended
+            // to. Fall through to a full parse of the current bytes.
         }
-        snaps
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let total_lines = text.lines().count();
+        let snaps: Vec<Snapshot> = parse_tape_text(&text);
+        let (seam_offset, seam_line) = seam_of(&text, 0);
+        let mut markets = std::collections::HashSet::new();
+        let mut results_by_ticker = std::collections::HashMap::new();
+        fold_health(&snaps, &mut markets, &mut results_by_ticker);
+        let grouped = Arc::new(group_windows(&snaps));
+        let entry = TapeEntry {
+            path: path.to_path_buf(),
+            len,
+            mtime,
+            snaps: Arc::new(snaps),
+            grouped,
+            total_lines,
+            markets,
+            results_by_ticker,
+            seam_offset,
+            seam_line,
+        };
+        let out = view(&entry);
+        *self.tape_cache.lock().unwrap() = Some(entry);
+        out
     }
+
+    fn snapshots_cached(&self, path: &Path) -> Arc<Vec<Snapshot>> {
+        self.tape(path).snaps
+    }
+
+    /// The slot simulation and per-strategy scores over one dataset,
+    /// cached by the tape's exact state (see analysis_cache).
+    fn analysis(&self, dpath: &Path) -> (SlotSimulation, Vec<ScoreReport>) {
+        let strategies = load_strategies(&self.strategies_dir);
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.paper_pot.to_bits().hash(&mut h);
+            for s in &strategies {
+                s.name.hash(&mut h);
+                s.fingerprint.hash(&mut h);
+            }
+            h.finish()
+        };
+        let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
+        {
+            let guard = self.analysis_cache.lock().unwrap();
+            if let Some(e) = &*guard {
+                if e.path == dpath && e.len == len && e.mtime == mtime && e.key == key {
+                    return (e.sim.clone(), e.scores.clone());
+                }
+            }
+        }
+        let view = self.tape(dpath);
+        // The tape entry carries the windows already grouped —
+        // built once per parse and folded over appends — so a
+        // recompute never pays a full-tape grouping again; the
+        // per-window entry index does the rest.
+        let fps: Vec<(u64, u64)> = view
+            .grouped
+            .values()
+            .map(|s| (facts_fingerprint(s), window_fingerprint(s)))
+            .collect();
+        let sim = simulate_slots_windows_fps(&strategies, &view.grouped, self.paper_pot, Some(&fps));
+        let scores: Vec<ScoreReport> = strategies
+            .iter()
+            .map(|s| score_strategy_windows_fps(s, &view.grouped, Standard::default(), Some(&fps)))
+            .collect();
+        let entry = AnalysisEntry {
+            path: dpath.to_path_buf(),
+            len,
+            mtime,
+            key,
+            sim,
+            scores,
+        };
+        let out = (entry.sim.clone(), entry.scores.clone());
+        *self.analysis_cache.lock().unwrap() = Some(entry);
+        out
+    }
+}
+
+/// Grow a held parse by the file's appended tail, if the append is
+/// real: the seam line must still sit at its recorded offset. The
+/// tail is parsed on its own — it starts at a line boundary (the
+/// old file length), so its line count and seam are exact.
+fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<TapeEntry> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut seam_buf = Vec::new();
+    f.seek(SeekFrom::Start(e.seam_offset)).ok()?;
+    std::io::Read::by_ref(&mut f)
+        .take(len - e.seam_offset)
+        .read_to_end(&mut seam_buf)
+        .ok()?;
+    let seam_text = String::from_utf8_lossy(&seam_buf);
+    let seam_first = seam_text.lines().next().unwrap_or("");
+    if seam_first != e.seam_line {
+        return None;
+    }
+    // Read exactly the statted growth, never to real EOF: a pass
+    // landing mid-read would otherwise be parsed now and parsed
+    // AGAIN by the next extension (which trusts e.len as its
+    // starting offset), duplicating its snapshots in every window.
+    let mut tail_buf = Vec::new();
+    f.seek(SeekFrom::Start(e.len)).ok()?;
+    std::io::Read::by_ref(&mut f)
+        .take(len - e.len)
+        .read_to_end(&mut tail_buf)
+        .ok()?;
+    let tail = String::from_utf8(tail_buf).ok()?;
+    e.total_lines += tail.lines().count();
+    // The held parse is shared with readers; extending it mutates
+    // in place when this entry is the only holder (the common
+    // case), and every fold touches only the new snapshots.
+    let new_snaps: Vec<Snapshot> = parse_tape_text(&tail);
+    fold_health(&new_snaps, &mut e.markets, &mut e.results_by_ticker);
+    {
+        let grouped = Arc::make_mut(&mut e.grouped);
+        for s in &new_snaps {
+            let w = grouped.entry(s.ticker.clone()).or_default();
+            // Appends arrive in fetch order, so the window stays
+            // sorted; an out-of-order tail re-sorts its window
+            // instead of silently corrupting the order.
+            let out_of_order = w
+                .last()
+                .map_or(false, |last| s.fetched_at < last.fetched_at);
+            w.push(s.clone());
+            if out_of_order {
+                w.sort_by_key(|x| x.fetched_at);
+            }
+        }
+    }
+    Arc::make_mut(&mut e.snaps).extend(new_snaps);
+    if !tail.is_empty() {
+        let (off, line) = seam_of(&tail, e.len);
+        e.seam_offset = off;
+        e.seam_line = line;
+    }
+    e.len = len;
+    e.mtime = mtime;
+    Some(e)
 }
 
 /// Collector health, computed from the tape itself — the same numbers
 /// an independent count of the file gives.
 fn collector_health(app: &App) -> serde_json::Value {
     let tape_path = app.data_dir.join("snapshots.jsonl");
-    let total_lines = std::fs::File::open(&tape_path)
-        .map(|f| std::io::BufReader::new(f).lines().count())
-        .unwrap_or(0);
-    let snapshots = app.snapshots_cached(&tape_path);
-    let mut markets: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut settled: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut results_by_ticker: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
-        std::collections::HashMap::new();
-    for s in &snapshots {
-        markets.insert(s.ticker.as_str());
-        if !s.result.is_empty() {
-            settled.insert(s.ticker.as_str());
-            results_by_ticker
-                .entry(s.ticker.as_str())
-                .or_default()
-                .insert(s.result.as_str());
-        }
-    }
-    let conflicting = results_by_ticker.values().filter(|r| r.len() > 1).count();
+    // One consistent view of the tape's current state: total lines,
+    // parsed snapshots and the health aggregates all come from the
+    // same read — the dropped-line count is the difference, and it
+    // must never mix two different reads. The aggregates are folded
+    // in as the tape is parsed, so stating them costs nothing here.
+    let view = app.tape(&tape_path);
     // The tape is append-ordered: the last line is the newest
     // pass's stamp. (A max() over fetched_at would let one
     // future-dated line anywhere in the tape certify a dead
     // collector as collecting, indefinitely.)
-    let newest = snapshots.last().map(|s| s.fetched_at);
+    let newest = view.newest_fetched_at;
     let now = now_unix();
     let age = newest.map(|n| (now - n).max(0));
     let future_dated = newest.map_or(false, |n| n > now + 300);
     let collecting = !future_dated
         && age.map_or(false, |a| a <= (app.collect_secs.max(60) * 2) as i64);
     serde_json::json!({
-        "snapshots_on_disk": total_lines,
-        "dropped_lines": total_lines.saturating_sub(snapshots.len()),
-        "markets_seen": markets.len(),
-        "settled_windows": settled.len(),
-        "conflicting_settlements": conflicting,
+        "snapshots_on_disk": view.total_lines,
+        "dropped_lines": view.total_lines.saturating_sub(view.snaps.len()),
+        "markets_seen": view.markets,
+        "settled_windows": view.settled_windows,
+        "conflicting_settlements": view.conflicting_settlements,
         "newest_snapshot_age_secs": age,
         "collect_interval_secs": app.collect_secs,
         "collecting": collecting,
@@ -1434,7 +2051,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, Str
 fn latest_markets(app: &App) -> Vec<Snapshot> {
     let snapshots = app.snapshots_cached(&app.data_dir.join("snapshots.jsonl"));
     let mut latest: BTreeMap<String, Snapshot> = BTreeMap::new();
-    for snap in snapshots {
+    for snap in snapshots.iter() {
         latest
             .entry(snap.ticker.clone())
             .and_modify(|e| {
@@ -1442,7 +2059,7 @@ fn latest_markets(app: &App) -> Vec<Snapshot> {
                     *e = snap.clone();
                 }
             })
-            .or_insert(snap);
+            .or_insert_with(|| snap.clone());
     }
     let mut out: Vec<Snapshot> = latest.into_values().collect();
     out.sort_by(|a, b| a.close_time.cmp(&b.close_time));
@@ -1457,9 +2074,11 @@ fn handle(app: &App, method: &str, path: &str) -> String {
     match (method, route) {
         ("GET", "/") => html_response(include_str!("../assets/index.html")),
         ("GET", "/api/home") => {
+            let (sim, _) = app.analysis(&app.data_dir.join("snapshots.jsonl"));
             let home = serde_json::json!({
                 "account": account_state(),
                 "collector": collector_health(app),
+                "stage_target": stage_progress(&sim),
                 "library_errors": load_strategies_with_errors(&app.strategies_dir)
                     .1
                     .iter()
@@ -1502,11 +2121,7 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                         .to_string(),
                 );
             }
-            let snapshots = app.snapshots_cached(&dpath);
-            let reports: Vec<ScoreReport> = load_strategies(&app.strategies_dir)
-                .iter()
-                .map(|s| score_strategy(s, &snapshots, Standard::default()))
-                .collect();
+            let (_, reports) = app.analysis(&dpath);
             json_response(200, &serde_json::to_string(&reports).unwrap())
         }
         ("GET", "/api/slots") => {
@@ -1518,10 +2133,9 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                         .to_string(),
                 );
             }
-            let snapshots = app.snapshots_cached(&dpath);
-            let strategies = load_strategies(&app.strategies_dir);
-            let sim = simulate_slots(&strategies, &snapshots, app.paper_pot);
+            let (sim, _) = app.analysis(&dpath);
             let mut body = serde_json::to_value(&sim).unwrap();
+            body["stage_target"] = serde_json::to_value(stage_progress(&sim)).unwrap();
             let total = sim.trades.len();
             let shown: Vec<&Trade> =
                 sim.trades.iter().skip(total.saturating_sub(5000)).collect();
@@ -1546,9 +2160,8 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                         .to_string(),
                 );
             }
-            let snapshots = app.snapshots_cached(&dpath);
             let strategies = load_strategies(&app.strategies_dir);
-            let sim = simulate_slots(&strategies, &snapshots, app.paper_pot);
+            let (sim, _) = app.analysis(&dpath);
             let (pot, per) = equity_curves(&sim);
             let mut series: Vec<serde_json::Value> = strategies
                 .iter()
@@ -1643,6 +2256,7 @@ fn main() {
 
     let app = Arc::new(App {
         tape_cache: std::sync::Mutex::new(None),
+        analysis_cache: std::sync::Mutex::new(None),
         data_dir,
         strategies_dir,
         paper_pot,
@@ -1679,6 +2293,93 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extension_keeps_untouched_window_fingerprints() {
+        // The entry index is keyed by window fingerprints; tape
+        // extension must never change the fingerprint of a window
+        // the append did not touch, or every recompute would
+        // re-scan the whole tape.
+        let dir = std::env::temp_dir().join(format!("ob-fp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snapshots.jsonl");
+        let line = |ticker: &str, at: i64, result: &str| {
+            let s = snap(ticker, at, "2026-11-18T00:15:00Z", result, Some(0.62), Some(0.40));
+            format!("{}\n", serde_json::to_string(&s).unwrap())
+        };
+        let mut text = String::new();
+        for i in 0..50 {
+            text.push_str(&line("KXAAA-1", 1000 + i, if i == 49 { "yes" } else { "" }));
+            text.push_str(&line("KXBBB-1", 1000 + i, if i == 49 { "no" } else { "" }));
+        }
+        std::fs::write(&path, &text).unwrap();
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: dir.clone(),
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        let v1 = app.tape(&path);
+        let fp_b1 = window_fingerprint(&v1.grouped["KXBBB-1"]);
+        let fp_a1 = window_fingerprint(&v1.grouped["KXAAA-1"]);
+        let mut extra = String::new();
+        for i in 50..60 {
+            extra.push_str(&line("KXAAA-1", 1000 + i, "yes"));
+        }
+        std::fs::write(&path, format!("{text}{extra}")).unwrap();
+        let v2 = app.tape(&path);
+        assert_ne!(fp_a1, window_fingerprint(&v2.grouped["KXAAA-1"]));
+        assert_eq!(
+            fp_b1,
+            window_fingerprint(&v2.grouped["KXBBB-1"]),
+            "untouched window's fingerprint changed across extension"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn entry_scan_resumes_over_a_grown_window() {
+        // A strategy that only enters on a snapshot that arrives
+        // in a later collect pass: the grown window's entry must
+        // be the tail entry (found by resuming the prefix scan),
+        // and a window whose entry sits in the prefix must keep
+        // that entry after growing.
+        let dir = std::env::temp_dir().join(format!("ob-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("late.rn"),
+            "pub fn name() { \"late\" }\npub fn side() { \"yes\" }\n\
+             pub fn allow_entry(yes_ask, no_ask, secs_to_close) { yes_ask >= 0.60 }\n",
+        )
+        .unwrap();
+        let strat = load_strategies(&dir).remove(0);
+        let close = "2030-01-01T01:00:00Z";
+        let prefix: Vec<Snapshot> = (0..5)
+            .map(|i| snap("KXRES-1", 100 + i, close, "", Some(0.50), Some(0.52)))
+            .collect();
+        assert_eq!(window_entry_keyed(&strat, Some("KXRES-1"), &prefix, window_fingerprint(&prefix)), None);
+        let mut grown = prefix.clone();
+        grown.push(snap("KXRES-1", 200, close, "yes", Some(0.62), Some(0.40)));
+        assert_eq!(
+            window_entry_keyed(&strat, Some("KXRES-1"), &grown, window_fingerprint(&grown)),
+            Some(0.62),
+            "resumed scan missed the tail entry"
+        );
+        // Entry inside the prefix survives growth verbatim.
+        let early: Vec<Snapshot> = (0..5)
+            .map(|i| snap("KXRES-2", 100 + i, close, "", Some(0.62), Some(0.40)))
+            .collect();
+        assert_eq!(window_entry_keyed(&strat, Some("KXRES-2"), &early, window_fingerprint(&early)), Some(0.62));
+        let mut grown2 = early.clone();
+        grown2.push(snap("KXRES-2", 200, close, "yes", Some(0.50), Some(0.52)));
+        assert_eq!(
+            window_entry_keyed(&strat, Some("KXRES-2"), &grown2, window_fingerprint(&grown2)),
+            Some(0.62)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn snap(ticker: &str, fetched_at: i64, close: &str, result: &str, ya: Option<f64>, na: Option<f64>) -> Snapshot {
         Snapshot {
@@ -1946,4 +2647,196 @@ mod tests {
             );
         }
     }
+
+    fn write_strategy(dir: &Path, file: &str, source: &str) -> PathBuf {
+        let path = dir.join(file);
+        std::fs::write(&path, source).unwrap();
+        path
+    }
+
+    #[test]
+    fn memory_limit_bounds_a_hostile_strategy() {
+        // The proven attack: one format! call writes ~600 MB inside
+        // ~24 VM instructions — far inside the instruction budget.
+        // Under the memory limit the call must error and degrade to
+        // no-entry, counted — never allocate its way out.
+        let dir = std::env::temp_dir().join(format!("ob-mem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hostile = write_strategy(
+            &dir,
+            "hostile.rn",
+            "pub fn name() { \"hostile-hoard\" }\n\
+             pub fn side() { \"yes\" }\n\
+             pub fn allow_entry(yes_ask, no_ask, secs_to_close) {\n\
+                 let s = format!(\"{:>600000000}\", \"x\");\n\
+                 s.len() > 0 && yes_ask <= 0.99\n\
+             }\n",
+        );
+        let strat = Strategy::load(&hostile).expect("hostile strategy loads");
+        assert!(!strat.allow_entry(0.50, 0.50, 120));
+        assert!(
+            strat.call_failures() >= 1,
+            "the memory breach must be counted as a failed call"
+        );
+        // An honest predicate over the same numbers is unaffected.
+        let honest = write_strategy(
+            &dir,
+            "honest.rn",
+            "pub fn name() { \"honest\" }\n\
+             pub fn side() { \"yes\" }\n\
+             pub fn allow_entry(yes_ask, no_ask, secs_to_close) { yes_ask <= 0.85 }\n",
+        );
+        let strat = Strategy::load(&honest).expect("honest strategy loads");
+        assert!(strat.allow_entry(0.50, 0.50, 120));
+        assert_eq!(strat.call_failures(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn entry_index_recomputes_a_window_that_grew() {
+        // A window whose snapshots give no entry, then grows by
+        // append (the collector's only write mode) to include an
+        // entering snapshot: the index must serve the NEW window's
+        // entry, never the stale no-entry.
+        let dir = std::env::temp_dir().join(format!("ob-idx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_strategy(
+            &dir,
+            "late.rn",
+            "pub fn name() { \"late\" }\n\
+             pub fn side() { \"yes\" }\n\
+             pub fn allow_entry(yes_ask, no_ask, secs_to_close) { secs_to_close <= 300 }\n",
+        );
+        let close = "2030-01-01T01:00:00Z"; // epoch 1893459600
+        let early = vec![snap("IDX", 1893459100, close, "yes", Some(0.60), Some(0.42))];
+        let strat = Strategy::load(&path).unwrap();
+        assert_eq!(window_entry(&strat, &early), None);
+        let mut grown = early.clone();
+        grown.push(snap("IDX", 1893459400, close, "yes", Some(0.62), Some(0.40)));
+        let strat = Strategy::load(&path).unwrap();
+        assert_eq!(window_entry(&strat, &grown), Some(0.62));
+        // And the unchanged window still resolves identically.
+        let strat = Strategy::load(&path).unwrap();
+        assert_eq!(window_entry(&strat, &grown), Some(0.62));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_terminating_strategy_exhausts_on_budget_deaths() {
+        // A while-true allow_entry dies on the instruction budget
+        // every call. The aggregate clock alone would take the full
+        // deadline to name it (and on a small tape, never within
+        // the pass); the death-run trigger must name it exhausted
+        // after BUDGET_DEATH_LIMIT consecutive budget halts — and
+        // this also pins is_budget_halt to the rune version's
+        // wording: if a rune bump changes the halt text, the deaths
+        // stop counting and this test fails loudly.
+        let dir = std::env::temp_dir().join(format!("ob-loop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_strategy(
+            &dir,
+            "looper.rn",
+            "pub fn name() { \"looper\" }\n\
+             pub fn side() { \"yes\" }\n\
+             pub fn allow_entry(yes_ask, no_ask, secs_to_close) {\n\
+                 let x = 0;\n\
+                 while true { x += 1; }\n\
+                 x > 0\n\
+             }\n",
+        );
+        let strat = Strategy::load(&path).unwrap();
+        for _ in 0..BUDGET_DEATH_LIMIT {
+            assert!(!strat.allow_entry(0.5, 0.5, 120));
+        }
+        assert!(
+            strat.budget_exhausted(),
+            "a non-terminating strategy was not named exhausted after {BUDGET_DEATH_LIMIT} budget deaths"
+        );
+        assert_eq!(strat.call_failures(), BUDGET_DEATH_LIMIT);
+        // Once exhausted, calls stop burning: no more failures accrue.
+        assert!(!strat.allow_entry(0.5, 0.5, 120));
+        assert_eq!(strat.call_failures(), BUDGET_DEATH_LIMIT);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stage_progress_math() {
+        let mk = |equity: f64| SlotSimulation {
+            conflicted_windows: 0,
+            paper_pot_start: 100.0,
+            paper_equity_dollars: equity,
+            slots: Vec::new(),
+            retired: Vec::new(),
+            strategy_totals: Vec::new(),
+            notes: Vec::new(),
+            trades: Vec::new(),
+        };
+        let st = stage_progress(&mk(250.0));
+        assert_eq!(st.target_dollars, 1000.0);
+        assert_eq!(st.start_dollars, 100.0);
+        assert!((st.progress_pct - 25.0).abs() < 1e-9);
+        assert_eq!(st.remaining_dollars, 750.0);
+        assert!(!st.reached);
+        let st = stage_progress(&mk(1250.0));
+        assert!(st.reached);
+        assert_eq!(st.remaining_dollars, 0.0);
+        assert!((st.progress_pct - 125.0).abs() < 1e-9);
+        // A losing pot reads as a losing pot: negative progress,
+        // more than the whole target still to go.
+        let st = stage_progress(&mk(-50.0));
+        assert!(!st.reached);
+        assert!((st.progress_pct + 5.0).abs() < 1e-9);
+        assert_eq!(st.remaining_dollars, 1050.0);
+    }
+
+    #[test]
+    fn tape_grows_by_append_and_survives_replacement() {
+        let dir = std::env::temp_dir().join(format!("ob-tape-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tape = dir.join("snapshots.jsonl");
+        let line = |t: &str, at: i64| {
+            serde_json::to_string(&snap(t, at, "2030-01-01T01:00:00Z", "", Some(0.5), Some(0.5)))
+                .unwrap()
+        };
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: dir.clone(),
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        std::fs::write(&tape, format!("{}\n{}\nnot json\n", line("A", 100), line("B", 110)))
+            .unwrap();
+        let view = app.tape(&tape);
+        assert_eq!((view.snaps.len(), view.total_lines), (2, 3), "garbage line counted, not parsed");
+        let snaps = &view.snaps;
+        // Append-only growth: the held parse extends by the tail.
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&tape).unwrap();
+        writeln!(f, "{}", line("C", 120)).unwrap();
+        drop(f);
+        let view = app.tape(&tape);
+        assert_eq!((view.snaps.len(), view.total_lines), (3, 4));
+        assert_eq!(view.snaps[2].ticker, "C");
+        // Wholesale replacement with different content (longer, and
+        // the seam line differs): the seam check must refuse the
+        // incremental path and the new content must be what is read.
+        let mut replacement = String::new();
+        for i in 0..6 {
+            replacement.push_str(&line("ZZ", 200 + i));
+            replacement.push('\n');
+        }
+        std::fs::write(&tape, &replacement).unwrap();
+        let view = app.tape(&tape);
+        assert_eq!((view.snaps.len(), view.total_lines), (6, 6));
+        assert!(view.snaps.iter().all(|s| s.ticker == "ZZ"));
+        // A shorter replacement parses whole too.
+        std::fs::write(&tape, format!("{}\n", line("Q", 300))).unwrap();
+        let view = app.tape(&tape);
+        assert_eq!((view.snaps.len(), view.total_lines), (1, 1));
+        assert_eq!(view.snaps[0].ticker, "Q");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
+

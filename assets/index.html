@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OpenBell — venue truth</title>
 <script>
   // Theme: dark by default, light available; the toggle lives in
@@ -9,69 +10,170 @@
   document.documentElement.dataset.theme = localStorage.getItem('openbell-theme') || 'dark';
 </script>
 <style>
-  :root {
-    --bg: #0f1115; --panel: #15181f; --border: #262a33; --text: #e6e6e6;
-    --dim: #8a8f98; --heading: #b9bec7; --accent: #e8b89d; --rowline: #1d2027;
+/* hallmark-rune · app: openbell · vernacular: trading desk · nav: none (single page) · signature: pot curve + slot strip · tokens: hr-template v1 · critique: weakest State coverage */
+  :root, [data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0f1115; --panel: #15181f; --panel-2: #1d202a; --field: #12141a;
+    --ink: #ece9e4; --muted: #a8adb8; --faint: #939ba8; --rule: #262a33;
+    --accent: #e8b89d; --accent-hover: #f0cbae; --accent-ink: #1a120b;
+    --ok: #4cc38a; --ok-bg: #143527; --warn: #d99a4e; --warn-bg: #3d2c12;
+    --err: #e06c60; --err-bg: #3a1d1a;
+    --series-2: #d19a6b; --series-3: #a8713f; --series-4: #6fa8a0;
+    --font-body: "Inter", -apple-system, "Segoe UI", sans-serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --text-meta: 11px; --text-label: 12px; --text-small: 13px; --text-dense: 14px;
+    --text-body: 15px; --text-title: 18px; --text-screen: 20px; --text-display: 24px;
+    --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px; --sp-7: 48px;
+    --r-control: 6px; --r-card: 8px; --r-panel: 12px; --r-chip: 999px;
+    --dur-micro: 120ms; --dur-short: 200ms; --dur-panel: 280ms;
+    --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
   }
   [data-theme="light"] {
-    --bg: #f6f4ef; --panel: #fffdf8; --border: #ddd5c2; --text: #20242c;
-    --dim: #6b7280; --heading: #4a4f58; --accent: #b06a35; --rowline: #e7e1d2;
+    color-scheme: light;
+    --bg: #f6f4ef; --panel: #fffdf8; --panel-2: #efe9dc; --field: #fffdf8;
+    --ink: #23262b; --muted: #565d66; --faint: #5d6771; --rule: #ddd5c2;
+    --accent: #9d5a24; --accent-hover: #8a4e1f; --accent-ink: #ffffff;
+    --ok: #177a4c; --ok-bg: #dcf0e4; --warn: #96600f; --warn-bg: #f7e7c6;
+    --err: #b3382e; --err-bg: #f9e3e0;
+    --series-2: #c98d54; --series-3: #8a5427; --series-4: #3f7d74;
   }
-  body { margin: 0; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); }
-  main { max-width: 960px; margin: 0 auto; padding: 22px 18px 40px; }
-  h1 { font-size: 20px; margin: 0 0 2px; }
-  .mode { color: var(--accent); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
-  .cards { display: flex; gap: 12px; margin: 18px 0; flex-wrap: wrap; }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; min-width: 180px; flex: 1; }
-  .card .k { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; }
-  .card .v { font-size: 20px; margin-top: 6px; }
-  .unavailable { color: var(--dim); font-style: italic; }
-  h2 { font-size: 14px; margin: 26px 0 8px; text-transform: uppercase; letter-spacing: .05em; color: var(--heading); }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--rowline); }
-  th { color: var(--dim); font-weight: 500; font-size: 11px; text-transform: uppercase; }
-  pre { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 14px; font-size: 13px; white-space: pre-wrap; }
-  .note { color: var(--dim); font-size: 12px; }
-  button { background: #2563eb; color: #fff; border: 0; border-radius: 6px; padding: 7px 13px; cursor: pointer; font-size: 13px; }
-  footer { margin-top: 34px; border-top: 1px solid var(--border); padding-top: 14px; }
-  footer .k { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 8px; }
-  #themeBtn { background: var(--panel); color: var(--text); border: 1px solid var(--border); display: inline-flex; align-items: center; gap: 8px; }
+  * { box-sizing: border-box; }
+  html, body { overflow-x: clip; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font-family: var(--font-body); font-size: var(--text-dense); line-height: 1.5; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  ::selection { background: var(--accent); color: var(--accent-ink); }
+  html { scrollbar-color: var(--rule) transparent; caret-color: var(--accent); }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+  }
+  main { max-width: 960px; margin: 0 auto; padding: var(--sp-5) var(--sp-4) var(--sp-7); }
+  h1 { font-size: var(--text-screen); line-height: 1.2; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+  .mode { color: var(--muted); font-size: var(--text-small); margin-top: var(--sp-1); display: flex; align-items: center; gap: var(--sp-2); }
+  .dot { width: 8px; height: 8px; border-radius: var(--r-chip); background: var(--faint); flex: none; }
+  .dot.ok { background: var(--ok); }
+  .dot.warn { background: var(--warn); }
+  .dot.err { background: var(--err); }
+  .dot.accent { background: var(--accent); }
+  h2 { font-size: var(--text-title); line-height: 1.25; font-weight: 600; margin: var(--sp-6) 0 var(--sp-3); }
+  .panel { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--r-panel); padding: var(--sp-4); }
+  .panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-4); flex-wrap: wrap; }
+  .panel-title { font-size: var(--text-label); color: var(--muted); }
+  .pot-figure { font-size: var(--text-display); font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.15; }
+  .asof { font-size: var(--text-meta); color: var(--faint); }
+  .stage-track { height: 8px; background: var(--panel-2); border-radius: var(--r-chip); margin-top: var(--sp-4); overflow: hidden; }
+  .stage-fill { height: 100%; background: var(--accent); border-radius: var(--r-chip); }
+  .stage-line { font-size: var(--text-small); color: var(--muted); margin-top: var(--sp-2); }
+  .series-legend { display: flex; flex-wrap: wrap; gap: var(--sp-2) var(--sp-5); margin-top: var(--sp-3); font-size: var(--text-small); }
+  .series-legend .swatch { display: inline-block; width: 14px; height: 3px; border-radius: var(--r-chip); vertical-align: middle; margin-right: var(--sp-2); }
+  .sw-pot { background: var(--accent); }
+  .sw-2 { background: var(--series-2); }
+  .sw-3 { background: var(--series-3); }
+  .sw-4 { background: var(--series-4); }
+  .num { font-variant-numeric: tabular-nums; }
+  .pnl-pos { color: var(--ok); }
+  .pnl-neg { color: var(--err); }
+  .unavailable { color: var(--faint); font-style: italic; }
+  .strip { display: flex; gap: var(--sp-3); flex-wrap: wrap; }
+  .slot { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--r-card); padding: var(--sp-3); flex: 1 1 160px; min-width: 150px; }
+  .slot.retired { background: var(--field); color: var(--muted); }
+  .slot .s-head { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--text-small); font-weight: 600; }
+  .slot .s-row { font-size: var(--text-small); color: var(--muted); margin-top: var(--sp-1); }
+  .slot .s-row .num { color: var(--ink); }
+  .slot.retired .s-row .num { color: var(--muted); }
+  .pips { display: inline-flex; gap: var(--sp-1); vertical-align: middle; }
+  .pip { width: 8px; height: 8px; border-radius: var(--r-chip); border: 1px solid var(--muted); }
+  .pip.hit { background: var(--err); border-color: var(--err); }
+  .facts { display: flex; flex-wrap: wrap; gap: var(--sp-3) var(--sp-6); }
+  .fact .k { font-size: var(--text-label); color: var(--muted); }
+  .fact .v { font-size: var(--text-dense); font-variant-numeric: tabular-nums; margin-top: var(--sp-1); }
+  .note { color: var(--muted); font-size: var(--text-small); margin-top: var(--sp-3); }
+  .state-line { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--text-small); color: var(--muted); margin-top: var(--sp-3); }
+  table { width: 100%; border-collapse: collapse; font-size: var(--text-small); font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: var(--sp-2) var(--sp-2); border-bottom: 1px solid var(--rule); }
+  th { color: var(--muted); font-weight: 500; font-size: var(--text-label); }
+  th, td { overflow-wrap: break-word; }
+  td:first-child { word-break: break-all; }
+  .verdict { display: inline; }
+  .verdict .dot { display: inline-block; vertical-align: middle; margin-right: var(--sp-2); }
+  button { background: var(--accent); color: var(--accent-ink); border: 0; border-radius: var(--r-control);
+           padding: var(--sp-2) var(--sp-3); cursor: pointer; font-size: var(--text-small); font-weight: 600; min-height: 36px; }
+  button:hover { background: var(--accent-hover); }
+  .btn-quiet { background: var(--panel); color: var(--ink); border: 1px solid var(--rule); display: inline-flex; align-items: center; gap: var(--sp-2); font-weight: 500; }
+  .btn-quiet:hover { background: var(--panel-2); }
+  details { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--r-panel); }
+  summary { cursor: pointer; padding: var(--sp-3) var(--sp-4); font-size: var(--text-small); font-weight: 600; min-height: 44px; display: flex; align-items: center; }
+  details .pre-wrap { padding: 0 var(--sp-4) var(--sp-4); }
+  pre { background: var(--field); border: 1px solid var(--rule); border-radius: var(--r-card); padding: var(--sp-3);
+        font-family: var(--font-mono); font-size: var(--text-small); white-space: pre-wrap; margin: 0; }
+  #load-error { display: none; background: var(--err-bg); border: 1px solid var(--err); border-radius: var(--r-card);
+                padding: var(--sp-3) var(--sp-4); margin-top: var(--sp-4); font-size: var(--text-small); }
+  #load-error.show { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+  footer { margin-top: var(--sp-7); border-top: 1px solid var(--rule); padding-top: var(--sp-4); }
+  footer .k { font-size: var(--text-label); color: var(--muted); margin-bottom: var(--sp-2); }
   .ic { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  @media (max-width: 768px) {
+    button { min-height: 44px; }
+  }
+  @media (max-width: 560px) {
+    th, td { padding: var(--sp-1) var(--sp-1); }
+    .col-last { display: none; }
+  }
 </style>
 </head>
 <body>
 <main>
   <h1>OpenBell</h1>
-  <div class="mode">Shadow mode — this build never places orders</div>
+  <div class="mode"><span class="dot accent" aria-hidden="true"></span>Shadow mode — this build never places orders</div>
 
-  <div class="cards">
-    <div class="card"><div class="k">Balance (venue)</div><div class="v" id="balance">…</div></div>
-    <div class="card"><div class="k">Day P&amp;L (venue)</div><div class="v" id="pnl">…</div></div>
-    <div class="card"><div class="k">Open positions</div><div class="v" id="positions">…</div></div>
-    <div class="card"><div class="k">Capital at risk</div><div class="v" id="risk">…</div></div>
+  <div id="load-error" role="alert">
+    <span id="load-error-text">The desk could not load.</span>
+    <button id="retryBtn" type="button" class="btn-quiet">Retry</button>
+  </div>
+
+  <h2>Paper pot</h2>
+  <section class="panel" aria-label="Paper pot and stage target">
+    <div class="panel-head">
+      <span class="panel-title">Paper equity over the collected tape</span>
+      <span class="pot-figure" id="pot-figure">…</span>
+    </div>
+    <div id="chart"></div>
+    <p class="note" id="chart-note"></p>
+    <div id="legend" class="series-legend"></div>
+    <div class="stage-track" role="img" aria-label="Stage one target progress, paper">
+      <div class="stage-fill" id="stage-fill" style="width: 0%"></div>
+    </div>
+    <div class="stage-line" id="stage-line">Stage target (paper): …</div>
+  </section>
+
+  <h2>Slots — paper only</h2>
+  <div class="strip" id="slots"></div>
+  <p class="note" id="slots-note"></p>
+
+  <h2>Venue account</h2>
+  <div class="facts">
+    <div class="fact"><div class="k">Balance (venue)</div><div class="v" id="balance">…</div></div>
+    <div class="fact"><div class="k">Day P&amp;L (venue)</div><div class="v" id="pnl">…</div></div>
+    <div class="fact"><div class="k">Open positions</div><div class="v" id="positions">…</div></div>
+    <div class="fact"><div class="k">Capital at risk</div><div class="v" id="risk">…</div></div>
   </div>
   <p class="note" id="account-note"></p>
 
   <h2>Collector — the forward tape</h2>
-  <div class="cards">
-    <div class="card"><div class="k">Tape lines on disk</div><div class="v" id="c-snaps">…</div></div>
-    <div class="card"><div class="k">Markets seen</div><div class="v" id="c-markets">…</div></div>
-    <div class="card"><div class="k">Settled windows</div><div class="v" id="c-settled">…</div></div>
-    <div class="card"><div class="k">Newest snapshot</div><div class="v" id="c-age">…</div></div>
+  <div class="facts">
+    <div class="fact"><div class="k">Tape lines on disk</div><div class="v" id="c-snaps">…</div></div>
+    <div class="fact"><div class="k">Markets seen</div><div class="v" id="c-markets">…</div></div>
+    <div class="fact"><div class="k">Settled windows</div><div class="v" id="c-settled">…</div></div>
+    <div class="fact"><div class="k">Newest snapshot</div><div class="v" id="c-age">…</div></div>
   </div>
-  <p class="note" id="c-note"></p>
+  <div class="state-line"><span class="dot" id="c-dot" aria-hidden="true"></span><span id="c-note"></span></div>
 
   <h2>Markets — public venue data, collected forward</h2>
   <button onclick="collect()">Collect now</button>
   <table>
-    <thead><tr><th>Market</th><th>Closes</th><th>Yes bid/ask</th><th>No bid/ask</th><th>Last</th><th>Result</th></tr></thead>
+    <thead><tr><th>Market</th><th>Closes</th><th>Yes bid/ask</th><th>No bid/ask</th><th class="col-last">Last</th><th>Result</th></tr></thead>
     <tbody id="markets"></tbody>
   </table>
-
-  <h2>Shadow equity — paper only</h2>
-  <div id="chart"></div>
-  <p class="note" id="chart-note"></p>
-  <div id="legend" class="note"></div>
 
   <h2>Shadow strategies — paper only, promotion standard as code</h2>
   <table>
@@ -80,11 +182,14 @@
   </table>
 
   <h2>Daily report</h2>
-  <pre id="report">…</pre>
+  <details>
+    <summary>Daily report — verbatim</summary>
+    <div class="pre-wrap"><pre id="report">…</pre></div>
+  </details>
 
   <footer id="settings">
     <div class="k">Settings</div>
-    <button id="themeBtn" type="button">
+    <button id="themeBtn" type="button" class="btn-quiet">
       <svg class="ic" aria-hidden="true"><use id="themeUse" href="#i-moon"/></svg>
       <span id="themeLabel">Appearance: Dark</span>
     </button>
@@ -102,18 +207,44 @@
   </defs>
 </svg>
 <script>
+const money = (v) => v < 0 ? '-$' + Math.abs(v).toFixed(2) : '$' + v.toFixed(2);
 const fmt = (v) => v === null || v === undefined ? '<span class="unavailable">unavailable</span>' : v;
+async function getJson(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error(url + ' answered ' + r.status);
+  return r.json();
+}
 async function load() {
-  const home = await (await fetch('/api/home')).json();
+  const errBox = document.getElementById('load-error');
+  try {
+    await loadAll();
+    errBox.classList.remove('show');
+  } catch (e) {
+    document.getElementById('load-error-text').textContent =
+      'The desk could not finish loading (' + e.message + '). Figures already on screen are the last good ones.';
+    errBox.classList.add('show');
+  }
+}
+async function loadAll() {
+  const home = await getJson('/api/home');
   const a = home.account;
-  document.getElementById('balance').innerHTML = a.balance === null ? fmt(null) : '$' + a.balance.toFixed(2);
-  document.getElementById('pnl').innerHTML = a.day_pnl === null ? fmt(null) : '$' + a.day_pnl.toFixed(2);
+  document.getElementById('balance').innerHTML = a.balance === null ? fmt(null) : money(a.balance);
+  document.getElementById('pnl').innerHTML = a.day_pnl === null ? fmt(null) : money(a.day_pnl);
   // Unknown is unavailable, never zero: a null here means the venue
   // has not told us, and the cards must say so.
   document.getElementById('positions').innerHTML = a.open_positions === null ? fmt(null) : a.open_positions.length;
   document.getElementById('risk').innerHTML = a.open_positions === null ? fmt(null)
     : a.open_positions.length === 0 ? '$0.00 (no open positions)' : 'see positions';
   document.getElementById('account-note').textContent = a.note;
+
+  const st = home.stage_target;
+  if (st) {
+    const pct = Math.max(0, Math.min(100, st.progress_pct));
+    document.getElementById('stage-fill').style.width = pct + '%';
+    document.getElementById('stage-line').textContent = st.reached
+      ? `Stage target (paper): ${money(st.paper_equity_dollars)} — the ${money(st.target_dollars)} stage-one target is reached on paper. Paper only, not venue money.`
+      : `Stage target (paper): ${money(st.paper_equity_dollars)} of the ${money(st.target_dollars)} stage-one target — ${st.progress_pct.toFixed(1)}% of the way, ${money(st.remaining_dollars)} to go. Paper only, not venue money.`;
+  }
 
   const c = home.collector;
   document.getElementById('c-snaps').textContent = c.snapshots_on_disk + (c.dropped_lines ? ' (' + c.dropped_lines + ' dropped)' : '');
@@ -122,11 +253,42 @@ async function load() {
   const age = c.newest_snapshot_age_secs;
   document.getElementById('c-age').textContent =
     age === null ? 'none yet' : age < 90 ? age + 's ago' : age < 5400 ? Math.round(age / 60) + 'm ago' : (age / 3600).toFixed(1) + 'h ago';
+  document.getElementById('c-dot').className = 'dot ' + (c.collecting ? 'ok' : 'err');
   document.getElementById('c-note').textContent = c.collecting
     ? `Collecting — a pass lands every ${c.collect_interval_secs}s. The tape is the forward record: windows are scored from what was collected before they settled.`
     : 'Not collecting — the newest snapshot is older than two collect intervals. Uncollected windows cannot be backfilled.';
 
-  const markets = await (await fetch('/api/markets')).json();
+  const slotsData = await getJson('/api/slots');
+  document.getElementById('pot-figure').textContent = money(slotsData.paper_equity_dollars);
+  const strip = document.getElementById('slots');
+  strip.innerHTML = '';
+  const mkSlot = (s, retired) => {
+    const div = document.createElement('div');
+    div.className = 'slot' + (retired ? ' retired' : '');
+    const pnl = retired ? s.paper_pnl_dollars : s.stint_pnl_dollars;
+    const pnlCls = pnl > 0 ? 'pnl-pos' : pnl < 0 ? 'pnl-neg' : '';
+    const pnlWord = pnl > 0 ? 'gain' : pnl < 0 ? 'loss' : 'flat';
+    let pips = '';
+    if (!retired) {
+      for (let i = 0; i < 3; i++) pips += `<span class="pip${i < s.strikes ? ' hit' : ''}"></span>`;
+    }
+    div.innerHTML = `
+      <div class="s-head"><span class="dot ${retired ? '' : 'accent'}" aria-hidden="true"></span>Slot ${s.slot + 1} — ${s.strategy}</div>
+      <div class="s-row">${retired ? `Retired after ${s.windows_traded} windows — rotated to ${s.rotated_to}` : `Status: ${s.status}`}</div>
+      ${retired ? '' : `<div class="s-row">Strikes <span class="pips" aria-hidden="true">${pips}</span> ${s.strikes} of 3</div>`}
+      <div class="s-row">${retired ? 'Stint P&amp;L' : 'This stint'}: <span class="num ${pnlCls}">${money(pnl)}</span> (${pnlWord})</div>
+      ${retired ? '' : `<div class="s-row">Slot equity: <span class="num">${money(s.equity_dollars)}</span></div>`}`;
+    return div;
+  };
+  for (const s of slotsData.slots) strip.appendChild(mkSlot(s, false));
+  for (const r of slotsData.retired) strip.appendChild(mkSlot(r, true));
+  if (!slotsData.slots.length && !slotsData.retired.length) {
+    strip.innerHTML = '<p class="unavailable">no slots — the strategy library is empty</p>';
+  }
+  document.getElementById('slots-note').textContent =
+    `Paper simulation: the pot is re-split evenly across ${slotsData.slots.length} slots each window; three consecutive losing windows retire a slot's strategy and rotate the next one in. Paper only — not venue money.`;
+
+  const markets = await getJson('/api/markets');
   const tb = document.getElementById('markets');
   tb.innerHTML = '';
   for (const m of markets.slice(0, 40)) {
@@ -134,14 +296,14 @@ async function load() {
     const cells = [m.ticker, m.close_time.replace('T', ' ').replace('Z', ' UTC'),
       `${m.yes_bid ?? '—'} / ${m.yes_ask ?? '—'}`, `${m.no_bid ?? '—'} / ${m.no_ask ?? '—'}`,
       m.last_price ?? '—', m.result || '—'];
-    for (const c of cells) { const td = document.createElement('td'); td.textContent = c; tr.appendChild(td); }
+    cells.forEach((cell, ci) => { const td = document.createElement('td'); if (ci === 4) td.className = 'col-last'; td.textContent = cell; tr.appendChild(td); });
     tb.appendChild(tr);
   }
   if (!markets.length) tb.innerHTML = '<tr><td colspan="6" class="unavailable">no snapshots collected yet</td></tr>';
 
   // Equity chart: the pot curve is the headline; each strategy's
   // cumulative paper P&L rides along thinner. Inline SVG, no libraries.
-  const eq = await (await fetch('/api/equity')).json();
+  const eq = await getJson('/api/equity');
   const chartEl = document.getElementById('chart');
   const allSeries = [{ strategy: 'paper pot', points: eq.pot, headline: true },
     ...eq.series.filter(s => s.points.length)];
@@ -153,15 +315,15 @@ async function load() {
     const y0 = Math.min(...ys, 0), y1 = Math.max(...ys, 0);
     const X = (x) => PAD + (x - x0) / Math.max(1, x1 - x0) * (W - 2 * PAD);
     const Y = (y) => H - PAD - (y - y0) / Math.max(1e-9, y1 - y0) * (H - 2 * PAD);
-    const palette = ['#7fb069', '#5e8ce6', '#b565d8', '#d8a24a', '#4fb3bf'];
     const css = getComputedStyle(document.documentElement);
-    const accent = css.getPropertyValue('--accent').trim() || '#e8b89d';
-    const line = css.getPropertyValue('--border').trim() || '#262a33';
+    const accent = css.getPropertyValue('--accent').trim();
+    const line = css.getPropertyValue('--rule').trim();
+    const seriesVars = ['--series-2', '--series-3', '--series-4'];
     let paths = '';
     allSeries.forEach((s, i) => {
       if (s.points.length < 2) return;
       const d = s.points.map((p, j) => `${j ? 'L' : 'M'}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(' ');
-      const color = s.headline ? accent : palette[(i - 1) % palette.length];
+      const color = s.headline ? accent : css.getPropertyValue(seriesVars[(i - 1) % seriesVars.length]).trim();
       paths += `<path d="${d}" fill="none" stroke="${color}" stroke-width="${s.headline ? 2.2 : 1.1}"/>`;
     });
     const zeroY = Y(0);
@@ -170,29 +332,41 @@ async function load() {
       ${paths}</svg>`;
     document.getElementById('chart-note').textContent =
       `Paper simulation over the collected tape, starting pot $${eq.paper_pot_start.toFixed(2)} split evenly across the slots each window. The heavy line is the pot; thin lines are each strategy's cumulative paper P&L. Paper only — not venue money.`;
-    const money = (v) => v < 0 ? '-$' + Math.abs(v).toFixed(2) : '$' + v.toFixed(2);
-    document.getElementById('legend').textContent = allSeries
-      .map(s => `${s.strategy}: ${s.points.length ? money(s.points[s.points.length - 1][1]) : 'no trades'}`)
-      .join(' · ');
+    const legend = document.getElementById('legend');
+    legend.innerHTML = '';
+    allSeries.forEach((s, i) => {
+      const span = document.createElement('span');
+      const color = s.headline ? accent : css.getPropertyValue(seriesVars[(i - 1) % seriesVars.length]).trim();
+      const last = s.points.length ? s.points[s.points.length - 1][1] : null;
+      span.innerHTML = `<span class="swatch sw-${s.headline ? 'pot' : ((i - 1) % 3) + 2}"></span>${s.strategy}: <span class="num">${last === null ? 'no trades' : money(last)}</span>`;
+      legend.appendChild(span);
+    });
   } else {
     chartEl.innerHTML = '<p class="unavailable">not enough collected tape to draw the equity curve yet</p>';
+    document.getElementById('legend').innerHTML = '';
   }
 
-  const strats = await (await fetch('/api/strategies')).json();
+  const strats = await getJson('/api/strategies');
   const sb = document.getElementById('strategies');
   sb.innerHTML = '';
   for (const s of strats) {
     const tr = document.createElement('tr');
+    const vCls = s.verdict.startsWith('PROVEN') ? 'ok' : s.verdict.startsWith('NOT PROVEN') ? 'warn' : '';
     const cells = [s.strategy, s.side, String(s.windows_traded),
-      s.mean_cents_per_contract === null ? '—' : s.mean_cents_per_contract.toFixed(2), s.verdict];
-    for (const c of cells) { const td = document.createElement('td'); td.textContent = c; tr.appendChild(td); }
+      s.mean_cents_per_contract === null ? '—' : s.mean_cents_per_contract.toFixed(2)];
+    for (const cell of cells) { const td = document.createElement('td'); td.textContent = cell; tr.appendChild(td); }
+    const td = document.createElement('td');
+    td.innerHTML = `<span class="verdict"><span class="dot ${vCls}" aria-hidden="true"></span>${s.verdict}</span>`;
+    tr.appendChild(td);
     sb.appendChild(tr);
   }
+  if (!strats.length) sb.innerHTML = '<tr><td colspan="5" class="unavailable">no strategies in the library</td></tr>';
 
-  const report = await (await fetch('/api/report')).json();
+  const report = await getJson('/api/report');
   document.getElementById('report').textContent = report.report;
 }
 async function collect() { await fetch('/api/collect', { method: 'POST' }); load(); }
+document.getElementById('retryBtn').addEventListener('click', load);
 
 function syncThemeButton() {
   const t = document.documentElement.dataset.theme;
@@ -210,5 +384,8 @@ syncThemeButton();
 load();
 setInterval(load, 30000);
 </script>
+<!-- hallmark-rune override log
+override · R1 · guard: no font files ship in this repo and external font requests are banned on this stack · reason: the template's named stack (Inter first, system fallbacks) is the considered choice available offline; mono carries figures and the verbatim report only
+-->
 </body>
 </html>

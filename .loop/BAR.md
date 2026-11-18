@@ -76,6 +76,20 @@ says unavailable.
   dashboard with the desk's own words removed.
 - C12 (owner): The look and feel of the finished screen. The loop never
   marks this passed.
+- C13 (cmd): Strategy evaluation is memory-bounded: a hostile Rune
+  strategy that tries to allocate ~600MB inside a few instructions
+  fails its calls, trades nothing, and leaves an honest neighbour's
+  record and the server's health untouched (peak RSS < 400MB).
+  (`.loop/checks/memory.sh`)
+- C14 (cmd): Report latency on a full-size tape (~225k snapshots,
+  ~750 settled windows): a warm report answers in under 2s, a
+  recompute after append-only growth costs a small fraction of the
+  cold pass, and cold / warm / post-append reports of the same
+  record are identical. (`.loop/checks/latency.sh`)
+- C15 (cmd): Stage-target tracking: the paper pot's progress toward
+  the $1,000 stage-one target is computed from the paper record and
+  labelled paper on /api/slots, /api/home and the daily report.
+  (`.loop/checks/stage.sh`)
 
 ## DIRECTION v1 (interface)
 
