@@ -19,7 +19,7 @@ the measuring machine the compounding stands on:
   [`strategies/`](strategies/); they are scored on paper against collected
   forward data. The desk's **promotion standard is code**: a strategy is
   "proven" only with ≥100 forward windows traded and *both* chronological
-  halves positive at ≥ +3.5¢ per contract after fees.
+  halves positive and an overall mean of ≥ +3.5¢ per contract after fees.
 
 ## Hard fence
 

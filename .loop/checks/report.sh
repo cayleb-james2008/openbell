@@ -29,6 +29,11 @@ PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s "http://127.0.0.1:$PORT/api/report" >/dev/null 2>&1 && break; sleep 0.5; done
 
 report=$(curl -s "http://127.0.0.1:$PORT/api/report" | jq -r '.report')
+second=$(echo "$report" | sed -n 2p)
+case "$second" in
+  "As of "*"cumulative over the collected tape"*) : ;;
+  *) echo "FAIL: report line 2 is not the as-of line naming its basis: $second"; exit 1;;
+esac
 first=$(echo "$report" | head -1)
 case "$first" in
   "Day P&L (venue): unavailable"*) : ;;

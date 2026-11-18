@@ -279,9 +279,11 @@ struct Strategy {
     side: String,
     unit: Arc<rune::Unit>,
     runtime: Arc<rune::runtime::RuntimeContext>,
-    /// When this strategy's scoring clock started (first call of a
-    /// pass) — the aggregate bound beside the per-call budget.
-    clock: std::cell::Cell<Option<std::time::Instant>>,
+    /// Time this strategy's own calls have consumed this pass —
+    /// the aggregate deadline meters THIS, never the pass's wall
+    /// clock (other strategies' calls interleave in a pass, and
+    /// their burn is not this strategy's to spend).
+    spent: std::cell::Cell<std::time::Duration>,
     /// Set once the aggregate allowance is spent: later calls in
     /// the pass degrade to no-entry without running the script.
     exhausted: std::cell::Cell<bool>,
@@ -302,7 +304,7 @@ impl Strategy {
         // Compiled-strategy cache keyed by (path, length, mtime):
         // compiling Rune from source on every request made every
         // surface pay it per hit. The Strategy handed out is always
-        // fresh (its budget clock and failure counters are per
+        // fresh (its budget meter and failure counters are per
         // pass); only the immutable compile is shared.
         let cache_key = std::fs::metadata(path).ok().map(|m| {
             (
@@ -331,7 +333,7 @@ impl Strategy {
                     side,
                     unit,
                     runtime,
-                    clock: std::cell::Cell::new(None),
+                    spent: std::cell::Cell::new(std::time::Duration::ZERO),
                     exhausted: std::cell::Cell::new(false),
                     call_failures: std::cell::Cell::new(0),
                 });
@@ -355,7 +357,7 @@ impl Strategy {
             side: String::new(),
             unit,
             runtime,
-            clock: std::cell::Cell::new(None),
+            spent: std::cell::Cell::new(std::time::Duration::ZERO),
             exhausted: std::cell::Cell::new(false),
             call_failures: std::cell::Cell::new(0),
         };
@@ -400,7 +402,10 @@ impl Strategy {
         args: (f64, f64, i64),
     ) -> Result<rune::Value, rune::runtime::VmError> {
         let mut vm = self.vm();
-        rune::runtime::budget::with(STRATEGY_BUDGET, move || vm.call([name], args)).call()
+        let t0 = std::time::Instant::now();
+        let out = rune::runtime::budget::with(STRATEGY_BUDGET, move || vm.call([name], args)).call();
+        self.spent.set(self.spent.get() + t0.elapsed());
+        out
     }
 
     fn call_string(&self, name: &str) -> Result<String, String> {
@@ -412,20 +417,17 @@ impl Strategy {
     }
 
     /// The aggregate bound: a strategy gets STRATEGY_DEADLINE_SECS
-    /// of wall clock per scoring pass (a pass builds fresh Strategy
-    /// objects). An honest predicate needs microseconds per call;
-    /// the allowance exists so a pathological script's cost is
-    /// bounded by seconds per surface, not by tape size.
+    /// of its OWN consumed call time per scoring pass (a pass
+    /// builds fresh Strategy objects). An honest predicate needs
+    /// microseconds per call; the allowance exists so a
+    /// pathological script's cost is bounded by seconds of its own
+    /// burn per surface, not by tape size — and never by a
+    /// neighbour's burn.
     fn budget_open(&self) -> bool {
         if self.exhausted.get() {
             return false;
         }
-        let start = self.clock.get().unwrap_or_else(|| {
-            let now = std::time::Instant::now();
-            self.clock.set(Some(now));
-            now
-        });
-        if start.elapsed().as_secs() >= STRATEGY_DEADLINE_SECS {
+        if self.spent.get().as_secs() >= STRATEGY_DEADLINE_SECS {
             self.exhausted.set(true);
             return false;
         }
@@ -967,8 +969,8 @@ fn equity_curves(sim: &SlotSimulation) -> (Vec<(i64, f64)>, Vec<(String, Vec<(i6
 
 /// VM instruction budget per strategy call (see call_budgeted).
 const STRATEGY_BUDGET: usize = 250_000;
-/// Wall-clock allowance per strategy per scoring pass (see
-/// Strategy::budget_open).
+/// Consumed-call-time allowance per strategy per scoring pass
+/// (see Strategy::budget_open).
 const STRATEGY_DEADLINE_SECS: u64 = 3;
 /// A strategy is a small predicate; a file past this size is a
 /// config error, and it is recompiled often enough that its size
@@ -1342,7 +1344,7 @@ fn dataset_path(app: &App, query: &str) -> PathBuf {
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
             .collect();
-        if !name.is_empty() {
+        if !name.is_empty() && name != "live" {
             return app.data_dir.join(format!("{name}-snapshots.jsonl"));
         }
     }
@@ -1805,7 +1807,6 @@ mod tests {
         snaps
     }
 
-    #[test]
     #[test]
     fn sizing_compounds_the_pot_across_windows() {
         // One strategy in a scratch library, so N=1 and the arithmetic
