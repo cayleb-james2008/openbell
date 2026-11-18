@@ -184,13 +184,15 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8491/api/slots?d
 
 # --- B22: window truth — conflicts unscored, the settled record's
 # own close time orders the compounding, sub-cent prices never size
-# a trade (D4/D6/D7).
+# a trade (D4/D6/D7). The honestly-dated window WINS on purpose: a
+# full-pot loss there would exhaust the pot before the sub-cent
+# window arrives and mask the price band entirely.
 mkdir -p "$WORK/data3" "$WORK/strats3"
 cat > "$WORK/data3/snapshots.jsonl" <<'JSON'
 {"series":"KXBTC15M","ticker":"KXBTC15M-C1","event_ticker":"KXBTC15M-C1","status":"active","close_time":"2030-01-01T00:15:00Z","yes_ask":0.5,"no_ask":0.5,"result":"yes","fetched_at":1893455000}
 {"series":"KXBTC15M","ticker":"KXBTC15M-C1","event_ticker":"KXBTC15M-C1","status":"active","close_time":"2030-01-01T00:15:00Z","yes_ask":0.5,"no_ask":0.5,"result":"no","fetched_at":1893455010}
 {"series":"KXBTC15M","ticker":"KXBTC15M-C2","event_ticker":"KXBTC15M-C2","status":"active","close_time":"not-a-date","yes_ask":0.5,"no_ask":0.5,"result":"","fetched_at":1893455020}
-{"series":"KXBTC15M","ticker":"KXBTC15M-C2","event_ticker":"KXBTC15M-C2","status":"active","close_time":"2030-01-01T01:00:00Z","yes_ask":0.5,"no_ask":0.5,"result":"no","fetched_at":1893455030}
+{"series":"KXBTC15M","ticker":"KXBTC15M-C2","event_ticker":"KXBTC15M-C2","status":"active","close_time":"2030-01-01T01:00:00Z","yes_ask":0.5,"no_ask":0.5,"result":"yes","fetched_at":1893455030}
 {"series":"KXBTC15M","ticker":"KXBTC15M-C3","event_ticker":"KXBTC15M-C3","status":"active","close_time":"2030-01-01T02:00:00Z","yes_ask":0.001,"no_ask":0.999,"result":"yes","fetched_at":1893455040}
 JSON
 cat > "$WORK/strats3/always.rn" <<'RN'
@@ -238,5 +240,39 @@ curl -s "http://127.0.0.1:8489/api/home" > "$WORK/home4.json"
 jq -e '.collector.collecting == false and .collector.newest_snapshot_age_secs > 7000' "$WORK/home4.json" >/dev/null \
   || { echo "FAIL: a future-dated mid-tape line makes a stale tape read as collecting, or the age is not the last line's"; cat "$WORK/home4.json" | jq .collector; exit 1; }
 
-echo "ROBUST OK: oversized bodies refused, looping strategies degrade, concurrent collects cannot splice the tape, env values clamped, strategy contract enforced, window truth defended, freshness cannot be forged"
+# --- B23: one looping strategy must not spend the honest
+# strategies' allowances (round 3, Finding 1: the deadline metered
+# the pass's wall clock, so the looper's burn exhausted everyone,
+# and the report's verdicts zeroed). Two servers, same fixture
+# tape: clean library vs clean + looper. Honest totals must be
+# IDENTICAL, and the looper server's report verdicts must match
+# its own /api/strategies.
+mkdir -p "$WORK/data5" "$WORK/strats5"
+cp "$WORK/data/fixture-snapshots.jsonl" "$WORK/data5/snapshots.jsonl"
+cp strategies/*.rn "$WORK/strats5/"
+mkdir -p "$WORK/strats5l"
+cp strategies/*.rn "$WORK/strats5l/"
+cp "$WORK/strats/looper.rn" "$WORK/strats5l/"
+OPENBELL_DATA="$WORK/data5" OPENBELL_STRATEGIES="$WORK/strats5" \
+OPENBELL_COLLECT_SECS=3600 PORT=8488 \
+  ./target/debug/openbell-rs > "$WORK/server5.log" 2>&1 &
+PIDS="$PIDS $!"
+OPENBELL_DATA="$WORK/data5" OPENBELL_STRATEGIES="$WORK/strats5l" \
+OPENBELL_COLLECT_SECS=3600 PORT=8487 \
+  ./target/debug/openbell-rs > "$WORK/server5l.log" 2>&1 &
+PIDS="$PIDS $!"
+for p in 8488 8487; do for i in $(seq 1 20); do curl -s "http://127.0.0.1:$p/api/home" >/dev/null 2>&1 && break; sleep 0.5; done; done
+curl -s "http://127.0.0.1:8488/api/slots" | jq '[.strategy_totals[] | {strategy, windows_traded}] | sort_by(.strategy)' > "$WORK/totals-clean.json"
+curl -s "http://127.0.0.1:8487/api/slots" | jq '[.strategy_totals[] | select(.strategy != "looper") | {strategy, windows_traded}] | sort_by(.strategy)' > "$WORK/totals-looper.json"
+diff -q "$WORK/totals-clean.json" "$WORK/totals-looper.json" >/dev/null \
+  || { echo "FAIL: a looping strategy changed the honest strategies' slot totals"; diff "$WORK/totals-clean.json" "$WORK/totals-looper.json"; exit 1; }
+curl -s "http://127.0.0.1:8487/api/slots" | jq -e '[.notes[]] | any(test("looper exhausted")) and (any(test("favourite-late exhausted")) | not)' >/dev/null \
+  || { echo "FAIL: the exhaustion notes do not name the looper alone"; curl -s "http://127.0.0.1:8487/api/slots" | jq .notes; exit 1; }
+rep_traded=$(curl -s "http://127.0.0.1:8487/api/report" | jq -r '.report' | grep -o 'favourite-late (yes): [0-9]* windows traded' | grep -o '[0-9]*' | head -1)
+api_traded=$(curl -s "http://127.0.0.1:8487/api/strategies" | jq '[.[] | select(.strategy=="favourite-late")][0].windows_traded')
+[ -n "$rep_traded" ] && [ "$rep_traded" = "$api_traded" ] \
+  || { echo "FAIL: the report's favourite-late verdict ($rep_traded traded) disagrees with /api/strategies ($api_traded) on the looper server"; exit 1; }
+
+echo "ROBUST OK: oversized bodies refused, looping strategies degrade alone, concurrent collects cannot splice the tape, env values clamped, strategy contract enforced, window truth defended, freshness cannot be forged"
+
 
