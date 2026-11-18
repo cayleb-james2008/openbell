@@ -6,7 +6,7 @@
 | B2 | Paper results are cents-per-contract only — no equity-split sizing, no paper pot, no dollar P&L. Bar C4. | Read ScoreReport: no contracts, no dollars, no pot. | high | kept |
 | B3 | Strategy library is two Rune scripts. The desk's book needs a richer library for slots to rotate through. Bar C5. | `ls strategies/` → favourite_late.rn, longshot_late.rn only. | medium | kept |
 | B4 | Collector health is invisible: nothing on the home screen says whether the tape is fresh, how big it is, or how many windows have settled. Bar C6. | GET /api/home: account + series only. | medium | kept |
-| B5 | No chart over the tape: paper performance has no equity curve, only summary numbers. Bar C7. | No /api/equity route exists. | medium | open |
+| B5 | No chart over the tape: paper performance has no equity curve, only summary numbers. Bar C7. | No /api/equity route exists. | medium | kept |
 | B6 | The daily report is a debug dump: counts and one-line verdicts, no per-slot story, no collector health, no pot. Bar C8. | GET /api/report and read it as the desk's owner. | medium | open |
 | B7 | UI is dark-only with uppercase micro-labels; no settings, no theme toggle. Bars C9, C11. | Serve the page: single dark theme, no settings area. | medium | open |
 
