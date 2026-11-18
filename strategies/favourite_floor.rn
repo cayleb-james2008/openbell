@@ -1,0 +1,16 @@
+// Slot shape: the favourite inside the desk's own price band.
+// Buy YES when the ask sits in the favourite band (0.40 to 0.85 — the
+// desk's favourite floor is 40c) in the last ten minutes of the window,
+// never in the final minute. Scored on paper by the shadow scorer —
+// this file places nothing.
+pub fn name() {
+    "favourite-floor"
+}
+
+pub fn side() {
+    "yes"
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    yes_ask >= 0.40 && yes_ask <= 0.85 && secs_to_close <= 600 && secs_to_close >= 61
+}

@@ -1,0 +1,16 @@
+// Slot shape: fade the favourite at favourite prices.
+// Buy NO when NO is priced inside the favourite band (0.40 to 0.85) in
+// the last ten minutes — the other side of the desk's favourite trade,
+// kept in the library so the slot system can rotate onto it and the
+// forward tape can judge it. Scored on paper — this file places nothing.
+pub fn name() {
+    "no-favourite"
+}
+
+pub fn side() {
+    "no"
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    no_ask >= 0.40 && no_ask <= 0.85 && secs_to_close <= 600 && secs_to_close >= 61
+}

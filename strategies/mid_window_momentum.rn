@@ -1,0 +1,16 @@
+// Slot shape: mid-window momentum.
+// Buy YES while the window still has five to ten minutes to run and
+// the market is leaning YES (ask 0.55 to 0.75) — earlier than the late
+// shapes, on the theory that a lean that forms mid-window persists.
+// Scored on paper by the shadow scorer — this file places nothing.
+pub fn name() {
+    "mid-window-momentum"
+}
+
+pub fn side() {
+    "yes"
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    yes_ask >= 0.55 && yes_ask <= 0.75 && secs_to_close <= 600 && secs_to_close >= 301
+}
