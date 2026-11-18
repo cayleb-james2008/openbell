@@ -724,7 +724,9 @@ fn window_entry_scan(strat: &Strategy, snaps: &[Snapshot]) -> Option<f64> {
         let secs_to_close = close - snap.fetched_at;
         if strat.allow_entry(ya, na, secs_to_close) {
             let price = if strat.side == "yes" { ya } else { na };
-            if (0.01..=0.99).contains(&price) {
+            // Only whole cents trade (README): 0.45 yes, never 0.4567.
+            let whole_cent = ((price * 100.0) - (price * 100.0).round()).abs() < 1e-9;
+            if (0.01..=0.99).contains(&price) && whole_cent {
                 return Some(price);
             }
         }
@@ -3131,6 +3133,30 @@ mod tests {
             "report must say a partial pass plainly"
         );
         SERIES_FAILED_LAST_PASS.store(0, std::sync::atomic::Ordering::Relaxed);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_whole_cent_prices_are_traded() {
+        // README: only whole-cent prices size a trade. An odd quote
+        // (0.4567) or a sub-cent quote (0.004) is no market.
+        let dir = std::env::temp_dir().join(format!("ob-cents-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("any.rn"),
+            "pub fn name() { \"any\" }\npub fn side() { \"yes\" }\n\
+             pub fn allow_entry(yes_ask, no_ask, secs_to_close) { true }\n",
+        )
+        .unwrap();
+        let strat = load_strategies(&dir).remove(0);
+        let close = "2030-01-01T01:00:00Z";
+        let scan = |ticker: &str, ask: f64| {
+            let w = [snap(ticker, 100, close, "", Some(ask), Some(0.52))];
+            window_entry_keyed(&strat, Some(ticker), &w, window_fingerprint(&w))
+        };
+        assert_eq!(scan("KXCENT-ODD", 0.4567), None, "0.4567 is not a whole cent");
+        assert_eq!(scan("KXCENT-SUB", 0.004), None, "0.004 is sub-cent");
+        assert_eq!(scan("KXCENT-OK", 0.45), Some(0.45), "0.45 trades at its price");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
