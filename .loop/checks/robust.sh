@@ -48,10 +48,15 @@ elapsed=$(( $(date +%s) - start ))
 [ $elapsed -lt 30 ] || { echo "FAIL: scoring wedged on a non-terminating strategy (${elapsed}s)"; exit 1; }
 jq -e '[.[] | select(.strategy == "looper") | .windows_traded] == [0]' "$WORK/strats.json" >/dev/null \
   || { echo "FAIL: the looping strategy traded windows instead of degrading to no-entry"; cat "$WORK/strats.json" | jq -c '.[] | select(.strategy=="looper")'; exit 1; }
-# Its load failure is NOT silent: a broken sibling is named in home.
+jq -e '[.[] | select(.strategy == "looper") | .budget_exhausted] == [true]' "$WORK/strats.json" >/dev/null \
+  || { echo "FAIL: the looping strategy's report does not name its budget exhaustion"; exit 1; }
+# Its load failure is NOT silent: a broken sibling is named in home
+# AND on the sizing surface (a silent drop would resize every slot).
 echo 'this is not rune' > "$WORK/strats/broken.rn"
 curl -s "http://127.0.0.1:$PORT/api/home" | jq -e '[.library_errors[].file] | index("broken.rn") != null' >/dev/null \
   || { echo "FAIL: a broken strategy file is not named in /api/home library_errors"; curl -s "http://127.0.0.1:$PORT/api/home" | jq -c .library_errors; exit 1; }
+curl -s "http://127.0.0.1:$PORT/api/slots?dataset=fixture" | jq -e '[.library_errors[].file] | index("broken.rn") != null' >/dev/null \
+  || { echo "FAIL: a broken strategy file is not named in /api/slots library_errors"; exit 1; }
 rm "$WORK/strats/broken.rn"
 
 # Concurrent collection passes cannot splice tape lines. Passes
@@ -85,5 +90,42 @@ curl -s "http://127.0.0.1:8495/api/home" | jq -e '.collector.collect_interval_se
   || { echo "FAIL: OPENBELL_COLLECT_SECS=0 was not clamped to the 5s floor"; curl -s "http://127.0.0.1:8495/api/home" | jq -c .collector; exit 1; }
 curl -s "http://127.0.0.1:8495/api/slots?dataset=fixture" | jq -e '.paper_pot_start == 100' >/dev/null \
   || { echo "FAIL: OPENBELL_PAPER_POT=inf did not fall back to the default pot"; exit 1; }
+
+mkdir -p "$WORK/shim-env" "$WORK/shim-garbage" "$WORK/data-env" "$WORK/data-garbage"
+cat > "$WORK/shim-env/curl" <<'SHIM'
+#!/bin/bash
+echo '{"error":{"code":"unavailable","message":"fake venue is down"}}'
+SHIM
+cat > "$WORK/shim-garbage/curl" <<'SHIM'
+#!/bin/bash
+echo '{"markets":[{"ticker":"KXBTC15M-FAKE","event_ticker":"KXBTC15M","close_time":"not-a-date","status":"finalized","result":"yes","yes_bid_dollars":"0.40","yes_ask_dollars":"0.45","no_bid_dollars":"0.55","no_ask_dollars":"0.60","last_price_dollars":"0.45"}]}'
+SHIM
+chmod +x "$WORK/shim-env/curl" "$WORK/shim-garbage/curl"
+PATH="$WORK/shim-env:$PATH" OPENBELL_DATA="$WORK/data-env" OPENBELL_STRATEGIES="$PWD/strategies" \
+OPENBELL_COLLECT_SECS=3600 PORT=8494 \
+  ./target/debug/openbell-rs > "$WORK/server-env.log" 2>&1 &
+PIDS="$PIDS $!"
+PATH="$WORK/shim-garbage:$PATH" OPENBELL_DATA="$WORK/data-garbage" OPENBELL_STRATEGIES="$PWD/strategies" \
+OPENBELL_COLLECT_SECS=3600 PORT=8493 \
+  ./target/debug/openbell-rs > "$WORK/server-garbage.log" 2>&1 &
+PIDS="$PIDS $!"
+for p in 8494 8493; do for i in $(seq 1 20); do curl -s "http://127.0.0.1:$p/api/home" >/dev/null 2>&1 && break; sleep 0.5; done; done
+code=$(curl -s -o "$WORK/env-resp.json" -w '%{http_code}' -X POST "http://127.0.0.1:8494/api/collect")
+[ "$code" = "502" ] || { echo "FAIL: a venue answering only error envelopes got HTTP $code, not 502: $(cat "$WORK/env-resp.json")"; exit 1; }
+code=$(curl -s -o "$WORK/garbage-resp.json" -w '%{http_code}' -X POST "http://127.0.0.1:8493/api/collect")
+[ "$code" = "502" ] || { echo "FAIL: a venue sending only invalid records got HTTP $code, not 502: $(cat "$WORK/garbage-resp.json")"; exit 1; }
+[ ! -s "$WORK/data-garbage/snapshots.jsonl" ] \
+  || { echo "FAIL: invalid venue records were written to the tape"; exit 1; }
+curl -s "http://127.0.0.1:8493/api/home" | jq -e '.collector.markets_seen == 0 and .collector.settled_windows == 0' >/dev/null \
+  || { echo "FAIL: invalid records counted as venue evidence on the home surface"; exit 1; }
+
+# A half-present credential gets its true reason (D-R4).
+OPENBELL_DATA="$WORK/data" OPENBELL_STRATEGIES="$PWD/strategies" \
+OPENBELL_COLLECT_SECS=3600 PORT=8492 KALSHI_API_KEY_ID=dummy-id \
+  ./target/debug/openbell-rs > "$WORK/server-half.log" 2>&1 &
+PIDS="$PIDS $!"
+for i in $(seq 1 20); do curl -s "http://127.0.0.1:8492/api/report" >/dev/null 2>&1 && break; sleep 0.5; done
+curl -s "http://127.0.0.1:8492/api/report" | jq -r '.report' | head -1 | grep -q 'no private key path is set' \
+  || { echo "FAIL: a credential ID without a key path does not get its true reason"; curl -s "http://127.0.0.1:8492/api/report" | jq -r '.report' | head -1; exit 1; }
 
 echo "ROBUST OK: oversized bodies refused, looping strategies degrade, concurrent collects cannot splice the tape, env values clamped"

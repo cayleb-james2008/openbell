@@ -54,7 +54,7 @@
 
   <h2>Collector — the forward tape</h2>
   <div class="cards">
-    <div class="card"><div class="k">Snapshots on disk</div><div class="v" id="c-snaps">…</div></div>
+    <div class="card"><div class="k">Tape lines on disk</div><div class="v" id="c-snaps">…</div></div>
     <div class="card"><div class="k">Markets seen</div><div class="v" id="c-markets">…</div></div>
     <div class="card"><div class="k">Settled windows</div><div class="v" id="c-settled">…</div></div>
     <div class="card"><div class="k">Newest snapshot</div><div class="v" id="c-age">…</div></div>
@@ -116,7 +116,7 @@ async function load() {
   document.getElementById('account-note').textContent = a.note;
 
   const c = home.collector;
-  document.getElementById('c-snaps').textContent = c.snapshots_on_disk;
+  document.getElementById('c-snaps').textContent = c.snapshots_on_disk + (c.dropped_lines ? ' (' + c.dropped_lines + ' dropped)' : '');
   document.getElementById('c-markets').textContent = c.markets_seen;
   document.getElementById('c-settled').textContent = c.settled_windows;
   const age = c.newest_snapshot_age_secs;

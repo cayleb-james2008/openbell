@@ -11,7 +11,7 @@ PORT=8478
 WORK=$(mktemp -d)
 trap 'kill $SERVER_PID 2>/dev/null; rm -rf "$WORK"' EXIT
 
-cargo build 2>&1 | tail -1
+cargo build >/dev/null 2>&1 || { echo "FAIL: cargo build failed"; exit 1; }
 mkdir -p "$WORK/data"
 python3 gen_fixture.py "$WORK/data/fixture-snapshots.jsonl"
 

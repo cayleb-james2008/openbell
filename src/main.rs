@@ -82,7 +82,7 @@ fn dollars(v: &serde_json::Value, key: &str) -> Option<f64> {
     v.get(key).and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok())
 }
 
-fn fetch_markets(series: &str, status: &str) -> Result<Vec<Snapshot>, String> {
+fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize), String> {
     let url = format!("{API_BASE}/markets?series_ticker={series}&status={status}&limit=100");
     let out = Command::new("curl")
         .args(["-s", "-m", "25", &url])
@@ -95,13 +95,29 @@ fn fetch_markets(series: &str, status: &str) -> Result<Vec<Snapshot>, String> {
         serde_json::from_slice(&out.stdout).map_err(|e| format!("venue returned non-JSON: {e}"))?;
     let fetched_at = now_unix();
     let mut snaps: Vec<Snapshot> = Vec::new();
-    if let Some(markets) = body.get("markets").and_then(|m| m.as_array()) {
+    let mut skipped = 0usize;
+    // A response without a markets array is not market data — the
+    // venue's error envelope is valid JSON with an "error" key, and
+    // treating it as an empty list would report a dead venue as a
+    // successful, empty collection.
+    let Some(markets) = body.get("markets").and_then(|m| m.as_array()) else {
+        return Err("venue response had no markets array".to_string());
+    };
+    {
         for m in markets {
             let get = |k: &str| m.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-            // A record without a ticker or a close time is not a
-            // market snapshot; writing it to the permanent tape
-            // would mint evidence out of a malformed response.
-            if get("ticker").is_empty() || get("close_time").is_empty() {
+            // A record that cannot be a snapshot is not written to
+            // the permanent tape: no ticker, a close time that does
+            // not parse (it would score at epoch 0 as a settled
+            // window that never existed), or a result outside the
+            // venue's vocabulary. Skips are counted and reported by
+            // the caller, never silent.
+            let result = get("result");
+            if get("ticker").is_empty()
+                || parse_iso_z(&get("close_time")).is_none()
+                || !matches!(result.as_str(), "" | "yes" | "no")
+            {
+                skipped += 1;
                 continue;
             }
             snaps.push(Snapshot {
@@ -120,7 +136,7 @@ fn fetch_markets(series: &str, status: &str) -> Result<Vec<Snapshot>, String> {
             });
         }
     }
-    Ok(snaps)
+    Ok((snaps, skipped))
 }
 
 /// One collector pass over every series the desk trades: open markets (the
@@ -148,7 +164,12 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
     for series in SERIES {
         for status in ["open", "settled"] {
             match fetch_markets(series, status) {
-                Ok(snaps) => {
+                Ok((snaps, skipped)) => {
+                    if skipped > 0 {
+                        errors.push(format!(
+                            "{series}/{status}: skipped {skipped} invalid record(s)"
+                        ));
+                    }
                     for snap in &snaps {
                         buf.push_str(&serde_json::to_string(snap).unwrap());
                         buf.push('\n');
@@ -219,6 +240,12 @@ struct Strategy {
     side: String,
     unit: Arc<rune::Unit>,
     runtime: Arc<rune::runtime::RuntimeContext>,
+    /// When this strategy's scoring clock started (first call of a
+    /// pass) — the aggregate bound beside the per-call budget.
+    clock: std::cell::Cell<Option<std::time::Instant>>,
+    /// Set once the aggregate allowance is spent: later calls in
+    /// the pass degrade to no-entry without running the script.
+    exhausted: std::cell::Cell<bool>,
 }
 
 impl Strategy {
@@ -242,6 +269,8 @@ impl Strategy {
             side: String::new(),
             unit,
             runtime,
+            clock: std::cell::Cell::new(None),
+            exhausted: std::cell::Cell::new(false),
         };
         strat.name = strat.call_string("name")?;
         strat.side = strat.call_string("side")?;
@@ -276,7 +305,35 @@ impl Strategy {
         rune::from_value::<String>(value).map_err(|e| e.to_string())
     }
 
+    /// The aggregate bound: a strategy gets STRATEGY_DEADLINE_SECS
+    /// of wall clock per scoring pass (a pass builds fresh Strategy
+    /// objects). An honest predicate needs microseconds per call;
+    /// the allowance exists so a pathological script's cost is
+    /// bounded by seconds per surface, not by tape size.
+    fn budget_open(&self) -> bool {
+        if self.exhausted.get() {
+            return false;
+        }
+        let start = self.clock.get().unwrap_or_else(|| {
+            let now = std::time::Instant::now();
+            self.clock.set(Some(now));
+            now
+        });
+        if start.elapsed().as_secs() >= STRATEGY_DEADLINE_SECS {
+            self.exhausted.set(true);
+            return false;
+        }
+        true
+    }
+
+    fn budget_exhausted(&self) -> bool {
+        self.exhausted.get()
+    }
+
     fn allow_entry(&self, yes_ask: f64, no_ask: f64, secs_to_close: i64) -> bool {
+        if !self.budget_open() {
+            return false;
+        }
         match self.call_budgeted("allow_entry", (yes_ask, no_ask, secs_to_close)) {
             Ok(value) => rune::from_value::<bool>(value).unwrap_or(false),
             Err(_) => false,
@@ -286,6 +343,7 @@ impl Strategy {
 
 #[derive(Serialize)]
 struct ScoreReport {
+    budget_exhausted: bool,
     strategy: String,
     side: String,
     windows_settled: usize,
@@ -383,6 +441,7 @@ fn score_strategy(strat: &Strategy, snapshots: &[Snapshot], standard: Standard) 
             .to_string()
     };
     ScoreReport {
+        budget_exhausted: strat.budget_exhausted(),
         strategy: strat.name.clone(),
         side: strat.side.clone(),
         windows_settled: settled,
@@ -622,6 +681,14 @@ fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f6
     // End-state disclosures: a strategy running in several slots at
     // once stakes several shares on the same windows — say so.
     let mut notes: Vec<String> = Vec::new();
+    for strat in strategies {
+        if strat.budget_exhausted() {
+            notes.push(format!(
+                "strategy {} exhausted its scoring budget and was treated as no-entry for the remaining windows",
+                strat.name
+            ));
+        }
+    }
     if total_equity <= 0.0 {
         notes.push(
             "the paper pot is exhausted — at zero or below, no slot can stake, so the simulation cannot trade again on this tape"
@@ -712,7 +779,10 @@ fn equity_curves(sim: &SlotSimulation) -> (Vec<(i64, f64)>, Vec<(String, Vec<(i6
 }
 
 /// VM instruction budget per strategy call (see call_budgeted).
-const STRATEGY_BUDGET: usize = 1_000_000;
+const STRATEGY_BUDGET: usize = 250_000;
+/// Wall-clock allowance per strategy per scoring pass (see
+/// Strategy::budget_open).
+const STRATEGY_DEADLINE_SECS: u64 = 3;
 
 fn load_strategies(dir: &Path) -> Vec<Strategy> {
     load_strategies_with_errors(dir).0
@@ -767,23 +837,29 @@ struct AccountState {
 fn account_state() -> AccountState {
     let key_id = std::env::var("KALSHI_API_KEY_ID").ok();
     let key_path = std::env::var("KALSHI_PRIVATE_KEY_PATH").ok();
-    match (key_id, key_path) {
-        (Some(_), Some(p)) if Path::new(&p).exists() => AccountState {
-            status: "unavailable".to_string(),
-            balance: None,
-            open_positions: None,
-            day_pnl: None,
-            note: "A credential is present in the environment, but signed venue reads are not enabled in this build — figures are shown as unavailable rather than guessed."
-                .to_string(),
-        },
-        _ => AccountState {
-            status: "unavailable".to_string(),
-            balance: None,
-            open_positions: None,
-            day_pnl: None,
-            note: "No venue credential in the environment — account figures are unavailable. Market data below is public venue data and needs no credential."
-                .to_string(),
-        },
+    let note = match (key_id, key_path) {
+        (Some(_), Some(p)) if Path::new(&p).exists() => {
+            "A credential is present in the environment, but signed venue reads are not enabled in this build — figures are shown as unavailable rather than guessed."
+        }
+        (Some(_), Some(_)) => {
+            "A venue credential ID is present in the environment, but its private key file is not — signed venue reads are not enabled in this build, and figures are shown as unavailable rather than guessed."
+        }
+        (Some(_), None) => {
+            "A venue credential ID is present in the environment, but no private key path is set — signed venue reads are not enabled in this build, and figures are shown as unavailable rather than guessed."
+        }
+        (None, Some(_)) => {
+            "A venue private key path is set in the environment, but no credential ID — signed venue reads are not enabled in this build, and figures are shown as unavailable rather than guessed."
+        }
+        (None, None) => {
+            "No venue credential in the environment — account figures are unavailable. Market data below is public venue data and needs no credential."
+        }
+    };
+    AccountState {
+        status: "unavailable".to_string(),
+        balance: None,
+        open_positions: None,
+        day_pnl: None,
+        note: note.to_string(),
     }
 }
 
@@ -1072,8 +1148,19 @@ fn handle(app: &App, method: &str, path: &str) -> String {
             json_response(200, &serde_json::to_string(&latest_markets(&app.data_dir)).unwrap())
         }
         ("POST", "/api/collect") => match collect_once(&app.data_dir) {
-            Ok((n, _errors)) => {
-                json_response(200, &format!("{{\"snapshots_written\":{n}}}"))
+            Ok((n, errors)) => {
+                if errors.is_empty() {
+                    json_response(200, &format!("{{\"snapshots_written\":{n}}}"))
+                } else {
+                    json_response(
+                        200,
+                        &serde_json::json!({
+                            "snapshots_written": n,
+                            "errors": errors
+                        })
+                        .to_string(),
+                    )
+                }
             }
             Err(e) => json_response(
                 502,
@@ -1098,6 +1185,13 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                 sim.trades.iter().skip(total.saturating_sub(5000)).collect();
             body["trades"] = serde_json::to_value(&shown).unwrap();
             body["trades_truncated"] = serde_json::json!(total > 5000);
+            body["library_errors"] = serde_json::json!(
+                load_strategies_with_errors(&app.strategies_dir)
+                    .1
+                    .iter()
+                    .map(|(file, error)| serde_json::json!({ "file": file, "error": error }))
+                    .collect::<Vec<_>>()
+            );
             json_response(200, &body.to_string())
         }
         ("GET", "/api/equity") => {
@@ -1121,6 +1215,11 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                 "paper_pot_start": sim.paper_pot_start,
                 "pot": pot,
                 "series": series,
+                "library_errors": load_strategies_with_errors(&app.strategies_dir)
+                    .1
+                    .iter()
+                    .map(|(file, error)| serde_json::json!({ "file": file, "error": error }))
+                    .collect::<Vec<_>>(),
             });
             json_response(200, &body.to_string())
         }
