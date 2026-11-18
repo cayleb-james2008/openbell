@@ -1,8 +1,8 @@
 #!/bin/bash
-# C3/C4 (API level): the slot system runs over a fixture tape where YES
-# loses every window — the favourite's slot takes three consecutive
-# strikes, retires the strategy, and rotates; slot equities sum to the
-# paper pot's equity.
+# C3/C4 (API level): the slot system runs over a fixture tape whose
+# first three windows settle NO — the favourite's slot takes three
+# consecutive strikes, retires the strategy, and rotates; slot equities
+# sum to the paper pot's equity.
 set -u
 cd "$(dirname "$0")/../.."
 PORT=8488
