@@ -228,20 +228,49 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
             )
         });
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| e.to_string())?;
-    use std::io::Write;
-    file.write_all(buf.as_bytes()).map_err(|e| e.to_string())?;
+    append_tape(&path, &buf).map_err(|e| e.to_string())?;
     Ok((written, errors))
 }
 
-fn parse_tape_text(text: &str) -> Vec<Snapshot> {
-    text.lines()
+/// Append one pass in a single write. A tape that ends in a torn line
+/// (no final newline, left by a crash mid-append) gets a newline first,
+/// so the torn fragment stays its own line and the pass is not spliced
+/// onto it.
+fn append_tape(path: &Path, body: &str) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut torn = false;
+    if let Ok(mut f) = std::fs::File::open(path) {
+        if f.metadata()?.len() > 0 {
+            f.seek(SeekFrom::End(-1))?;
+            let mut last = [0u8; 1];
+            f.read_exact(&mut last)?;
+            torn = last[0] != b'\n';
+        }
+    }
+    let mut out = String::new();
+    if torn {
+        out.push('\n');
+    }
+    out.push_str(body);
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(out.as_bytes())
+}
+
+/// Parse a tape as bytes, one record per line. A line that is not
+/// valid UTF-8 or not a snapshot is dropped and counted in the line
+/// total, exactly like any malformed line; it never hides its
+/// neighbours. Returns (snapshots, lines in the file).
+fn parse_tape_bytes(bytes: &[u8]) -> (Vec<Snapshot>, usize) {
+    let mut lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
+    if lines.last().map_or(false, |l| l.is_empty()) {
+        lines.pop();
+    }
+    let snaps = lines
+        .iter()
+        .filter_map(|l| std::str::from_utf8(l).ok())
         .filter_map(|l| serde_json::from_str::<Snapshot>(l).ok())
-        .collect()
+        .collect();
+    (snaps, lines.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -1615,6 +1644,10 @@ struct TapeEntry {
     /// the seam an append must continue.
     seam_offset: u64,
     seam_line: String,
+    /// Whether the parsed bytes end at a line boundary. A torn last
+    /// line cannot be extended: the next pass's first byte would
+    /// finish it, and the line count would be off by one.
+    ends_newline: bool,
 }
 
 /// The seam an append must continue, plus the health aggregates:
@@ -1759,10 +1792,10 @@ impl App {
             // Seam check failed: the file was replaced, not appended
             // to. Fall through to a full parse of the current bytes.
         }
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        let total_lines = text.lines().count();
-        let snaps: Vec<Snapshot> = parse_tape_text(&text);
-        let (seam_offset, seam_line) = seam_of(&text, 0);
+        let bytes = std::fs::read(path).unwrap_or_default();
+        let (snaps, total_lines) = parse_tape_bytes(&bytes);
+        let (seam_offset, seam_line) = seam_of(&String::from_utf8_lossy(&bytes), 0);
+        let ends_newline = bytes.last().map_or(true, |b| *b == b'\n');
         let mut markets = std::collections::HashSet::new();
         let mut results_by_ticker = std::collections::HashMap::new();
         fold_health(&snaps, &mut markets, &mut results_by_ticker);
@@ -1778,6 +1811,7 @@ impl App {
             results_by_ticker,
             seam_offset,
             seam_line,
+            ends_newline,
         };
         let out = view(&entry);
         *self.tape_cache.lock().unwrap() = Some(entry);
@@ -1846,6 +1880,9 @@ impl App {
 /// old file length), so its line count and seam are exact.
 fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<TapeEntry> {
     use std::io::{Read, Seek, SeekFrom};
+    if !e.ends_newline {
+        return None;
+    }
     let mut f = std::fs::File::open(path).ok()?;
     let mut seam_buf = Vec::new();
     f.seek(SeekFrom::Start(e.seam_offset)).ok()?;
@@ -1868,12 +1905,11 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
         .take(len - e.len)
         .read_to_end(&mut tail_buf)
         .ok()?;
-    let tail = String::from_utf8(tail_buf).ok()?;
-    e.total_lines += tail.lines().count();
+    let (new_snaps, tail_lines) = parse_tape_bytes(&tail_buf);
+    e.total_lines += tail_lines;
     // The held parse is shared with readers; extending it mutates
     // in place when this entry is the only holder (the common
     // case), and every fold touches only the new snapshots.
-    let new_snaps: Vec<Snapshot> = parse_tape_text(&tail);
     fold_health(&new_snaps, &mut e.markets, &mut e.results_by_ticker);
     {
         let grouped = Arc::make_mut(&mut e.grouped);
@@ -1892,10 +1928,11 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
         }
     }
     Arc::make_mut(&mut e.snaps).extend(new_snaps);
-    if !tail.is_empty() {
-        let (off, line) = seam_of(&tail, e.len);
+    if !tail_buf.is_empty() {
+        let (off, line) = seam_of(&String::from_utf8_lossy(&tail_buf), e.len);
         e.seam_offset = off;
         e.seam_line = line;
+        e.ends_newline = tail_buf.last() == Some(&b'\n');
     }
     e.len = len;
     e.mtime = mtime;
@@ -2836,6 +2873,81 @@ mod tests {
         let view = app.tape(&tape);
         assert_eq!((view.snaps.len(), view.total_lines), (1, 1));
         assert_eq!(view.snaps[0].ticker, "Q");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn one_non_utf8_line_does_not_hide_the_tape() {
+        let dir = std::env::temp_dir().join(format!("ob-utf8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tape = dir.join("snapshots.jsonl");
+        let line = |t: &str, at: i64| {
+            serde_json::to_string(&snap(t, at, "2030-01-01T01:00:00Z", "", Some(0.5), Some(0.5)))
+                .unwrap()
+        };
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: dir.clone(),
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        // A valid snapshot whose ticker holds a byte that is not UTF-8.
+        let mut bad = line("Z", 105).into_bytes();
+        let z = bad.iter().position(|c| *c == b'Z').unwrap();
+        bad[z] = 0xff;
+        let mut bytes = format!("{}\n", line("A", 100)).into_bytes();
+        bytes.extend_from_slice(&bad);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(format!("{}\n", line("B", 110)).as_bytes());
+        std::fs::write(&tape, &bytes).unwrap();
+        let view = app.tape(&tape);
+        assert_eq!(
+            (view.snaps.len(), view.total_lines),
+            (2, 3),
+            "the invalid line is dropped and counted; its neighbours still parse"
+        );
+        // The same holds for a line that arrives by append.
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&tape).unwrap();
+        f.write_all(&bad).unwrap();
+        f.write_all(b"\n").unwrap();
+        writeln!(f, "{}", line("C", 120)).unwrap();
+        drop(f);
+        let view = app.tape(&tape);
+        assert_eq!((view.snaps.len(), view.total_lines), (3, 5));
+        assert_eq!(view.snaps[2].ticker, "C");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pass_after_a_torn_tape_line_is_not_spliced_onto_it() {
+        let dir = std::env::temp_dir().join(format!("ob-torn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tape = dir.join("snapshots.jsonl");
+        let line = |t: &str, at: i64| {
+            serde_json::to_string(&snap(t, at, "2030-01-01T01:00:00Z", "", Some(0.5), Some(0.5)))
+                .unwrap()
+        };
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: dir.clone(),
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        // A crash left a torn last line with no newline.
+        std::fs::write(&tape, format!("{}\n{{\"ticker\":\"TO", line("A", 100))).unwrap();
+        let view = app.tape(&tape);
+        assert_eq!((view.snaps.len(), view.total_lines), (1, 2));
+        // The next pass lands after the torn line.
+        append_tape(&tape, &format!("{}\n{}\n", line("B", 110), line("C", 120))).unwrap();
+        let view = app.tape(&tape);
+        let tickers: Vec<&str> = view.snaps.iter().map(|s| s.ticker.as_str()).collect();
+        assert_eq!(tickers, ["A", "B", "C"], "the pass must not be lost inside the torn line");
+        assert_eq!(view.total_lines, 4, "the torn fragment is its own counted line");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
