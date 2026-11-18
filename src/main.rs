@@ -2020,6 +2020,16 @@ fn dataset_path(app: &App, query: &str) -> PathBuf {
     app.data_dir.join("snapshots.jsonl")
 }
 
+/// The verdict as the named dataset may state it. The fixture is the
+/// labelled example tape written for tests, never forward evidence.
+fn dataset_verdict(verdict: &str, dataset: &str) -> String {
+    if dataset == "fixture" && verdict.starts_with("PROVEN on forward evidence") {
+        return "PROVEN on the example tape (not forward evidence, paper only - no orders placed)"
+            .to_string();
+    }
+    verdict.to_string()
+}
+
 fn json_response(status: u16, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2239,7 +2249,11 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                         .to_string(),
                 );
             }
-            let (_, reports) = app.analysis(&dpath);
+            let (_, mut reports) = app.analysis(&dpath);
+            let dataset = dataset_name(query);
+            for report in &mut reports {
+                report.verdict = dataset_verdict(&report.verdict, &dataset);
+            }
             json_response(200, &serde_json::to_string(&reports).unwrap())
         }
         ("GET", "/api/slots") => {
@@ -3084,6 +3098,16 @@ mod tests {
             None
         );
         assert_eq!(refuse_request("GET", &headers("127.0.0.1:9820", &json_foreign), 0, &[]), None);
+    }
+
+    #[test]
+    fn example_tape_verdict_never_claims_forward_evidence() {
+        let live = "PROVEN on forward evidence (paper only — no orders placed)";
+        assert_eq!(dataset_verdict(live, "live"), live);
+        assert_eq!(
+            dataset_verdict(live, "fixture"),
+            "PROVEN on the example tape (not forward evidence, paper only - no orders placed)"
+        );
     }
 
     #[test]
