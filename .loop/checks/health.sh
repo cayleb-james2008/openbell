@@ -14,6 +14,10 @@ export PATH="$HOME/.rust/bin:$PATH"
 cargo build >/dev/null 2>&1 || { echo "FAIL: cargo build"; exit 1; }
 mkdir -p "$WORK/data"
 python3 gen_fixture.py "$WORK/data/snapshots.jsonl" >/dev/null
+# Phase 1 must see the fixture tape exactly as written: make the file
+# read-only so the server's own startup collection pass cannot append
+# a fresh snapshot and change the answer mid-check.
+chmod 444 "$WORK/data/snapshots.jsonl"
 
 OPENBELL_DATA="$WORK/data" OPENBELL_STRATEGIES="$PWD/strategies" \
 OPENBELL_COLLECT_SECS=3600 PORT=$PORT \
@@ -37,6 +41,7 @@ echo "$home" | jq -e '.collector.collecting == false and .collector.newest_snaps
   || { echo "FAIL: stale fixture tape does not read as not-collecting: $(echo "$home" | jq -c .collector)"; exit 1; }
 
 # A real collection pass (public venue data) freshens the same surface.
+chmod 644 "$WORK/data/snapshots.jsonl"
 curl -s -X POST "http://127.0.0.1:$PORT/api/collect" >/dev/null
 home2=$(curl -s "http://127.0.0.1:$PORT/api/home")
 echo "$home2" | jq -e --argjson s "$exp_snaps" '
