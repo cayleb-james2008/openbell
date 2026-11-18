@@ -1,0 +1,41 @@
+#!/bin/bash
+# Ultra-loop verify kit for openbell-rs. Usage: bash .loop/verify <label>
+# Runs every hermetic check, cheapest first, each under a timeout.
+# Raw output lands in .loop/runs/<label>/; prints one summary line;
+# exits non-zero when any check fails.
+# Note: proof.sh collects REAL public Kalshi market data (read-only GET,
+# no auth) into a temp dir — that is the project's own proof, by design.
+set -u
+export PATH="$HOME/.rust/bin:$PATH"
+LABEL="${1:-run}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT="$ROOT/.loop/runs/$LABEL"
+mkdir -p "$OUT"
+cd "$ROOT"
+
+pass=0; fail=0; failed_names=""
+
+run_check() {
+  local name="$1" tmo="$2"; shift 2
+  echo "== $name ==" >> "$OUT/all.log"
+  timeout "$tmo" "$@" >> "$OUT/$name.log" 2>&1
+  local code=$?
+  cat "$OUT/$name.log" >> "$OUT/all.log"
+  if [ $code -eq 0 ]; then
+    pass=$((pass+1))
+  else
+    fail=$((fail+1)); failed_names="$failed_names $name(exit=$code)"
+  fi
+}
+
+: > "$OUT/all.log"
+run_check build 600 cargo build
+run_check test 600 cargo test
+for f in .loop/checks/*.sh; do
+  [ -e "$f" ] || continue
+  run_check "$(basename "$f" .sh)" 300 bash "$f"
+done
+run_check proof 300 bash proof.sh
+
+echo "verify[$LABEL]: pass=$pass fail=$fail${failed_names:+ FAILED:$failed_names}"
+[ $fail -eq 0 ]
