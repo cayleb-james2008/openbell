@@ -28,7 +28,6 @@ export function Textarea({
         ) || undefined
       }
       data-size={size}
-      data-slot="textarea-control"
     >
       <FieldPrimitive.Control
         ref={ref}
@@ -46,7 +45,6 @@ export function Textarea({
               size === "lg" &&
                 "min-h-18.5 py-[calc(--spacing(2)-1px)] max-sm:min-h-21.5",
             )}
-            data-slot="textarea"
             {...mergeProps(defaultProps, props)}
           />
         )}

@@ -21,16 +21,16 @@ function SearchField({ label, value, onChange }: { label: string; value: string;
 }
 
 // A verdict is a sentence the server wrote: it wraps to as many lines as it needs, at every width, and is never clipped.
-const WRAP = "h-auto max-w-full whitespace-normal py-1 text-left leading-snug";
+const WRAP = "!h-auto !rounded-chip max-w-full whitespace-normal py-1 text-left leading-snug";
 function VerdictPill({ verdict, fixture }: { verdict: string; fixture: boolean }) {
   if (fixture && verdict.startsWith("PROVEN")) {
     return <Pill variant="outline" className={WRAP + " text-warning-foreground"}>meets the bar on the example tape (not forward evidence)</Pill>;
   }
   if (verdict.startsWith("PROVEN")) {
-    return <Pill variant="outline" className={WRAP + " text-success-foreground"}><PillStatus><PillIndicator variant="success" />{verdict}</PillStatus></Pill>;
+    return <Pill variant="outline" className={WRAP + " text-success-foreground"}><PillStatus className="border-r-0 pr-0"><PillIndicator variant="success" />{verdict}</PillStatus></Pill>;
   }
   if (verdict.startsWith("NOT PROVEN")) {
-    return <Pill variant="outline" className={WRAP + " text-unread"}><PillStatus><PillIndicator variant="error" />{verdict}</PillStatus></Pill>;
+    return <Pill variant="outline" className={WRAP + " text-unread"}><PillStatus className="border-r-0 pr-0"><PillIndicator variant="error" />{verdict}</PillStatus></Pill>;
   }
   return <Pill variant="outline" className={WRAP + " text-ink-2"}>{verdict}</Pill>;
 }
@@ -69,16 +69,16 @@ export function Strategies({ read, libraryErrors, dataset, onRetry }: { read: Fo
                 const label = s.windows_traded >= need ? s.windows_traded + " windows (" + need + " needed)" : s.windows_traded + " of " + need;
                 return (
                   <TableRow key={s.strategy}>
-                    <TableCell data-label="Strategy" className="stack-first max-w-56 font-mono"><span className="block break-all md:truncate" title={s.strategy}>{s.strategy}</span></TableCell>
-                    <TableCell data-label="Side" className="font-mono">{s.side}</TableCell>
-                    <TableCell data-label="Windows traded" className="min-w-0">
+                    <TableCell data-label="Strategy" className="stack-first c-name max-w-56 font-mono"><span className="block break-words md:truncate" title={s.strategy}>{s.strategy}</span></TableCell>
+                    <TableCell data-label="Side" className="c-side font-mono">{s.side}</TableCell>
+                    <TableCell data-label="Windows traded" className="stack-break c-windows min-w-0">
                       <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 md:justify-start">
                         <Tracker data={Array.from({ length: 10 }, (_, i) => ({ key: i, color: (i + 1) * need / 10 <= done ? "bg-info-foreground" : "bg-track", tooltip: "Windows " + (i * need / 10 + 1) + " to " + ((i + 1) * need / 10) }))} className="h-2 w-28" />
                         <span className="font-mono text-sm text-ink-2">{label}</span>
                       </div>
                     </TableCell>
-                    <TableCell data-label="Mean cents" className="text-right font-mono tabular-nums">{s.mean_cents_per_contract === null ? "-" : s.mean_cents_per_contract.toFixed(2)}</TableCell>
-                    <TableCell data-label="Verdict" className="min-w-0 max-w-md"><VerdictPill verdict={s.verdict} fixture={dataset === "fixture"} /></TableCell>
+                    <TableCell data-label="Mean cents" className="c-mean text-right font-mono tabular-nums">{s.mean_cents_per_contract === null ? "-" : s.mean_cents_per_contract.toFixed(2)}</TableCell>
+                    <TableCell data-label="Verdict" className="stack-break c-verdict min-w-0 max-w-md"><VerdictPill verdict={s.verdict} fixture={dataset === "fixture"} /></TableCell>
                   </TableRow>
                 );
               })}

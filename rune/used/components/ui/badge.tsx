@@ -53,7 +53,6 @@ export function Badge({
 }: BadgeProps): React.ReactElement {
   const defaultProps = {
     className: cn(badgeVariants({ className, size, variant })),
-    "data-slot": "badge",
   };
 
   return useRender({
