@@ -71,5 +71,16 @@ fi
 [ "$(grep -c 'use std::process::Command;' src/main.rs)" = "1" ] || { echo "FAIL: the Command import line is not the plain one"; fail=1; }
 ntok=$(grep -o 'Command' src/main.rs | wc -l)
 [ "$ntok" = "2" ] || { echo "FAIL: src/main.rs has $ntok Command tokens, expected exactly 2 (import + collector call)"; fail=1; }
+# The browser opener (src/open.rs, zero-hassle first run) is the third
+# process site: exactly one Command::new (the platform opener, started in
+# the background), no URL of its own (main.rs builds the loopback address it
+# is given), and no socket. Process spawns are pinned to these three files
+# and nothing else under src/, so a new spawn site anywhere fails the fence.
+[ "$(grep -c 'Command::new' src/open.rs)" = "1" ] || { echo "FAIL: src/open.rs must have exactly 1 Command::new (the platform opener)"; fail=1; }
+[ "$(grep -o 'Command' src/open.rs | wc -l)" = "2" ] || { echo "FAIL: src/open.rs has extra Command tokens (expected the import and the one call)"; fail=1; }
+if grep -n 'https\?://' src/open.rs >/dev/null; then echo "FAIL: src/open.rs names a URL; the opener may only open the loopback address it is given"; fail=1; fi
+spawners=$(grep -rl 'Command::new' src | sort | tr '\n' ' ')
+[ "$spawners" = "src/main.rs src/open.rs src/update.rs " ] || { echo "FAIL: process spawns outside the three pinned files: [$spawners]"; fail=1; }
+if grep -rn 'TcpStream::connect\|UdpSocket' src >/dev/null; then echo "FAIL: outbound socket code present under src/"; fail=1; fi
 [ $fail -eq 0 ] && echo "FENCE OK: no order-placement surface in source or binary; venue traffic is the collector's public GET only"
 exit $fail
