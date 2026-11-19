@@ -113,3 +113,47 @@ Pinned-hook status: `.loop/checks/equity.sh` `http` rule updated in its own comm
 - Measured (fixture and live, 320/390/768/1440, light and dark): 0 small-text contrast failures under 4.5:1, 0 controls under 44 px, 0 focusable controls without a visible ring, 0 sideways overflow.
 - Hallmark lint: 2 FAIL and 9 WARN remain. FAIL: the ring-offset literal in Tailwind's own base rule; the `.transition` candidate, which the five motion parts create with their `transition=` prop names. WARN: dark-variant background classes of the card table variant, which the app never renders.
 - Open defect: the verdict pills in the strategies table show a line through their text in the render. Not yet traced.
+
+## Final sections (fe final, 2026-11-19)
+
+### Colour scheme (owner palette, `_fe/palette-claude.css`)
+- Light is the default (ivory), dark the full second theme (warm near-black). Fonts, radii and the shadow recipe stay Console.
+- Clay (`--blue`, #d97757) is the one primary key, the current selection and the live state. Blue is the instrument colour: `--dot-blue` #6a9bcc for dots and instrument trace lines; text uses a darker blue (`--info-foreground` #2f5f94 light, #9dc0e4 dark) because #6a9bcc is about 3:1 on ivory and fails text.
+- Sage and red are state only (gain/loss, retired, not proven). The equity trace: pot in ink, instrument lines in blue and greys.
+- Focus ring: `--focus` (#b35634 light, #e08a6d dark). Clay alone is 2.8:1 on ivory, under the 3:1 ring rule, so the ring is the darker token; `--ring` maps to it.
+- `theme.css` is edited by hand. `_fe/gen-theme.py` OPENBELL is stale (it lacks `--input` and `--focus`); do not regenerate without porting those.
+- The kit pin `theme.sh` now asserts light as the default (own commit).
+
+### Library rows (Library | need of this product | part used | file)
+| Library | Need of this product | Part used | File |
+|---|---|---|---|
+| Motion Primitives | section tabs glide to the chosen section; a running collect shows it runs; the tape state word morphs | AnimatedBackground, BorderTrail, TextMorph | components/ui/animated-background.tsx, border-trail.tsx, text-morph.tsx |
+| COSS UI | search in a list; Live/Fixture and theme choice; the list of rows; the pressable Collect now and Retry | InputGroup, Button, Table, SegmentedControl, Tooltip | components/ui/input-group.tsx, button.tsx, table.tsx, segmented-control.tsx, tooltip.tsx |
+| Cult UI | the report's rest, the trail's groups and the update notes open in place | Expandable, ExpandableTrigger, ExpandableContent | components/ui/expandable.tsx |
+| Kibo UI | venue / tape / paper tags and the slot and verdict states | Pill, PillStatus, PillIndicator | components/kibo-ui/pill/index.tsx |
+| Tremor | the stage target is one percentage; strikes and windows are rows of states | ProgressCircle, Tracker | components/ProgressCircle/ProgressCircle.tsx, components/Tracker/Tracker.tsx |
+| Vaul | no need here: the section tabs are one scroll row at 390 px, and a sheet would add a tap to reach the same tabs | none | none |
+| Sonner | a collect result, or an update result, where the person is not looking | Toaster, toast.success, toast.error | package `sonner` (App.tsx, Panels.tsx, Update.tsx) |
+| Motion | the equity lines are drawn once; the rest comes from the presets | motion/react `motion.path` pathLength, once (`drawOnce`) | package `motion`, src/motionProps.ts |
+
+SlidingNumber (Motion Primitives) is in rune/used but no longer imported: its rolling digit strips rendered overlapping glyphs in the built page, so the pot and tape counts are plain mono readings.
+
+### Local edits to parts
+`rune/used/LOCAL-EDITS.md` is unchanged this round: no part was edited. The focus ring, the phone table and the palette are in tokens.css, theme.css and index.css, not in copied parts.
+
+### Measured (fixture and live, 2026-11-19, built page)
+- Phone page height (390 px, light): live 4,695 px; fixture 4,827 px. Round start was 4,855 px (fixture). Target ~3,500 px is NOT reached. Live breakdown: sticky header 169, purpose 92, lead 492, chart 448, trail 678, tape and account 759, slots 768, strategies 907, markets 114, footer 204.
+- Sideways overflow: scrollWidth equals the viewport at 320, 390, 768 and 1440, both themes, with no element outside its own scroller (the section-tab row is the only one).
+- Tap targets: 0 controls under 44 px (buttons, links, tabs, switches, inputs) at 320 to 1440, both themes.
+- Contrast, both themes, 390 and 1440, fixture: 211 to 218 text nodes, lowest 4.72:1 (text rule 4.5). Input edges (search fields) 3:1 or better on the wrapper.
+- Hallmark render lint (`sloplint.mjs --scope app --render`): 0 FAIL, 0 REFLEX, 0 WARN.
+- `cargo test`: 52 unit and 1 integration test passed.
+
+### Pinned hooks (unchanged, plus the default)
+Kept as before (see "Pinned hooks" above). `theme.sh` now reads `getItem('openbell-theme')||'light'`, asserted in its own commit.
+
+### Parity
+The parity inventory above stands. This round changed no behaviour and no wording: the rolling digits became plain text, the phone trail shows full labels, and the Collected markets preview on phone shows 4 rows instead of 8 (the same "Showing the first N of M" note).
+
+### What was not checked
+- Vaul (not used). A screen-reader pass on the rebuilt phone rows. The live dataset at 320 px beyond the overflow and target measures. Phone pictures were reviewed as 390 px halves, not 1:1 crops of every block. The kit's proof.sh queries the live Kalshi public API.
