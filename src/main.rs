@@ -3243,5 +3243,25 @@ mod tests {
         SERIES_FAILED_NAMES.lock().unwrap().clear();
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn allowed_hosts_are_accepted_only_when_listed() {
+        let host = |h: &str| vec![("host".to_string(), h.to_string())];
+        let allowed = vec!["openbell.lan".to_string()];
+        // A listed name is accepted with or without a port.
+        assert_eq!(refuse_request("GET", &host("openbell.lan"), 0, &allowed), None);
+        assert_eq!(refuse_request("GET", &host("openbell.lan:9820"), 0, &allowed), None);
+        assert_eq!(refuse_request("GET", &host("OpenBell.LAN:9820"), 0, &allowed), None);
+        // Loopback names are always accepted, even with nothing listed.
+        for h in ["localhost:9820", "127.0.0.1:9820", "[::1]:9820", "[::1]"] {
+            assert_eq!(refuse_request("GET", &host(h), 0, &[]), None, "{h}");
+        }
+        // Any other Host is refused, listed or not, and a name that merely
+        // contains a listed one is not a match.
+        assert_eq!(refuse_request("GET", &host("evil.example:9820"), 0, &allowed).map(|r| r.0), Some(403));
+        assert_eq!(refuse_request("GET", &host("openbell.lan.evil.example"), 0, &allowed).map(|r| r.0), Some(403));
+        assert_eq!(refuse_request("GET", &host("evil.example"), 0, &[]).map(|r| r.0), Some(403));
+        assert_eq!(refuse_request("GET", &[], 0, &allowed).map(|r| r.0), Some(403), "no Host header");
+    }
 }
 
