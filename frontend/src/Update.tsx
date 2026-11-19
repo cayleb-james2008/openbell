@@ -253,11 +253,11 @@ export function VersionRow({ u }: { u: U }) {
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-ink-2">
       {version.release_url
-        ? <a href={version.release_url} target="_blank" rel="noopener" className="rounded-md text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-blue">OpenBell {version.version}</a>
+        ? <a href={version.release_url} target="_blank" rel="noopener" className="inline-flex min-h-11 items-center rounded-md text-ink underline-offset-4 hover:underline">OpenBell {version.version}</a>
         : <span className="text-ink">OpenBell {version.version}</span>}
-      {u.hiddenByDismiss && <Button ref={u.refs.showRef} variant="outline" size="sm" onClick={u.showAgain}>Show update</Button>}
+      {u.hiddenByDismiss && <Button ref={u.refs.showRef} variant="outline" className="min-h-11" onClick={u.showAgain}>Show update</Button>}
       {snap && LOCAL && snap.mode !== "off" && (
-        <Button variant="outline" size="sm" disabled={busy} onClick={u.check}>{u.busy === "check" ? "Checking..." : "Check for updates"}</Button>
+        <Button variant="outline" className="min-h-11" disabled={busy} onClick={u.check}>{u.busy === "check" ? "Checking..." : "Check for updates"}</Button>
       )}
       {snap && !LOCAL && <span>To update, open OpenBell on the computer it runs on.</span>}
       {line && <p role="status" className="min-w-0 break-words">{line}</p>}

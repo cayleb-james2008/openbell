@@ -9,7 +9,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
-import { glide } from "@/motion";
+import { sectionGlide } from "@/motionProps";
 import { type Dataset, type Read, type Home, useDesk } from "@/lib/desk";
 import { Lead } from "@/Lead";
 import { AccountPanel, SlotsPanel, TapeHealth } from "@/Panels";
@@ -71,7 +71,7 @@ function HowToRead() {
     <dl className="grid gap-3 text-sm">
       <div><dt className="font-medium text-ink"><Pill variant="outline" className="text-info-foreground">venue</Pill></dt><dd className="mt-1 text-ink-2">What Kalshi reports, read from the venue.</dd></div>
       <div><dt className="font-medium text-ink"><Pill variant="outline" className="text-ink-2">tape</Pill></dt><dd className="mt-1 text-ink-2">Counted from the snapshots the collector wrote.</dd></div>
-      <div><dt className="font-medium text-ink"><Pill variant="outline" className="text-blue">paper</Pill></dt><dd className="mt-1 text-ink-2">The pretend-money simulation. Paper only, not venue money.</dd></div>
+      <div><dt className="font-medium text-ink"><Pill variant="outline" className="text-warning-foreground">paper</Pill></dt><dd className="mt-1 text-ink-2">The pretend-money simulation. Paper only, not venue money.</dd></div>
       <dd className="text-ink-2">Anything not obtained reads unavailable, with the reason.</dd>
     </dl>
   );
@@ -81,7 +81,7 @@ function HowToRead() {
   if (wide) {
     return (
       <Popover>
-        <PopoverTrigger aria-label="How to read this" className="inline-flex size-11 cursor-pointer items-center justify-center rounded-md text-ink-2 outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:text-ink focus-visible:ring-2 focus-visible:ring-blue">{trigger}</PopoverTrigger>
+        <PopoverTrigger aria-label="How to read this" className="inline-flex size-11 cursor-pointer items-center justify-center rounded-md text-ink-2 outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) hover:text-ink focus-visible:ring-2 focus-visible:ring-blue">{trigger}</PopoverTrigger>
         <PopoverContent className="w-96 rounded-[10px] border border-hairline bg-surface p-4 text-ink">
           <p className="mb-3 text-sm font-medium text-ink">How to read this</p>
           {body}
@@ -145,7 +145,7 @@ function Shell() {
   const allFailed = !!reads && Object.values(reads).every((r) => !r.ok);
   const failMsg = reads && !reads.home.ok ? reads.home.msg : "";
   const fixture = dataset === "fixture";
-  const segItem = "min-h-11 md:min-h-0";
+  const segItem = "!h-11 !min-w-11";
 
   return (
     <TooltipProvider>
@@ -156,13 +156,13 @@ function Shell() {
             <span className="mr-1">OpenBell</span>
             <HowToRead />
           </div>
-          <Pill variant="outline" className="text-ink-2"><PillStatus><PillIndicator variant="info" />Paper only</PillStatus>This build places no orders</Pill>
-          <Pill id="chip" variant="outline" className="max-w-full text-ink-2" title="Collector health">
+          <Pill variant="outline" className="!h-7 text-ink-2"><PillStatus><PillIndicator variant="info" />Paper only</PillStatus>This build places no orders</Pill>
+          <Pill id="chip" variant="outline" className="!h-7 max-w-full text-ink-2" title="Collector health">
             <span id="chip-dot" aria-hidden="true" className={"size-2 rounded-full " + cw.dot} />
             <span id="chip-text" className="min-w-0 break-words">{allFailed ? "Collector: unavailable" : cw.line}</span>
           </Pill>
           <div className="flex items-center gap-2">
-            <SegmentedControl aria-label="Which tape the paper figures use" size="sm">
+            <SegmentedControl aria-label="Which tape the paper figures use">
               {(["live", "fixture"] as const).map((d) => (
                 <SegmentedControlItem key={d} id={d === "live" ? "seg-live" : "seg-fixture"} className={segItem} aria-pressed={dataset === d} data-checked={dataset === d ? "" : undefined} onClick={() => pickDataset(d)}>
                   {d === "live" ? "Live tape" : "Fixture"}
@@ -170,7 +170,7 @@ function Shell() {
               ))}
             </SegmentedControl>
             <div id="settings">
-              <SegmentedControl aria-label="Appearance" size="sm" id="themeBtn">
+              <SegmentedControl aria-label="Appearance" id="themeBtn">
                 {(["dark", "light"] as const).map((t) => (
                   <SegmentedControlItem key={t} className={segItem} aria-label={t === "dark" ? "Dark appearance" : "Light appearance"} aria-pressed={theme === t} data-checked={theme === t ? "" : undefined} onClick={() => pickTheme(t)}>
                     {t === "dark" ? <Moon className="size-4" strokeWidth={1.5} aria-hidden /> : <Sun className="size-4" strokeWidth={1.5} aria-hidden />}
@@ -185,11 +185,11 @@ function Shell() {
             defaultValue={active}
             onValueChange={(id) => { const s = SECTIONS.find((x) => x.id === id); if (s) go(s); }}
             className="rounded-md bg-raised"
-            transition={glide}
+            {...sectionGlide}
           >
             {SECTIONS.map((s) => (
               <button key={s.id} type="button" data-id={s.id} aria-current={active === s.id ? "location" : undefined}
-                className="h-11 shrink-0 cursor-pointer rounded-md px-3 text-sm font-medium text-ink-2 outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:text-ink focus-visible:ring-2 focus-visible:ring-blue data-[checked=true]:text-ink">
+                className="h-11 shrink-0 cursor-pointer rounded-md px-3 text-sm font-medium text-ink-2 outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) hover:text-ink focus-visible:ring-2 focus-visible:ring-blue data-[checked=true]:text-ink">
                 {s.label}
               </button>
             ))}

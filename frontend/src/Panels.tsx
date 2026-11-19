@@ -117,7 +117,7 @@ export function AccountPanel({ read, onRetry }: { read: Read<Home> | null; onRet
   const home = read && read.ok ? read.v : null;
   const a = home?.account;
   const allNull = !!a && a.balance === null && a.day_pnl === null && a.open_positions === null;
-  const pnlClass = a && a.day_pnl !== null ? (a.day_pnl > 0 ? "text-dot-green" : a.day_pnl < 0 ? "text-unread" : "text-ink") : "text-ink";
+  const pnlClass = a && a.day_pnl !== null ? (a.day_pnl > 0 ? "text-success-foreground" : a.day_pnl < 0 ? "text-unread" : "text-ink") : "text-ink";
   return (
     <section id="account" aria-labelledby="account-title" className="min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
       <PanelHead id="account-title" title="Venue account" tag={<Pill variant="outline" className="text-info-foreground">venue</Pill>} />
@@ -158,7 +158,7 @@ export function SlotsPanel({ read, onRetry, notes }: { read: Read<Slots> | null;
   const rows = s ? [...s.slots.map((x) => ({ ...x, retired: false })), ...s.retired.map((x) => ({ ...x, retired: true }))] : [];
   return (
     <section id="slots-card" aria-labelledby="slots-title" className="min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
-      <PanelHead id="slots-title" title="Slots, paper only" tag={<Pill variant="outline" className="text-blue">paper</Pill>} />
+      <PanelHead id="slots-title" title="Slots, paper only" tag={<Pill variant="outline" className="text-warning-foreground">paper</Pill>} />
       {read && !read.ok && <div className="mt-3"><PanelError msg={read.msg} onRetry={onRetry} /></div>}
       {!s && !(read && !read.ok) && <span className="mt-4 block h-24 rounded-md bg-track" aria-hidden />}
       {s && rows.length === 0 && (
@@ -180,13 +180,13 @@ export function SlotsPanel({ read, onRetry, notes }: { read: Read<Slots> | null;
             <TableBody>
               {rows.map((r) => {
                 const stint = r.retired ? r.paper_pnl_dollars : r.stint_pnl_dollars ?? 0;
-                const cls = stint > 0 ? "text-dot-green" : stint < 0 ? "text-unread" : "text-ink";
+                const cls = stint > 0 ? "text-success-foreground" : stint < 0 ? "text-unread" : "text-ink";
                 return (
                   <TableRow key={(r.retired ? "r" : "s") + r.slot} className={r.retired ? "text-ink-2" : undefined}>
                     <TableCell data-label="Slot" className="stack-first font-mono">{r.slot + 1}</TableCell>
                     <TableCell data-label="Strategy" className="max-w-56 font-mono"><span className="block break-all md:truncate" title={r.strategy}>{r.strategy}</span></TableCell>
                     <TableCell data-label="Status">
-                      <Pill variant="outline" className={"h-auto " + (r.retired ? "text-ink-2" : "text-dot-green")}>
+                      <Pill variant="outline" className={"h-auto " + (r.retired ? "text-ink-2" : "text-success-foreground")}>
                         <PillStatus><PillIndicator variant={r.retired ? "warning" : "success"} />{r.retired ? "retired" : r.status ?? "active"}</PillStatus>
                       </Pill>
                     </TableCell>
