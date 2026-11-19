@@ -50,7 +50,9 @@ page=$(curl -s "http://127.0.0.1:$PORT/")
 echo "$page" | grep -q '/api/equity' || { echo "FAIL: the page never fetches /api/equity"; exit 1; }
 echo "$page" | grep -q '<svg' || { echo "FAIL: the page builds no SVG chart"; exit 1; }
 echo "$page" | grep -qi 'paper' || { echo "FAIL: the chart is not labelled paper"; exit 1; }
-if echo "$page" | grep -q 'cdn\|http://\|https://' ; then echo "FAIL: the page pulls an external resource"; exit 1; fi
+# Only a loaded resource counts (src/href/url()/@import to http(s)). The React bundle carries the
+# harmless SVG namespace string http://www.w3.org/2000/svg, so a bare http:// match is not a fetch.
+if echo "$page" | grep -qiE '(src|href)=["'"'"']?https?://|url\(["'"'"']?https?://|@import|cdn\.' ; then echo "FAIL: the page pulls an external resource"; exit 1; fi
 
 # Interior points: recompute favourite-late's whole curve from the
 # trade ledger the slots endpoint exposes, and compare every point.
