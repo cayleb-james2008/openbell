@@ -301,6 +301,16 @@
     button { min-height: 44px; }
   }
   [hidden] { display: none !important; }
+  .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  .how { max-width: 70ch; margin: 8px 16px 0; color: var(--ink-2); font-size: 14px; line-height: 20px; }
+  .how strong { color: var(--ink); font-weight: 500; }
+  .how .tag { vertical-align: 1px; }
+  .jump-label { color: var(--ink-3); font-size: 12px; align-self: center; }
+  .jump a { font-size: 12px; color: var(--ink-3); padding: 0 8px; min-height: 44px; }
+  .clip { display: block; min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td .clip { max-width: 24ch; }
+  .why, .note-list li { overflow-wrap: anywhere; }
+  #live-title:focus { outline: 2px solid var(--ink-2); outline-offset: 2px; }
   .purpose { max-width: 1280px; margin: 0 auto; padding: 12px 16px 0; }
   .purpose p { margin: 0; color: var(--ink-2); font-size: 14px; line-height: 20px; max-width: 70ch; }
   .seg-caption { margin: 0; color: var(--ink-2); font-size: 13px; line-height: 20px; max-width: 46ch; }
@@ -343,7 +353,7 @@
       <span id="chip-text">Collector: checking</span>
     </span>
     <div class="top-actions" id="settings">
-      <button id="themeBtn" type="button" class="btn-quiet" aria-label="Switch appearance">
+      <button id="themeBtn" type="button" class="btn-quiet">
         <svg class="ic" aria-hidden="true"><use id="themeUse" href="#i-moon"/></svg>
         <span id="themeLabel">Appearance: Dark</span>
       </button>
@@ -352,6 +362,7 @@
 </header>
 
 <div class="purpose"><p id="purpose">A paper-trading desk for Kalshi’s 15-minute crypto markets: it collects the venue’s public data, tests strategies on paper, and reports what happened. It never places orders.</p></div>
+<p class="how" id="how"><strong>How to read this:</strong> start with the Daily report, which sums up the day. Tags: <span class="tag tag-venue">venue</span> = what Kalshi reports; <span class="tag tag-tape">tape</span> = counted from the snapshots collected; <span class="tag tag-paper">paper</span> = the pretend-money simulation.</p>
 <div class="bar">
   <div class="seg" role="group" aria-label="Which tape the paper figures use">
     <button type="button" id="seg-live" aria-pressed="true">Live tape</button>
@@ -359,16 +370,18 @@
   </div>
   <p class="seg-caption" id="seg-caption">Live tape: what the collector recorded. Fixture: example data written for tests.</p>
   <nav class="jump" aria-label="Jump to a section">
-    <a href="#report-card">Report</a>
+    <span class="jump-label">Jump to:</span>
+    <a href="#report-card" data-live-link>Report</a>
     <a href="#pot">Paper pot</a>
     <a href="#tape">Tape health</a>
-    <a href="#account">Venue account</a>
+    <a href="#account" data-live-link>Venue account</a>
     <a href="#slots-card">Slots</a>
     <a href="#strategies">Strategies</a>
     <a href="#markets-card">Markets</a>
   </nav>
 </div>
 
+<p class="sr-only" id="announce" aria-live="polite"></p>
 <main id="top">
   <div class="banner" id="fixture-banner" role="note" hidden>
     <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 8v5M12 16.2v.3"/></svg>
@@ -382,7 +395,7 @@
 
   <div class="live-group" id="live-group">
     <div class="live-head" id="live-head" hidden>
-      <p class="live-title">Live desk, not the example tape</p>
+      <p class="live-title" id="live-title" tabindex="-1">Live desk, not the example tape</p>
       <button type="button" class="btn-quiet" id="live-toggle" aria-expanded="false" aria-controls="live-content">Show</button>
     </div>
     <div class="live-content" id="live-content">
@@ -438,10 +451,11 @@
     <p class="panel-error" data-err="slots" hidden></p>
     <div class="pot-top">
       <div>
-        <div class="pot-figure" id="pot-figure" aria-live="polite"><span class="sk" style="display:inline-block;width:160px;height:36px"></span></div>
+        <div class="pot-figure" id="pot-figure"><span class="sk" style="display:inline-block;width:160px;height:36px"></span></div>
         <div class="pot-change" id="pot-change">&nbsp;</div>
       </div>
     </div>
+    <p class="sr-only" id="pot-announce" aria-live="polite"></p>
     <div class="stage">
       <div class="track" role="progressbar" id="stage-track" aria-label="Stage one target progress, paper" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
         <div class="fill" id="stage-fill"></div>
@@ -519,7 +533,7 @@
     <div class="panel-body" id="markets-panel" hidden>
       <div class="panel-actions">
         <p class="note" style="margin:0" id="markets-note"></p>
-        <button type="button" class="btn-primary" onclick="collect()">Collect now</button>
+        <button type="button" class="btn-primary" id="collect-btn">Collect now</button>
       </div>
       <div class="table-wrap">
         <table>
@@ -640,6 +654,7 @@ function renderPot(slots, eq, home) {
   const pot = slots.paper_equity_dollars;
   const start = slots.paper_pot_start;
   $('pot-figure').textContent = money(pot);
+  $('pot-announce').textContent = 'Paper pot: ' + money(pot) + ' (paper, not venue money)';
   const change = pot - start;
   $('pot-change').textContent = (change >= 0 ? '+' : '-') + '$' + Math.abs(change).toFixed(2) + ' against the $' + start.toFixed(2) + ' start (paper)';
   $('pot-change').className = 'pot-change ' + (change > 0 ? 'pos' : change < 0 ? 'neg' : '');
@@ -718,7 +733,9 @@ function renderSlots(slotsData) {
     const card = el('article', 'slot' + (retired ? ' retired' : ''));
     const head = el('div', 'slot-head');
     head.append(el('span', null, 'Slot ' + (s.slot + 1)), el('span', 'pill ' + (retired ? 'pill-neutral' : 'pill-ok'), retired ? 'retired' : s.status));
-    card.append(head, el('div', 'slot-name', s.strategy));
+    const sn = el('div', 'slot-name clip', s.strategy);
+    sn.title = s.strategy;
+    card.append(head, sn);
     if (!retired) {
       const row = el('div', 'strikes');
       const pips = el('span', 'pips'); pips.setAttribute('aria-hidden', 'true');
@@ -769,6 +786,7 @@ function renderMarkets(markets) {
     cells.forEach((cell, ci) => {
       const td = el('td', ci === 0 || ci === 2 || ci === 3 || ci === 4 ? 'mono' : null, String(cell));
       if (ci === 4) td.className = 'mono col-last';
+      if (ci === 0) { td.textContent = ''; const sp = el('span', 'clip', String(cell)); sp.title = String(cell); td.append(sp); }
       tr.append(td);
     });
     tb.append(tr);
@@ -798,7 +816,11 @@ function renderStrategies(strats) {
   sb.replaceChildren();
   for (const s of strats) {
     const tr = document.createElement('tr');
-    tr.append(el('td', 'mono', s.strategy), el('td', 'mono', s.side));
+    const nameTd = el('td', 'mono');
+    const nm = el('span', 'clip', s.strategy);
+    nm.title = s.strategy;
+    nameTd.append(nm);
+    tr.append(nameTd, el('td', 'mono', s.side));
     tr.children[0].dataset.label = 'Strategy';
     tr.children[1].dataset.label = 'Side';
     const need = s.standard ? s.standard.min_windows : 100;
@@ -830,6 +852,15 @@ function renderStrategies(strats) {
   }
 }
 
+const SHAPES = {
+  home: (x) => !!x && typeof x.account === 'object' && !!x.account && !!x.collector && typeof x.collector === 'object'
+    && typeof x.collector.collecting === 'boolean' && typeof x.collector.snapshots_on_disk === 'number',
+  slots: (x) => !!x && typeof x.paper_equity_dollars === 'number' && Array.isArray(x.slots) && Array.isArray(x.retired),
+  equity: (x) => !!x && Array.isArray(x.pot) && Array.isArray(x.series),
+  markets: (x) => Array.isArray(x),
+  strategies: (x) => Array.isArray(x),
+  report: (x) => !!x && typeof x.report === 'string',
+};
 async function loadAll() {
   // Each read is independent: a failed read shows an error in its own panel and the rest stays current.
   const urls = { home: '/api/home', slots: '/api/slots' + dsQuery(), equity: '/api/equity' + dsQuery(),
@@ -837,7 +868,11 @@ async function loadAll() {
   const names = Object.keys(urls);
   const got = {};
   await Promise.all(names.map(async (k) => {
-    try { got[k] = { ok: true, v: await getJson(urls[k]) }; }
+    try {
+      const body = await getJson(urls[k]);
+      if (!SHAPES[k](body)) throw new Error('answered with an unexpected shape');
+      got[k] = { ok: true, v: body };
+    }
     catch (e) { got[k] = { ok: false, msg: e.message }; }
   }));
   const allFailed = names.every((k) => !got[k].ok);
@@ -893,11 +928,24 @@ function syncSource() {
   $('live-toggle').textContent = liveOpen ? 'Hide' : 'Show';
 }
 $('live-toggle').addEventListener('click', () => { liveOpen = !liveOpen; syncSource(); });
+document.querySelectorAll('a[data-live-link]').forEach((a) => a.addEventListener('click', (ev) => {
+  if (dataset !== 'fixture') return;
+  ev.preventDefault();
+  if (!liveOpen) { liveOpen = true; syncSource(); }
+  $('live-title').focus({ preventScroll: true });
+  document.querySelector(a.getAttribute('href')).scrollIntoView({ block: 'start' });
+}));
 
 async function collect() {
+  const b = $('collect-btn');
+  b.disabled = true;
+  b.textContent = 'Collecting…';
   try { await fetch('/api/collect', { method: 'POST' }); } catch (e) { /* load() reports the failure */ }
+  b.disabled = false;
+  b.textContent = 'Collect now';
   load();
 }
+$('collect-btn').addEventListener('click', collect);
 
 function setDataset(next) {
   dataset = next;
@@ -908,6 +956,7 @@ function setDataset(next) {
   if (next === 'fixture') url.searchParams.set('dataset', 'fixture'); else url.searchParams.delete('dataset');
   history.replaceState(null, '', url);
   syncSource();
+  $('announce').textContent = next === 'fixture' ? 'Showing the example tape' : 'Showing the live tape';
   load();
 }
 $('seg-live').addEventListener('click', () => setDataset('live'));
