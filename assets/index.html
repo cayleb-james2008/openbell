@@ -3,198 +3,555 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OpenBell — venue truth</title>
+<meta name="description" content="OpenBell, a paper-only desk that records Kalshi 15-minute market data and scores strategies on paper.">
+<title>OpenBell, venue truth</title>
 <script>
-  // Theme: dark by default, light available; the toggle lives in
-  // Settings at the foot of the page. Set before first paint.
+  // Theme: dark by default, light on request. Set before first paint.
   document.documentElement.dataset.theme = localStorage.getItem('openbell-theme') || 'dark';
 </script>
 <style>
-/* hallmark-rune · app: openbell · vernacular: trading desk · nav: none (single page) · signature: pot curve + slot strip · tokens: hr-template v1 · critique: weakest State coverage */
+/* Hallmark: app openbell, shape: app screen, genre: modern-minimal, theme: console (material only, faces from the owner Geist), critique: first screen answers five questions, states drawn, labels as tags */
   :root, [data-theme="dark"] {
     color-scheme: dark;
-    --bg: #0f1115; --panel: #15181f; --panel-2: #1d202a; --field: #12141a;
-    --ink: #ece9e4; --muted: #a8adb8; --faint: #939ba8; --rule: #262a33;
-    --accent: #e8b89d; --accent-hover: #f0cbae; --accent-ink: #1a120b;
-    --ok: #4cc38a; --ok-bg: #143527; --warn: #d99a4e; --warn-bg: #3d2c12;
-    --err: #e06c60; --err-bg: #3a1d1a;
-    --series-2: #d19a6b; --series-3: #a8713f; --series-4: #6fa8a0;
-    --font-body: "Inter", -apple-system, "Segoe UI", sans-serif;
-    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    --text-meta: 11px; --text-label: 12px; --text-small: 13px; --text-dense: 14px;
-    --text-body: 15px; --text-title: 18px; --text-screen: 20px; --text-display: 24px;
-    --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px; --sp-7: 48px;
-    --r-control: 6px; --r-card: 8px; --r-panel: 12px; --r-chip: 999px;
-    --dur-micro: 120ms; --dur-short: 200ms; --dur-panel: 280ms;
-    --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+    --canvas: #0d0f12; --surface: #14171c; --raised: #1a1e25; --track: #21262e; --hairline: #252a33;
+    --ink: #eceef2; --ink-2: #a3aab9; --ink-3: #8a92a3;
+    --accent: #eceef2; --accent-ink: #0d0f12;
+    --ok: #4cc38a; --ok-bg: rgba(76, 195, 138, 0.14);
+    --warn: #e0a85a; --warn-bg: rgba(224, 168, 90, 0.14);
+    --err: #ef7a6e; --err-bg: rgba(239, 122, 110, 0.14);
+    --neutral-bg: rgba(255, 255, 255, 0.07); --neutral-fg: #c3c8d4;
+    --venue-bg: rgba(134, 173, 255, 0.14); --venue-fg: #9dbcff;
+    --tape-bg: rgba(127, 214, 204, 0.13); --tape-fg: #8ddcd3;
+    --paper-bg: rgba(195, 178, 247, 0.14); --paper-fg: #c9bcf8;
+    --series-pot: #eceef2; --series-2: #86adff; --series-3: #7fd6cc; --series-4: #c9bcf8; --series-5: #e0a85a;
+    --shadow-lift: 0 9px 24px rgba(0, 0, 0, 0.5);
+    --dur-micro: 120ms; --dur-short: 200ms;
+    --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --shadow-raised: 0 1px 2px rgba(0, 0, 0, 0.25);
   }
   [data-theme="light"] {
     color-scheme: light;
-    --bg: #f6f4ef; --panel: #fffdf8; --panel-2: #efe9dc; --field: #fffdf8;
-    --ink: #23262b; --muted: #565d66; --faint: #5d6771; --rule: #ddd5c2;
-    --accent: #9d5a24; --accent-hover: #8a4e1f; --accent-ink: #ffffff;
-    --ok: #177a4c; --ok-bg: #dcf0e4; --warn: #96600f; --warn-bg: #f7e7c6;
-    --err: #b3382e; --err-bg: #f9e3e0;
-    --series-2: #c98d54; --series-3: #8a5427; --series-4: #3f7d74;
+    --canvas: #f3f4f6; --surface: #ffffff; --raised: #ffffff; --track: #e9ecf1; --hairline: #dfe3ea;
+    --ink: #13151a; --ink-2: #4f5666; --ink-3: #5d6475;
+    --accent: #14161b; --accent-ink: #ffffff;
+    --ok: #0f7a4a; --ok-bg: #dff3e8;
+    --warn: #8a5a00; --warn-bg: #fbf0d6;
+    --err: #b3382e; --err-bg: #fbe4e1;
+    --neutral-bg: #eceff3; --neutral-fg: #333a48;
+    --venue-bg: #e4edff; --venue-fg: #1a4fc4;
+    --tape-bg: #dcf3ef; --tape-fg: #0b6b5f;
+    --paper-bg: #efe8fb; --paper-fg: #5b2fb3;
+    --series-pot: #13151a; --series-2: #1a4fc4; --series-3: #0b6b5f; --series-4: #5b2fb3; --series-5: #8a5a00;
+    --shadow-lift: 0 9px 24px rgba(16, 24, 40, 0.12);
+    --shadow-raised: 0 1px 2px rgba(16, 24, 40, 0.08);
   }
   * { box-sizing: border-box; }
   html, body { overflow-x: clip; }
-  body { margin: 0; background: var(--bg); color: var(--ink);
-         font-family: var(--font-body); font-size: var(--text-dense); line-height: 1.5; }
-  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  ::selection { background: var(--accent); color: var(--accent-ink); }
-  html { scrollbar-color: var(--rule) transparent; caret-color: var(--accent); }
-  @media (prefers-reduced-motion: reduce) {
-    *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+  body {
+    margin: 0; background: var(--canvas); color: var(--ink);
+    font-family: var(--font-sans);
+    font-size: 14px; line-height: 20px; font-weight: 400;
+    -webkit-font-smoothing: antialiased;
   }
-  main { max-width: 960px; margin: 0 auto; padding: var(--sp-5) var(--sp-4) var(--sp-7); }
-  h1 { font-size: var(--text-screen); line-height: 1.2; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
-  .mode { color: var(--muted); font-size: var(--text-small); margin-top: var(--sp-1); display: flex; align-items: center; gap: var(--sp-2); }
-  .dot { width: 8px; height: 8px; border-radius: var(--r-chip); background: var(--faint); flex: none; }
+  :focus-visible { outline: 2px solid var(--ink-2); outline-offset: 2px; }
+  ::selection { background: var(--ink); color: var(--canvas); }
+  .mono, .num, pre, code {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+  svg.ic { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+
+  /* top bar */
+  .top {
+    position: sticky; top: 0; z-index: 5; background: var(--canvas);
+    border-bottom: 1px solid var(--hairline);
+  }
+  .top-in {
+    max-width: 1280px; margin: 0 auto; padding: 8px 16px; min-height: 56px;
+    display: flex; align-items: center; gap: 12px 20px; flex-wrap: wrap;
+  }
+  #chip-text { overflow-wrap: anywhere; min-width: 0; }
+  .wordmark { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 16px; letter-spacing: -0.01em; margin-right: auto; }
+  .wordmark svg { color: var(--ink); }
+  .paper-note { display: inline-flex; align-items: center; gap: 8px; color: var(--ink-2); font-size: 13px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 8px; min-height: 32px; max-width: 100%; padding: 8px 12px; line-height: 20px;
+    border: 1px solid var(--hairline); border-radius: 999px; font-size: 13px; color: var(--ink-2);
+    background: var(--surface);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 999px; background: var(--ink-3); flex: none; }
   .dot.ok { background: var(--ok); }
-  .dot.warn { background: var(--warn); }
   .dot.err { background: var(--err); }
-  .dot.accent { background: var(--accent); }
-  h2 { font-size: var(--text-title); line-height: 1.25; font-weight: 600; margin: var(--sp-6) 0 var(--sp-3); }
-  .panel { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--r-panel); padding: var(--sp-4); }
-  .panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-4); flex-wrap: wrap; }
-  .panel-title { font-size: var(--text-label); color: var(--muted); }
-  .pot-figure { font-size: var(--text-display); font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.15; }
-  .asof { font-size: var(--text-meta); color: var(--faint); }
-  .stage-track { height: 8px; background: var(--panel-2); border-radius: var(--r-chip); margin-top: var(--sp-4); overflow: hidden; }
-  .stage-fill { height: 100%; background: var(--accent); border-radius: var(--r-chip); }
-  .stage-line { font-size: var(--text-small); color: var(--muted); margin-top: var(--sp-2); }
-  .series-legend { display: flex; flex-wrap: wrap; gap: var(--sp-2) var(--sp-5); margin-top: var(--sp-3); font-size: var(--text-small); }
-  .series-legend .swatch { display: inline-block; width: 14px; height: 3px; border-radius: var(--r-chip); vertical-align: middle; margin-right: var(--sp-2); }
-  .sw-pot { background: var(--accent); }
+  .dot.warn { background: var(--warn); }
+  .top-actions { display: flex; align-items: center; gap: 8px; }
+
+  /* shared controls */
+  button {
+    font: inherit; font-size: 13px; font-weight: 500; cursor: pointer;
+    min-height: 44px; padding: 0 12px; border-radius: 8px; border: 1px solid transparent;
+    display: inline-flex; align-items: center; gap: 8px;
+    transition: background-color var(--dur-micro, 120ms) ease-out, transform var(--dur-micro, 120ms) ease-out, color var(--dur-micro, 120ms) ease-out, border-color var(--dur-micro, 120ms) ease-out;
+  }
+  button:active { transform: translateY(1px); }
+  button:disabled { cursor: default; opacity: 0.5; }
+  .btn-primary { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  .btn-primary:hover { opacity: 0.88; }
+  .btn-quiet { background: var(--surface); color: var(--ink); border-color: var(--hairline); }
+  .btn-quiet:hover { background: var(--raised); }
+  .seg {
+    display: inline-flex; padding: 4px; gap: 4px; background: var(--track); border-radius: 10px;
+  }
+  .seg button {
+    background: transparent; color: var(--ink-2); border-radius: 7px; min-height: 44px; padding: 0 12px;
+  }
+  .seg button:hover { color: var(--ink); }
+  .seg button[aria-pressed="true"] { background: var(--raised); color: var(--ink); box-shadow: var(--shadow-raised); }
+
+  /* layout */
+  .bar { max-width: 1280px; margin: 0 auto; padding: 12px 16px 0; display: flex; align-items: center; gap: 12px 16px; flex-wrap: wrap; }
+  .jump { margin-left: auto; display: flex; gap: 4px; flex-wrap: wrap; }
+  .jump a {
+    color: var(--ink-2); text-decoration: none; font-size: 13px; padding: 8px 12px; border-radius: 8px; min-height: 44px;
+    display: inline-flex; align-items: center;
+  }
+  .jump a:hover { color: var(--ink); background: var(--surface); }
+  main { max-width: 1280px; margin: 0 auto; padding: 16px 16px 40px; display: grid; gap: 16px; }
+  /* placement: one 12-column grid; mobile order is the base, desktop overrides it */
+  .dash-top, .dash-l, .dash-r { display: contents; }
+  #report-card { order: 1; }
+  #pot { order: 2; }
+  #tape { order: 3; }
+  #report-body { order: 4; }
+  #chart-card { order: 5; }
+  #slots-card { order: 6; }
+  #account { order: 7; }
+  #strategies { order: 8; }
+  #markets-card { order: 9; }
+  @media (min-width: 900px) {
+    main { grid-template-columns: repeat(12, minmax(0, 1fr)); align-items: start; }
+    main > * { grid-column: 1 / -1; }
+    .dash-top { display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: 16px; align-items: start; order: 1; }
+    .dash-l, .dash-r { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+    #pot { grid-column: span 4; order: 2; }
+    #chart-card { grid-column: span 8; order: 2; }
+    #tape { order: 3; }
+    #tape .stats { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+    #slots-card { order: 4; }
+    #strategies { order: 5; }
+    #markets-card { order: 6; }
+  }
+  section.card {
+    background: var(--surface); border: 1px solid var(--hairline); border-radius: 12px; padding: 16px;
+    min-width: 0; scroll-margin-top: 72px;
+  }
+  .card-head { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; justify-content: space-between; margin-bottom: 12px; }
+  .card-title { font-size: 14px; font-weight: 500; color: var(--ink-2); margin: 0; }
+  .card-title:focus { outline: 2px solid var(--ink-2); outline-offset: 4px; }
+  .tags { display: inline-flex; gap: 8px; flex-wrap: wrap; }
+  .tag {
+    display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 6px;
+    font-size: 12px; font-weight: 500; white-space: nowrap;
+  }
+  .tag-venue { background: var(--venue-bg); color: var(--venue-fg); }
+  .tag-tape { background: var(--tape-bg); color: var(--tape-fg); }
+  .tag-paper { background: var(--paper-bg); color: var(--paper-fg); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px; height: 24px; padding: 0 8px; border-radius: 999px;
+    font-size: 12px; font-weight: 500; white-space: nowrap;
+  }
+  .pill-ok { background: var(--ok-bg); color: var(--ok); }
+  .pill-err { background: var(--err-bg); color: var(--err); }
+  .pill-warn { background: var(--warn-bg); color: var(--warn); }
+  .pill-neutral { background: var(--neutral-bg); color: var(--neutral-fg); }
+  .muted { color: var(--ink-2); }
+  .unavailable { color: var(--ink-3); font-style: italic; }
+  .pos { color: var(--ok); }
+  .neg { color: var(--err); }
+  .note { color: var(--ink-2); font-size: 13px; margin: 12px 0 0; }
+
+  /* report */
+  .report-head { font-size: 22px; line-height: 1.3; font-weight: 500; margin: 0 0 12px; text-wrap: balance; overflow-wrap: break-word; min-width: 0; }
+  .report-wrap { position: relative; }
+  .report-wrap.capped::after {
+    content: ""; position: absolute; left: 1px; right: 1px; bottom: 1px; height: 56px; border-radius: 0 0 8px 8px;
+    background: linear-gradient(to bottom, transparent, var(--canvas)); pointer-events: none;
+  }
+  .toggle-report { width: 100%; justify-content: center; margin-top: 12px; background: var(--raised); color: var(--ink); border: 1px solid var(--hairline); }
+  .report-body {
+    font-size: 13px; line-height: 1.6; color: var(--ink-2); white-space: pre-wrap; margin: 0;
+    overflow-wrap: anywhere; background: var(--canvas); border: 1px solid var(--hairline); border-radius: 8px; padding: 12px 16px;
+  }
+
+  /* pot */
+  .pot-top { display: flex; align-items: flex-end; gap: 12px 24px; flex-wrap: wrap; justify-content: space-between; }
+  .pot-figure { font-family: var(--font-mono); font-size: 36px; line-height: 1.1; font-weight: 500; font-variant-numeric: tabular-nums; min-width: 0; overflow-wrap: anywhere; }
+  .pot-change { font-size: 13px; color: var(--ink-2); margin-top: 8px; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  #chart { margin-top: 12px; min-height: 150px; }
+  #chart svg { width: 100%; height: auto; display: block; }
+  #chart .empty-chart {
+    min-height: 150px; display: flex; align-items: center; justify-content: center; text-align: center;
+    border: 1px dashed var(--hairline); border-radius: 8px; padding: 16px; color: var(--ink-2); font-size: 13px;
+  }
+  .series-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 12px; font-size: 13px; color: var(--ink-2); }
+  .series-legend span { display: inline-flex; align-items: center; gap: 8px; }
+  .swatch { display: inline-block; width: 12px; height: 3px; border-radius: 2px; }
+  .sw-pot { background: var(--series-pot); }
   .sw-2 { background: var(--series-2); }
   .sw-3 { background: var(--series-3); }
   .sw-4 { background: var(--series-4); }
-  .num { font-variant-numeric: tabular-nums; }
-  .pnl-pos { color: var(--ok); }
-  .pnl-neg { color: var(--err); }
-  .unavailable { color: var(--faint); font-style: italic; }
-  .strip { display: flex; gap: var(--sp-3); flex-wrap: wrap; }
-  .slot { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--r-card); padding: var(--sp-3); flex: 1 1 160px; min-width: 150px; }
-  .slot.retired { background: var(--field); color: var(--muted); }
-  .slot .s-head { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--text-small); font-weight: 600; }
-  .slot .s-row { font-size: var(--text-small); color: var(--muted); margin-top: var(--sp-1); }
-  .slot .s-row .num { color: var(--ink); }
-  .slot.retired .s-row .num { color: var(--muted); }
-  .pips { display: inline-flex; gap: var(--sp-1); vertical-align: middle; }
-  .pip { width: 8px; height: 8px; border-radius: var(--r-chip); border: 1px solid var(--muted); }
+  .sw-5 { background: var(--series-5); }
+  .stage { margin-top: 16px; }
+  .stage-line { font-size: 13px; color: var(--ink-2); margin-top: 8px; }
+  .track { height: 8px; background: var(--track); border-radius: 999px; overflow: hidden; }
+  .fill { height: 100%; width: 100%; background: var(--ink); border-radius: 999px; transform-origin: left center; transform: scaleX(0); transition: transform 200ms ease-out; }
+
+  /* stat rows */
+  .stats { display: grid; gap: 12px 16px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stat { min-width: 0; border-left: 1px solid var(--hairline); padding-left: 12px; }
+  .stat .k { font-size: 13px; color: var(--ink-2); }
+  .stat .v { font-family: var(--font-mono); font-size: 20px; font-weight: 500; font-variant-numeric: tabular-nums; margin-top: 4px; overflow-wrap: anywhere; min-width: 0; }
+  .stat .v small { font-size: 13px; color: var(--ink-2); font-weight: 400; }
+  .stat .src { margin-top: 8px; }
+  .state-line { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); margin: 0 0 16px; padding: 8px 12px; width: max-content; max-width: 100%; border: 1px solid var(--hairline); border-radius: 8px; }
+  .why { font-size: 13px; color: var(--ink-2); margin: 12px 0 0; }
+
+  /* slots */
+  .slots { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+  .slot {
+    background: var(--raised); border: 1px solid var(--hairline); border-radius: 10px; padding: 12px; min-width: 0;
+    transition: border-color var(--dur-short, 200ms) ease-out;
+  }
+  .slot:hover { border-color: var(--ink-3); }
+  .slot.retired { background: var(--canvas); }
+  .slot-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; color: var(--ink-2); }
+  .slot-name { font-family: var(--font-mono); font-size: 14px; color: var(--ink); margin: 8px 0 12px; overflow-wrap: anywhere; font-weight: 500; }
+  .strikes { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); }
+  .pips { display: inline-flex; gap: 4px; }
+  .pip { width: 10px; height: 10px; border-radius: 999px; border: 1px solid var(--ink-3); transition: background-color var(--dur-short, 200ms) ease-out; }
   .pip.hit { background: var(--err); border-color: var(--err); }
-  .facts { display: flex; flex-wrap: wrap; gap: var(--sp-3) var(--sp-6); }
-  .fact .k { font-size: var(--text-label); color: var(--muted); }
-  .fact .v { font-size: var(--text-dense); font-variant-numeric: tabular-nums; margin-top: var(--sp-1); }
-  .note { color: var(--muted); font-size: var(--text-small); margin-top: var(--sp-3); }
-  .state-line { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--text-small); color: var(--muted); margin-top: var(--sp-3); }
-  table { width: 100%; border-collapse: collapse; font-size: var(--text-small); font-variant-numeric: tabular-nums; }
-  th, td { text-align: left; padding: var(--sp-2) var(--sp-2); border-bottom: 1px solid var(--rule); }
-  th { color: var(--muted); font-weight: 500; font-size: var(--text-label); }
-  th, td { overflow-wrap: break-word; }
-  td:first-child { word-break: break-all; }
-  .verdict { display: inline; }
-  .verdict .dot { display: inline-block; vertical-align: middle; margin-right: var(--sp-2); }
-  button { background: var(--accent); color: var(--accent-ink); border: 0; border-radius: var(--r-control);
-           padding: var(--sp-2) var(--sp-3); cursor: pointer; font-size: var(--text-small); font-weight: 600; min-height: 36px; }
-  button:hover { background: var(--accent-hover); }
-  .btn-quiet { background: var(--panel); color: var(--ink); border: 1px solid var(--rule); display: inline-flex; align-items: center; gap: var(--sp-2); font-weight: 500; }
-  .btn-quiet:hover { background: var(--panel-2); }
-  details { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--r-panel); }
-  summary { cursor: pointer; padding: var(--sp-3) var(--sp-4); font-size: var(--text-small); font-weight: 600; min-height: 44px; display: flex; align-items: center; }
-  details .pre-wrap { padding: 0 var(--sp-4) var(--sp-4); }
-  pre { background: var(--field); border: 1px solid var(--rule); border-radius: var(--r-card); padding: var(--sp-3);
-        font-family: var(--font-mono); font-size: var(--text-small); white-space: pre-wrap; margin: 0; }
-  #load-error { display: none; background: var(--err-bg); border: 1px solid var(--err); border-radius: var(--r-card);
-                padding: var(--sp-3) var(--sp-4); margin-top: var(--sp-4); font-size: var(--text-small); }
-  #load-error.show { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
-  footer { margin-top: var(--sp-7); border-top: 1px solid var(--rule); padding-top: var(--sp-4); }
-  footer .k { font-size: var(--text-label); color: var(--muted); margin-bottom: var(--sp-2); }
-  .ic { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-  @media (max-width: 768px) {
+  .slot-line { font-size: 13px; color: var(--ink-2); margin-top: 8px; }
+  .slot-line .num { color: var(--ink); }
+  .slot-line .tags { margin-left: 8px; vertical-align: middle; }
+
+  /* tables */
+  .table-wrap { overflow-x: auto; margin: 0 -4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--hairline); vertical-align: middle; overflow-wrap: anywhere; }
+  th { color: var(--ink-2); font-weight: 500; font-size: 13px; white-space: nowrap; }
+  td.mono, td.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  tr:hover td { background: var(--raised); }
+  .bar-cell { display: flex; align-items: center; gap: 12px; min-width: 150px; }
+  .bar-cell .track { flex: 1; height: 6px; }
+  .bar-cell .fill { background: var(--ink-2); }
+  .bar-cell .count { font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--ink-2); font-size: 13px; }
+  .empty-row td { color: var(--ink-2); padding: 20px 8px; text-align: center; }
+
+  /* markets collapsed */
+  .toggle { width: 100%; justify-content: space-between; background: var(--raised); border-color: var(--hairline); color: var(--ink); min-height: 44px; font-size: 14px; }
+  .toggle:hover { background: var(--track); }
+  .toggle .chev { transition: transform var(--dur-short, 200ms) ease-out; }
+  .toggle[aria-expanded="true"] .chev { transform: rotate(180deg); }
+  .panel-body { margin-top: 12px; }
+  .panel-body[hidden] { display: none; }
+  .collect-status { margin: 0; font-size: 13px; color: var(--err); flex-basis: 100%; }
+  .collect-status:empty { display: none; }
+  .panel-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+
+  /* example tape + errors */
+  .banner {
+    display: flex; gap: 12px; align-items: flex-start; background: var(--paper-bg); color: var(--ink);
+    border: 1px solid var(--hairline); border-radius: 10px; padding: 12px 16px; font-size: 13px;
+  }
+  .banner[hidden] { display: none; }
+  .banner strong { font-weight: 600; }
+  .banner svg { color: var(--paper-fg); margin-top: 1px; }
+  #load-error {
+    display: none; background: var(--err-bg); color: var(--ink); border: 1px solid var(--err); border-radius: 10px;
+    padding: 12px 16px; font-size: 13px; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  #load-error.show { display: flex; }
+  #load-error-text { flex: 1; min-width: 200px; }
+
+  /* skeletons */
+  .sk {
+    background: var(--track); border-radius: 8px; min-height: 16px;
+    animation: sk-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes sk-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+
+  footer { max-width: 1280px; margin: 0 auto; padding: 0 16px 32px; color: var(--ink-3); font-size: 13px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+  }
+  @media (max-width: 720px) {
+    .jump { margin-left: 0; }
+    .jump a { white-space: nowrap; }
+    .report-head { font-size: 19px; }
+    .pot-figure { font-size: 30px; }
+    .col-last { display: none; }
+    th, td { padding: 8px; }
+    #strategies thead { display: none; }
+    #strategies table, #strategies tbody, #strategies tr { display: block; width: 100%; }
+    #strategies tr { border-bottom: 1px solid var(--hairline); padding: 8px 0; }
+    #strategies tr:hover td { background: transparent; }
+    #strategies td { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 0; padding: 4px 0; min-width: 0; }
+    #strategies td::before { content: attr(data-label); color: var(--ink-2); font-size: 13px; flex: none; }
+    #strategies td[data-label="Strategy"]::before, #strategies td.empty-row::before { content: none; }
+    #strategies td .bar-cell { min-width: 0; flex: 1; justify-content: flex-end; }
+    #strategies td .pill { white-space: normal; text-align: right; }
+    #strategies td.empty-row { display: block; }
     button { min-height: 44px; }
   }
-  @media (max-width: 560px) {
-    th, td { padding: var(--sp-1) var(--sp-1); }
-    .col-last { display: none; }
+  [hidden] { display: none !important; }
+  .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  .how { max-width: 70ch; margin: 8px 0 0; color: var(--ink-2); font-size: 14px; line-height: 20px; }
+  .how strong { color: var(--ink); font-weight: 500; }
+  .how .tag { vertical-align: 1px; }
+  .jump-label { color: var(--ink-3); font-size: 12px; align-self: center; }
+  .jump a { font-size: 12px; color: var(--ink-3); padding: 0 8px; min-height: 44px; }
+  .clip { display: block; min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td .clip { max-width: 24ch; }
+  .why, .note-list li { overflow-wrap: anywhere; }
+  #live-title:focus { outline: 2px solid var(--ink-2); outline-offset: 2px; }
+  .purpose { max-width: 1280px; margin: 0 auto; padding: 12px 16px 0; }
+  .purpose p { margin: 0; color: var(--ink-2); font-size: 14px; line-height: 20px; max-width: 70ch; }
+  .seg-caption { margin: 0; color: var(--ink-2); font-size: 13px; line-height: 20px; max-width: 46ch; }
+  .panel-error {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 0 0 16px; padding: 12px 16px;
+    background: var(--err-bg); color: var(--ink); border: 1px solid var(--err); border-radius: 8px; font-size: 13px;
+  }
+  .note-list { margin: 8px 0 0; padding-left: 16px; color: var(--ink-2); font-size: 13px; }
+  .note-list li { margin: 4px 0; }
+  .tag-example { background: var(--warn-bg); color: var(--warn); }
+  .pill-example { background: var(--venue-bg); color: var(--venue-fg); }
+  body[data-source="live"] .ex-tag { display: none; }
+  .live-group, .live-content { display: contents; }
+  .live-head {
+    order: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    margin-bottom: 16px; padding: 8px 12px; border: 1px dashed var(--hairline); border-radius: 12px;
+  }
+  .live-title { margin: 0; font-size: 14px; font-weight: 500; color: var(--ink-2); }
+  @media (min-width: 900px) { .live-group, .live-content { display: block; } }
+  @media (max-width: 400px) {
+    #strategies td { flex-wrap: wrap; }
+    #strategies td .bar-cell { min-width: 0; flex: 1 1 100%; justify-content: flex-start; }
+    #strategies td .pill { white-space: normal; text-align: left; max-width: 100%; }
   }
 </style>
 </head>
-<body>
-<main>
-  <h1>OpenBell</h1>
-  <div class="mode"><span class="dot accent" aria-hidden="true"></span>Shadow mode — this build never places orders</div>
+<body data-source="live">
+<header class="top">
+  <div class="top-in">
+    <div class="wordmark">
+      <svg class="ic" width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/></svg>
+      OpenBell
+    </div>
+    <span class="paper-note">
+      <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M5.6 5.6l12.8 12.8"/></svg>
+      Paper only: this build places no orders
+    </span>
+    <span class="chip" id="chip" title="Collector health">
+      <span class="dot" id="chip-dot" aria-hidden="true"></span>
+      <span id="chip-text">Collector: checking</span>
+    </span>
+    <div class="top-actions" id="settings">
+      <button id="themeBtn" type="button" class="btn-quiet">
+        <svg class="ic" aria-hidden="true"><use id="themeUse" href="#i-moon"/></svg>
+        <span id="themeLabel">Appearance: Dark</span>
+      </button>
+    </div>
+  </div>
+</header>
+
+<div class="purpose"><p id="purpose">A paper-trading desk for Kalshi’s 15-minute crypto markets: it collects the venue’s public data, tests strategies on paper, and reports what happened. It never places orders.</p>
+<p class="how" id="how"><strong>How to read this:</strong> start with the Daily report, which sums up the day. Tags: <span class="tag tag-venue">venue</span> = what Kalshi reports; <span class="tag tag-tape">tape</span> = counted from the snapshots collected; <span class="tag tag-paper">paper</span> = the pretend-money simulation.</p></div>
+<div class="bar">
+  <div class="seg" role="group" aria-label="Which tape the paper figures use">
+    <button type="button" id="seg-live" aria-pressed="true">Live tape</button>
+    <button type="button" id="seg-fixture" aria-pressed="false">Fixture</button>
+  </div>
+  <p class="seg-caption" id="seg-caption">Live tape: what the collector recorded. Fixture: example data written for tests.</p>
+  <nav class="jump" aria-label="Jump to a section">
+    <span class="jump-label">Jump to:</span>
+    <a href="#report-card" data-live-link>Report</a>
+    <a href="#pot">Paper pot</a>
+    <a href="#tape">Tape health</a>
+    <a href="#account" data-live-link>Venue account</a>
+    <a href="#slots-card">Slots</a>
+    <a href="#strategies">Strategies</a>
+    <a href="#markets-card">Markets</a>
+  </nav>
+</div>
+
+<p class="sr-only" id="announce" aria-live="polite"></p>
+<main id="top">
+  <div class="banner" id="fixture-banner" role="note" hidden>
+    <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 8v5M12 16.2v.3"/></svg>
+    <div><strong>Example tape.</strong> Paper figures below come from a labelled fixture of 120 settled windows written for tests. They were not collected from Kalshi. The daily report and the venue account always read the live desk.</div>
+  </div>
 
   <div id="load-error" role="alert">
     <span id="load-error-text">The desk could not load.</span>
     <button id="retryBtn" type="button" class="btn-quiet">Retry</button>
   </div>
 
-  <h2>Paper pot</h2>
-  <section class="panel" aria-label="Paper pot and stage target">
-    <div class="panel-head">
-      <span class="panel-title">Paper equity over the collected tape</span>
-      <span class="pot-figure" id="pot-figure">…</span>
+  <div class="live-group" id="live-group">
+    <div class="live-head" id="live-head" hidden>
+      <p class="live-title" id="live-title" tabindex="-1">Live desk, not the example tape</p>
+      <button type="button" class="btn-quiet" id="live-toggle" aria-expanded="false" aria-controls="live-content">Show</button>
     </div>
-    <div id="chart"></div>
-    <p class="note" id="chart-note"></p>
-    <div id="legend" class="series-legend"></div>
-    <div class="stage-track" role="img" aria-label="Stage one target progress, paper">
-      <div class="stage-fill" id="stage-fill" style="width: 0%"></div>
+    <div class="live-content" id="live-content">
+  <div class="dash-top">
+    <div class="dash-l">
+  <section class="card" id="report-card" aria-labelledby="report-title">
+    <div class="card-head">
+      <h2 class="card-title" id="report-title" tabindex="-1">Daily report</h2>
+      <span class="tags"><span class="tag tag-venue">venue</span><span class="tag tag-tape">tape</span></span>
     </div>
-    <div class="stage-line" id="stage-line">Stage target (paper): …</div>
+    <p class="panel-error" data-err="report" hidden></p>
+    <p class="report-head" id="report-head"><span class="sk" style="display:block;width:70%;height:24px"></span></p>
   </section>
 
-  <h2>Slots — paper only</h2>
-  <div class="strip" id="slots"></div>
-  <p class="note" id="slots-note"></p>
+  <section class="card" id="report-body" aria-labelledby="report-body-title">
+    <div class="card-head">
+      <h2 class="card-title" id="report-body-title">The rest of the report, verbatim</h2>
+    </div>
+    <p class="panel-error" data-err="report" hidden></p>
+    <div class="report-wrap" id="report-wrap">
+      <pre class="report-body" id="report"><span class="sk" style="display:block;height:120px"></span></pre>
+    </div>
+    <button type="button" class="toggle-report" id="report-toggle" aria-expanded="false" aria-controls="report">Show full report</button>
+  </section>
 
-  <h2>Venue account</h2>
-  <div class="facts">
-    <div class="fact"><div class="k">Balance (venue)</div><div class="v" id="balance">…</div></div>
-    <div class="fact"><div class="k">Day P&amp;L (venue)</div><div class="v" id="pnl">…</div></div>
-    <div class="fact"><div class="k">Open positions</div><div class="v" id="positions">…</div></div>
-    <div class="fact"><div class="k">Capital at risk</div><div class="v" id="risk">…</div></div>
+    </div>
+    <div class="dash-r">
+  <section class="card" id="account" aria-labelledby="account-title">
+    <div class="card-head">
+      <h2 class="card-title" id="account-title" tabindex="-1">Venue account</h2>
+      <span class="tags"><span class="tag tag-venue">venue</span></span>
+    </div>
+    <p class="panel-error" data-err="home" hidden></p>
+    <div class="stats">
+      <div class="stat"><div class="k">Balance</div><div class="v" id="balance">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
+      <div class="stat"><div class="k">Day P&amp;L</div><div class="v" id="pnl">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
+      <div class="stat"><div class="k">Open positions</div><div class="v" id="positions">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
+      <div class="stat"><div class="k">Capital at risk</div><div class="v" id="risk">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
+    </div>
+    <p class="why" id="account-note"></p>
+    <p class="why">Account figures need a Kalshi API key on the machine running OpenBell; without one they stay unavailable. Market data below does not need it.</p>
+  </section>
+
+    </div>
+    </div>
   </div>
-  <p class="note" id="account-note"></p>
-
-  <h2>Collector — the forward tape</h2>
-  <div class="facts">
-    <div class="fact"><div class="k">Tape lines on disk</div><div class="v" id="c-snaps">…</div></div>
-    <div class="fact"><div class="k">Markets seen</div><div class="v" id="c-markets">…</div></div>
-    <div class="fact"><div class="k">Settled windows</div><div class="v" id="c-settled">…</div></div>
-    <div class="fact"><div class="k">Newest snapshot</div><div class="v" id="c-age">…</div></div>
+    </div>
   </div>
-  <div class="state-line"><span class="dot" id="c-dot" aria-hidden="true"></span><span id="c-note"></span></div>
+  <section class="card" id="pot" aria-labelledby="pot-title">
+    <div class="card-head">
+      <h2 class="card-title" id="pot-title">Paper pot</h2>
+      <span class="tags"><span class="tag tag-example ex-tag">example tape</span><span class="tag tag-paper">paper</span></span>
+    </div>
+    <p class="panel-error" data-err="slots" hidden></p>
+    <div class="pot-top">
+      <div>
+        <div class="pot-figure" id="pot-figure"><span class="sk" style="display:inline-block;width:160px;height:36px"></span></div>
+        <div class="pot-change" id="pot-change">&nbsp;</div>
+      </div>
+    </div>
+    <p class="sr-only" id="pot-announce" aria-live="polite"></p>
+    <div class="stage">
+      <div class="track" role="progressbar" id="stage-track" aria-label="Stage one target progress, paper" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="fill" id="stage-fill"></div>
+      </div>
+      <div class="stage-line" id="stage-line">Stage target (paper): loading</div>
+    </div>
+  </section>
 
-  <h2>Markets — public venue data, collected forward</h2>
-  <button onclick="collect()">Collect now</button>
-  <table>
-    <thead><tr><th>Market</th><th>Closes</th><th>Yes bid/ask</th><th>No bid/ask</th><th class="col-last">Last</th><th>Result</th></tr></thead>
-    <tbody id="markets"></tbody>
-  </table>
+  <section class="card" id="chart-card" aria-labelledby="chart-title">
+    <div class="card-head">
+      <h2 class="card-title" id="chart-title">Paper equity over the collected tape</h2>
+      <span class="tags"><span class="tag tag-example ex-tag">example tape</span><span class="tag tag-paper">paper</span></span>
+    </div>
+    <p class="panel-error" data-err="equity" hidden></p>
+    <div id="chart" role="img" aria-label="Paper equity curves"><div class="sk" style="height:150px"></div></div>
+    <p class="note" id="chart-note"></p>
+    <div id="legend" class="series-legend"></div>
+  </section>
 
-  <h2>Shadow strategies — paper only, promotion standard as code</h2>
-  <table>
-    <thead><tr><th>Strategy</th><th>Side</th><th>Windows traded</th><th>Mean ¢/contract</th><th>Verdict</th></tr></thead>
-    <tbody id="strategies"></tbody>
-  </table>
+  <section class="card" id="tape" aria-labelledby="tape-title">
+    <div class="card-head">
+      <h2 class="card-title" id="tape-title">Collector, the forward tape</h2>
+      <span class="tags"><span class="tag tag-tape">tape</span></span>
+    </div>
+    <p class="panel-error" data-err="home" hidden></p>
+    <div class="state-line"><span class="dot" id="c-dot" aria-hidden="true"></span><span id="c-note">Checking the tape.</span></div>
+    <p class="why" id="c-fail" hidden></p>
+    <div class="stats">
+      <div class="stat"><div class="k">Tape lines</div><div class="v" id="c-snaps">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
+      <div class="stat"><div class="k">Markets seen</div><div class="v" id="c-markets">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
+      <div class="stat"><div class="k">Settled windows</div><div class="v" id="c-settled">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
+      <div class="stat"><div class="k">Dropped lines</div><div class="v" id="c-dropped">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
+      <div class="stat"><div class="k">Conflicting settlements</div><div class="v" id="c-conflicts">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
+      <div class="stat"><div class="k">Newest snapshot</div><div class="v" id="c-age">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
+    </div>
+  </section>
 
-  <h2>Daily report</h2>
-  <details>
-    <summary>Daily report — verbatim</summary>
-    <div class="pre-wrap"><pre id="report">…</pre></div>
-  </details>
+  <section class="card" id="slots-card" aria-labelledby="slots-title">
+      <div class="card-head">
+        <h2 class="card-title" id="slots-title">Slots, paper only</h2>
+        <span class="tags"><span class="tag tag-example ex-tag">example tape</span><span class="tag tag-paper">paper</span></span>
+      </div>
+    <p class="panel-error" data-err="slots" hidden></p>
+      <div class="slots" id="slots"><div class="sk" style="height:140px"></div><div class="sk" style="height:140px"></div><div class="sk" style="height:140px"></div></div>
+      <p class="note" id="slots-note"></p>
+      <ul class="note-list" id="slot-notes" hidden></ul>
+    </section>
 
-  <footer id="settings">
-    <div class="k">Settings</div>
-    <button id="themeBtn" type="button" class="btn-quiet">
-      <svg class="ic" aria-hidden="true"><use id="themeUse" href="#i-moon"/></svg>
-      <span id="themeLabel">Appearance: Dark</span>
+    <section class="card" id="strategies" aria-labelledby="strategies-title">
+    <div class="card-head">
+      <h2 class="card-title" id="strategies-title">Strategies against the promotion standard</h2>
+      <span class="tags"><span class="tag tag-example ex-tag">example tape</span><span class="tag tag-paper">paper</span></span>
+    </div>
+    <p class="panel-error" data-err="strategies" hidden></p>
+    <p class="why" style="margin:0 0 12px">A strategy is proven only after 100 forward windows, both chronological halves positive, and +3.5 cents per contract after fees. Until then it is unproven, and the verdict says so.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th scope="col">Strategy</th><th scope="col">Side</th><th scope="col">Windows traded, of 100</th><th scope="col">Mean cents per contract</th><th scope="col">Verdict</th></tr></thead>
+        <tbody id="strategies-body"><tr class="empty-row"><td colspan="5"><span class="sk" style="display:block;height:60px"></span></td></tr></tbody>
+      </table>
+    </div>
+    <div id="library-errors"></div>
+  </section>
+
+  <section class="card" id="markets-card" aria-labelledby="markets-title">
+    <div class="card-head">
+      <h2 class="card-title" id="markets-title">Collected markets</h2>
+      <span class="tags"><span class="tag tag-tape">tape</span></span>
+    </div>
+    <p class="panel-error" data-err="markets" hidden></p>
+    <button type="button" class="toggle" id="markets-toggle" aria-expanded="false" aria-controls="markets-panel">
+      <span id="markets-count">Collected tape, loading</span>
+      <svg class="ic chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
     </button>
-  </footer>
+    <div class="panel-body" id="markets-panel" hidden>
+      <div class="panel-actions">
+        <p class="note" style="margin:0" id="markets-note"></p>
+        <p class="collect-status" id="collect-status" role="status"></p>
+        <button type="button" class="btn-primary" id="collect-btn">Collect now</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th scope="col">Market</th><th scope="col">Closes</th><th scope="col">Yes bid/ask</th><th scope="col">No bid/ask</th><th scope="col" class="col-last">Last</th><th scope="col">Result</th></tr></thead>
+          <tbody id="markets"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
 </main>
+<footer>Every figure is venue (read from Kalshi), tape (counted from the collected snapshots), or paper (the slot simulation). Anything not obtained reads unavailable, with the reason.</footer>
+
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
   <defs>
     <symbol id="i-sun" viewBox="0 0 24 24">
@@ -207,173 +564,433 @@
   </defs>
 </svg>
 <script>
+const $ = (id) => document.getElementById(id);
 const money = (v) => v < 0 ? '-$' + Math.abs(v).toFixed(2) : '$' + v.toFixed(2);
-const fmt = (v) => v === null || v === undefined ? '<span class="unavailable">unavailable</span>' : v;
+const moneyWhole = (v) => v < 0 ? '-$' + Math.abs(Math.round(v)) : '$' + Math.round(v);
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = text;
+  return n;
+}
+function unavailableNode() { return el('span', 'unavailable', 'unavailable'); }
+function setValue(id, value) {
+  const n = $(id);
+  n.replaceChildren(value === null || value === undefined ? unavailableNode() : document.createTextNode(String(value)));
+}
+function pillFor(verdict) {
+  if (verdict.startsWith('PROVEN')) return 'pill pill-ok';
+  if (verdict.startsWith('NOT PROVEN')) return 'pill pill-err';
+  return 'pill pill-neutral';
+}
+function ageWords(age) {
+  if (age === null || age === undefined) return 'none yet';
+  return age < 90 ? age + 's ago' : age < 5400 ? Math.round(age / 60) + 'm ago' : (age / 3600).toFixed(1) + 'h ago';
+}
+const dayLabel = (x) => new Date(x * 1000).toISOString().slice(0, 10);
+let dataset = new URLSearchParams(location.search).get('dataset') === 'fixture' ? 'fixture' : 'live';
+let reportExpanded = false;
+let reportBody = null;
+const REPORT_PREVIEW_LINES = 6;
+const dsQuery = () => dataset === 'fixture' ? '?dataset=fixture' : '';
+
 async function getJson(url, opts) {
   const r = await fetch(url, opts);
   if (!r.ok) throw new Error(url + ' answered ' + r.status);
   return r.json();
 }
-async function load() {
-  const errBox = document.getElementById('load-error');
-  try {
-    await loadAll();
-    errBox.classList.remove('show');
-  } catch (e) {
-    document.getElementById('load-error-text').textContent =
-      'The desk could not finish loading (' + e.message + '). Figures already on screen are the last good ones.';
-    errBox.classList.add('show');
-  }
+
+async function load() { await loadAll(); }
+
+function renderAccount(a) {
+  setValue('balance', a.balance === null ? null : money(a.balance));
+  setValue('pnl', a.day_pnl === null ? null : money(a.day_pnl));
+  // Unknown is unavailable, never zero: a null here means the venue has not told us.
+  setValue('positions', a.open_positions === null ? null : a.open_positions.length);
+  setValue('risk', a.open_positions === null ? null : a.open_positions.length === 0 ? '$0.00 (no open positions)' : 'see positions');
+  if (a.day_pnl !== null) $('pnl').className = 'v ' + (a.day_pnl > 0 ? 'pos' : a.day_pnl < 0 ? 'neg' : '');
+  $('account-note').textContent = a.note;
 }
-async function loadAll() {
-  const home = await getJson('/api/home');
-  const a = home.account;
-  document.getElementById('balance').innerHTML = a.balance === null ? fmt(null) : money(a.balance);
-  document.getElementById('pnl').innerHTML = a.day_pnl === null ? fmt(null) : money(a.day_pnl);
-  // Unknown is unavailable, never zero: a null here means the venue
-  // has not told us, and the cards must say so.
-  document.getElementById('positions').innerHTML = a.open_positions === null ? fmt(null) : a.open_positions.length;
-  document.getElementById('risk').innerHTML = a.open_positions === null ? fmt(null)
-    : a.open_positions.length === 0 ? '$0.00 (no open positions)' : 'see positions';
-  document.getElementById('account-note').textContent = a.note;
 
-  const st = home.stage_target;
-  if (st) {
-    const pct = Math.max(0, Math.min(100, st.progress_pct));
-    document.getElementById('stage-fill').style.width = pct + '%';
-    document.getElementById('stage-line').textContent = st.reached
-      ? `Stage target (paper): ${money(st.paper_equity_dollars)} — the ${money(st.target_dollars)} stage-one target is reached on paper. Paper only, not venue money.`
-      : `Stage target (paper): ${money(st.paper_equity_dollars)} of the ${money(st.target_dollars)} stage-one target — ${st.progress_pct.toFixed(1)}% of the way, ${money(st.remaining_dollars)} to go. Paper only, not venue money.`;
-  }
+function applyReport() {
+  if (reportBody === null) return;
+  // Collapsed shows the first lines only; the rest is left out of the layout (not clipped),
+  // so nothing hidden sits under the button or the card head.
+  const lines = reportBody.split('\n');
+  const more = lines.length > REPORT_PREVIEW_LINES;
+  const expanded = reportExpanded || !more;
+  $('report').textContent = expanded ? reportBody : lines.slice(0, REPORT_PREVIEW_LINES).join('\n');
+  $('report').classList.toggle('capped', more && !expanded);
+  $('report-wrap').classList.toggle('capped', more && !expanded);
+  const btn = $('report-toggle');
+  btn.hidden = !more;
+  btn.setAttribute('aria-expanded', String(reportExpanded));
+  btn.textContent = reportExpanded ? 'Collapse report' : 'Show full report';
+}
+$('report-toggle').addEventListener('click', () => { reportExpanded = !reportExpanded; applyReport(); });
 
-  const c = home.collector;
-  document.getElementById('c-snaps').textContent = c.snapshots_on_disk + (c.dropped_lines ? ' (' + c.dropped_lines + ' dropped)' : '');
-  document.getElementById('c-markets').textContent = c.markets_seen;
-  document.getElementById('c-settled').textContent = c.settled_windows;
-  const age = c.newest_snapshot_age_secs;
-  document.getElementById('c-age').textContent =
-    age === null ? 'none yet' : age < 90 ? age + 's ago' : age < 5400 ? Math.round(age / 60) + 'm ago' : (age / 3600).toFixed(1) + 'h ago';
-  document.getElementById('c-dot').className = 'dot ' + (c.collecting ? 'ok' : 'err');
-  document.getElementById('c-note').textContent = c.collecting
-    ? `Collecting — a pass lands every ${c.collect_interval_secs}s. The tape is the forward record: windows are scored from what was collected before they settled.`
-    : 'Not collecting — the newest snapshot is older than two collect intervals. Uncollected windows cannot be backfilled.';
+function renderTape(c) {
+  setValue('c-snaps', c.snapshots_on_disk);
+  setValue('c-markets', c.markets_seen);
+  setValue('c-settled', c.settled_windows);
+  setValue('c-dropped', c.dropped_lines);
+  setValue('c-conflicts', c.conflicting_settlements);
+  setValue('c-age', ageWords(c.newest_snapshot_age_secs));
+  const failed = c.series_failed_last_pass;
+  const names = c.series_failed_names || [];
+  const failNote = failed + ' of ' + c.series_total + ' market reads failed on the last pass';
+  $('chip').title = names.length ? 'Failed series: ' + names.join(', ') : 'Collector health';
+  $('c-fail').hidden = !failed;
+  $('c-fail').textContent = failed ? (names.length ? 'Failed series: ' + names.join(', ') + '. ' : '') + 'Some markets were not recorded on that pass; the next pass retries.' : '';
+  const healthy = c.collecting && c.dropped_lines === 0 && c.conflicting_settlements === 0 && !failed;
+  $('c-dot').className = 'dot ' + (c.collecting ? (healthy ? 'ok' : 'warn') : 'err');
+  $('c-note').textContent = c.snapshots_on_disk === 0
+    ? 'Empty: no tape has been written yet, so nothing is scored. The collector writes its first pass on start, or when you press Collect now in Collected markets. Windows cannot be backfilled.'
+    : !c.collecting
+    ? 'Stale: the newest snapshot is older than two collect intervals, so the collector is not collecting. Uncollected windows cannot be backfilled.'
+    : healthy
+      ? 'Healthy: collecting, a pass lands every ' + c.collect_interval_secs + 's. The tape is the forward record, and windows are scored from what was collected before they settled.'
+      : 'Collecting, with ' + (c.dropped_lines ? c.dropped_lines + ' dropped line(s)' : '') + (c.dropped_lines && c.conflicting_settlements ? ' and ' : '') + (c.conflicting_settlements ? c.conflicting_settlements + ' window(s) with conflicting settlements, which are not scored' : '') + (failed ? ((c.dropped_lines || c.conflicting_settlements) ? ' and ' : '') + failNote : '') + '.';
+  $('chip-dot').className = 'dot ' + (c.collecting ? (healthy ? 'ok' : 'warn') : 'err');
+  $('chip-text').textContent = c.collecting ? 'Collecting, newest ' + ageWords(c.newest_snapshot_age_secs) + (failed ? ' · ' + failNote : '') : 'Not collecting';
+}
 
-  const slotsData = await getJson('/api/slots');
-  document.getElementById('pot-figure').textContent = money(slotsData.paper_equity_dollars);
-  const strip = document.getElementById('slots');
-  strip.innerHTML = '';
-  const mkSlot = (s, retired) => {
-    const div = document.createElement('div');
-    div.className = 'slot' + (retired ? ' retired' : '');
-    const pnl = retired ? s.paper_pnl_dollars : s.stint_pnl_dollars;
-    const pnlCls = pnl > 0 ? 'pnl-pos' : pnl < 0 ? 'pnl-neg' : '';
-    const pnlWord = pnl > 0 ? 'gain' : pnl < 0 ? 'loss' : 'flat';
-    let pips = '';
-    if (!retired) {
-      for (let i = 0; i < 3; i++) pips += `<span class="pip${i < s.strikes ? ' hit' : ''}"></span>`;
-    }
-    div.innerHTML = `
-      <div class="s-head"><span class="dot ${retired ? '' : 'accent'}" aria-hidden="true"></span>Slot ${s.slot + 1} — ${s.strategy}</div>
-      <div class="s-row">${retired ? `Retired after ${s.windows_traded} windows — rotated to ${s.rotated_to}` : `Status: ${s.status}`}</div>
-      ${retired ? '' : `<div class="s-row">Strikes <span class="pips" aria-hidden="true">${pips}</span> ${s.strikes} of 3</div>`}
-      <div class="s-row">${retired ? 'Stint P&amp;L' : 'This stint'}: <span class="num ${pnlCls}">${money(pnl)}</span> (${pnlWord})</div>
-      ${retired ? '' : `<div class="s-row">Slot equity: <span class="num">${money(s.equity_dollars)}</span></div>`}`;
-    return div;
-  };
-  for (const s of slotsData.slots) strip.appendChild(mkSlot(s, false));
-  for (const r of slotsData.retired) strip.appendChild(mkSlot(r, true));
-  if (!slotsData.slots.length && !slotsData.retired.length) {
-    strip.innerHTML = '<p class="unavailable">no slots — the strategy library is empty</p>';
-  }
-  document.getElementById('slots-note').textContent =
-    `Paper simulation: the pot is re-split evenly across ${slotsData.slots.length} slots each window; three consecutive losing windows retire a slot's strategy and rotate the next one in. Paper only — not venue money.`;
+function renderPot(slots, eq, home) {
+  const settled = home && home.collector ? home.collector.settled_windows : null;
+  const pot = slots.paper_equity_dollars;
+  const start = slots.paper_pot_start;
+  $('pot-figure').textContent = money(pot);
+  $('pot-announce').textContent = 'Paper pot: ' + money(pot) + ' (paper, not venue money)';
+  const change = pot - start;
+  $('pot-change').textContent = (change >= 0 ? '+' : '-') + '$' + Math.abs(change).toFixed(2) + ' against the $' + start.toFixed(2) + ' start (paper)';
+  $('pot-change').className = 'pot-change ' + (change > 0 ? 'pos' : change < 0 ? 'neg' : '');
 
-  const markets = await getJson('/api/markets');
-  const tb = document.getElementById('markets');
-  tb.innerHTML = '';
-  for (const m of markets.slice(0, 40)) {
-    const tr = document.createElement('tr');
-    const cells = [m.ticker, m.close_time.replace('T', ' ').replace('Z', ' UTC'),
-      `${m.yes_bid ?? '—'} / ${m.yes_ask ?? '—'}`, `${m.no_bid ?? '—'} / ${m.no_ask ?? '—'}`,
-      m.last_price ?? '—', m.result || '—'];
-    cells.forEach((cell, ci) => { const td = document.createElement('td'); if (ci === 4) td.className = 'col-last'; td.textContent = cell; tr.appendChild(td); });
-    tb.appendChild(tr);
-  }
-  if (!markets.length) tb.innerHTML = '<tr><td colspan="6" class="unavailable">no snapshots collected yet</td></tr>';
+  const target = (slots.stage_target || (home && home.stage_target) || {}).target_dollars || 1000;
+  const pct = Math.max(0, Math.min(100, pot / target * 100));
+  $('stage-fill').style.transform = 'scaleX(' + (pct / 100).toFixed(4) + ')';
+  $('stage-track').setAttribute('aria-valuenow', pct.toFixed(1));
+  const reached = pot >= target;
+  $('stage-line').textContent = reached
+    ? 'Stage target (paper): ' + money(pot) + ' of the ' + money(target) + ' stage-one target, reached on paper. Paper only, not venue money.'
+    : 'Stage target (paper): ' + money(pot) + ' of the ' + money(target) + ' stage-one target, ' + pct.toFixed(1) + '% of the way, ' + money(target - pot) + ' to go. Paper only, not venue money.';
 
-  // Equity chart: the pot curve is the headline; each strategy's
-  // cumulative paper P&L rides along thinner. Inline SVG, no libraries.
-  const eq = await getJson('/api/equity');
-  const chartEl = document.getElementById('chart');
-  const allSeries = [{ strategy: 'paper pot', points: eq.pot, headline: true },
-    ...eq.series.filter(s => s.points.length)];
+  if (!eq) return;
+  const chart = $('chart');
+  const allSeries = [{ strategy: 'paper pot', points: eq.pot, headline: true }, ...eq.series.filter(s => s.points.length)];
   const flat = allSeries.flatMap(s => s.points);
-  if (flat.length > 1) {
-    const W = 920, H = 190, PAD = 8;
+  const traded = slots.slots.reduce((n, s) => n + s.windows_traded, 0) + slots.retired.reduce((n, s) => n + s.windows_traded, 0);
+  if (flat.length > 1 && eq.pot.length > 1) {
+    const W = Math.max(300, Math.round(chart.clientWidth || 640)), H = 170, PADL = 52, PADR = 8, PADT = 8, PADB = 22;
     const xs = flat.map(p => p[0]), ys = flat.map(p => p[1]);
     const x0 = Math.min(...xs), x1 = Math.max(...xs);
-    const y0 = Math.min(...ys, 0), y1 = Math.max(...ys, 0);
-    const X = (x) => PAD + (x - x0) / Math.max(1, x1 - x0) * (W - 2 * PAD);
-    const Y = (y) => H - PAD - (y - y0) / Math.max(1e-9, y1 - y0) * (H - 2 * PAD);
+    const y0 = Math.min(...ys, start), y1 = Math.max(...ys, start);
+    const X = (x) => PADL + (x - x0) / Math.max(1, x1 - x0) * (W - PADL - PADR);
+    const Y = (y) => H - PADB - (y - y0) / Math.max(1e-9, y1 - y0) * (H - PADT - PADB);
     const css = getComputedStyle(document.documentElement);
-    const accent = css.getPropertyValue('--accent').trim();
-    const line = css.getPropertyValue('--rule').trim();
-    const seriesVars = ['--series-2', '--series-3', '--series-4'];
+    const line = css.getPropertyValue('--hairline').trim();
+    const muted = css.getPropertyValue('--ink-3').trim();
+    const seriesVars = ['--series-2', '--series-3', '--series-4', '--series-5'];
     let paths = '';
     allSeries.forEach((s, i) => {
       if (s.points.length < 2) return;
-      const d = s.points.map((p, j) => `${j ? 'L' : 'M'}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(' ');
-      const color = s.headline ? accent : css.getPropertyValue(seriesVars[(i - 1) % seriesVars.length]).trim();
-      paths += `<path d="${d}" fill="none" stroke="${color}" stroke-width="${s.headline ? 2.2 : 1.1}"/>`;
+      const d = s.points.map((p, j) => (j ? 'L' : 'M') + X(p[0]).toFixed(1) + ',' + Y(p[1]).toFixed(1)).join(' ');
+      const color = s.headline ? css.getPropertyValue('--series-pot').trim() : css.getPropertyValue(seriesVars[(i - 1) % seriesVars.length]).trim();
+      paths += '<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="' + (s.headline ? 2.2 : 1.2) + '" stroke-linejoin="round"/>';
     });
-    const zeroY = Y(0);
-    chartEl.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Paper equity curves">
-      <line x1="${PAD}" y1="${zeroY}" x2="${W - PAD}" y2="${zeroY}" stroke="${line}"/>
-      ${paths}</svg>`;
-    document.getElementById('chart-note').textContent =
-      `Paper simulation over the collected tape, starting pot $${eq.paper_pot_start.toFixed(2)} split evenly across the slots each window. The heavy line is the pot; thin lines are each strategy's cumulative paper P&L. Paper only — not venue money.`;
-    const legend = document.getElementById('legend');
-    legend.innerHTML = '';
+    const ticks = [y1, (y0 + y1) / 2, y0];
+    let grid = '';
+    ticks.forEach((t) => {
+      grid += '<line x1="' + PADL + '" y1="' + Y(t).toFixed(1) + '" x2="' + (W - PADR) + '" y2="' + Y(t).toFixed(1) + '" stroke="' + line + '"/>'
+        + '<text x="' + (PADL - 6) + '" y="' + (Y(t) + 4).toFixed(1) + '" text-anchor="end" font-size="11" fill="' + muted + '" font-family="Geist Mono, monospace">' + moneyWhole(t) + '</text>';
+    });
+    const zeroY = Y(start);
+    const xl = '<text x="' + PADL + '" y="' + (H - 4) + '" font-size="11" fill="' + muted + '" font-family="Geist Mono, monospace">' + dayLabel(x0) + '</text>'
+      + '<text x="' + (W - PADR) + '" y="' + (H - 4) + '" text-anchor="end" font-size="11" fill="' + muted + '" font-family="Geist Mono, monospace">' + dayLabel(x1) + '</text>';
+    chart.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Paper equity curves, the pot and each strategy, with dollar axis labels">'
+      + grid + '<line x1="' + PADL + '" y1="' + zeroY.toFixed(1) + '" x2="' + (W - PADR) + '" y2="' + zeroY.toFixed(1) + '" stroke="' + muted + '" stroke-dasharray="3 3"/>'
+      + paths + xl + '</svg>';
+    $('chart-note').textContent = 'Paper simulation over the collected tape, starting pot $' + eq.paper_pot_start.toFixed(2) + ' split evenly across the slots each window. The heavy line is the pot, the dashed line is the start. Paper only, not venue money.';
+    const legend = $('legend');
+    legend.replaceChildren();
     allSeries.forEach((s, i) => {
-      const span = document.createElement('span');
-      const color = s.headline ? accent : css.getPropertyValue(seriesVars[(i - 1) % seriesVars.length]).trim();
+      const span = el('span');
       const last = s.points.length ? s.points[s.points.length - 1][1] : null;
-      span.innerHTML = `<span class="swatch sw-${s.headline ? 'pot' : ((i - 1) % 3) + 2}"></span>${s.strategy}: <span class="num">${last === null ? 'no trades' : money(last)}</span>`;
-      legend.appendChild(span);
+      const sw = el('span', 'swatch sw-' + (s.headline ? 'pot' : ((i - 1) % 4) + 2));
+      span.append(sw, document.createTextNode(s.strategy + ': '));
+      const v = el('span', 'mono', last === null ? 'no trades' : money(last));
+      span.append(v);
+      legend.append(span);
     });
   } else {
-    chartEl.innerHTML = '<p class="unavailable">not enough collected tape to draw the equity curve yet</p>';
-    document.getElementById('legend').innerHTML = '';
+    const empty = el('div', 'empty-chart');
+    empty.textContent = traded === 0
+      ? 'No paper trades yet, so there is no pot line. The line starts at the first window a slot stakes on. ' + (settled === null ? 'The tape count is unavailable right now.' : 'The tape has ' + settled + ' settled window' + (settled === 1 ? '' : 's') + ', and no slot has traded in them yet.') + ''
+      : 'Not enough collected tape to draw the curve yet. Two points are needed.';
+    chart.replaceChildren(empty);
+    $('chart-note').textContent = '';
+    $('legend').replaceChildren();
   }
+}
 
-  const strats = await getJson('/api/strategies');
-  const sb = document.getElementById('strategies');
-  sb.innerHTML = '';
+function renderSlots(slotsData) {
+  const strip = $('slots');
+  strip.replaceChildren();
+  const mk = (s, retired) => {
+    const card = el('article', 'slot' + (retired ? ' retired' : ''));
+    const head = el('div', 'slot-head');
+    head.append(el('span', null, 'Slot ' + (s.slot + 1)), el('span', 'pill ' + (retired ? 'pill-neutral' : 'pill-ok'), retired ? 'retired' : s.status));
+    const sn = el('div', 'slot-name clip', s.strategy);
+    sn.title = s.strategy;
+    card.append(head, sn);
+    if (!retired) {
+      const row = el('div', 'strikes');
+      const pips = el('span', 'pips'); pips.setAttribute('aria-hidden', 'true');
+      for (let i = 0; i < 3; i++) pips.append(el('span', 'pip' + (i < s.strikes ? ' hit' : '')));
+      row.append(pips, el('span', null, 'strikes ' + s.strikes + ' of 3'));
+      card.append(row);
+    } else {
+      card.append(el('div', 'slot-line', 'Retired after ' + s.windows_traded + ' windows, rotated to ' + s.rotated_to + '.'));
+    }
+    const stint = retired ? s.paper_pnl_dollars : s.stint_pnl_dollars;
+    const cls = stint > 0 ? 'pos' : stint < 0 ? 'neg' : '';
+    const line = el('div', 'slot-line');
+    if (retired) {
+      line.append(document.createTextNode('Stint P&L: '), el('span', 'num ' + cls, money(stint)), document.createTextNode(' (' + (stint > 0 ? 'gain' : stint < 0 ? 'loss' : 'flat') + ')'));
+    } else {
+      line.append(document.createTextNode('This stint, ' + s.stint_windows + ' windows: '), el('span', 'num ' + cls, money(stint)), document.createTextNode(' (' + (stint > 0 ? 'gain' : stint < 0 ? 'loss' : 'flat') + ')'));
+      line.append(el('span', 'tags', null));
+      line.lastChild.append(el('span', 'tag tag-paper', 'paper'));
+    }
+    card.append(line);
+    if (!retired) {
+      const tot = el('div', 'slot-line');
+      tot.append(document.createTextNode('Slot total: '), el('span', 'num', money(s.equity_dollars)), document.createTextNode(' equity, P&L '), el('span', 'num', money(s.paper_pnl_dollars)));
+      tot.append(document.createTextNode(' '), el('span', 'tag tag-paper', 'paper'));
+      card.append(tot);
+    }
+    return card;
+  };
+  for (const s of slotsData.slots) strip.append(mk(s, false));
+  for (const r of slotsData.retired) strip.append(mk(r, true));
+  if (!slotsData.slots.length && !slotsData.retired.length) {
+    strip.append(el('p', 'unavailable', 'No slots yet. The strategy library in strategies/ is empty, so there is nothing to score. Add a .rn file there and reload.'));
+  }
+  $('slots-note').textContent = 'Paper simulation: the pot is re-split evenly across ' + slotsData.slots.length + ' slots each window. Three consecutive losing windows retire a slot’s strategy and rotate the next one in. Paper only, not venue money.';
+  const notes = slotsData.notes || [];
+  $('slot-notes').replaceChildren(...notes.map((n) => el('li', null, n)));
+  $('slot-notes').hidden = !notes.length;
+}
+
+function renderMarkets(markets) {
+  const tb = $('markets');
+  tb.replaceChildren();
+  for (const m of markets.slice(0, 40)) {
+    const tr = document.createElement('tr');
+    const cells = [m.ticker, m.close_time.replace('T', ' ').replace('Z', ' UTC'),
+      (m.yes_bid ?? '-') + ' / ' + (m.yes_ask ?? '-'), (m.no_bid ?? '-') + ' / ' + (m.no_ask ?? '-'),
+      m.last_price ?? '-', m.result || '-'];
+    cells.forEach((cell, ci) => {
+      const td = el('td', ci === 0 || ci === 2 || ci === 3 || ci === 4 ? 'mono' : null, String(cell));
+      if (ci === 4) td.className = 'mono col-last';
+      if (ci === 0) { td.textContent = ''; const sp = el('span', 'clip', String(cell)); sp.title = String(cell); td.append(sp); }
+      tr.append(td);
+    });
+    tb.append(tr);
+  }
+  if (!markets.length) tb.append(el('tr', 'empty-row'));
+  if (!markets.length) tb.lastChild.append(Object.assign(el('td', null, 'No snapshots collected yet. The collector writes one pass every collect interval, or press Collect now to write one pass.'), { colSpan: 6 }));
+  $('markets-count').textContent = 'Collected tape, ' + markets.length + ' markets';
+  $('markets-note').textContent = markets.length > 40 ? 'Showing the first 40 of ' + markets.length + ' collected markets.' : '';
+}
+
+// A strategy file that did not load: named, with its plain error. The
+// server's text only ever goes in as textContent.
+function renderLibraryErrors(errors) {
+  const box = $('library-errors');
+  box.replaceChildren();
+  for (const e of errors || []) {
+    const body = el('div');
+    body.append(el('strong', null, e.file), document.createTextNode(' did not load, so it is not scored. ' + e.error));
+    const row = el('div', 'banner');
+    row.append(body);
+    box.append(row);
+  }
+}
+
+function renderStrategies(strats) {
+  const sb = $('strategies-body');
+  sb.replaceChildren();
   for (const s of strats) {
     const tr = document.createElement('tr');
-    const vCls = s.verdict.startsWith('PROVEN') ? 'ok' : s.verdict.startsWith('NOT PROVEN') ? 'warn' : '';
-    const cells = [s.strategy, s.side, String(s.windows_traded),
-      s.mean_cents_per_contract === null ? '—' : s.mean_cents_per_contract.toFixed(2)];
-    for (const cell of cells) { const td = document.createElement('td'); td.textContent = cell; tr.appendChild(td); }
-    const td = document.createElement('td');
-    td.innerHTML = `<span class="verdict"><span class="dot ${vCls}" aria-hidden="true"></span>${s.verdict}</span>`;
-    tr.appendChild(td);
-    sb.appendChild(tr);
+    const nameTd = el('td', 'mono');
+    const nm = el('span', 'clip', s.strategy);
+    nm.title = s.strategy;
+    nameTd.append(nm);
+    tr.append(nameTd, el('td', 'mono', s.side));
+    tr.children[0].dataset.label = 'Strategy';
+    tr.children[1].dataset.label = 'Side';
+    const need = s.standard ? s.standard.min_windows : 100;
+    const frac = Math.min(1, s.windows_traded / need);
+    const cellBar = el('td');
+    cellBar.dataset.label = 'Windows traded, of 100';
+    const wrap = el('div', 'bar-cell');
+    const trk = el('div', 'track'); trk.setAttribute('role', 'progressbar');
+    trk.setAttribute('aria-valuemin', '0'); trk.setAttribute('aria-valuemax', String(need)); trk.setAttribute('aria-valuenow', String(s.windows_traded));
+    trk.setAttribute('aria-label', s.strategy + ' windows traded');
+    const f = el('div', 'fill'); f.style.transform = 'scaleX(' + frac.toFixed(4) + ')'; trk.append(f);
+    const winTxt = s.windows_traded >= need ? s.windows_traded + ' windows (' + need + ' needed)' : s.windows_traded + ' of ' + need;
+    wrap.append(trk, el('span', 'count', winTxt));
+    cellBar.append(wrap);
+    tr.append(cellBar);
+    tr.append(el('td', 'mono', s.mean_cents_per_contract === null ? '-' : s.mean_cents_per_contract.toFixed(2)));
+    tr.children[3].dataset.label = 'Mean cents per contract';
+    const vtd = el('td');
+    vtd.dataset.label = 'Verdict';
+    if (dataset === 'fixture' && s.verdict.startsWith('PROVEN')) vtd.append(el('span', 'pill pill-example', 'meets the bar on the example tape (not forward evidence)'));
+    else vtd.append(el('span', pillFor(s.verdict), s.verdict));
+    tr.append(vtd);
+    sb.append(tr);
   }
-  if (!strats.length) sb.innerHTML = '<tr><td colspan="5" class="unavailable">no strategies in the library</td></tr>';
-
-  const report = await getJson('/api/report');
-  document.getElementById('report').textContent = report.report;
+  if (!strats.length) {
+    const tr = el('tr', 'empty-row');
+    const td = el('td', null, 'No strategies in the library. Each strategy is a small .rn file in strategies/, and the desk scores whatever is there.');
+    td.colSpan = 5; tr.append(td); sb.append(tr);
+  }
 }
-async function collect() { await fetch('/api/collect', { method: 'POST' }); load(); }
-document.getElementById('retryBtn').addEventListener('click', load);
+
+const SHAPES = {
+  home: (x) => !!x && typeof x.account === 'object' && !!x.account && !!x.collector && typeof x.collector === 'object'
+    && typeof x.collector.collecting === 'boolean' && typeof x.collector.snapshots_on_disk === 'number',
+  slots: (x) => !!x && typeof x.paper_equity_dollars === 'number' && Array.isArray(x.slots) && Array.isArray(x.retired),
+  equity: (x) => !!x && Array.isArray(x.pot) && Array.isArray(x.series),
+  markets: (x) => Array.isArray(x),
+  strategies: (x) => Array.isArray(x),
+  report: (x) => !!x && typeof x.report === 'string',
+};
+async function loadAll() {
+  // Each read is independent: a failed read shows an error in its own panel and the rest stays current.
+  const urls = { home: '/api/home', slots: '/api/slots' + dsQuery(), equity: '/api/equity' + dsQuery(),
+    markets: '/api/markets', strategies: '/api/strategies' + dsQuery(), report: '/api/report' };
+  const names = Object.keys(urls);
+  const got = {};
+  await Promise.all(names.map(async (k) => {
+    try {
+      const body = await getJson(urls[k]);
+      if (!SHAPES[k](body)) throw new Error('answered with an unexpected shape');
+      got[k] = { ok: true, v: body };
+    }
+    catch (e) { got[k] = { ok: false, msg: e.message }; }
+  }));
+  const allFailed = names.every((k) => !got[k].ok);
+  $('load-error').classList.toggle('show', allFailed);
+  if (allFailed) {
+    $('chip-dot').className = 'dot err';
+    $('chip-text').textContent = 'Collector: unavailable';
+    $('load-error-text').textContent = 'The desk could not load: none of its six reads answered (' + got.home.msg + '). Check that openbell-rs is running on this address, then Retry.';
+  }
+  for (const k of names) setPanelError(k, got[k].ok ? null : got[k].msg);
+  if (allFailed) return;
+  const v = (k) => (got[k].ok ? got[k].v : null);
+  const home = v('home'), slots = v('slots'), eq = v('equity'), markets = v('markets'), strats = v('strategies'), report = v('report');
+  if (home) {
+    renderAccount(home.account);
+    renderTape(home.collector);
+    renderLibraryErrors(home.library_errors);
+  } else {
+    $('chip-dot').className = 'dot err';
+    $('chip-text').textContent = 'Collector: unavailable';
+  }
+  if (slots) { renderPot(slots, eq, home); renderSlots(slots); }
+  else if (!$('pot-figure').textContent.trim()) setValue('pot-figure', null);
+  if (strats) renderStrategies(strats);
+  if (markets) renderMarkets(markets);
+  if (report) {
+    const lines = report.report.split('\n');
+    $('report-head').textContent = lines[0];
+    reportBody = lines.slice(1).join('\n');
+    applyReport();
+  }
+}
+
+function setPanelError(key, msg) {
+  document.querySelectorAll('[data-err]').forEach((p) => {
+    if (p.dataset.err !== key) return;
+    if (!msg) { p.hidden = true; p.replaceChildren(); return; }
+    const b = el('button', 'btn-quiet', 'Retry');
+    b.type = 'button';
+    b.addEventListener('click', load);
+    p.replaceChildren(document.createTextNode('This part did not load (' + msg + '). The rest of the page is unaffected. '), b);
+    p.hidden = false;
+    p.closest('section').querySelectorAll('.sk').forEach((n) => n.remove());
+  });
+}
+
+let liveOpen = false;
+function syncSource() {
+  document.body.dataset.source = dataset;
+  $('live-head').hidden = dataset !== 'fixture';
+  $('live-content').hidden = dataset === 'fixture' && !liveOpen;
+  $('live-toggle').setAttribute('aria-expanded', String(liveOpen));
+  $('live-toggle').textContent = liveOpen ? 'Hide' : 'Show';
+}
+$('live-toggle').addEventListener('click', () => { liveOpen = !liveOpen; syncSource(); });
+document.querySelectorAll('a[data-live-link]').forEach((a) => a.addEventListener('click', (ev) => {
+  ev.preventDefault();
+  const target = document.querySelector(a.getAttribute('href'));
+  if (dataset === 'fixture' && !liveOpen) { liveOpen = true; syncSource(); }
+  target.querySelector('h2').focus({ preventScroll: true });
+  target.scrollIntoView({ block: 'start' });
+}));
+
+async function collect() {
+  const b = $('collect-btn');
+  const status = $('collect-status');
+  b.disabled = true;
+  b.textContent = 'Collecting…';
+  status.textContent = '';
+  let problem = '';
+  try {
+    const r = await fetch('/api/collect', { method: 'POST' });
+    const body = await r.json().catch(() => null);
+    if (!r.ok) problem = (body && body.error) || ('the desk answered ' + r.status);
+    else if (body && body.error) problem = body.error;
+  } catch (e) {
+    problem = e.message;
+  }
+  if (problem) status.textContent = 'Could not collect right now. Nothing was written. Try again in a minute. Server said: ' + problem;
+  b.disabled = false;
+  b.textContent = 'Collect now';
+  load();
+}
+$('collect-btn').addEventListener('click', collect);
+
+function setDataset(next) {
+  dataset = next;
+  $('seg-live').setAttribute('aria-pressed', String(next === 'live'));
+  $('seg-fixture').setAttribute('aria-pressed', String(next === 'fixture'));
+  $('fixture-banner').hidden = next !== 'fixture';
+  const url = new URL(location.href);
+  if (next === 'fixture') url.searchParams.set('dataset', 'fixture'); else url.searchParams.delete('dataset');
+  history.replaceState(null, '', url);
+  syncSource();
+  $('announce').textContent = next === 'fixture' ? 'Showing the example tape' : 'Showing the live tape';
+  load();
+}
+$('seg-live').addEventListener('click', () => setDataset('live'));
+$('seg-fixture').addEventListener('click', () => setDataset('fixture'));
+$('markets-toggle').addEventListener('click', (ev) => {
+  const open = ev.currentTarget.getAttribute('aria-expanded') !== 'true';
+  ev.currentTarget.setAttribute('aria-expanded', String(open));
+  $('markets-panel').hidden = !open;
+});
+$('retryBtn').addEventListener('click', load);
 
 function syncThemeButton() {
   const t = document.documentElement.dataset.theme;
-  document.getElementById('themeUse').setAttribute('href', t === 'dark' ? '#i-moon' : '#i-sun');
-  document.getElementById('themeLabel').textContent = 'Appearance: ' + (t === 'dark' ? 'Dark' : 'Light');
+  $('themeUse').setAttribute('href', t === 'dark' ? '#i-moon' : '#i-sun');
+  $('themeLabel').textContent = 'Appearance: ' + (t === 'dark' ? 'Dark' : 'Light');
 }
-document.getElementById('themeBtn').addEventListener('click', () => {
+$('themeBtn').addEventListener('click', () => {
   const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme = next;
   localStorage.setItem('openbell-theme', next);
@@ -381,11 +998,9 @@ document.getElementById('themeBtn').addEventListener('click', () => {
   load();
 });
 syncThemeButton();
-load();
+applyReport();
+setDataset(dataset);
 setInterval(load, 30000);
 </script>
-<!-- hallmark-rune override log
-override · R1 · guard: no font files ship in this repo and external font requests are banned on this stack · reason: the template's named stack (Inter first, system fallbacks) is the considered choice available offline; mono carries figures and the verbatim report only
--->
 </body>
 </html>

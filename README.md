@@ -19,9 +19,9 @@ each scored against the same tape:
   current total paper equity is split evenly across the slots, and each slot
   stakes its share at its strategy's entry price, fees included. The pot
   compounds: a winning window grows the next window's stakes, a losing one
-  shrinks them. Only a price the venue could actually trade sizes a trade —
-  Kalshi trades whole cents, so a sub-cent quote is treated as no market,
-  never as a five-figure paper win.
+  shrinks them. Only a whole-cent price between 0.01 and 0.99 sizes a trade.
+  Kalshi trades whole cents, so any other quote (0.4567, or a sub-cent 0.004)
+  is treated as no market, never as a five-figure paper win.
 - **Strikes are consecutive losses.** Three in a row retire the strategy from
   its slot, and the next library strategy that is not already running takes
   its place. If every other strategy is already running, the next in order
@@ -48,6 +48,16 @@ or returns a non-boolean is counted and named, never read as a quiet one;
 and a strategy that never returns degrades to no-entry under an aggregate
 time budget, with the degradation stated in the simulation's notes.
 
+## Same-site guard
+
+Every request must name a local Host: `localhost`, `127.0.0.1` or `[::1]`, or
+a host name listed in `OPENBELL_ALLOWED_HOSTS` (comma-separated, no port).
+Other Hosts are refused with 403. A state-changing request (any method but
+GET or HEAD) is refused with 403 when the browser says it is cross-site, or
+when its Origin names a different authority than its Host. A request with a
+body must be `application/json` (415). Refusals are plain JSON errors, and
+reads stay open to same-host clients.
+
 ## Venue truth, or "unavailable"
 
 Every number on the home screen and in the daily report is one of three
@@ -73,6 +83,19 @@ can never be backfilled. Freshness is read from the tape's last line, so a
 single future-dated record cannot make a stopped collector read as alive.
 A collect pass that fails, or writes nothing, is reported as a failure.
 
+The tape is read as bytes. `snapshots_on_disk` counts valid snapshots only;
+a line that is not valid UTF-8 or not a snapshot is counted in
+`dropped_lines` and never hides its neighbours. `lines_on_disk` is every
+line in the tape file: `snapshots_on_disk + dropped_lines`. A torn last line (no final
+newline, left by a crash mid-append) is kept as its own dropped line: the
+next pass starts on a fresh line, so its snapshots are not lost.
+
+When reads fail on a pass, `/api/home` carries `series_failed_last_pass`
+(failed reads on the last pass), `series_total` (10: open and settled reads
+for five series) and `series_failed_names` (the series behind them). The
+report's Collector line then reads, for example, `4 of 10 market reads failed
+on the last pass (5 series, open and settled): KXBTC15M, KXSOL15M.`
+
 ## The daily report
 
 One short page, written to be read:
@@ -92,6 +115,15 @@ One short page, written to be read:
    Until then the verdict is "insufficient evidence" — which, on a young
    tape, is most of them, and the report says so.
 
+## The example tape
+
+`dataset=fixture` reads a labelled example tape written for tests. The page
+groups its figures apart from the live desk under an "example tape" tag, and
+its verdict reads `PROVEN on the example tape (not forward evidence, paper
+only - no orders placed)`. The live desk's verdict stays `PROVEN on forward
+evidence (paper only — no orders placed)`. The daily report always reads the
+live desk.
+
 ## Status
 
 The forward evidence is young: the tape has been collecting since
@@ -110,11 +142,14 @@ cargo run            # serves the desk on $PORT (default 8472)
 Environment: `OPENBELL_DATA` (tape directory), `OPENBELL_STRATEGIES`
 (strategy library directory), `OPENBELL_COLLECT_SECS` (collector interval),
 `OPENBELL_PAPER_POT` (paper pot for the slot simulation, default $100 —
-always labelled a simulation parameter, never venue money).
+always labelled a simulation parameter, never venue money),
+`OPENBELL_ALLOWED_HOSTS` (extra host names allowed past the same-site guard,
+see above), `PORT` (default 8472).
 
 ## Checks
 
-`bash .loop/verify` builds the binary, runs the Rust tests, and runs the
+`cargo test` runs 28 unit tests. `bash .loop/verify` builds the binary, runs
+the Rust tests, and runs the
 check kit: the order-path fence, slot rotation and reconciliation against
 independent recomputation, collector health counted both ways, the equity
 curve reconciled against the slot report, the daily report's honesty
@@ -127,6 +162,7 @@ every change.
 - `src/main.rs` — the whole server: collector, shadow scorer, slot system,
   report, and the HTTP API.
 - `strategies/*.rn` — the strategy library (Rune).
-- `assets/index.html` — the desk's single page: account, collector health,
-  the paper equity chart, and the daily report. Light and dark themes, dark
-  by default, the switch in the settings footer.
+- `assets/index.html` — the desk's single page: a purpose line and a "How to
+  read this" line, account, collector health, the paper equity chart, the
+  strategies, and the daily report. Each panel shows its own error. Light and
+  dark themes, dark by default, the switch in the settings footer.

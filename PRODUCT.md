@@ -34,7 +34,14 @@ chart serve it.
   from the collected tape, or from the paper simulation — and each kind is
   labelled as what it is. Anything else is shown as unavailable.
 - Paper figures are always labelled paper. A strategy is "proven" only by
-  the promotion standard in code, on forward evidence.
+  the promotion standard in code, on forward evidence. The example tape is
+  labelled as such and never reads as forward evidence.
+- The page opens with a purpose line and a "How to read this" line. Each
+  panel shows its own error when its data fails to load.
+- Collector failures are stated as counts of market reads, with the series
+  named when known.
+- No write request from another site is served; see the same-site guard in
+  README.md.
 - Light and dark themes, toggle in settings, dark is the default.
 - Icons are drawn symbols, never letters, never emoji.
 - No order placement exists in this build, in any form.

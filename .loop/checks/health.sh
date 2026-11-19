@@ -51,7 +51,8 @@ echo "$home2" | jq -e --argjson s "$exp_snaps" '
   || { echo "FAIL: after a collection pass the surface does not read fresh: $(echo "$home2" | jq -c .collector)"; exit 1; }
 
 # Phase 3: corrupt lines are counted, not vanished. A tape with
-# garbage lines reports every line on disk and names the dropped.
+# garbage lines reports every line on disk (lines_on_disk), counts only the
+# valid ones as snapshots (snapshots_on_disk), and names the dropped.
 mkdir -p "$WORK/data3"
 python3 gen_fixture.py "$WORK/data3/snapshots.jsonl" >/dev/null
 printf 'not json at all\n{"ticker": "BROKEN"\n' >> "$WORK/data3/snapshots.jsonl"
@@ -63,7 +64,7 @@ PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s "http://127.0.0.1:8498/api/home" >/dev/null 2>&1 && break; sleep 0.5; done
 home3=$(curl -s "http://127.0.0.1:8498/api/home")
 echo "$home3" | jq -e --argjson t "$total3" '
-  .collector.snapshots_on_disk == $t and .collector.dropped_lines == 2' >/dev/null \
+  .collector.lines_on_disk == $t and .collector.dropped_lines == 2 and .collector.snapshots_on_disk == ($t - 2)' >/dev/null \
   || { echo "FAIL: corrupt tape lines are not counted and named as dropped (total $total3): $(echo "$home3" | jq -c .collector)"; exit 1; }
 
 echo "HEALTH OK: collector block matches an independent tape count; stale reads stale, a fresh pass reads collecting, corrupt lines are counted as dropped"
