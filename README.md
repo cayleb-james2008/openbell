@@ -133,6 +133,21 @@ slot system is a paper scorer. Whether any strategy ever earns promotion is
 a question the tape will answer over time; the desk's job until then is to
 keep collecting and keep the numbers honest.
 
+## Versions and updates
+
+The running version is shown on the page, in `GET /api/version` and `GET /api/home`, and by `openbell-rs --version`. Every release is tagged `vX.Y.Z` on GitHub, with a changelog entry in `CHANGELOG.md`, binaries for each platform and a `SHA256SUMS` file; pushing a tag runs `.github/workflows/release.yml`, which refuses a tag that does not match the version in `Cargo.toml`.
+
+Self-update (`src/update.rs`): the desk asks the newest GitHub release of its own repository whether a newer version exists (shortly after start and every 6 hours). `GET /api/update` says what it found; `POST /api/update/check` asks now. `POST /api/update/apply` downloads the binary for this platform, checks its SHA-256 against the release's `SHA256SUMS`, runs it with `--version` to confirm it is the build it claims to be, and only then swaps it in. `POST /api/update/restart` then starts the new build. Any failed step leaves the installed program untouched. Downloads go through `curl`, and the only URLs fetched are https (plain http only for a loopback address).
+
+Updating is refused for a cargo-built binary, from any Host other than a loopback name (`OPENBELL_ALLOWED_HOSTS` does not permit it), and a restart is refused with 409 while a collection pass is running or when no update is waiting.
+
+| Var | Default |
+| --- | --- |
+| `OPENBELL_UPDATE_MODE` | `notify` (check and tell); `auto` also downloads and installs (a restart is still yours to press); `off` never contacts GitHub |
+| `OPENBELL_UPDATE_REPO` | `cayleb-james2008/openbell` |
+| `OPENBELL_UPDATE_API` | `https://api.github.com` (plain http only for a loopback address) |
+| `OPENBELL_UPDATE_DEV` | `1` allows replacing a cargo-built binary (tests only) |
+
 ## Running it
 
 ```sh
@@ -148,7 +163,7 @@ see above), `PORT` (default 8472).
 
 ## Checks
 
-`cargo test` runs 28 unit tests. `bash .loop/verify` builds the binary, runs
+`cargo test` runs the unit tests and the `--version` integration test. `bash .loop/verify` builds the binary, runs
 the Rust tests, and runs the
 check kit: the order-path fence, slot rotation and reconciliation against
 independent recomputation, collector health counted both ways, the equity
