@@ -1,5 +1,8 @@
 # OpenBell
 
+[![latest release](https://img.shields.io/github/v/release/cayleb-james2008/openbell)](https://github.com/cayleb-james2008/openbell/releases)
+
+
 A compounding desk for Kalshi's 15-minute markets, rebuilt in Rust. OpenBell
 collects the venue's public market data around the clock, scores a library of
 strategies against that tape on paper, and writes a daily report whose first
@@ -135,7 +138,9 @@ keep collecting and keep the numbers honest.
 
 ## Versions and updates
 
-The running version is shown on the page, in `GET /api/version` and `GET /api/home`, and by `openbell-rs --version`. Every release is tagged `vX.Y.Z` on GitHub, with a changelog entry in `CHANGELOG.md`, binaries for each platform and a `SHA256SUMS` file; pushing a tag runs `.github/workflows/release.yml`, which refuses a tag that does not match the version in `Cargo.toml`.
+**Releasing:** bump `version` in `Cargo.toml`, add a `## X.Y.Z - date` entry to `CHANGELOG.md`, and merge to `main`. `.github/workflows/release.yml` sees the new version, builds every platform and publishes the GitHub Release `vX.Y.Z` with the binaries and `SHA256SUMS`; a push that does not change the version publishes nothing, and a new version without a changelog entry fails the workflow. Pushing a `vX.Y.Z` tag by hand does the same.
+
+The running version is shown on the page, in `GET /api/version` and `GET /api/home`, and by `openbell-rs --version`. Every release is tagged `vX.Y.Z` on GitHub, with a changelog entry in `CHANGELOG.md`, binaries for each platform and a `SHA256SUMS` file; merging a new version to `main` (or pushing a tag) runs `.github/workflows/release.yml`, which refuses a tag that does not match the version in `Cargo.toml`.
 
 Self-update (`src/update.rs`): the desk asks the newest GitHub release of its own repository whether a newer version exists (shortly after start and every 6 hours). `GET /api/update` says what it found; `POST /api/update/check` asks now. `POST /api/update/apply` downloads the binary for this platform, checks its SHA-256 against the release's `SHA256SUMS`, runs it with `--version` to confirm it is the build it claims to be, and only then swaps it in. `POST /api/update/restart` then starts the new build. Any failed step leaves the installed program untouched. Downloads go through `curl`, and the only URLs fetched are https (plain http only for a loopback address).
 
