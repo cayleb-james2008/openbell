@@ -183,6 +183,13 @@ fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize), S
 /// spliced, unparseable tape lines.
 static COLLECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Series fetches that failed on the most recent pass: the count the
+/// pass logs as "series failed", stated on the health block and report.
+static SERIES_FAILED_LAST_PASS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// The series tickers behind that count, in SERIES order, each once.
+static SERIES_FAILED_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// Run one pass. Ok carries (snapshots written, per-series errors);
 /// a pass that wrote nothing BECAUSE everything failed is Err, so
 /// the API can say so instead of returning a cheerful 200 with 0.
@@ -196,6 +203,7 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
     let mut buf = String::new();
     let mut written = 0;
     let mut errors: Vec<String> = Vec::new();
+    let mut failed_series: Vec<String> = Vec::new();
     for series in SERIES {
         for status in ["open", "settled"] {
             match fetch_markets(series, status) {
@@ -204,6 +212,9 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
                         errors.push(format!(
                             "{series}/{status}: skipped {skipped} invalid record(s)"
                         ));
+                        if !failed_series.iter().any(|f| f == series) {
+                            failed_series.push(series.to_string());
+                        }
                     }
                     for snap in &snaps {
                         buf.push_str(&serde_json::to_string(snap).unwrap());
@@ -214,10 +225,15 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
                 Err(e) => {
                     eprintln!("collect {series}/{status}: {e}");
                     errors.push(format!("{series}/{status}: {e}"));
+                    if !failed_series.iter().any(|f| f == series) {
+                        failed_series.push(series.to_string());
+                    }
                 }
             }
         }
     }
+    SERIES_FAILED_LAST_PASS.store(errors.len(), std::sync::atomic::Ordering::Relaxed);
+    *SERIES_FAILED_NAMES.lock().unwrap_or_else(|p| p.into_inner()) = failed_series;
     if written == 0 {
         return Err(if errors.is_empty() {
             "collection wrote nothing — every series returned empty".to_string()
@@ -228,20 +244,49 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
             )
         });
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| e.to_string())?;
-    use std::io::Write;
-    file.write_all(buf.as_bytes()).map_err(|e| e.to_string())?;
+    append_tape(&path, &buf).map_err(|e| e.to_string())?;
     Ok((written, errors))
 }
 
-fn parse_tape_text(text: &str) -> Vec<Snapshot> {
-    text.lines()
+/// Append one pass in a single write. A tape that ends in a torn line
+/// (no final newline, left by a crash mid-append) gets a newline first,
+/// so the torn fragment stays its own line and the pass is not spliced
+/// onto it.
+fn append_tape(path: &Path, body: &str) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut torn = false;
+    if let Ok(mut f) = std::fs::File::open(path) {
+        if f.metadata()?.len() > 0 {
+            f.seek(SeekFrom::End(-1))?;
+            let mut last = [0u8; 1];
+            f.read_exact(&mut last)?;
+            torn = last[0] != b'\n';
+        }
+    }
+    let mut out = String::new();
+    if torn {
+        out.push('\n');
+    }
+    out.push_str(body);
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(out.as_bytes())
+}
+
+/// Parse a tape as bytes, one record per line. A line that is not
+/// valid UTF-8 or not a snapshot is dropped and counted in the line
+/// total, exactly like any malformed line; it never hides its
+/// neighbours. Returns (snapshots, lines in the file).
+fn parse_tape_bytes(bytes: &[u8]) -> (Vec<Snapshot>, usize) {
+    let mut lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
+    if lines.last().map_or(false, |l| l.is_empty()) {
+        lines.pop();
+    }
+    let snaps = lines
+        .iter()
+        .filter_map(|l| std::str::from_utf8(l).ok())
         .filter_map(|l| serde_json::from_str::<Snapshot>(l).ok())
-        .collect()
+        .collect();
+    (snaps, lines.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -373,7 +418,13 @@ impl Strategy {
             .with_context(&context)
             .with_diagnostics(&mut diagnostics)
             .build()
-            .map_err(|e| format!("strategy {} failed to build: {e}", path.display()))?;
+            .map_err(|e| {
+                format!(
+                    "strategy {} failed to build: {}",
+                    path.display(),
+                    e.to_string().replace(" (see diagnostics for details)", "")
+                )
+            })?;
         let unit = Arc::new(unit);
         let mut strat = Strategy {
             name: String::new(),
@@ -689,7 +740,9 @@ fn window_entry_scan(strat: &Strategy, snaps: &[Snapshot]) -> Option<f64> {
         let secs_to_close = close - snap.fetched_at;
         if strat.allow_entry(ya, na, secs_to_close) {
             let price = if strat.side == "yes" { ya } else { na };
-            if (0.01..=0.99).contains(&price) {
+            // Only whole cents trade (README): 0.45 yes, never 0.4567.
+            let whole_cent = ((price * 100.0) - (price * 100.0).round()).abs() < 1e-9;
+            if (0.01..=0.99).contains(&price) && whole_cent {
                 return Some(price);
             }
         }
@@ -1480,12 +1533,31 @@ fn daily_report(app: &App) -> String {
             }
         ),
         format!(
-            "Collector: {} — {} snapshots on disk across {} markets, {} distinct settled windows; newest snapshot {}.",
+            "Collector: {} — {} snapshots on disk across {} markets, {} distinct settled windows; newest snapshot {}.{}",
             if collecting { "collecting" } else { "NOT collecting" },
             health["snapshots_on_disk"],
             health["markets_seen"],
             health["settled_windows"],
-            age_text
+            age_text,
+            match health["series_failed_last_pass"].as_u64() {
+                Some(n) if n > 0 => {
+                    let names: Vec<&str> = health["series_failed_names"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+                    let named = if names.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", names.join(", "))
+                    };
+                    format!(
+                        " {n} of {} market reads failed on the last pass ({} series, open and settled){named}.",
+                        health["series_total"],
+                        SERIES.len()
+                    )
+                }
+                _ => String::new(),
+            }
         ),
     ];
     if !collecting {
@@ -1615,6 +1687,10 @@ struct TapeEntry {
     /// the seam an append must continue.
     seam_offset: u64,
     seam_line: String,
+    /// Whether the parsed bytes end at a line boundary. A torn last
+    /// line cannot be extended: the next pass's first byte would
+    /// finish it, and the line count would be off by one.
+    ends_newline: bool,
 }
 
 /// The seam an append must continue, plus the health aggregates:
@@ -1759,10 +1835,10 @@ impl App {
             // Seam check failed: the file was replaced, not appended
             // to. Fall through to a full parse of the current bytes.
         }
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        let total_lines = text.lines().count();
-        let snaps: Vec<Snapshot> = parse_tape_text(&text);
-        let (seam_offset, seam_line) = seam_of(&text, 0);
+        let bytes = std::fs::read(path).unwrap_or_default();
+        let (snaps, total_lines) = parse_tape_bytes(&bytes);
+        let (seam_offset, seam_line) = seam_of(&String::from_utf8_lossy(&bytes), 0);
+        let ends_newline = bytes.last().map_or(true, |b| *b == b'\n');
         let mut markets = std::collections::HashSet::new();
         let mut results_by_ticker = std::collections::HashMap::new();
         fold_health(&snaps, &mut markets, &mut results_by_ticker);
@@ -1778,6 +1854,7 @@ impl App {
             results_by_ticker,
             seam_offset,
             seam_line,
+            ends_newline,
         };
         let out = view(&entry);
         *self.tape_cache.lock().unwrap() = Some(entry);
@@ -1846,6 +1923,9 @@ impl App {
 /// old file length), so its line count and seam are exact.
 fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<TapeEntry> {
     use std::io::{Read, Seek, SeekFrom};
+    if !e.ends_newline {
+        return None;
+    }
     let mut f = std::fs::File::open(path).ok()?;
     let mut seam_buf = Vec::new();
     f.seek(SeekFrom::Start(e.seam_offset)).ok()?;
@@ -1868,12 +1948,11 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
         .take(len - e.len)
         .read_to_end(&mut tail_buf)
         .ok()?;
-    let tail = String::from_utf8(tail_buf).ok()?;
-    e.total_lines += tail.lines().count();
+    let (new_snaps, tail_lines) = parse_tape_bytes(&tail_buf);
+    e.total_lines += tail_lines;
     // The held parse is shared with readers; extending it mutates
     // in place when this entry is the only holder (the common
     // case), and every fold touches only the new snapshots.
-    let new_snaps: Vec<Snapshot> = parse_tape_text(&tail);
     fold_health(&new_snaps, &mut e.markets, &mut e.results_by_ticker);
     {
         let grouped = Arc::make_mut(&mut e.grouped);
@@ -1892,10 +1971,11 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
         }
     }
     Arc::make_mut(&mut e.snaps).extend(new_snaps);
-    if !tail.is_empty() {
-        let (off, line) = seam_of(&tail, e.len);
+    if !tail_buf.is_empty() {
+        let (off, line) = seam_of(&String::from_utf8_lossy(&tail_buf), e.len);
         e.seam_offset = off;
         e.seam_line = line;
+        e.ends_newline = tail_buf.last() == Some(&b'\n');
     }
     e.len = len;
     e.mtime = mtime;
@@ -1923,7 +2003,8 @@ fn collector_health(app: &App) -> serde_json::Value {
     let collecting = !future_dated
         && age.map_or(false, |a| a <= (app.collect_secs.max(60) * 2) as i64);
     serde_json::json!({
-        "snapshots_on_disk": view.total_lines,
+        "snapshots_on_disk": view.snaps.len(),
+        "lines_on_disk": view.total_lines,
         "dropped_lines": view.total_lines.saturating_sub(view.snaps.len()),
         "markets_seen": view.markets,
         "settled_windows": view.settled_windows,
@@ -1931,6 +2012,9 @@ fn collector_health(app: &App) -> serde_json::Value {
         "newest_snapshot_age_secs": age,
         "collect_interval_secs": app.collect_secs,
         "collecting": collecting,
+        "series_failed_last_pass": SERIES_FAILED_LAST_PASS.load(std::sync::atomic::Ordering::Relaxed),
+        "series_failed_names": SERIES_FAILED_NAMES.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+        "series_total": SERIES.len() * 2,
     })
 }
 
@@ -1968,6 +2052,16 @@ fn dataset_path(app: &App, query: &str) -> PathBuf {
     app.data_dir.join("snapshots.jsonl")
 }
 
+/// The verdict as the named dataset may state it. The fixture is the
+/// labelled example tape written for tests, never forward evidence.
+fn dataset_verdict(verdict: &str, dataset: &str) -> String {
+    if dataset == "fixture" && verdict.starts_with("PROVEN on forward evidence") {
+        return "PROVEN on the example tape (not forward evidence, paper only - no orders placed)"
+            .to_string();
+    }
+    verdict.to_string()
+}
+
 fn json_response(status: u16, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1987,7 +2081,62 @@ fn html_response(body: &str) -> String {
 /// aborted this process, collector and all, before this cap).
 const MAX_BODY_BYTES: usize = 1_000_000;
 
-fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String)> {
+/// The hostname of a Host or Origin authority: "[::1]" for an IPv6
+/// literal, otherwise the part before the port.
+fn authority_host(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        authority.split_inclusive(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    }
+}
+
+/// The same-site rule, shared with Fleet. Every request must name a
+/// local Host unless OPENBELL_ALLOWED_HOSTS lists it. A state-changing
+/// request (anything but GET or HEAD) is refused when a browser says
+/// it came from another site, when its Origin names another authority
+/// than its Host, or when it carries a body that is not JSON. Returns
+/// the status and message of the refusal, or None to serve it.
+fn refuse_request(
+    method: &str,
+    headers: &[(String, String)],
+    body_len: usize,
+    allowed: &[String],
+) -> Option<(u16, &'static str)> {
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    };
+    let host = header("host").to_ascii_lowercase();
+    let host_name = authority_host(&host);
+    let host_ok = matches!(host_name, "localhost" | "127.0.0.1" | "[::1]")
+        || allowed.iter().any(|a| a == host_name);
+    if !host_ok {
+        return Some((403, "this desk answers only on localhost unless OPENBELL_ALLOWED_HOSTS names this host"));
+    }
+    if matches!(method, "GET" | "HEAD") {
+        return None;
+    }
+    if header("sec-fetch-site") == "cross-site" {
+        return Some((403, "cross-site requests are refused"));
+    }
+    let origin = header("origin");
+    if !origin.is_empty() {
+        let origin_authority = origin.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
+        if !origin_authority.eq_ignore_ascii_case(&host) {
+            return Some((403, "cross-origin requests are refused"));
+        }
+    }
+    if body_len > 0 && !header("content-type").to_ascii_lowercase().starts_with("application/json") {
+        return Some((415, "requests with a body must be Content-Type: application/json"));
+    }
+    None
+}
+
+fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String, Vec<(String, String)>)> {
     // One deadline for the whole request: a per-read timeout alone
     // is defeated by a client dripping a byte just under it.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -2018,17 +2167,28 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, Str
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
     let mut content_length = 0usize;
+    let mut headers: Vec<(String, String)> = Vec::new();
     loop {
         let line = read_line_by_byte(&mut reader)?;
         if line == "\r\n" || line.is_empty() {
             break;
         }
-        if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
-            content_length = v.trim().parse().unwrap_or(0);
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            if name == "content-length" {
+                content_length = value.parse().unwrap_or(0);
+            }
+            headers.push((name, value));
         }
     }
     if content_length > MAX_BODY_BYTES {
-        return Some(("__too_large__".to_string(), String::new(), String::new()));
+        return Some((
+            "__too_large__".to_string(),
+            String::new(),
+            String::new(),
+            Vec::new(),
+        ));
     }
     let mut body: Vec<u8> = Vec::with_capacity(content_length);
     if content_length > 0 {
@@ -2045,7 +2205,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, Str
             }
         }
     }
-    Some((method, path, String::from_utf8_lossy(&body).to_string()))
+    Some((method, path, String::from_utf8_lossy(&body).to_string(), headers))
 }
 
 fn latest_markets(app: &App) -> Vec<Snapshot> {
@@ -2121,7 +2281,11 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                         .to_string(),
                 );
             }
-            let (_, reports) = app.analysis(&dpath);
+            let (_, mut reports) = app.analysis(&dpath);
+            let dataset = dataset_name(query);
+            for report in &mut reports {
+                report.verdict = dataset_verdict(&report.verdict, &dataset);
+            }
             json_response(200, &serde_json::to_string(&reports).unwrap())
         }
         ("GET", "/api/slots") => {
@@ -2262,21 +2426,33 @@ fn main() {
         paper_pot,
         collect_secs,
     });
+    let allowed_hosts: Vec<String> = std::env::var("OPENBELL_ALLOWED_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect();
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind failed");
     println!("openbell-rs listening on http://127.0.0.1:{port} (shadow mode — no order path exists)");
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
                 let app = app.clone();
+                let allowed_hosts = allowed_hosts.clone();
                 std::thread::spawn(move || {
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
-                    if let Some((method, path, _body)) = read_request(&mut stream) {
+                    if let Some((method, path, body, headers)) = read_request(&mut stream) {
                         if method == "__too_large__" {
                             let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\n\r\n{\"error\":\"request body too large\"}";
                             let _ = stream.write_all(resp.as_bytes());
                             return;
                         }
-                        let response = handle(&app, &method, &path);
+                        let response = match refuse_request(&method, &headers, body.len(), &allowed_hosts) {
+                            Some((status, message)) => {
+                                json_response(status, &serde_json::json!({ "error": message }).to_string())
+                            }
+                            None => handle(&app, &method, &path),
+                        };
                         let _ = stream.write_all(response.as_bytes());
                     }
                 });
@@ -2836,6 +3012,296 @@ mod tests {
         let view = app.tape(&tape);
         assert_eq!((view.snaps.len(), view.total_lines), (1, 1));
         assert_eq!(view.snaps[0].ticker, "Q");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn one_non_utf8_line_does_not_hide_the_tape() {
+        let dir = std::env::temp_dir().join(format!("ob-utf8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tape = dir.join("snapshots.jsonl");
+        let line = |t: &str, at: i64| {
+            serde_json::to_string(&snap(t, at, "2030-01-01T01:00:00Z", "", Some(0.5), Some(0.5)))
+                .unwrap()
+        };
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: dir.clone(),
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        // A valid snapshot whose ticker holds a byte that is not UTF-8.
+        let mut bad = line("Z", 105).into_bytes();
+        let z = bad.iter().position(|c| *c == b'Z').unwrap();
+        bad[z] = 0xff;
+        let mut bytes = format!("{}\n", line("A", 100)).into_bytes();
+        bytes.extend_from_slice(&bad);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(format!("{}\n", line("B", 110)).as_bytes());
+        std::fs::write(&tape, &bytes).unwrap();
+        let view = app.tape(&tape);
+        assert_eq!(
+            (view.snaps.len(), view.total_lines),
+            (2, 3),
+            "the invalid line is dropped and counted; its neighbours still parse"
+        );
+        // The same holds for a line that arrives by append.
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&tape).unwrap();
+        f.write_all(&bad).unwrap();
+        f.write_all(b"\n").unwrap();
+        writeln!(f, "{}", line("C", 120)).unwrap();
+        drop(f);
+        let view = app.tape(&tape);
+        assert_eq!((view.snaps.len(), view.total_lines), (3, 5));
+        assert_eq!(view.snaps[2].ticker, "C");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pass_after_a_torn_tape_line_is_not_spliced_onto_it() {
+        let dir = std::env::temp_dir().join(format!("ob-torn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tape = dir.join("snapshots.jsonl");
+        let line = |t: &str, at: i64| {
+            serde_json::to_string(&snap(t, at, "2030-01-01T01:00:00Z", "", Some(0.5), Some(0.5)))
+                .unwrap()
+        };
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: dir.clone(),
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        // A crash left a torn last line with no newline.
+        std::fs::write(&tape, format!("{}\n{{\"ticker\":\"TO", line("A", 100))).unwrap();
+        let view = app.tape(&tape);
+        assert_eq!((view.snaps.len(), view.total_lines), (1, 2));
+        // The next pass lands after the torn line.
+        append_tape(&tape, &format!("{}\n{}\n", line("B", 110), line("C", 120))).unwrap();
+        let view = app.tape(&tape);
+        let tickers: Vec<&str> = view.snaps.iter().map(|s| s.ticker.as_str()).collect();
+        assert_eq!(tickers, ["A", "B", "C"], "the pass must not be lost inside the torn line");
+        assert_eq!(view.total_lines, 4, "the torn fragment is its own counted line");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn same_site_rule_refuses_foreign_writes() {
+        let headers = |host: &str, extra: &[(&str, &str)]| {
+            let mut h = vec![("host".to_string(), host.to_string())];
+            h.extend(extra.iter().map(|(n, v)| (n.to_string(), v.to_string())));
+            h
+        };
+        let json_foreign = [("content-type", "application/json"), ("origin", "http://evil.example")];
+        let json_same = [("content-type", "application/json"), ("origin", "http://127.0.0.1:9820")];
+        // A foreign page's POST is refused; the same origin is served.
+        assert_eq!(
+            refuse_request("POST", &headers("127.0.0.1:9820", &json_foreign), 2, &[]).map(|r| r.0),
+            Some(403),
+            "foreign Origin refused"
+        );
+        assert_eq!(refuse_request("POST", &headers("127.0.0.1:9820", &json_same), 2, &[]), None);
+        // A shell POST without a body is served; a text/plain body is not.
+        assert_eq!(refuse_request("POST", &headers("localhost:9820", &[]), 0, &[]), None);
+        assert_eq!(
+            refuse_request("POST", &headers("127.0.0.1:9820", &[("content-type", "text/plain")]), 20, &[])
+                .map(|r| r.0),
+            Some(415),
+            "text/plain POST refused"
+        );
+        assert_eq!(
+            refuse_request("POST", &headers("127.0.0.1:9820", &[("sec-fetch-site", "cross-site")]), 0, &[])
+                .map(|r| r.0),
+            Some(403)
+        );
+        // A foreign Host is refused on every method unless allowed; reads stay open locally.
+        assert_eq!(
+            refuse_request("GET", &headers("openbell.example", &[]), 0, &[]).map(|r| r.0),
+            Some(403),
+            "foreign Host refused"
+        );
+        assert_eq!(
+            refuse_request("GET", &headers("openbell.example", &[]), 0, &["openbell.example".to_string()]),
+            None
+        );
+        assert_eq!(refuse_request("GET", &headers("127.0.0.1:9820", &json_foreign), 0, &[]), None);
+    }
+
+    #[test]
+    fn example_tape_verdict_never_claims_forward_evidence() {
+        let live = "PROVEN on forward evidence (paper only — no orders placed)";
+        assert_eq!(dataset_verdict(live, "live"), live);
+        assert_eq!(
+            dataset_verdict(live, "fixture"),
+            "PROVEN on the example tape (not forward evidence, paper only - no orders placed)"
+        );
+    }
+
+    #[test]
+    fn only_whole_cent_prices_are_traded() {
+        // README: only whole-cent prices size a trade. An odd quote
+        // (0.4567) or a sub-cent quote (0.004) is no market.
+        let dir = std::env::temp_dir().join(format!("ob-cents-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("any.rn"),
+            "pub fn name() { \"any\" }\npub fn side() { \"yes\" }\n\
+             pub fn allow_entry(yes_ask, no_ask, secs_to_close) { true }\n",
+        )
+        .unwrap();
+        let strat = load_strategies(&dir).remove(0);
+        let close = "2030-01-01T01:00:00Z";
+        let scan = |ticker: &str, ask: f64| {
+            let w = [snap(ticker, 100, close, "", Some(ask), Some(0.52))];
+            window_entry_keyed(&strat, Some(ticker), &w, window_fingerprint(&w))
+        };
+        assert_eq!(scan("KXCENT-ODD", 0.4567), None, "0.4567 is not a whole cent");
+        assert_eq!(scan("KXCENT-SUB", 0.004), None, "0.004 is sub-cent");
+        assert_eq!(scan("KXCENT-OK", 0.45), Some(0.45), "0.45 trades at its price");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn broken_strategy_file_is_named_without_a_dangling_pointer() {
+        // The app keeps no diagnostics output, so the error must not
+        // point the reader at any.
+        let dir = std::env::temp_dir().join(format!("ob-broken-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("broken.rn"), "pub fn name() {\n").unwrap();
+        let (strats, errors) = load_strategies_with_errors(&dir);
+        assert!(strats.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, "broken.rn");
+        assert!(errors[0].1.contains("failed to build"), "error: {}", errors[0].1);
+        assert!(!errors[0].1.contains("diagnostics"), "error: {}", errors[0].1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invalid_lines_are_dropped_not_counted_as_snapshots() {
+        let dir = std::env::temp_dir().join(format!("ob-count-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |t: &str, at: i64| {
+            serde_json::to_string(&snap(t, at, "2030-01-01T01:00:00Z", "", Some(0.5), Some(0.5)))
+                .unwrap()
+        };
+        let now = now_unix();
+        let mut bytes = format!("{}\n", line("A", now)).into_bytes();
+        bytes.extend_from_slice(b"{\"ticker\":\"broken\n");
+        bytes.extend_from_slice(format!("{}\n", line("B", now)).as_bytes());
+        std::fs::write(dir.join("snapshots.jsonl"), &bytes).unwrap();
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: dir.clone(),
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        let (_, body) = handle(&app, "GET", "/api/home").split_once("\r\n\r\n").map(|(h, b)| (h, b.to_string())).unwrap();
+        let home: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(home["collector"]["snapshots_on_disk"], 2, "only valid snapshots are counted");
+        assert_eq!(home["collector"]["dropped_lines"], 1, "the invalid line is still reported as dropped");
+        assert!(
+            daily_report(&app).contains(" — 2 snapshots on disk across"),
+            "report must use the same valid count"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_series_are_named_on_the_home_block() {
+        let dir = std::env::temp_dir().join(format!("ob-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: dir.clone(),
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        SERIES_FAILED_LAST_PASS.store(4, std::sync::atomic::Ordering::Relaxed);
+        *SERIES_FAILED_NAMES.lock().unwrap() = vec!["KXBTC15M".to_string(), "KXSOL15M".to_string()];
+        let (_, body) = handle(&app, "GET", "/api/home").split_once("\r\n\r\n").map(|(h, b)| (h, b.to_string())).unwrap();
+        let home: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(home["collector"]["series_failed_names"], serde_json::json!(["KXBTC15M", "KXSOL15M"]));
+        assert_eq!(home["collector"]["series_failed_last_pass"], 4);
+        assert_eq!(home["collector"]["series_total"], 10);
+        assert!(
+            daily_report(&app).contains(
+                "4 of 10 market reads failed on the last pass (5 series, open and settled): KXBTC15M, KXSOL15M."
+            ),
+            "report: {}",
+            daily_report(&app)
+        );
+        SERIES_FAILED_LAST_PASS.store(0, std::sync::atomic::Ordering::Relaxed);
+        SERIES_FAILED_NAMES.lock().unwrap().clear();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn allowed_hosts_are_accepted_only_when_listed() {
+        let host = |h: &str| vec![("host".to_string(), h.to_string())];
+        let allowed = vec!["openbell.lan".to_string()];
+        // A listed name is accepted with or without a port.
+        assert_eq!(refuse_request("GET", &host("openbell.lan"), 0, &allowed), None);
+        assert_eq!(refuse_request("GET", &host("openbell.lan:9820"), 0, &allowed), None);
+        assert_eq!(refuse_request("GET", &host("OpenBell.LAN:9820"), 0, &allowed), None);
+        // Loopback names are always accepted, even with nothing listed.
+        for h in ["localhost:9820", "127.0.0.1:9820", "[::1]:9820", "[::1]"] {
+            assert_eq!(refuse_request("GET", &host(h), 0, &[]), None, "{h}");
+        }
+        // Any other Host is refused, listed or not, and a name that merely
+        // contains a listed one is not a match.
+        assert_eq!(refuse_request("GET", &host("evil.example:9820"), 0, &allowed).map(|r| r.0), Some(403));
+        assert_eq!(refuse_request("GET", &host("openbell.lan.evil.example"), 0, &allowed).map(|r| r.0), Some(403));
+        assert_eq!(refuse_request("GET", &host("evil.example"), 0, &[]).map(|r| r.0), Some(403));
+        assert_eq!(refuse_request("GET", &[], 0, &allowed).map(|r| r.0), Some(403), "no Host header");
+    }
+
+    #[test]
+    fn lines_on_disk_is_valid_plus_dropped() {
+        let dir = std::env::temp_dir().join(format!("ob-lines-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |t: &str, at: i64| {
+            serde_json::to_string(&snap(t, at, "2030-01-01T01:00:00Z", "", Some(0.5), Some(0.5)))
+                .unwrap()
+        };
+        let now = now_unix();
+        // Valid, invalid UTF-8, malformed JSON, valid: four lines on disk.
+        let mut bytes = format!("{}\n", line("A", now)).into_bytes();
+        let mut bad = line("Z", now).into_bytes();
+        let z = bad.iter().position(|c| *c == b'Z').unwrap();
+        bad[z] = 0xff;
+        bytes.extend_from_slice(&bad);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"{\"ticker\": \"malformed\"\n");
+        bytes.extend_from_slice(format!("{}\n", line("B", now)).as_bytes());
+        std::fs::write(dir.join("snapshots.jsonl"), &bytes).unwrap();
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: dir.clone(),
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        let (_, body) = handle(&app, "GET", "/api/home").split_once("\r\n\r\n").map(|(h, b)| (h, b.to_string())).unwrap();
+        let home: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let c = &home["collector"];
+        assert_eq!(c["snapshots_on_disk"], 2, "valid snapshots only");
+        assert_eq!(c["dropped_lines"], 2);
+        assert_eq!(c["lines_on_disk"], 4, "every line in the file");
+        assert_eq!(
+            c["lines_on_disk"].as_u64().unwrap(),
+            c["snapshots_on_disk"].as_u64().unwrap() + c["dropped_lines"].as_u64().unwrap()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
