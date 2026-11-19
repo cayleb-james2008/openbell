@@ -50,14 +50,14 @@ function useWide() {
   return wide;
 }
 
-function collectorWords(home: Home | null): { dot: string; line: string } {
-  if (!home) return { dot: "bg-track", line: "Collector: checking" };
+function collectorWords(home: Home | null): { dot: string; line: string; short: string } {
+  if (!home) return { dot: "bg-track", line: "Collector: checking", short: "Checking" };
   const c = home.collector;
   const failed = c.series_failed_last_pass ?? 0;
   const healthy = c.collecting && c.dropped_lines === 0 && c.conflicting_settlements === 0 && !failed;
   const dot = c.collecting ? (healthy ? "bg-info-foreground" : "bg-dot-amber") : "bg-unread";
   const line = c.collecting ? "Collecting, newest " + ageOf(c.newest_snapshot_age_secs) : "Not collecting";
-  return { dot, line };
+  return { dot, line, short: c.collecting ? "Collecting" : "Not collecting" };
 }
 function ageOf(age: number | null): string {
   if (age === null) return "none yet";
@@ -145,7 +145,7 @@ function Shell() {
   const allFailed = !!reads && Object.values(reads).every((r) => !r.ok);
   const failMsg = reads && !reads.home.ok ? reads.home.msg : "";
   const fixture = dataset === "fixture";
-  const segItem = "!h-11 !min-w-11";
+  const segItem = "!h-11 !min-w-11 !text-ink";
 
   return (
     <TooltipProvider>
@@ -156,10 +156,10 @@ function Shell() {
             <span className="mr-1">OpenBell</span>
             <HowToRead />
           </div>
-          <Pill variant="outline" className="!h-7 text-ink-2"><PillStatus><PillIndicator variant="info" />Paper only</PillStatus>This build places no orders</Pill>
-          <Pill id="chip" variant="outline" className="!h-7 max-w-full text-ink-2" title="Collector health">
+          <Pill variant="outline" className="!h-7 flex-1 sm:flex-none text-ink-2" title="Paper only: this build places no orders"><PillStatus><PillIndicator variant="info" />Paper only</PillStatus><span className="hidden sm:inline">This build places no orders</span></Pill>
+          <Pill id="chip" variant="outline" className="!h-7 flex-1 sm:flex-none max-w-full text-ink-2" title="Collector health">
             <span id="chip-dot" aria-hidden="true" className={"size-2 rounded-full " + cw.dot} />
-            <span id="chip-text" className="min-w-0 break-words">{allFailed ? "Collector: unavailable" : cw.line}</span>
+            <span id="chip-text" className="min-w-0 break-words">{allFailed ? "Collector: unavailable" : cw.short}</span>
           </Pill>
           <div className="flex items-center gap-2">
             <SegmentedControl aria-label="Which tape the paper figures use">

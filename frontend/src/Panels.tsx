@@ -183,14 +183,14 @@ export function SlotsPanel({ read, onRetry, notes }: { read: Read<Slots> | null;
                 const cls = stint > 0 ? "text-success-foreground" : stint < 0 ? "text-unread" : "text-ink";
                 return (
                   <TableRow key={(r.retired ? "r" : "s") + r.slot} className={r.retired ? "text-ink-2" : undefined}>
-                    <TableCell data-label="Slot" className="stack-first font-mono">{r.slot + 1}</TableCell>
-                    <TableCell data-label="Strategy" className="max-w-56 font-mono"><span className="block break-all md:truncate" title={r.strategy}>{r.strategy}</span></TableCell>
-                    <TableCell data-label="Status">
+                    <TableCell data-label="Slot" className="stack-first c-slot font-mono">{r.slot + 1}</TableCell>
+                    <TableCell data-label="Strategy" className="c-name max-w-56 font-mono"><span className="block break-words md:truncate" title={r.strategy}>{r.strategy}</span></TableCell>
+                    <TableCell data-label="Status" className="c-status">
                       <Pill variant="outline" className={"h-auto " + (r.retired ? "text-ink-2" : "text-success-foreground")}>
                         <PillStatus><PillIndicator variant={r.retired ? "warning" : "success"} />{r.retired ? "retired" : r.status ?? "active"}</PillStatus>
                       </Pill>
                     </TableCell>
-                    <TableCell data-label="Strikes">
+                    <TableCell data-label="Strikes" className="stack-break c-strikes">
                       {r.retired ? <span>{r.windows_traded} windows</span> : (
                         <div className="flex items-center gap-2">
                           <Tracker data={[0, 1, 2].map((i) => ({ key: i, color: i < (r.strikes ?? 0) ? "bg-unread" : "bg-track", tooltip: "Strike " + (i + 1) + " of 3" }))} className="h-2 w-20" />
@@ -198,10 +198,10 @@ export function SlotsPanel({ read, onRetry, notes }: { read: Read<Slots> | null;
                         </div>
                       )}
                     </TableCell>
-                    <TableCell data-label="Stint P&L" className={"text-right font-mono tabular-nums " + cls}>
+                    <TableCell data-label="Stint P&L" className={"c-pnl text-right font-mono tabular-nums " + cls}>
                       {money(stint)}{r.retired ? "" : <span className="text-ink-2"> · {r.stint_windows ?? 0} windows</span>}
                     </TableCell>
-                    <TableCell data-label="Equity" className="text-right font-mono tabular-nums text-ink">{r.retired ? "retired" : money(r.equity_dollars ?? 0)}</TableCell>
+                    <TableCell data-label="Equity" className="c-equity text-right font-mono tabular-nums text-ink">{r.retired ? "retired" : money(r.equity_dollars ?? 0)}</TableCell>
                   </TableRow>
                 );
               })}

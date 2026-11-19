@@ -3,6 +3,19 @@
 @source not "../../rune/used/LOCAL-EDITS.md";
 @source not "../DESIGN.md";
 @source not "../../rune/used/motion.ts";
+/* Five motion parts are scanned by name only: their motion prop name is not a class, so they are excluded from the scan and their static classes are listed here. */
+@source inline("&& (!bounds.height) (integerDigits.length */ /** // 0% 1) 10 100% 9, === @/lib/utils Enter ExpandableCard ExpandableCardContent ExpandableCardFooter ExpandableCardHeader ExpandableTrigger Math.pow(10, SlidingNumberProps SlidingNumberProps) Toggle [integerPart, [mask-clip:padding-box,border-box] [mask-composite:intersect]");
+@source inline("[mask-image:linear-gradient(transparent,transparent),linear-gradient(CanvasText,CanvasText)] absValue absValue.toString().split( absolute and animate animated are aria-hidden= as aspect-square assistive auto between bg-blue bg-white big blur(0px) blur(16px) blur(4px) blur(8px) blur-lg blur-md blur-sm border border-transparent both button children className= client columns const counts");
+@source inline("cursor-pointer dark:shadow-[inset_0_0_1px_1px_hsl(var(--border)/0.5)] dark:sm:shadow-[inset_0_0_2px_1px_hsl(var(--border)/0.5)] data-checked data-id decimalPart decimalPart] decimalSeparator decimalSeparator?: digit digits, div duration-300 ease-in-out easeIn easeInOut easeOut edit: every exit expand export exposed false false, flex flex-col flex-grow for from function grid grid-cols-1 group");
+@source inline("group) group, group?: groupedInteger groups h-full height hidden hold horizontal i) if index index) initial inline-block inline-flex inset-0 integerDigits integerDigits.length integerDigits.map((_, integerPlaces integerValue invisible is items-center items-start justify-between know leading-none linear local max-w-[calc(100%-1rem)] md:max-w-[calc(100%-4rem)] md:p-2 md:p-4 md:rounded-3xl");
+@source inline("md:rounded-[2rem] money motion/react moving mx-auto number of once, overflow-hidden overflow-x-visible overflow-y-clip p-1 p-2 p-4 p-6 padStart padStart?: paddedInteger paddedInteger.split( parseInt(integerPart, pointer-events-none popLayout pt-0 push px-4 react react-use-measure real rect(0 ref relative render replace return ring-1 ring-border/50 rolling round rounded-[inherit] rounded-lg");
+@source inline("rounded-md running separator shadow-[inset_0_0_1px_1px_hsl(var(--border)/0.3)] shadow-md shadow-xl slide-down slide-left slide-right slide-up sm:max-w-[calc(100%-2rem)] sm:p-1.5 sm:p-3 sm:rounded-lg sm:rounded-xl sm:shadow-[inset_0_0_2px_1px_hsl(var(--border)/0.3)] so space-y-1.5 spoken spring still tabular-nums technology text. the they thousands three to transition-[opacity,transform] true type");
+@source inline("until use value value, value: vertical visible w-[1ch] w-full we z-10");
+@source not "../../rune/used/components/ui/animated-background.tsx";
+@source not "../../rune/used/components/ui/border-trail.tsx";
+@source not "../../rune/used/components/ui/text-morph.tsx";
+@source not "../../rune/used/components/ui/sliding-number.tsx";
+@source not "../../rune/used/components/ui/expandable.tsx";
 @source not "./motionProps.ts";
 /* Tokens: the house roles (tokens.css), then this app's Hallmark theme values (theme.css), then its fonts. */
 @import "./tokens.css";
@@ -44,24 +57,24 @@
   [data-vaul-drawer], [data-vaul-overlay] { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
 
-/* Phone (under 768 px): a table becomes stacked rows, each cell labelled by its column (data-label). No page overflow. */
+/* Phone (under 768 px): a table row becomes a short block of lines, no page overflow. Slots: line 1 slot, name and status;
+   line 2 strikes, P&L, equity. Strategies: line 1 name and side; line 2 verdict; line 3 windows and mean cents. */
 @media (max-width: 767px) {
   table.stack, table.stack tbody, table.stack tr, table.stack td { display: block; width: 100%; }
   table.stack thead { display: none; }
-  table.stack tr { border-bottom: 1px solid var(--hairline); padding: 12px 0; }
-  table.stack td { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 0; padding: 4px 0; min-width: 0; text-align: right; white-space: normal; }
-  table.stack td[data-label]::before { content: attr(data-label); color: var(--ink-2); text-align: left; flex: none; font-size: 14px; }
-  table.stack td.stack-first { justify-content: flex-start; font-weight: 500; font-size: 16px; }
-  table.stack td.stack-first::before { content: none; }
+  table.stack tr { display: flex; flex-wrap: wrap; align-items: center; column-gap: 12px; row-gap: 8px; border-bottom: 1px solid var(--hairline); padding: 12px 0; }
+  table.stack td { display: flex; align-items: center; gap: 8px; border: 0; padding: 0; min-width: 0; width: auto; text-align: left; white-space: normal; font-size: 14px; }
+  table.stack td::before { content: none; }
+  table.stack td.stack-first { font-weight: 500; font-size: 16px; }
+  table.stack td.stack-break { flex-basis: 100%; }
+  table.stack td.c-name { flex: 1 1 0; }
+  table.stack td.c-status, table.stack td.c-mean { margin-left: auto; }
+  table.stack td.c-verdict { order: 2; }
+  table.stack td.c-windows, table.stack td.c-mean { order: 3; }
+  table.stack td.c-name span { overflow-wrap: break-word; }
 }
 
-/* Hallmark floor: the page never scrolls sideways; headings balance their lines. */
+/* The page never scrolls sideways; headings balance their lines; every control shows a visible focus ring. */
 html, body { overflow-x: clip; }
 h1, h2, h3, h4 { text-wrap: balance; }
 :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
-/* The bare utility moves only colour, opacity and transform, so a focus ring never fades in. */
-@utility transition {
-  transition-property: color, background-color, border-color, opacity, transform;
-  transition-timing-function: var(--ease-house);
-  transition-duration: var(--dur-press);
-}

@@ -17,7 +17,6 @@ export function Avatar({
         "relative isolate inline-flex size-(--avatar-size,--spacing(8)) shrink-0 select-none items-center justify-center overflow-hidden rounded-full align-middle font-medium text-[calc(var(--avatar-size,--spacing(8))*0.375)]/none",
         className,
       )}
-      data-slot="avatar"
       {...props}
     />
   );
@@ -33,7 +32,6 @@ export function AvatarImage({
         "absolute inset-0 z-10 size-full rounded-[inherit] object-cover data-error:invisible data-loading:invisible",
         className,
       )}
-      data-slot="avatar-image"
       {...props}
     />
   );
@@ -49,7 +47,6 @@ export function AvatarFallback({
         "absolute inset-0 flex size-full items-center justify-center rounded-[inherit] bg-border",
         className,
       )}
-      data-slot="avatar-fallback"
       {...props}
     />
   );
@@ -86,7 +83,6 @@ export function AvatarGroup({
           : "*:not-last:mask-(--avatar-group-mask) *:not-last:mask-subtract *:not-last:mask-position-(--avatar-group-mask-position) *:not-last:mask-no-repeat *:not-last:mask-size-(--avatar-group-mask-size) [--avatar-group-cut-x:var(--avatar-group-cut-end)] *:not-last:*:data-[slot=avatar-fallback]:pe-[calc(var(--avatar-group-nudge)*2)] supports-[mask-composite:subtract]:*:not-last:rounded-none rtl:[--avatar-group-cut-x:var(--avatar-group-cut-start)]",
         className,
       )}
-      data-slot="avatar-group"
       data-topmost={topmost}
       style={
         {
@@ -107,7 +103,6 @@ export function AvatarGroupCount({
   return (
     <Avatar
       className={cn("text-ink", className)}
-      data-slot="avatar-group-count"
       {...props}
     >
       <AvatarFallback>{children}</AvatarFallback>

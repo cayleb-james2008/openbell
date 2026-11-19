@@ -42,12 +42,10 @@ export function Input({
         ) || undefined
       }
       data-size={size}
-      data-slot="input-control"
     >
       {nativeInput ? (
         <input
           className={inputClassName}
-          data-slot="input"
           size={typeof size === "number" ? size : undefined}
           style={typeof style === "function" ? undefined : style}
           {...props}
@@ -55,7 +53,6 @@ export function Input({
       ) : (
         <InputPrimitive
           className={inputClassName}
-          data-slot="input"
           size={typeof size === "number" ? size : undefined}
           style={style}
           {...props}

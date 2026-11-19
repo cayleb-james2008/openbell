@@ -75,7 +75,6 @@ export function Button({
         {loading && (
           <Spinner
             className="pointer-events-none absolute"
-            data-slot="button-loading-indicator"
           />
         )}
       </>
@@ -83,7 +82,6 @@ export function Button({
     className: cn(buttonVariants({ className, size, variant })),
     "aria-disabled": loading || undefined,
     "data-loading": loading ? "" : undefined,
-    "data-slot": "button",
     disabled: isDisabled,
     type: typeValue,
   };

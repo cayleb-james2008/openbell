@@ -20,7 +20,7 @@ export const segmentedControlItemLayoutClassName =
   "gap-1.5 [&_svg:not([class*='opacity-'])]:opacity-80 [&_svg:not([class*='size-'])]:size-4.5 sm:[&_svg:not([class*='size-'])]:size-4 [&_svg]:pointer-events-none [&_svg]:-mx-0.5 [&_svg]:shrink-0";
 
 export const segmentedControlIndicatorSurfaceClassName =
-  "rounded-md bg-background shadow-sm/5 dark:bg-input";
+  "rounded-md bg-raised shadow-sm/5";
 
 const SegmentedControlContext: React.Context<SegmentedControlSize> =
   React.createContext<SegmentedControlSize>("default");
@@ -46,7 +46,6 @@ export function SegmentedControl({
       className,
     ),
     "data-size": size,
-    "data-slot": "segmented-control",
   };
 
   const element = useRender({
@@ -85,7 +84,6 @@ export function SegmentedControlItem({
       className,
     ),
     "data-size": resolvedSize,
-    "data-slot": "segmented-control-item",
     ...(render ? {} : { type: "button" as const }),
   };
 
@@ -218,7 +216,6 @@ function SegmentedControlIndicator(): React.ReactElement {
         "pointer-events-none absolute top-0 left-0 -z-1 h-(--active-item-height) w-(--active-item-width) translate-x-(--active-item-left) translate-y-(--active-item-top) transition-transform duration-200 ease-in-out motion-reduce:transition-none",
         segmentedControlIndicatorSurfaceClassName,
       )}
-      data-slot="segmented-control-indicator"
       hidden={!rect}
       ref={ref}
       style={
