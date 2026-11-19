@@ -1981,7 +1981,7 @@ fn collector_health(app: &App) -> serde_json::Value {
     let collecting = !future_dated
         && age.map_or(false, |a| a <= (app.collect_secs.max(60) * 2) as i64);
     serde_json::json!({
-        "snapshots_on_disk": view.total_lines,
+        "snapshots_on_disk": view.snaps.len(),
         "dropped_lines": view.total_lines.saturating_sub(view.snaps.len()),
         "markets_seen": view.markets,
         "settled_windows": view.settled_windows,
@@ -3181,4 +3181,36 @@ mod tests {
         assert!(!errors[0].1.contains("diagnostics"), "error: {}", errors[0].1);
         std::fs::remove_dir_all(&dir).ok();
     }
+    #[test]
+    fn invalid_lines_are_dropped_not_counted_as_snapshots() {
+        let dir = std::env::temp_dir().join(format!("ob-count-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |t: &str, at: i64| {
+            serde_json::to_string(&snap(t, at, "2030-01-01T01:00:00Z", "", Some(0.5), Some(0.5)))
+                .unwrap()
+        };
+        let now = now_unix();
+        let mut bytes = format!("{}\n", line("A", now)).into_bytes();
+        bytes.extend_from_slice(b"{\"ticker\":\"broken\n");
+        bytes.extend_from_slice(format!("{}\n", line("B", now)).as_bytes());
+        std::fs::write(dir.join("snapshots.jsonl"), &bytes).unwrap();
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: dir.clone(),
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        let (_, body) = handle(&app, "GET", "/api/home").split_once("\r\n\r\n").map(|(h, b)| (h, b.to_string())).unwrap();
+        let home: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(home["collector"]["snapshots_on_disk"], 2, "only valid snapshots are counted");
+        assert_eq!(home["collector"]["dropped_lines"], 1, "the invalid line is still reported as dropped");
+        assert!(
+            daily_report(&app).contains(" — 2 snapshots on disk across"),
+            "report must use the same valid count"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
 }
