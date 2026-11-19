@@ -8,6 +8,8 @@
 //! paper against collected forward data, and a strategy is only "proven"
 //! when it passes the desk's promotion standard on forward evidence.
 
+mod update;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Write};
