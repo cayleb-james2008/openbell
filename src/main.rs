@@ -187,6 +187,8 @@ static COLLECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// pass logs as "series failed", stated on the health block and report.
 static SERIES_FAILED_LAST_PASS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// The series tickers behind that count, in SERIES order, each once.
+static SERIES_FAILED_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Run one pass. Ok carries (snapshots written, per-series errors);
 /// a pass that wrote nothing BECAUSE everything failed is Err, so
@@ -201,6 +203,7 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
     let mut buf = String::new();
     let mut written = 0;
     let mut errors: Vec<String> = Vec::new();
+    let mut failed_series: Vec<String> = Vec::new();
     for series in SERIES {
         for status in ["open", "settled"] {
             match fetch_markets(series, status) {
@@ -209,6 +212,9 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
                         errors.push(format!(
                             "{series}/{status}: skipped {skipped} invalid record(s)"
                         ));
+                        if !failed_series.iter().any(|f| f == series) {
+                            failed_series.push(series.to_string());
+                        }
                     }
                     for snap in &snaps {
                         buf.push_str(&serde_json::to_string(snap).unwrap());
@@ -219,11 +225,15 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
                 Err(e) => {
                     eprintln!("collect {series}/{status}: {e}");
                     errors.push(format!("{series}/{status}: {e}"));
+                    if !failed_series.iter().any(|f| f == series) {
+                        failed_series.push(series.to_string());
+                    }
                 }
             }
         }
     }
     SERIES_FAILED_LAST_PASS.store(errors.len(), std::sync::atomic::Ordering::Relaxed);
+    *SERIES_FAILED_NAMES.lock().unwrap_or_else(|p| p.into_inner()) = failed_series;
     if written == 0 {
         return Err(if errors.is_empty() {
             "collection wrote nothing — every series returned empty".to_string()
@@ -1530,10 +1540,22 @@ fn daily_report(app: &App) -> String {
             health["settled_windows"],
             age_text,
             match health["series_failed_last_pass"].as_u64() {
-                Some(n) if n > 0 => format!(
-                    " {n} of {} series failed on the last pass.",
-                    health["series_total"]
-                ),
+                Some(n) if n > 0 => {
+                    let names: Vec<&str> = health["series_failed_names"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+                    let named = if names.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", names.join(", "))
+                    };
+                    format!(
+                        " {n} of {} market reads failed on the last pass ({} series, open and settled){named}.",
+                        health["series_total"],
+                        SERIES.len()
+                    )
+                }
                 _ => String::new(),
             }
         ),
@@ -1990,6 +2012,7 @@ fn collector_health(app: &App) -> serde_json::Value {
         "collect_interval_secs": app.collect_secs,
         "collecting": collecting,
         "series_failed_last_pass": SERIES_FAILED_LAST_PASS.load(std::sync::atomic::Ordering::Relaxed),
+        "series_failed_names": SERIES_FAILED_NAMES.lock().unwrap_or_else(|p| p.into_inner()).clone(),
         "series_total": SERIES.len() * 2,
     })
 }
@@ -3119,30 +3142,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_series_on_the_last_pass_are_stated() {
-        let dir = std::env::temp_dir().join(format!("ob-series-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let app = App {
-            data_dir: dir.clone(),
-            strategies_dir: dir.clone(),
-            paper_pot: 100.0,
-            collect_secs: 60,
-            tape_cache: std::sync::Mutex::new(None),
-            analysis_cache: std::sync::Mutex::new(None),
-        };
-        SERIES_FAILED_LAST_PASS.store(3, std::sync::atomic::Ordering::Relaxed);
-        let health = collector_health(&app);
-        assert_eq!(health["series_failed_last_pass"], 3);
-        assert_eq!(health["series_total"], 10);
-        assert!(
-            daily_report(&app).contains("3 of 10 series failed on the last pass"),
-            "report must say a partial pass plainly"
-        );
-        SERIES_FAILED_LAST_PASS.store(0, std::sync::atomic::Ordering::Relaxed);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn only_whole_cent_prices_are_traded() {
         // README: only whole-cent prices size a trade. An odd quote
         // (0.4567) or a sub-cent quote (0.004) is no market.
@@ -3181,6 +3180,7 @@ mod tests {
         assert!(!errors[0].1.contains("diagnostics"), "error: {}", errors[0].1);
         std::fs::remove_dir_all(&dir).ok();
     }
+
     #[test]
     fn invalid_lines_are_dropped_not_counted_as_snapshots() {
         let dir = std::env::temp_dir().join(format!("ob-count-{}", std::process::id()));
@@ -3213,4 +3213,35 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn failed_series_are_named_on_the_home_block() {
+        let dir = std::env::temp_dir().join(format!("ob-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: dir.clone(),
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        SERIES_FAILED_LAST_PASS.store(4, std::sync::atomic::Ordering::Relaxed);
+        *SERIES_FAILED_NAMES.lock().unwrap() = vec!["KXBTC15M".to_string(), "KXSOL15M".to_string()];
+        let (_, body) = handle(&app, "GET", "/api/home").split_once("\r\n\r\n").map(|(h, b)| (h, b.to_string())).unwrap();
+        let home: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(home["collector"]["series_failed_names"], serde_json::json!(["KXBTC15M", "KXSOL15M"]));
+        assert_eq!(home["collector"]["series_failed_last_pass"], 4);
+        assert_eq!(home["collector"]["series_total"], 10);
+        assert!(
+            daily_report(&app).contains(
+                "4 of 10 market reads failed on the last pass (5 series, open and settled): KXBTC15M, KXSOL15M."
+            ),
+            "report: {}",
+            daily_report(&app)
+        );
+        SERIES_FAILED_LAST_PASS.store(0, std::sync::atomic::Ordering::Relaxed);
+        SERIES_FAILED_NAMES.lock().unwrap().clear();
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
+
