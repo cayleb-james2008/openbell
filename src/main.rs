@@ -2004,6 +2004,7 @@ fn collector_health(app: &App) -> serde_json::Value {
         && age.map_or(false, |a| a <= (app.collect_secs.max(60) * 2) as i64);
     serde_json::json!({
         "snapshots_on_disk": view.snaps.len(),
+        "lines_on_disk": view.total_lines,
         "dropped_lines": view.total_lines.saturating_sub(view.snaps.len()),
         "markets_seen": view.markets,
         "settled_windows": view.settled_windows,
@@ -3262,6 +3263,46 @@ mod tests {
         assert_eq!(refuse_request("GET", &host("openbell.lan.evil.example"), 0, &allowed).map(|r| r.0), Some(403));
         assert_eq!(refuse_request("GET", &host("evil.example"), 0, &[]).map(|r| r.0), Some(403));
         assert_eq!(refuse_request("GET", &[], 0, &allowed).map(|r| r.0), Some(403), "no Host header");
+    }
+
+    #[test]
+    fn lines_on_disk_is_valid_plus_dropped() {
+        let dir = std::env::temp_dir().join(format!("ob-lines-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |t: &str, at: i64| {
+            serde_json::to_string(&snap(t, at, "2030-01-01T01:00:00Z", "", Some(0.5), Some(0.5)))
+                .unwrap()
+        };
+        let now = now_unix();
+        // Valid, invalid UTF-8, malformed JSON, valid: four lines on disk.
+        let mut bytes = format!("{}\n", line("A", now)).into_bytes();
+        let mut bad = line("Z", now).into_bytes();
+        let z = bad.iter().position(|c| *c == b'Z').unwrap();
+        bad[z] = 0xff;
+        bytes.extend_from_slice(&bad);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"{\"ticker\": \"malformed\"\n");
+        bytes.extend_from_slice(format!("{}\n", line("B", now)).as_bytes());
+        std::fs::write(dir.join("snapshots.jsonl"), &bytes).unwrap();
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: dir.clone(),
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        let (_, body) = handle(&app, "GET", "/api/home").split_once("\r\n\r\n").map(|(h, b)| (h, b.to_string())).unwrap();
+        let home: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let c = &home["collector"];
+        assert_eq!(c["snapshots_on_disk"], 2, "valid snapshots only");
+        assert_eq!(c["dropped_lines"], 2);
+        assert_eq!(c["lines_on_disk"], 4, "every line in the file");
+        assert_eq!(
+            c["lines_on_disk"].as_u64().unwrap(),
+            c["snapshots_on_disk"].as_u64().unwrap() + c["dropped_lines"].as_u64().unwrap()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
