@@ -302,7 +302,7 @@
   }
   [hidden] { display: none !important; }
   .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
-  .how { max-width: 70ch; margin: 8px 16px 0; color: var(--ink-2); font-size: 14px; line-height: 20px; }
+  .how { max-width: 70ch; margin: 8px 0 0; color: var(--ink-2); font-size: 14px; line-height: 20px; }
   .how strong { color: var(--ink); font-weight: 500; }
   .how .tag { vertical-align: 1px; }
   .jump-label { color: var(--ink-3); font-size: 12px; align-self: center; }
@@ -361,8 +361,8 @@
   </div>
 </header>
 
-<div class="purpose"><p id="purpose">A paper-trading desk for Kalshi’s 15-minute crypto markets: it collects the venue’s public data, tests strategies on paper, and reports what happened. It never places orders.</p></div>
-<p class="how" id="how"><strong>How to read this:</strong> start with the Daily report, which sums up the day. Tags: <span class="tag tag-venue">venue</span> = what Kalshi reports; <span class="tag tag-tape">tape</span> = counted from the snapshots collected; <span class="tag tag-paper">paper</span> = the pretend-money simulation.</p>
+<div class="purpose"><p id="purpose">A paper-trading desk for Kalshi’s 15-minute crypto markets: it collects the venue’s public data, tests strategies on paper, and reports what happened. It never places orders.</p>
+<p class="how" id="how"><strong>How to read this:</strong> start with the Daily report, which sums up the day. Tags: <span class="tag tag-venue">venue</span> = what Kalshi reports; <span class="tag tag-tape">tape</span> = counted from the snapshots collected; <span class="tag tag-paper">paper</span> = the pretend-money simulation.</p></div>
 <div class="bar">
   <div class="seg" role="group" aria-label="Which tape the paper figures use">
     <button type="button" id="seg-live" aria-pressed="true">Live tape</button>
