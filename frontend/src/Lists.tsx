@@ -1,5 +1,5 @@
-// Strategies against the promotion standard, and the collected markets: tables with one search field each.
-import { useState } from "react";
+// Strategies against the promotion standard, and the collected markets: bands of the one instrument surface, one search field each.
+import { type ReactNode, useState } from "react";
 import { Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
@@ -15,22 +15,24 @@ function SearchField({ label, value, onChange }: { label: string; value: string;
   return (
     <InputGroup className="max-w-sm">
       <InputGroupAddon><Search className="size-4 text-icon" strokeWidth={1.5} aria-hidden /></InputGroupAddon>
-      <InputGroupInput type="search" aria-label={label} placeholder={label} value={value} onChange={(e) => onChange(e.target.value)} />
+      <InputGroupInput type="search" aria-label={label} placeholder={label} value={value} onChange={(e) => onChange(e.target.value)} className="min-h-11 md:min-h-0" />
     </InputGroup>
   );
 }
 
+// A verdict is a sentence the server wrote: it wraps to as many lines as it needs, at every width, and is never clipped.
+const WRAP = "h-auto max-w-full whitespace-normal py-1 text-left leading-snug";
 function VerdictPill({ verdict, fixture }: { verdict: string; fixture: boolean }) {
   if (fixture && verdict.startsWith("PROVEN")) {
-    return <Pill variant="outline" className="text-blue">meets the bar on the example tape (not forward evidence)</Pill>;
+    return <Pill variant="outline" className={WRAP + " text-blue"}>meets the bar on the example tape (not forward evidence)</Pill>;
   }
   if (verdict.startsWith("PROVEN")) {
-    return <Pill variant="outline" className="text-dot-green"><PillStatus><PillIndicator variant="success" />{verdict}</PillStatus></Pill>;
+    return <Pill variant="outline" className={WRAP + " text-dot-green"}><PillStatus><PillIndicator variant="success" />{verdict}</PillStatus></Pill>;
   }
   if (verdict.startsWith("NOT PROVEN")) {
-    return <Pill variant="outline" className="h-auto whitespace-normal text-unread"><PillStatus><PillIndicator variant="error" />{verdict}</PillStatus></Pill>;
+    return <Pill variant="outline" className={WRAP + " text-unread"}><PillStatus><PillIndicator variant="error" />{verdict}</PillStatus></Pill>;
   }
-  return <Pill variant="outline" className="text-ink-2">{verdict}</Pill>;
+  return <Pill variant="outline" className={WRAP + " text-ink-2"}>{verdict}</Pill>;
 }
 
 export function Strategies({ read, libraryErrors, dataset, onRetry }: { read: Found<Strategy[]>; libraryErrors: { file: string; error: string }[]; dataset: Dataset; onRetry: () => void }) {
@@ -39,7 +41,7 @@ export function Strategies({ read, libraryErrors, dataset, onRetry }: { read: Fo
   const needle = q.trim().toLowerCase();
   const shown = all ? all.filter((s) => s.strategy.toLowerCase().includes(needle)) : [];
   return (
-    <section id="strategies" aria-labelledby="strategies-title" className="scroll-mt-28 rounded-[10px] border border-hairline bg-surface p-5">
+    <section id="strategies" aria-labelledby="strategies-title" className="min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
       <div className="flex flex-wrap items-center gap-2">
         <h2 id="strategies-title" tabIndex={-1} className="mr-auto text-sm font-medium text-ink-2 outline-none">Strategies against the promotion standard</h2>
         <Pill variant="outline" className="text-blue">paper</Pill>
@@ -49,8 +51,8 @@ export function Strategies({ read, libraryErrors, dataset, onRetry }: { read: Fo
       <div className="mt-4"><SearchField label="Search strategies" value={q} onChange={setQ} /></div>
       {!all && !(read && !read.ok) && <span className="mt-4 block h-24 rounded-md bg-track" aria-hidden />}
       {all && (
-        <div className="mt-4 overflow-x-auto">
-          <Table className="min-w-[620px]">
+        <div className="mt-4 min-w-0 overflow-x-auto">
+          <Table className="stack md:min-w-[640px]">
             <TableHeader>
               <TableRow>
                 <TableHead>Strategy</TableHead>
@@ -67,16 +69,16 @@ export function Strategies({ read, libraryErrors, dataset, onRetry }: { read: Fo
                 const label = s.windows_traded >= need ? s.windows_traded + " windows (" + need + " needed)" : s.windows_traded + " of " + need;
                 return (
                   <TableRow key={s.strategy}>
-                    <TableCell className="max-w-56 font-mono"><span className="block truncate" title={s.strategy}>{s.strategy}</span></TableCell>
-                    <TableCell className="font-mono">{s.side}</TableCell>
-                    <TableCell>
-                      <div className="flex min-w-40 items-center gap-3">
+                    <TableCell data-label="Strategy" className="stack-first max-w-56 font-mono"><span className="block break-all md:truncate" title={s.strategy}>{s.strategy}</span></TableCell>
+                    <TableCell data-label="Side" className="font-mono">{s.side}</TableCell>
+                    <TableCell data-label="Windows traded" className="min-w-0">
+                      <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 md:justify-start">
                         <Tracker data={Array.from({ length: 10 }, (_, i) => ({ key: i, color: (i + 1) * need / 10 <= done ? "bg-info-foreground" : "bg-track", tooltip: "Windows " + (i * need / 10 + 1) + " to " + ((i + 1) * need / 10) }))} className="h-2 w-28" />
-                        <span className="whitespace-nowrap font-mono text-sm text-ink-2">{label}</span>
+                        <span className="font-mono text-sm text-ink-2">{label}</span>
                       </div>
                     </TableCell>
-                    <TableCell className="text-right font-mono tabular-nums">{s.mean_cents_per_contract === null ? "-" : s.mean_cents_per_contract.toFixed(2)}</TableCell>
-                    <TableCell><VerdictPill verdict={s.verdict} fixture={dataset === "fixture"} /></TableCell>
+                    <TableCell data-label="Mean cents" className="text-right font-mono tabular-nums">{s.mean_cents_per_contract === null ? "-" : s.mean_cents_per_contract.toFixed(2)}</TableCell>
+                    <TableCell data-label="Verdict" className="min-w-0 max-w-md"><VerdictPill verdict={s.verdict} fixture={dataset === "fixture"} /></TableCell>
                   </TableRow>
                 );
               })}
@@ -110,13 +112,13 @@ export function Markets({ read, onRetry }: { read: Found<Market[]>; onRetry: () 
   const total = all ? all.length : null;
   const dash = (v: number | null | undefined) => (v === null || v === undefined ? "-" : String(v));
   return (
-    <section id="markets-card" aria-labelledby="markets-title" className="scroll-mt-28 rounded-[10px] border border-hairline bg-surface p-5">
+    <section id="markets-card" aria-labelledby="markets-title" className="min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
       <div className="flex flex-wrap items-center gap-2">
         <h2 id="markets-title" tabIndex={-1} className="mr-auto text-sm font-medium text-ink-2 outline-none">Collected markets</h2>
         <Pill variant="outline" className="text-ink-2">tape</Pill>
       </div>
       {read && !read.ok && <div className="mt-3"><PanelError msg={read.msg} onRetry={onRetry} /></div>}
-      <Button id="markets-toggle" variant="outline" aria-expanded={open} aria-controls="markets-panel" className="mt-4 w-full justify-between" onClick={() => setOpen(!open)}>
+      <Button id="markets-toggle" variant="outline" aria-expanded={open} aria-controls="markets-panel" className="mt-4 min-h-11 w-full justify-between" onClick={() => setOpen(!open)}>
         <span id="markets-count">{total === null ? "Collected tape, loading" : "Collected tape, " + total + " markets"}</span>
         <span aria-hidden>{open ? "Hide" : "Show"}</span>
       </Button>
@@ -125,8 +127,8 @@ export function Markets({ read, onRetry }: { read: Found<Market[]>; onRetry: () 
           <SearchField label="Search markets" value={q} onChange={setQ} />
           <p id="markets-note" className="text-sm text-ink-2">{total !== null && total > 40 ? "Showing the first 40 of " + total + " collected markets." : ""}</p>
         </div>
-        <div className="mt-4 overflow-x-auto">
-          <Table className="min-w-[600px]">
+        <div className="mt-4 min-w-0 overflow-x-auto">
+          <Table className="stack md:min-w-[600px]">
             <TableHeader>
               <TableRow>
                 <TableHead>Market</TableHead>
@@ -140,12 +142,12 @@ export function Markets({ read, onRetry }: { read: Found<Market[]>; onRetry: () 
             <TableBody id="markets">
               {shown.map((m) => (
                 <TableRow key={m.ticker}>
-                  <TableCell className="max-w-56 font-mono"><span className="block truncate" title={m.ticker}>{m.ticker}</span></TableCell>
-                  <TableCell className="font-mono whitespace-nowrap">{m.close_time.replace("T", " ").replace("Z", " UTC")}</TableCell>
-                  <TableCell className="font-mono">{dash(m.yes_bid)} / {dash(m.yes_ask)}</TableCell>
-                  <TableCell className="font-mono">{dash(m.no_bid)} / {dash(m.no_ask)}</TableCell>
-                  <TableCell className="hidden font-mono md:table-cell">{dash(m.last_price)}</TableCell>
-                  <TableCell className="font-mono">{m.result || "-"}</TableCell>
+                  <TableCell data-label="Market" className="stack-first max-w-56 font-mono"><span className="block break-all md:truncate" title={m.ticker}>{m.ticker}</span></TableCell>
+                  <TableCell data-label="Closes" className="font-mono">{m.close_time.replace("T", " ").replace("Z", " UTC")}</TableCell>
+                  <TableCell data-label="Yes bid/ask" className="font-mono">{dash(m.yes_bid)} / {dash(m.yes_ask)}</TableCell>
+                  <TableCell data-label="No bid/ask" className="font-mono">{dash(m.no_bid)} / {dash(m.no_ask)}</TableCell>
+                  <TableCell data-label="Last" className="hidden font-mono md:table-cell">{dash(m.last_price)}</TableCell>
+                  <TableCell data-label="Result" className="font-mono">{m.result || "-"}</TableCell>
                 </TableRow>
               ))}
               {all && !all.length && (

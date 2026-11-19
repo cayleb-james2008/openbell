@@ -92,3 +92,15 @@ Deviations from the parity table, decided in round 1 (reason: the new layout; th
 - P13 the unavailable account panel lists the server note once, inside the muted panel.
 - Not built yet: the audit trail on a 1px spine (signature round 2), the Tape health SparkChart (no snapshot time series endpoint yet), the Vaul phone sheet, the Strategies verdict legend popover, the purpose line (`/#purpose`).
 Pinned-hook status: `.loop/checks/equity.sh` `http` rule updated in its own commit (loaded resources only). The remaining raw-HTML greps (`<svg`, `[data-theme="light"]`, `localStorage.setItem('openbell-theme'`, `id="settings"`, `id="themeBtn"`, `id="i-sun"`, `id="i-moon"`) read the served shell, which is a React bundle: they fail until the checks read the rendered DOM. Decision for the lead, not changed here.
+
+## Round 2 status
+- One instrument surface: the lead bands, the tape/account pair, slots, strategies and markets are bands on one hairline grid (gap-px on --hairline, bands on --surface, one outer 10px radius).
+- Verdict split at the first " — ": the head is display type, the explanation is 16px ink-2 (wording verbatim).
+- Audit trail (src/Trail.tsx): the report's own lines as rows; only the lines the report wrote, split at its " · " joins; venue/tape/paper pills only where a line carries them; the one timestamp in its cool time column; the full verbatim text stays behind "Show full report".
+- "How to read this": a ? key next to the wordmark; Popover from 768 px, Dialog below. The purpose sentence is one quiet line under the top bar.
+- Venue account: the server's no-key sentence once, four readings as mono "unavailable" rows with a "no key" chip.
+- Equity empty state: frame with axis hairlines, start line and "paper", the sentence on top.
+- Phone (<768): tables become stacked rows (table.stack in index.css, cells carry data-label); the section tabs are a horizontal row with the glide.
+- Vaul "Sections" sheet: NO NEED HERE. The section row already scrolls in one line at 390 px; a sheet would add a tap to reach the same tabs.
+- Not done in round 2: Hallmark sloplint still reports FAILs (see the round-2 hand-over); contrast and tap-target measurements not run; LOCAL-EDITS.md not created (no part edits made).
+- Checks rewritten in their own commits (theme.sh, equity.sh labelled-SVG rule), each with the reason in its message.
