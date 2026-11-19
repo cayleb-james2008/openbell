@@ -36,7 +36,7 @@ function readDataset(): Dataset {
 }
 
 function readTheme(): "light" | "dark" {
-  return document.documentElement.dataset.theme === "light" ? "light" : "dark";
+  return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
 }
 
 
@@ -71,7 +71,7 @@ function HowToRead() {
   if (wide) {
     return (
       <Popover>
-        <PopoverTrigger aria-label="How to read this" className="inline-flex size-11 cursor-pointer items-center justify-center rounded-md text-ink-2 outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) hover:text-ink focus-visible:ring-2 focus-visible:ring-blue">{trigger}</PopoverTrigger>
+        <PopoverTrigger aria-label="How to read this" className="inline-flex size-11 cursor-pointer items-center justify-center rounded-md text-ink-2 outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) hover:text-ink focus-visible:ring-2 focus-visible:ring-ring">{trigger}</PopoverTrigger>
         <PopoverContent className="w-96 rounded-[10px] border border-hairline bg-surface p-4 text-ink">
           <p className="mb-3 text-sm font-medium text-ink">How to read this</p>
           {body}
@@ -81,7 +81,7 @@ function HowToRead() {
   }
   return (
     <Dialog>
-      <DialogTrigger aria-label="How to read this" className="inline-flex size-11 cursor-pointer items-center justify-center rounded-md text-ink-2 outline-none focus-visible:ring-2 focus-visible:ring-blue">{trigger}</DialogTrigger>
+      <DialogTrigger aria-label="How to read this" className="inline-flex size-11 cursor-pointer items-center justify-center rounded-md text-ink-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">{trigger}</DialogTrigger>
       <DialogContent className="rounded-[10px] border border-hairline bg-surface p-5 text-ink">
         <DialogTitle className="mb-3 text-base font-medium">How to read this</DialogTitle>
         {body}
@@ -179,7 +179,7 @@ function Shell() {
           >
             {SECTIONS.map((s) => (
               <button key={s.id} type="button" data-id={s.id} aria-current={active === s.id ? "location" : undefined}
-                className="h-11 shrink-0 cursor-pointer rounded-md px-3 text-sm font-medium text-ink-2 outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) hover:text-ink focus-visible:ring-2 focus-visible:ring-blue data-[checked=true]:text-ink">
+                className="h-11 shrink-0 cursor-pointer rounded-md px-3 text-sm font-medium text-ink-2 outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) hover:text-ink focus-visible:ring-2 focus-visible:ring-ring data-[checked=true]:text-ink">
                 {s.label}
               </button>
             ))}
