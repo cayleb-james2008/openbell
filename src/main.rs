@@ -2361,6 +2361,10 @@ fn handle(app: &App, method: &str, path: &str) -> String {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref().is_some_and(|a| a == "--version" || a == "-V") {
+        println!("openbell-rs {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let port: u16 = match std::env::var("PORT") {
         Ok(p) => p.parse().unwrap_or_else(|_| {
             panic!("PORT is set to '{p}', which is not a valid port — refusing to silently fall back to 8472")
