@@ -85,7 +85,8 @@ A collect pass that fails, or writes nothing, is reported as a failure.
 
 The tape is read as bytes. `snapshots_on_disk` counts valid snapshots only;
 a line that is not valid UTF-8 or not a snapshot is counted in
-`dropped_lines` and never hides its neighbours. A torn last line (no final
+`dropped_lines` and never hides its neighbours. `lines_on_disk` is every
+line in the tape file: `snapshots_on_disk + dropped_lines`. A torn last line (no final
 newline, left by a crash mid-append) is kept as its own dropped line: the
 next pass starts on a fresh line, so its snapshots are not lost.
 
@@ -147,7 +148,7 @@ see above), `PORT` (default 8472).
 
 ## Checks
 
-`cargo test` runs 27 unit tests. `bash .loop/verify` builds the binary, runs
+`cargo test` runs 28 unit tests. `bash .loop/verify` builds the binary, runs
 the Rust tests, and runs the
 check kit: the order-path fence, slot rotation and reconciliation against
 independent recomputation, collector health counted both ways, the equity
