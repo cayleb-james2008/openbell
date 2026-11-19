@@ -1,4 +1,4 @@
-// Tape health, venue account and slots: the bento under the lead surface, cut from one surface with 1px seams.
+// Tape health, venue account and slots: bands of the one instrument surface.
 import { type ReactNode, useState } from "react";
 import { toast } from "sonner";
 import { BorderTrail } from "@/components/ui/border-trail";
@@ -14,14 +14,14 @@ export function PanelError({ msg, onRetry }: { msg: string; onRetry: () => void 
   return (
     <div role="alert" className="flex flex-wrap items-center gap-3 rounded-md border border-unread/40 bg-unread/10 px-3 py-2 text-sm text-ink">
       <p className="min-w-0 flex-1 break-words">This part did not load ({msg}). The rest of the page is unaffected.</p>
-      <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>
+      <Button variant="outline" size="sm" className="min-h-11" onClick={onRetry}>Retry</Button>
     </div>
   );
 }
 
 function Stat({ label, id, children }: { label: string; id: string; children: ReactNode }) {
   return (
-    <div className="min-w-0 border-l border-hairline pl-3">
+    <div className="min-w-0">
       <div className="text-sm text-ink-2">{label}</div>
       <div id={id} className="mt-1 min-w-0 break-words font-mono text-2xl font-normal tabular-nums text-ink">{children}</div>
     </div>
@@ -59,8 +59,7 @@ export function TapeHealth({ read, onRetry, onCollected }: { read: Read<Home> | 
       problem = e instanceof Error ? e.message : String(e);
     }
     if (problem) {
-      const text = "Could not collect right now. Nothing was written. Try again in a minute. Server said: " + problem;
-      setStatus(text);
+      setStatus("Could not collect right now. Nothing was written. Try again in a minute. Server said: " + problem);
       toast.error("Collect failed. Nothing was written.");
     } else {
       toast.success("Collected one pass into the tape.");
@@ -84,7 +83,7 @@ export function TapeHealth({ read, onRetry, onCollected }: { read: Read<Home> | 
   const dot = !c ? "bg-track" : c.collecting ? (healthy ? "bg-info-foreground" : "bg-dot-amber") : "bg-unread";
 
   return (
-    <section id="tape" aria-labelledby="tape-title" className="relative scroll-mt-28 bg-surface p-5">
+    <section id="tape" aria-labelledby="tape-title" className="relative min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
       {collecting && <BorderTrail className="bg-blue" size={120} />}
       <PanelHead id="tape-title" title="Collector, the forward tape" tag={<Pill variant="outline" className="text-ink-2">tape</Pill>} />
       {read && !read.ok && <div className="mt-3"><PanelError msg={read.msg} onRetry={onRetry} /></div>}
@@ -96,7 +95,7 @@ export function TapeHealth({ read, onRetry, onCollected }: { read: Read<Home> | 
           {!!failed && names.length > 0 && <p id="c-fail" className="mt-1 break-words">Failed series: {names.join(", ")}.</p>}
         </div>
       </div>
-      <div className="mt-5 grid grid-cols-2 gap-x-4 gap-y-5">
+      <div className="mt-5 grid grid-cols-2 gap-x-6 gap-y-5">
         <Stat label="Tape lines" id="c-snaps">{count(c?.snapshots_on_disk)}</Stat>
         <Stat label="Markets seen" id="c-markets">{count(c?.markets_seen)}</Stat>
         <Stat label="Settled windows" id="c-settled">{count(c?.settled_windows)}</Stat>
@@ -105,12 +104,14 @@ export function TapeHealth({ read, onRetry, onCollected }: { read: Read<Home> | 
         <Stat label="Newest snapshot" id="c-age">{c ? ageWords(c.newest_snapshot_age_secs) : UNAVAILABLE}</Stat>
       </div>
       <div className="mt-6 flex flex-wrap items-center gap-3">
-        <Button id="collect-btn" variant="default" disabled={collecting} onClick={collect}>{collecting ? "Collecting…" : "Collect now"}</Button>
+        <Button id="collect-btn" variant="default" className="min-h-11" disabled={collecting} onClick={collect}>{collecting ? "Collecting…" : "Collect now"}</Button>
         <p id="collect-status" role="status" className="min-w-0 basis-full break-words text-sm text-unread empty:hidden">{status}</p>
       </div>
     </section>
   );
 }
+
+const READINGS = ["Balance", "Day P&L", "Open positions", "Capital at risk"];
 
 export function AccountPanel({ read, onRetry }: { read: Read<Home> | null; onRetry: () => void }) {
   const home = read && read.ok ? read.v : null;
@@ -118,28 +119,36 @@ export function AccountPanel({ read, onRetry }: { read: Read<Home> | null; onRet
   const allNull = !!a && a.balance === null && a.day_pnl === null && a.open_positions === null;
   const pnlClass = a && a.day_pnl !== null ? (a.day_pnl > 0 ? "text-dot-green" : a.day_pnl < 0 ? "text-unread" : "text-ink") : "text-ink";
   return (
-    <section id="account" aria-labelledby="account-title" className="scroll-mt-28 bg-surface p-5">
+    <section id="account" aria-labelledby="account-title" className="min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
       <PanelHead id="account-title" title="Venue account" tag={<Pill variant="outline" className="text-info-foreground">venue</Pill>} />
       {read && !read.ok && <div className="mt-3"><PanelError msg={read.msg} onRetry={onRetry} /></div>}
       {allNull ? (
-        <div className="mt-4 rounded-md border border-hairline bg-board p-4 text-sm text-ink-2">
-          <p className="text-ink">Not connected: account figures need a Kalshi API key on the machine running OpenBell. Market data does not need it.</p>
-          <dl className="mt-3 grid grid-cols-1 gap-x-4 gap-y-2 font-mono text-sm sm:grid-cols-2">
-            {["Balance", "Day P&L", "Open positions", "Capital at risk"].map((k) => (
-              <div key={k} className="flex justify-between gap-2"><dt className="font-sans">{k}</dt><dd className="text-ink-3">unavailable</dd></div>
+        <>
+          {/* The one statement of the no-key fact: the server's own sentence. */}
+          <p id="account-note" className="mt-4 max-w-[60ch] text-sm text-ink-2">{a?.note ?? ""}</p>
+          <dl className="mt-4 grid gap-0">
+            {READINGS.map((k) => (
+              <div key={k} className="flex min-h-11 items-center justify-between gap-3 border-t border-hairline first:border-t-0">
+                <dt className="text-sm text-ink">{k}</dt>
+                <dd className="flex items-center gap-2 font-mono text-sm">
+                  <span className="text-ink-3">unavailable</span>
+                  <Pill variant="outline" className="h-auto text-ink-2">no key</Pill>
+                </dd>
+              </div>
             ))}
           </dl>
-          <p id="account-note" className="mt-3 break-words">{a?.note ?? ""}</p>
-        </div>
+        </>
       ) : (
-        <div className="mt-4 grid grid-cols-2 gap-x-4 gap-y-5">
-          <Stat label="Balance" id="balance">{a?.balance === null || a?.balance === undefined ? UNAVAILABLE : money(a.balance)}</Stat>
-          <Stat label="Day P&L" id="pnl"><span className={pnlClass}>{a?.day_pnl === null || a?.day_pnl === undefined ? "unavailable" : money(a.day_pnl)}</span></Stat>
-          <Stat label="Open positions" id="positions">{a?.open_positions === null || a?.open_positions === undefined ? UNAVAILABLE : a.open_positions.length}</Stat>
-          <Stat label="Capital at risk" id="risk">{a?.open_positions === null || a?.open_positions === undefined ? UNAVAILABLE : a.open_positions.length === 0 ? "$0.00 (no open positions)" : "see positions"}</Stat>
-        </div>
+        <>
+          <div className="mt-4 grid grid-cols-2 gap-x-6 gap-y-5">
+            <Stat label="Balance" id="balance">{a?.balance === null || a?.balance === undefined ? UNAVAILABLE : money(a.balance)}</Stat>
+            <Stat label="Day P&L" id="pnl"><span className={pnlClass}>{a?.day_pnl === null || a?.day_pnl === undefined ? "unavailable" : money(a.day_pnl)}</span></Stat>
+            <Stat label="Open positions" id="positions">{a?.open_positions === null || a?.open_positions === undefined ? UNAVAILABLE : a.open_positions.length}</Stat>
+            <Stat label="Capital at risk" id="risk">{a?.open_positions === null || a?.open_positions === undefined ? UNAVAILABLE : a.open_positions.length === 0 ? "$0.00 (no open positions)" : "see positions"}</Stat>
+          </div>
+          <p id="account-note" className="mt-4 text-sm text-ink-2">{a?.note ?? ""}</p>
+        </>
       )}
-      {!allNull && <p id="account-note" className="mt-4 text-sm text-ink-2">{a?.note ?? ""}</p>}
     </section>
   );
 }
@@ -148,7 +157,7 @@ export function SlotsPanel({ read, onRetry, notes }: { read: Read<Slots> | null;
   const s = read && read.ok ? read.v : null;
   const rows = s ? [...s.slots.map((x) => ({ ...x, retired: false })), ...s.retired.map((x) => ({ ...x, retired: true }))] : [];
   return (
-    <section id="slots-card" aria-labelledby="slots-title" className="scroll-mt-28 p-5">
+    <section id="slots-card" aria-labelledby="slots-title" className="min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
       <PanelHead id="slots-title" title="Slots, paper only" tag={<Pill variant="outline" className="text-blue">paper</Pill>} />
       {read && !read.ok && <div className="mt-3"><PanelError msg={read.msg} onRetry={onRetry} /></div>}
       {!s && !(read && !read.ok) && <span className="mt-4 block h-24 rounded-md bg-track" aria-hidden />}
@@ -156,8 +165,8 @@ export function SlotsPanel({ read, onRetry, notes }: { read: Read<Slots> | null;
         <p className="mt-4 text-sm text-ink-2">No slots yet. The strategy library in strategies/ is empty, so there is nothing to score. Add a .rn file there and reload.</p>
       )}
       {s && rows.length > 0 && (
-        <div className="mt-4 overflow-x-auto">
-          <Table className="min-w-[640px]">
+        <div className="mt-4 min-w-0 overflow-x-auto">
+          <Table className="stack md:min-w-[640px]">
             <TableHeader>
               <TableRow>
                 <TableHead>Slot</TableHead>
@@ -173,32 +182,32 @@ export function SlotsPanel({ read, onRetry, notes }: { read: Read<Slots> | null;
                 const stint = r.retired ? r.paper_pnl_dollars : r.stint_pnl_dollars ?? 0;
                 const cls = stint > 0 ? "text-dot-green" : stint < 0 ? "text-unread" : "text-ink";
                 return (
-                  <TableRow key={(r.retired ? "r" : "s") + r.slot} className={r.retired ? "text-ink-3" : undefined}>
-                    <TableCell className="font-mono">{r.slot + 1}</TableCell>
-                    <TableCell className="max-w-56 font-mono"><span className="block truncate" title={r.strategy}>{r.strategy}</span></TableCell>
-                    <TableCell>
-                      <Pill variant="outline" className={r.retired ? "text-ink-2" : "text-dot-green"}>
+                  <TableRow key={(r.retired ? "r" : "s") + r.slot} className={r.retired ? "text-ink-2" : undefined}>
+                    <TableCell data-label="Slot" className="stack-first font-mono">{r.slot + 1}</TableCell>
+                    <TableCell data-label="Strategy" className="max-w-56 font-mono"><span className="block break-all md:truncate" title={r.strategy}>{r.strategy}</span></TableCell>
+                    <TableCell data-label="Status">
+                      <Pill variant="outline" className={"h-auto " + (r.retired ? "text-ink-2" : "text-dot-green")}>
                         <PillStatus><PillIndicator variant={r.retired ? "warning" : "success"} />{r.retired ? "retired" : r.status ?? "active"}</PillStatus>
                       </Pill>
                     </TableCell>
-                    <TableCell>
-                      {r.retired ? <span className="text-ink-2">{r.windows_traded} windows</span> : (
+                    <TableCell data-label="Strikes">
+                      {r.retired ? <span>{r.windows_traded} windows</span> : (
                         <div className="flex items-center gap-2">
                           <Tracker data={[0, 1, 2].map((i) => ({ key: i, color: i < (r.strikes ?? 0) ? "bg-unread" : "bg-track", tooltip: "Strike " + (i + 1) + " of 3" }))} className="h-2 w-20" />
                           <span className="font-mono text-sm text-ink-2">{r.strikes ?? 0}/3</span>
                         </div>
                       )}
                     </TableCell>
-                    <TableCell className={"text-right font-mono tabular-nums " + cls}>
+                    <TableCell data-label="Stint P&L" className={"text-right font-mono tabular-nums " + cls}>
                       {money(stint)}{r.retired ? "" : <span className="text-ink-2"> · {r.stint_windows ?? 0} windows</span>}
                     </TableCell>
-                    <TableCell className="text-right font-mono tabular-nums text-ink">{r.retired ? "retired" : money(r.equity_dollars ?? 0)}</TableCell>
+                    <TableCell data-label="Equity" className="text-right font-mono tabular-nums text-ink">{r.retired ? "retired" : money(r.equity_dollars ?? 0)}</TableCell>
                   </TableRow>
                 );
               })}
             </TableBody>
           </Table>
-          <p id="slots-note" className="mt-3 text-sm text-ink-2">Paper simulation: the pot is re-split evenly across {s.slots.length} slots each window. Three consecutive losing windows retire a slot’s strategy and rotate the next one in. Paper only, not venue money.</p>
+          <p id="slots-note" className="mt-3 max-w-[90ch] text-sm text-ink-2">Paper simulation: the pot is re-split evenly across {s.slots.length} slots each window. Three consecutive losing windows retire a slot’s strategy and rotate the next one in. Paper only, not venue money.</p>
           {notes && notes.length > 0 && (
             <ul id="slot-notes" className="mt-2 list-disc pl-5 text-sm text-ink-2">{notes.map((n) => <li key={n} className="break-words">{n}</li>)}</ul>
           )}

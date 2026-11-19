@@ -1,12 +1,14 @@
 import { type CSSProperties, useEffect, useState } from "react";
 import { MotionConfig } from "motion/react";
-import { Bell, Moon, Sun } from "lucide-react";
+import { Bell, CircleHelp, Moon, Sun } from "lucide-react";
 import { Toaster } from "sonner";
 import { AnimatedBackground } from "@/components/ui/animated-background";
 import { SegmentedControl, SegmentedControlItem } from "@/components/ui/segmented-control";
 import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { glide } from "@/motion";
 import { type Dataset, type Read, type Home, useDesk } from "@/lib/desk";
 import { Lead } from "@/Lead";
@@ -24,6 +26,9 @@ const SECTIONS = [
   { id: "markets", label: "Markets", target: "markets-card" },
 ] as const;
 
+const PURPOSE = "A paper-trading desk for Kalshi’s 15-minute crypto markets: it collects the venue’s public data, tests strategies on paper, and reports what happened. It never places orders.";
+const WIDE = "(min-width: 768px)";
+
 const ok = <T,>(r: Read<T> | undefined): T | null => (r && r.ok ? r.v : null);
 
 function readDataset(): Dataset {
@@ -34,18 +39,65 @@ function readTheme(): "light" | "dark" {
   return document.documentElement.dataset.theme === "light" ? "light" : "dark";
 }
 
-function collectorWords(home: Home | null): { word: string; dot: string; line: string } {
-  if (!home) return { word: "Collector: checking", dot: "bg-track", line: "Collector: checking" };
+function useWide() {
+  const [wide, setWide] = useState(() => matchMedia(WIDE).matches);
+  useEffect(() => {
+    const mq = matchMedia(WIDE);
+    const on = () => setWide(mq.matches);
+    mq.addEventListener("change", on);
+    return () => mq.removeEventListener("change", on);
+  }, []);
+  return wide;
+}
+
+function collectorWords(home: Home | null): { dot: string; line: string } {
+  if (!home) return { dot: "bg-track", line: "Collector: checking" };
   const c = home.collector;
   const failed = c.series_failed_last_pass ?? 0;
   const healthy = c.collecting && c.dropped_lines === 0 && c.conflicting_settlements === 0 && !failed;
   const dot = c.collecting ? (healthy ? "bg-info-foreground" : "bg-dot-amber") : "bg-unread";
   const line = c.collecting ? "Collecting, newest " + ageOf(c.newest_snapshot_age_secs) : "Not collecting";
-  return { word: c.collecting ? (healthy ? "Healthy" : "Collecting with issues") : "Stale", dot, line };
+  return { dot, line };
 }
 function ageOf(age: number | null): string {
   if (age === null) return "none yet";
   return age < 90 ? age + "s ago" : age < 5400 ? Math.round(age / 60) + "m ago" : (age / 3600).toFixed(1) + "h ago";
+}
+
+// The tag meanings, once, in a Popover from 768 px and in a Dialog on a phone.
+function HowToRead() {
+  const wide = useWide();
+  const body = (
+    <dl className="grid gap-3 text-sm">
+      <div><dt className="font-medium text-ink"><Pill variant="outline" className="text-info-foreground">venue</Pill></dt><dd className="mt-1 text-ink-2">What Kalshi reports, read from the venue.</dd></div>
+      <div><dt className="font-medium text-ink"><Pill variant="outline" className="text-ink-2">tape</Pill></dt><dd className="mt-1 text-ink-2">Counted from the snapshots the collector wrote.</dd></div>
+      <div><dt className="font-medium text-ink"><Pill variant="outline" className="text-blue">paper</Pill></dt><dd className="mt-1 text-ink-2">The pretend-money simulation. Paper only, not venue money.</dd></div>
+      <dd className="text-ink-2">Anything not obtained reads unavailable, with the reason.</dd>
+    </dl>
+  );
+  const trigger = (
+    <CircleHelp className="size-5" strokeWidth={1.5} aria-hidden />
+  );
+  if (wide) {
+    return (
+      <Popover>
+        <PopoverTrigger aria-label="How to read this" className="inline-flex size-11 cursor-pointer items-center justify-center rounded-md text-ink-2 outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:text-ink focus-visible:ring-2 focus-visible:ring-blue">{trigger}</PopoverTrigger>
+        <PopoverContent className="w-96 rounded-[10px] border border-hairline bg-surface p-4 text-ink">
+          <p className="mb-3 text-sm font-medium text-ink">How to read this</p>
+          {body}
+        </PopoverContent>
+      </Popover>
+    );
+  }
+  return (
+    <Dialog>
+      <DialogTrigger aria-label="How to read this" className="inline-flex size-11 cursor-pointer items-center justify-center rounded-md text-ink-2 outline-none focus-visible:ring-2 focus-visible:ring-blue">{trigger}</DialogTrigger>
+      <DialogContent className="rounded-[10px] border border-hairline bg-surface p-5 text-ink">
+        <DialogTitle className="mb-3 text-base font-medium">How to read this</DialogTitle>
+        {body}
+      </DialogContent>
+    </Dialog>
+  );
 }
 
 function Shell() {
@@ -93,14 +145,16 @@ function Shell() {
   const allFailed = !!reads && Object.values(reads).every((r) => !r.ok);
   const failMsg = reads && !reads.home.ok ? reads.home.msg : "";
   const fixture = dataset === "fixture";
+  const segItem = "min-h-11 md:min-h-0";
 
   return (
     <TooltipProvider>
       <header className="sticky top-0 z-20 border-b border-hairline bg-canvas">
         <div className="mx-auto flex min-h-14 max-w-[1280px] flex-wrap items-center gap-x-5 gap-y-2 px-4 py-2">
-          <div className="mr-auto flex items-center gap-2 text-base font-medium text-ink">
+          <div className="mr-auto flex items-center gap-1 text-base font-medium text-ink">
             <Bell className="size-5 text-ink" strokeWidth={1.5} aria-hidden />
-            OpenBell
+            <span className="mr-1">OpenBell</span>
+            <HowToRead />
           </div>
           <Pill variant="outline" className="text-ink-2"><PillStatus><PillIndicator variant="info" />Paper only</PillStatus>This build places no orders</Pill>
           <Pill id="chip" variant="outline" className="max-w-full text-ink-2" title="Collector health">
@@ -110,7 +164,7 @@ function Shell() {
           <div className="flex items-center gap-2">
             <SegmentedControl aria-label="Which tape the paper figures use" size="sm">
               {(["live", "fixture"] as const).map((d) => (
-                <SegmentedControlItem key={d} id={d === "live" ? "seg-live" : "seg-fixture"} aria-pressed={dataset === d} data-checked={dataset === d ? "" : undefined} onClick={() => pickDataset(d)}>
+                <SegmentedControlItem key={d} id={d === "live" ? "seg-live" : "seg-fixture"} className={segItem} aria-pressed={dataset === d} data-checked={dataset === d ? "" : undefined} onClick={() => pickDataset(d)}>
                   {d === "live" ? "Live tape" : "Fixture"}
                 </SegmentedControlItem>
               ))}
@@ -118,9 +172,8 @@ function Shell() {
             <div id="settings">
               <SegmentedControl aria-label="Appearance" size="sm" id="themeBtn">
                 {(["dark", "light"] as const).map((t) => (
-                  <SegmentedControlItem key={t} aria-label={t === "dark" ? "Dark appearance" : "Light appearance"} aria-pressed={theme === t} data-checked={theme === t ? "" : undefined} onClick={() => pickTheme(t)}>
+                  <SegmentedControlItem key={t} className={segItem} aria-label={t === "dark" ? "Dark appearance" : "Light appearance"} aria-pressed={theme === t} data-checked={theme === t ? "" : undefined} onClick={() => pickTheme(t)}>
                     {t === "dark" ? <Moon className="size-4" strokeWidth={1.5} aria-hidden /> : <Sun className="size-4" strokeWidth={1.5} aria-hidden />}
-                    <span className="sr-only">{t === "dark" ? "Dark" : "Light"}</span>
                   </SegmentedControlItem>
                 ))}
               </SegmentedControl>
@@ -136,13 +189,15 @@ function Shell() {
           >
             {SECTIONS.map((s) => (
               <button key={s.id} type="button" data-id={s.id} aria-current={active === s.id ? "location" : undefined}
-                className="h-10 shrink-0 cursor-pointer rounded-md px-3 text-sm font-medium text-ink-2 outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:text-ink focus-visible:ring-2 focus-visible:ring-blue data-[checked=true]:text-ink">
+                className="h-11 shrink-0 cursor-pointer rounded-md px-3 text-sm font-medium text-ink-2 outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:text-ink focus-visible:ring-2 focus-visible:ring-blue data-[checked=true]:text-ink">
                 {s.label}
               </button>
             ))}
           </AnimatedBackground>
         </nav>
       </header>
+
+      <p className="mx-auto max-w-[1280px] px-4 pt-3 text-sm text-ink-2">{PURPOSE}</p>
 
       <main id="top" className="mx-auto grid max-w-[1280px] grid-cols-[minmax(0,1fr)] gap-4 px-4 pb-10 pt-4">
         <p className="sr-only" aria-live="polite">{fixture ? "Showing the example tape" : "Showing the live tape"}</p>
@@ -155,22 +210,21 @@ function Shell() {
         {allFailed && (
           <div id="load-error" role="alert" className="flex flex-wrap items-center gap-3 rounded-[10px] border border-unread/40 bg-unread/10 px-4 py-3 text-sm text-ink">
             <span id="load-error-text" className="min-w-0 flex-1 basis-64">The desk could not load: none of its six reads answered ({failMsg}). Check that openbell-rs is running on this address, then Retry.</span>
-            <Button id="retryBtn" variant="outline" onClick={load}>Retry</Button>
+            <Button id="retryBtn" variant="outline" className="min-h-11" onClick={load}>Retry</Button>
           </div>
         )}
 
-        <Lead reads={reads} dataset={dataset} onRetry={load} />
-
-        <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-px overflow-hidden rounded-[10px] border border-hairline bg-hairline lg:grid-cols-2">
-          <TapeHealth read={reads?.home ?? null} onRetry={load} onCollected={load} />
-          <AccountPanel read={reads?.home ?? null} onRetry={load} />
-          <div className="bg-surface lg:col-span-2">
-            <SlotsPanel read={reads?.slots ?? null} onRetry={load} notes={ok(reads?.slots ?? undefined)?.notes} />
+        {/* One instrument surface: bands divided by 1px rules on the hairline ground. */}
+        <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-px overflow-hidden rounded-[10px] border border-hairline bg-hairline">
+          <Lead reads={reads} dataset={dataset} onRetry={load} />
+          <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-px bg-hairline lg:grid-cols-2">
+            <TapeHealth read={reads?.home ?? null} onRetry={load} onCollected={load} />
+            <AccountPanel read={reads?.home ?? null} onRetry={load} />
           </div>
+          <SlotsPanel read={reads?.slots ?? null} onRetry={load} notes={ok(reads?.slots ?? undefined)?.notes} />
+          <Strategies read={reads?.strategies ?? null} libraryErrors={home?.library_errors ?? []} dataset={dataset} onRetry={load} />
+          <Markets read={reads?.markets ?? null} onRetry={load} />
         </div>
-
-        <Strategies read={reads?.strategies ?? null} libraryErrors={home?.library_errors ?? []} dataset={dataset} onRetry={load} />
-        <Markets read={reads?.markets ?? null} onRetry={load} />
       </main>
 
       <footer className="mx-auto grid max-w-[1280px] gap-3 px-4 pb-10 text-sm text-ink-3">

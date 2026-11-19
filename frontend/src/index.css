@@ -38,3 +38,14 @@
 @media (prefers-reduced-motion: reduce) {
   [data-vaul-drawer], [data-vaul-overlay] { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+/* Phone (under 768 px): a table becomes stacked rows, each cell labelled by its column (data-label). No page overflow. */
+@media (max-width: 767px) {
+  table.stack, table.stack tbody, table.stack tr, table.stack td { display: block; width: 100%; }
+  table.stack thead { display: none; }
+  table.stack tr { border-bottom: 1px solid var(--hairline); padding: 12px 0; }
+  table.stack td { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 0; padding: 4px 0; min-width: 0; text-align: right; white-space: normal; }
+  table.stack td[data-label]::before { content: attr(data-label); color: var(--ink-2); text-align: left; flex: none; font-size: 14px; }
+  table.stack td.stack-first { justify-content: flex-start; font-weight: 500; font-size: 16px; }
+  table.stack td.stack-first::before { content: none; }
+}
