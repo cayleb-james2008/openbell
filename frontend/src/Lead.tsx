@@ -4,7 +4,6 @@ import { motion } from "motion/react";
 import { Pill } from "@/components/kibo-ui/pill";
 import { ProgressCircle } from "@/components/ProgressCircle/ProgressCircle";
 import { Expandable, ExpandableContent, ExpandableTrigger } from "@/components/ui/expandable";
-import { SlidingNumber } from "@/components/ui/sliding-number";
 import { drawOnce } from "@/motionProps";
 import { type Dataset, type Equity, type Read, type Reads, type Slots, dayLabel, money, moneyWhole } from "@/lib/desk";
 import { PanelError } from "@/Panels";
@@ -12,7 +11,8 @@ import { useWide } from "@/lib/media";
 import { AuditTrail, splitVerdict } from "@/Trail";
 
 const ok = <T,>(r: Read<T> | undefined): T | null => (r && r.ok ? r.v : null);
-const SERIES_COLORS = ["var(--info-foreground)", "var(--success-foreground)", "var(--ink-2)", "var(--destructive-foreground)"];
+// The pot is ink; instrument lines are blue (and two greys), so sage and red stay for gain and loss state only.
+const SERIES_COLORS = ["var(--dot-blue)", "var(--ink-3)", "var(--ink-2)", "var(--icon)"];
 const PADL = 64, PADR = 8, PADT = 10, PADB = 26;
 
 function useWidth() {
@@ -29,14 +29,13 @@ function useWidth() {
 }
 
 function PotFigure({ pot }: { pot: number }) {
-  const wide = useWide();
   const cents = Math.round(Math.abs(pot) * 100);
   const whole = Math.floor(cents / 100);
   const frac = String(cents % 100).padStart(2, "0");
   return (
     <div id="pot-figure" className="flex flex-nowrap items-baseline whitespace-nowrap font-mono text-[clamp(2.25rem,5.6vw,3.75rem)] leading-none font-normal tabular-nums text-ink">
       <span className="shrink-0">{pot < 0 ? "-$" : "$"}</span>
-      <span className="inline-flex shrink-0 whitespace-nowrap">{wide ? <SlidingNumber value={whole} /> : whole}</span>
+      <span className="inline-flex shrink-0 whitespace-nowrap">{whole}</span>
       <span className="shrink-0 text-[0.5em] text-ink-2">.{frac}</span>
     </div>
   );
@@ -44,7 +43,7 @@ function PotFigure({ pot }: { pot: number }) {
 
 function Trace({ eq, start, traded, settled }: { eq: Equity | null; start: number; traded: number; settled: number | null }) {
   const [ref, width] = useWidth();
-  const H = useWide() ? 184 : 150;
+  const H = useWide() ? 184 : 132;
   const allSeries: { strategy: string; points: [number, number][]; headline?: boolean }[] = eq
     ? [{ strategy: "paper pot", points: eq.pot, headline: true }, ...eq.series.filter((s) => s.points.length)]
     : [];
@@ -154,7 +153,7 @@ export function Lead({ reads, dataset, onRetry }: { reads: Reads | null; dataset
 
   return (
     <>
-      <div className="grid min-w-0 gap-8 bg-surface p-5 lg:grid-cols-[minmax(0,7fr)_minmax(0,5fr)] lg:p-6">
+      <div className="grid min-w-0 gap-6 bg-surface p-4 md:gap-8 md:p-5 lg:grid-cols-[minmax(0,7fr)_minmax(0,5fr)] lg:p-6">
         <section id="report-card" aria-labelledby="report-title" className="min-w-0 scroll-mt-28">
           <div className="flex flex-wrap items-center gap-2">
             <h2 id="report-title" tabIndex={-1} className="mr-auto text-sm font-medium text-ink-2 outline-none">Daily report</h2>
@@ -201,7 +200,7 @@ export function Lead({ reads, dataset, onRetry }: { reads: Reads | null; dataset
         </section>
       </div>
 
-      <section id="chart-card" aria-labelledby="chart-title" className="min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
+      <section id="chart-card" aria-labelledby="chart-title" className="min-w-0 scroll-mt-28 bg-surface p-4 md:p-5 lg:p-6">
         <div className="flex flex-wrap items-center gap-2">
           <h2 id="chart-title" className="mr-auto text-sm font-medium text-ink-2">Paper equity over the collected tape</h2>
           <Pill variant="outline" className="text-warning-foreground">paper</Pill>
@@ -211,7 +210,7 @@ export function Lead({ reads, dataset, onRetry }: { reads: Reads | null; dataset
       </section>
 
       {report && (
-        <section id="trail-card" aria-labelledby="trail-title" className="min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
+        <section id="trail-card" aria-labelledby="trail-title" className="min-w-0 scroll-mt-28 bg-surface p-4 md:p-5 lg:p-6">
           <div className="flex flex-wrap items-center gap-2">
             <h2 id="trail-title" className="mr-auto text-sm font-medium text-ink-2">The report, line by line</h2>
             <span className="text-sm text-ink-2">only what the report wrote</span>
@@ -221,7 +220,7 @@ export function Lead({ reads, dataset, onRetry }: { reads: Reads | null; dataset
             {({ isExpanded }: { isExpanded: boolean }) => (
               <>
                 <ExpandableTrigger aria-expanded={isExpanded} aria-controls="report"
-                  className="flex min-h-11 w-full cursor-pointer items-center justify-between gap-3 rounded-md border border-hairline px-4 text-left outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) hover:bg-board focus-visible:ring-2 focus-visible:ring-blue">
+                  className="flex min-h-11 w-full cursor-pointer items-center justify-between gap-3 rounded-md border border-hairline px-4 text-left outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) hover:bg-board focus-visible:ring-2 focus-visible:ring-ring">
                   <span className="text-sm text-ink-2">The full report, verbatim</span>
                   <span className="text-sm font-medium text-ink">{isExpanded ? "Collapse report" : "Show full report"}</span>
                 </ExpandableTrigger>

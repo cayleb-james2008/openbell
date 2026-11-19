@@ -5,11 +5,9 @@ import { BorderTrail } from "@/components/ui/border-trail";
 import { Button } from "@/components/ui/button";
 import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { SlidingNumber } from "@/components/ui/sliding-number";
 import { TextMorph } from "@/components/ui/text-morph";
 import { Tracker } from "@/components/Tracker/Tracker";
 import { type Home, type Read, type Slots, ageWords, money } from "@/lib/desk";
-import { useWide } from "@/lib/media";
 
 export function PanelError({ msg, onRetry }: { msg: string; onRetry: () => void }) {
   return (
@@ -31,9 +29,8 @@ function Stat({ label, id, children }: { label: string; id: string; children: Re
 
 const UNAVAILABLE = <span className="text-ink-3">unavailable</span>;
 function Count({ v }: { v: number | null | undefined }) {
-  const wide = useWide();
   if (v === null || v === undefined) return UNAVAILABLE;
-  return wide ? <SlidingNumber value={v} /> : <>{v}</>;
+  return <>{v}</>;
 }
 const count = (v: number | null | undefined) => <Count v={v} />;
 
@@ -89,7 +86,7 @@ export function TapeHealth({ read, onRetry, onCollected }: { read: Read<Home> | 
   const dot = !c ? "bg-track" : c.collecting ? (healthy ? "bg-info-foreground" : "bg-dot-amber") : "bg-unread";
 
   return (
-    <section id="tape" aria-labelledby="tape-title" className="relative min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
+    <section id="tape" aria-labelledby="tape-title" className="relative min-w-0 scroll-mt-28 bg-surface p-4 md:p-5 lg:p-6">
       {collecting && <BorderTrail className="bg-blue" size={120} />}
       <PanelHead id="tape-title" title="Collector, the forward tape" tag={<Pill variant="outline" className="text-ink-2">tape</Pill>} />
       {read && !read.ok && <div className="mt-3"><PanelError msg={read.msg} onRetry={onRetry} /></div>}
@@ -101,7 +98,7 @@ export function TapeHealth({ read, onRetry, onCollected }: { read: Read<Home> | 
           {!!failed && names.length > 0 && <p id="c-fail" className="mt-1 break-words">Failed series: {names.join(", ")}.</p>}
         </div>
       </div>
-      <div className="mt-5 grid grid-cols-2 gap-x-6 gap-y-5">
+      <div className="mt-4 grid grid-cols-2 gap-x-6 gap-y-4 md:mt-5 md:gap-y-5">
         <Stat label="Tape lines" id="c-snaps">{count(c?.snapshots_on_disk)}</Stat>
         <Stat label="Markets seen" id="c-markets">{count(c?.markets_seen)}</Stat>
         <Stat label="Settled windows" id="c-settled">{count(c?.settled_windows)}</Stat>
@@ -125,7 +122,7 @@ export function AccountPanel({ read, onRetry }: { read: Read<Home> | null; onRet
   const allNull = !!a && a.balance === null && a.day_pnl === null && a.open_positions === null;
   const pnlClass = a && a.day_pnl !== null ? (a.day_pnl > 0 ? "text-success-foreground" : a.day_pnl < 0 ? "text-unread" : "text-ink") : "text-ink";
   return (
-    <section id="account" aria-labelledby="account-title" className="min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
+    <section id="account" aria-labelledby="account-title" className="min-w-0 scroll-mt-28 bg-surface p-4 md:p-5 lg:p-6">
       <PanelHead id="account-title" title="Venue account" tag={<Pill variant="outline" className="text-info-foreground">venue</Pill>} />
       {read && !read.ok && <div className="mt-3"><PanelError msg={read.msg} onRetry={onRetry} /></div>}
       {allNull ? (
@@ -134,7 +131,7 @@ export function AccountPanel({ read, onRetry }: { read: Read<Home> | null; onRet
           <p id="account-note" className="mt-4 max-w-[60ch] text-sm text-ink-2">{a?.note ?? ""}</p>
           <dl className="mt-4 grid gap-0">
             {READINGS.map((k) => (
-              <div key={k} className="flex min-h-11 items-center justify-between gap-3 border-t border-hairline first:border-t-0">
+              <div key={k} className="flex min-h-9 items-center justify-between gap-3 border-t border-hairline first:border-t-0 md:min-h-11">
                 <dt className="text-sm text-ink">{k}</dt>
                 <dd className="flex items-center gap-2 font-mono text-sm">
                   <span className="text-ink-3">unavailable</span>
@@ -163,7 +160,7 @@ export function SlotsPanel({ read, onRetry, notes }: { read: Read<Slots> | null;
   const s = read && read.ok ? read.v : null;
   const rows = s ? [...s.slots.map((x) => ({ ...x, retired: false })), ...s.retired.map((x) => ({ ...x, retired: true }))] : [];
   return (
-    <section id="slots-card" aria-labelledby="slots-title" className="min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
+    <section id="slots-card" aria-labelledby="slots-title" className="min-w-0 scroll-mt-28 bg-surface p-4 md:p-5 lg:p-6">
       <PanelHead id="slots-title" title="Slots, paper only" tag={<Pill variant="outline" className="text-warning-foreground">paper</Pill>} />
       {read && !read.ok && <div className="mt-3"><PanelError msg={read.msg} onRetry={onRetry} /></div>}
       {!s && !(read && !read.ok) && <span className="mt-4 block h-24 rounded-md bg-track" aria-hidden />}
@@ -193,10 +190,10 @@ export function SlotsPanel({ read, onRetry, notes }: { read: Read<Slots> | null;
                     <TableCell data-label="Strategy" className="c-name max-w-56 font-mono"><span className="block break-words md:truncate" title={r.strategy}>{r.strategy}</span></TableCell>
                     <TableCell data-label="Status" className="c-status">
                       <Pill variant="outline" className={"h-auto " + (r.retired ? "text-ink-2" : "text-success-foreground")}>
-                        <PillStatus><PillIndicator variant={r.retired ? "warning" : "success"} />{r.retired ? "retired" : r.status ?? "active"}</PillStatus>
+                        <PillStatus className="border-r-0 pr-0"><PillIndicator variant={r.retired ? "warning" : "success"} />{r.retired ? "retired" : r.status ?? "active"}</PillStatus>
                       </Pill>
                     </TableCell>
-                    <TableCell data-label="Strikes" className="stack-break c-strikes">
+                    <TableCell data-label="Strikes" className="c-strikes">
                       {r.retired ? <span>{r.windows_traded} windows</span> : (
                         <div className="flex items-center gap-2">
                           <Tracker data={[0, 1, 2].map((i) => ({ key: i, color: i < (r.strikes ?? 0) ? "bg-unread" : "bg-track", tooltip: "Strike " + (i + 1) + " of 3" }))} className="h-2 w-20" />

@@ -102,7 +102,7 @@
   --destructive-foreground: #b4232f; /* readable red text on a pale red wash. DERIVED */
   --border: var(--hairline);
   --input: var(--hairline);
-  --ring: var(--blue);
+  --ring: var(--focus);
   --info: var(--blue);          --info-foreground: #1a56d6;     /* DERIVED from accent */
   --success: var(--dot-online); --success-foreground: #067a54;  /* text on the COSS success badge. DERIVED, CHANGED 2026-11-10 from the Active pill text #087d58 (MEASURED), which is 4.49:1 on the badge fill (success at 8% over white) and failed the render check's contrast sweep; #067a54 is 4.68:1 */
   --warning: var(--dot-amber);  --warning-foreground: #8a5a00;  /* DERIVED */
