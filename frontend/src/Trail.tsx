@@ -105,16 +105,16 @@ const TAG_CLASS: Record<NonNullable<TrailRow["tag"]>, string> = {
 
 function RowItem({ r }: { r: TrailRow }) {
   return (
-    <li className={"grid min-h-9 items-center gap-x-4 py-1.5 pr-1 text-sm md:grid-cols-[minmax(0,13rem)_minmax(0,1fr)_auto] " + (r.depth ? "pl-8" : "pl-4")}>
-      <div className="flex min-w-0 items-center gap-2">
+    <li className={"flex min-w-0 items-center gap-2 py-1.5 pr-1 text-sm md:grid md:min-h-9 md:grid-cols-[minmax(0,13rem)_minmax(0,1fr)_auto] md:gap-x-4 " + (r.depth ? "pl-8" : "pl-4")}>
+      <div className="flex min-w-0 max-w-[45%] shrink-0 items-center gap-2 md:max-w-none">
         <span className="min-w-0 truncate font-medium text-ink" title={r.label}>{r.label}</span>
-        {r.tag && <Pill variant="outline" className={"h-auto py-0 " + TAG_CLASS[r.tag]}>{r.tag}</Pill>}
+        {r.tag && <Pill variant="outline" className={"h-auto shrink-0 py-0 " + TAG_CLASS[r.tag]}>{r.tag}</Pill>}
       </div>
-      <div className="min-w-0 truncate" title={[r.value, r.note].filter(Boolean).join(" — ")}>
+      <div className="min-w-0 flex-1 truncate md:flex-none" title={[r.value, r.note].filter(Boolean).join(" — ")}>
         {r.value ? <span className="font-mono tabular-nums text-ink">{r.value}</span> : <span className="text-ink-2">-</span>}
         {r.note && <span className="ml-2 text-ink-2">{r.note}</span>}
       </div>
-      {r.time && <time dateTime={r.time} className="font-mono text-sm tabular-nums text-info-foreground md:text-right">{r.time}</time>}
+      {r.time && <time dateTime={r.time} className="hidden font-mono text-sm tabular-nums text-info-foreground md:block md:text-right">{r.time}</time>}
     </li>
   );
 }

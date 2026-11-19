@@ -9,6 +9,7 @@ import { SlidingNumber } from "@/components/ui/sliding-number";
 import { TextMorph } from "@/components/ui/text-morph";
 import { Tracker } from "@/components/Tracker/Tracker";
 import { type Home, type Read, type Slots, ageWords, money } from "@/lib/desk";
+import { useWide } from "@/lib/media";
 
 export function PanelError({ msg, onRetry }: { msg: string; onRetry: () => void }) {
   return (
@@ -23,13 +24,18 @@ function Stat({ label, id, children }: { label: string; id: string; children: Re
   return (
     <div className="min-w-0">
       <div className="text-sm text-ink-2">{label}</div>
-      <div id={id} className="mt-1 min-w-0 break-words font-mono text-2xl font-normal tabular-nums text-ink">{children}</div>
+      <div id={id} className="mt-1 min-w-0 break-words font-mono text-xl font-normal tabular-nums text-ink md:text-2xl">{children}</div>
     </div>
   );
 }
 
 const UNAVAILABLE = <span className="text-ink-3">unavailable</span>;
-const count = (v: number | null | undefined) => (v === null || v === undefined ? UNAVAILABLE : <SlidingNumber value={v} />);
+function Count({ v }: { v: number | null | undefined }) {
+  const wide = useWide();
+  if (v === null || v === undefined) return UNAVAILABLE;
+  return wide ? <SlidingNumber value={v} /> : <>{v}</>;
+}
+const count = (v: number | null | undefined) => <Count v={v} />;
 
 function PanelHead({ id, title, tag }: { id: string; title: string; tag: ReactNode }) {
   return (

@@ -11,6 +11,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { sectionGlide } from "@/motionProps";
 import { type Dataset, type Read, type Home, useDesk } from "@/lib/desk";
+import { useWide } from "@/lib/media";
 import { Lead } from "@/Lead";
 import { AccountPanel, SlotsPanel, TapeHealth } from "@/Panels";
 import { Markets, Strategies } from "@/Lists";
@@ -27,7 +28,6 @@ const SECTIONS = [
 ] as const;
 
 const PURPOSE = "A paper-trading desk for Kalshi’s 15-minute crypto markets: it collects the venue’s public data, tests strategies on paper, and reports what happened. It never places orders.";
-const WIDE = "(min-width: 768px)";
 
 const ok = <T,>(r: Read<T> | undefined): T | null => (r && r.ok ? r.v : null);
 
@@ -39,16 +39,6 @@ function readTheme(): "light" | "dark" {
   return document.documentElement.dataset.theme === "light" ? "light" : "dark";
 }
 
-function useWide() {
-  const [wide, setWide] = useState(() => matchMedia(WIDE).matches);
-  useEffect(() => {
-    const mq = matchMedia(WIDE);
-    const on = () => setWide(mq.matches);
-    mq.addEventListener("change", on);
-    return () => mq.removeEventListener("change", on);
-  }, []);
-  return wide;
-}
 
 function collectorWords(home: Home | null): { dot: string; line: string; short: string } {
   if (!home) return { dot: "bg-track", line: "Collector: checking", short: "Checking" };
