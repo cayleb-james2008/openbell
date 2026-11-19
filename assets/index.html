@@ -339,6 +339,22 @@
     #strategies td .bar-cell { min-width: 0; flex: 1 1 100%; justify-content: flex-start; }
     #strategies td .pill { white-space: normal; text-align: left; max-width: 100%; }
   }
+  .update-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 12px 16px;
+    border: 1px solid var(--hairline); border-radius: 12px; background: var(--surface); }
+  .upd-main { flex: 1 1 260px; min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 12px; }
+  .upd-title { margin: 0; font-weight: 500; color: var(--ink); overflow-wrap: anywhere; }
+  .upd-notes { margin: 0; flex: 1 1 200px; min-width: 0; color: var(--ink-2); font-size: 13px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .upd-hint, .upd-msg { margin: 4px 0 0; flex-basis: 100%; color: var(--ink-2); font-size: 13px; overflow-wrap: anywhere; }
+  .upd-msg:empty { display: none; }
+  .upd-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  a.btn-quiet { display: inline-flex; align-items: center; min-height: 44px; padding: 0 12px; border-radius: 8px;
+    border: 1px solid var(--hairline); background: var(--surface); text-decoration: none; color: var(--ink); font-size: 13px; font-weight: 500; }
+  .version-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; font-size: 13px; color: var(--ink-2); }
+  .version-row a { color: var(--ink); display: inline-flex; align-items: center; min-height: 44px; }
+  .check-result { margin: 0; color: var(--ink-2); overflow-wrap: anywhere; }
+  .check-result:empty { display: none; }
+  .foot-note { margin: 16px 0 0; }
 </style>
 </head>
 <body data-source="live">
@@ -397,6 +413,16 @@
     <button id="retryBtn" type="button" class="btn-quiet">Retry</button>
   </div>
 
+  <p class="sr-only" id="upd-live" role="status" aria-live="polite"></p>
+  <section class="update-banner" id="update-banner" role="region" aria-label="OpenBell update" hidden>
+    <div class="upd-main">
+      <p class="upd-title" id="upd-title"></p>
+      <p class="upd-notes" id="upd-notes" hidden></p>
+      <p class="upd-hint" id="upd-hint" hidden></p>
+      <p class="upd-msg" id="upd-msg"></p>
+    </div>
+    <div class="upd-actions" id="upd-actions"></div>
+  </section>
   <div class="live-group" id="live-group">
     <div class="live-head" id="live-head" hidden>
       <p class="live-title" id="live-title" tabindex="-1">Live desk, not the example tape</p>
@@ -550,7 +576,13 @@
     </div>
   </section>
 </main>
-<footer>Every figure is venue (read from Kalshi), tape (counted from the collected snapshots), or paper (the slot simulation). Anything not obtained reads unavailable, with the reason.</footer>
+<footer>
+  <div class="version-row" id="version-row" hidden>
+    <a id="version-link" href="https://github.com/cayleb-james2008/openbell/releases" target="_blank" rel="noopener">OpenBell</a>
+    <button type="button" class="btn-quiet" id="check-updates">Check for updates</button>
+    <p class="check-result" id="check-result" role="status"></p>
+  </div>
+  <p class="foot-note">Every figure is venue (read from Kalshi), tape (counted from the collected snapshots), or paper (the slot simulation). Anything not obtained reads unavailable, with the reason.</footer>
 
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
   <defs>
@@ -998,6 +1030,191 @@ $('themeBtn').addEventListener('click', () => {
   load();
 });
 syncThemeButton();
+/* ---------- version and updates ---------- */
+/* The server checks GitHub in the background; this page only asks it what it knows. */
+const RELEASES_URL = 'https://github.com/cayleb-james2008/openbell/releases/tag/v';
+const UPDATE_DISMISS_KEY = 'openbell-update-dismissed';
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let updateSnap = null;
+let justInstalled = '';
+
+function plainError(e) {
+  if (e && e.name === 'TypeError') return 'Could not reach OpenBell. Is it running?';
+  return (e && e.message) || 'Something went wrong. Try again.';
+}
+function firstLine(text) {
+  return String(text || '').split('\n').map((l) => l.trim()).find((l) => l) || '';
+}
+function dismissedFor() { try { return localStorage.getItem(UPDATE_DISMISS_KEY) || ''; } catch (e) { return ''; } }
+function rememberDismiss(v) { try { localStorage.setItem(UPDATE_DISMISS_KEY, v); } catch (e) {} }
+function checkedWords(secs) {
+  if (!secs) return 'not yet';
+  const mins = Math.round((Date.now() - secs * 1000) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return mins + ' min ago';
+  return Math.round(mins / 60) + ' h ago';
+}
+function say(text) { $('upd-live').textContent = text; }
+function showMsg(text) { $('upd-msg').textContent = text; }
+function updateButton(label, cls, onClick) {
+  const b = el('button', 'btn-quiet' + (cls ? ' ' + cls : ''), label);
+  b.type = 'button';
+  b.addEventListener('click', () => onClick(b));
+  return b;
+}
+function updateLink(label, href) {
+  const a = el('a', 'btn-quiet', label);
+  a.href = href; a.target = '_blank'; a.rel = 'noopener';
+  a.append(el('span', 'sr-only', ' (opens in a new tab)'));
+  return a;
+}
+function resultLine(s) {
+  if (s.mode === 'off') return 'Updates are off on this OpenBell.';
+  if (s.error) return s.error;
+  if (s.staged) return 'Version ' + s.staged + ' is installed. Restart to use it.';
+  if (s.available) return 'Version ' + s.latest + ' is available.';
+  if (!s.checked_at) return 'Not checked yet.';
+  return 'You are on the newest version (checked ' + checkedWords(s.checked_at) + ').';
+}
+
+function renderUpdate(s) {
+  updateSnap = s;
+  if (!s.staged) justInstalled = '';
+  const actions = $('upd-actions');
+  const title = $('upd-title'), notes = $('upd-notes'), hint = $('upd-hint');
+  actions.replaceChildren();
+  notes.hidden = true; notes.textContent = ''; notes.removeAttribute('title');
+  hint.hidden = true; hint.textContent = '';
+  let show = false;
+  if (s.staged) {
+    show = true;
+    title.textContent = justInstalled || ('Version ' + s.staged + ' is installed. Restart to use it.');
+    actions.append(updateButton('Restart now', 'btn-primary', restartNow));
+  } else if (s.available && s.latest && dismissedFor() !== s.latest) {
+    show = true;
+    title.textContent = 'Version ' + s.latest + ' is available';
+    const line = firstLine(s.notes);
+    if (line) { notes.textContent = line; notes.title = line; notes.hidden = false; }
+    if (s.can_apply) {
+      actions.append(updateButton('Update now', 'btn-primary', applyNow));
+    } else {
+      hint.textContent = s.dev_build ? 'Update OpenBell from the terminal.' : 'Update from the machine OpenBell runs on.';
+      hint.hidden = false;
+    }
+    actions.append(updateLink("What's new", s.release_url || (RELEASES_URL + s.latest)));
+    actions.append(updateButton('Dismiss', '', () => { rememberDismiss(s.latest); renderUpdate(updateSnap); }));
+  }
+  $('update-banner').hidden = !show;
+  $('check-updates').hidden = s.mode === 'off';
+  $('check-result').textContent = resultLine(s);
+}
+
+async function loadVersion() {
+  try {
+    const r = await fetch('/api/version', { cache: 'no-store' });
+    if (!r.ok) return;
+    const v = await r.json();
+    if (typeof v.version !== 'string') return;
+    const link = $('version-link');
+    link.textContent = 'OpenBell ' + v.version;
+    link.href = RELEASES_URL + v.version;
+    $('version-row').hidden = false;
+  } catch (e) { /* no version line when the server does not answer */ }
+}
+
+async function loadUpdate() {
+  try {
+    const r = await fetch('/api/update', { cache: 'no-store' });
+    if (!r.ok) return;
+    const s = await r.json();
+    if (typeof s.mode !== 'string' || typeof s.available !== 'boolean') return;
+    renderUpdate(s);
+  } catch (e) { /* best effort: the page says nothing it cannot verify */ }
+}
+
+async function checkNow() {
+  const b = $('check-updates');
+  b.disabled = true;
+  $('check-result').textContent = 'Checking…';
+  try {
+    const r = await fetch('/api/update/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const s = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(s.error || 'The check did not finish. Try again later.');
+    renderUpdate(s);
+  } catch (e) {
+    $('check-result').textContent = plainError(e);
+  }
+  b.disabled = false;
+}
+$('check-updates').addEventListener('click', checkNow);
+
+async function applyNow(btn) {
+  const latest = updateSnap ? updateSnap.latest : '';
+  btn.disabled = true;
+  btn.textContent = 'Downloading and checking...';
+  say('Downloading and checking...');
+  showMsg('Downloading and checking...');
+  try {
+    const r = await fetch('/api/update/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || 'The update did not install. Try again later.');
+    justInstalled = 'Installed ' + latest + '. Restart to use it.';
+    renderUpdate(Object.assign({}, data, { staged: data.staged || latest }));
+    say(justInstalled);
+    showMsg('');
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = 'Update now';
+    say(plainError(e));
+    showMsg(plainError(e));
+  }
+}
+
+async function restartNow(btn) {
+  btn.disabled = true;
+  btn.textContent = 'Restarting…';
+  say('Restarting…');
+  showMsg('Restarting…');
+  try {
+    const r = await fetch('/api/update/restart', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || 'OpenBell could not restart.');
+  } catch (e) {
+    // A dropped connection is the restart itself; any other failure is shown as it is.
+    if (!(e && e.name === 'TypeError')) {
+      btn.disabled = false;
+      btn.textContent = 'Restart now';
+      say(plainError(e));
+      showMsg(plainError(e));
+      return;
+    }
+  }
+  waitForReturn();
+}
+
+/* Poll the version every second for up to a minute, then reload on the new process. */
+function waitForReturn() {
+  const started = Date.now();
+  const tick = async () => {
+    if (Date.now() - started > 60000) {
+      const msg = 'OpenBell did not come back within a minute. Start it again: run openbell-rs, or restart its service. Then reload this page.';
+      say(msg);
+      showMsg(msg);
+      return;
+    }
+    try {
+      const r = await fetch('/api/version', { cache: 'no-store' });
+      if (r.ok) { location.reload(); return; }
+    } catch (e) { /* still restarting */ }
+    setTimeout(tick, 1000);
+  };
+  setTimeout(tick, 1000);
+}
+
+loadVersion();
+loadUpdate();
+setInterval(loadUpdate, UPDATE_CHECK_MS);
+
 applyReport();
 setDataset(dataset);
 setInterval(load, 30000);
