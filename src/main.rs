@@ -124,6 +124,8 @@ fn dollars(v: &serde_json::Value, key: &str) -> Option<f64> {
 fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize), String> {
     let url = format!("{API_BASE}/markets?series_ticker={series}&status={status}&limit=100");
     let out = Command::new("curl")
+        // -q first: never read the user's ~/.curlrc.
+        .arg("-q")
         .args(["-s", "-m", "25", &url])
         .output()
         .map_err(|e| format!("curl failed: {e}"))?;
@@ -2526,7 +2528,12 @@ fn update_response(method: &str, path: &str, host: &str) -> Option<String> {
     Some(match (method, path) {
         ("GET", "/api/version") => json_response(
             200,
-            &json!({ "name": "openbell-rs", "version": env!("CARGO_PKG_VERSION") }).to_string(),
+            &json!({
+                "name": "openbell-rs",
+                "version": env!("CARGO_PKG_VERSION"),
+                "release_url": format!("https://github.com/{}/releases/tag/v{}", up.cfg.repo, env!("CARGO_PKG_VERSION")),
+            })
+            .to_string(),
         ),
         ("GET", "/api/update") => json_response(200, &up.snapshot().to_string()),
         ("POST", "/api/update/check") => json_response(200, &up.check_now().to_string()),
@@ -3422,6 +3429,7 @@ mod tests {
         let (status, v) = body_json(&update_response("GET", "/api/version", "127.0.0.1:8472").unwrap());
         assert_eq!(status, 200);
         assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.2.0")));
+        assert_eq!(v["release_url"], json!("https://github.com/cayleb-james2008/openbell/releases/tag/v0.2.0"));
     }
 
     #[test]
