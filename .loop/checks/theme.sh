@@ -1,5 +1,5 @@
 #!/bin/bash
-# C9: the page ships light + dark themes — dark is the default, the
+# C9: the page ships light + dark themes — light is the default, the
 # toggle lives in a Settings section, the choice persists, and icons
 # are drawn symbols, never letters or emoji. (Served-page assertions:
 # this environment has no browser to execute the page.)
@@ -25,8 +25,8 @@ echo "$page" | grep -q 'data-theme' || { echo "FAIL: page has no data-theme mech
 # The shipped page is a React bundle: the CSS minifier drops quotes, and the ids and names live in the bundle
 # (the rendered DOM is built at run time). Each assertion below is the equivalent of the old raw-HTML string.
 echo "$page" | grep -qE 'data-theme=.?light' || { echo "FAIL: no light theme variable set"; exit 1; }
-echo "$page" | grep -qF "getItem('openbell-theme')||'dark'" \
-  || { echo "FAIL: dark is not the default theme"; exit 1; }
+echo "$page" | grep -qF "getItem('openbell-theme')||'light'" \
+  || { echo "FAIL: light is not the default theme"; exit 1; }
 echo "$page" | grep -qE 'setItem\(.openbell-theme' \
   || { echo "FAIL: theme choice is not persisted"; exit 1; }
 echo "$page" | grep -qE 'id.{1,3}.settings.'  || { echo "FAIL: no Settings section for the toggle"; exit 1; }
@@ -44,4 +44,4 @@ if bad:
 PYEOF
 [ $? -eq 0 ] || exit 1
 
-echo "THEME OK: light + dark themes, dark default, toggle in Settings, persisted, symbol icons only"
+echo "THEME OK: light + dark themes, light default, toggle in Settings, persisted, symbol icons only"
