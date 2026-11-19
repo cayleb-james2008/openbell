@@ -578,7 +578,7 @@
 </main>
 <footer>
   <div class="version-row" id="version-row" hidden>
-    <a id="version-link" href="https://github.com/cayleb-james2008/openbell/releases" target="_blank" rel="noopener">OpenBell</a>
+    <a id="version-link" target="_blank" rel="noopener">OpenBell</a>
     <button type="button" class="btn-quiet" id="check-updates">Check for updates</button>
     <p class="check-result" id="check-result" role="status"></p>
   </div>
@@ -1032,7 +1032,6 @@ $('themeBtn').addEventListener('click', () => {
 syncThemeButton();
 /* ---------- version and updates ---------- */
 /* The server checks GitHub in the background; this page only asks it what it knows. */
-const RELEASES_URL = 'https://github.com/cayleb-james2008/openbell/releases/tag/v';
 const UPDATE_DISMISS_KEY = 'openbell-update-dismissed';
 const UPDATE_CHECK_MS = 30 * 60 * 1000;
 let updateSnap = null;
@@ -1101,7 +1100,7 @@ function renderUpdate(s) {
       hint.textContent = s.dev_build ? 'Update OpenBell from the terminal.' : 'Update from the machine OpenBell runs on.';
       hint.hidden = false;
     }
-    actions.append(updateLink("What's new", s.release_url || (RELEASES_URL + s.latest)));
+    if (s.release_url) actions.append(updateLink("What's new", s.release_url));
     actions.append(updateButton('Dismiss', '', () => { rememberDismiss(s.latest); renderUpdate(updateSnap); }));
   }
   $('update-banner').hidden = !show;
@@ -1117,7 +1116,9 @@ async function loadVersion() {
     if (typeof v.version !== 'string') return;
     const link = $('version-link');
     link.textContent = 'OpenBell ' + v.version;
-    link.href = RELEASES_URL + v.version;
+    // The link is live only when the server names the release page; otherwise the version stays plain text.
+    if (typeof v.release_url === 'string' && v.release_url) link.href = v.release_url;
+    else link.removeAttribute('href');
     $('version-row').hidden = false;
   } catch (e) { /* no version line when the server does not answer */ }
 }
