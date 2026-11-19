@@ -393,3 +393,23 @@
     color: var(--ink-3);
   }
 }
+
+/* Round 3 (Hallmark floor): no default palette, no default shadows. Every colour the copied parts can name
+   resolves to a role token of this app; the Console theme has no shadow (theme.css). */
+@theme {
+  --shadow: none;
+  --color-red-*: initial;
+  --color-yellow-*: initial;
+  --color-gray-*: initial;
+  --color-black: initial;
+  --color-white: initial;
+  --shadow-2xs: none; --shadow-xs: none; --shadow-sm: none; --shadow-md: none; --shadow-lg: none; --shadow-xl: none; --shadow-2xl: none;
+  --inset-shadow-2xs: none; --inset-shadow-xs: none; --inset-shadow-sm: none;
+  --drop-shadow-xs: none; --drop-shadow-sm: none; --drop-shadow-md: none; --drop-shadow-lg: none; --drop-shadow-xl: none; --drop-shadow-2xl: none;
+}
+@theme inline {
+  --color-gray-200: var(--track); --color-gray-500: var(--ink-3);
+  --color-red-200: var(--tag-plan-bg); --color-red-500: var(--unread);
+  --color-yellow-200: var(--pill-warn-bg); --color-yellow-500: var(--dot-amber);
+  --color-black: var(--ink-button); --color-white: var(--raised);
+}

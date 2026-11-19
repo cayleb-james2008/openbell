@@ -5,7 +5,7 @@ import { Pill } from "@/components/kibo-ui/pill";
 import { ProgressCircle } from "@/components/ProgressCircle/ProgressCircle";
 import { Expandable, ExpandableContent, ExpandableTrigger } from "@/components/ui/expandable";
 import { SlidingNumber } from "@/components/ui/sliding-number";
-import { dur, ease } from "@/motion";
+import { drawOnce } from "@/motionProps";
 import { type Dataset, type Equity, type Read, type Reads, type Slots, dayLabel, money, moneyWhole } from "@/lib/desk";
 import { PanelError } from "@/Panels";
 import { AuditTrail, splitVerdict } from "@/Trail";
@@ -72,7 +72,7 @@ function Trace({ eq, start, traded, settled }: { eq: Equity | null; start: numbe
       const color = s.headline ? "var(--ink)" : SERIES_COLORS[(i - 1) % SERIES_COLORS.length];
       return (
         <motion.path key={s.strategy} d={d} fill="none" strokeWidth={s.headline ? 2.2 : 1.4} strokeLinejoin="round"
-          style={{ stroke: color }} initial={{ pathLength: 0 }} animate={{ pathLength: 1 }} transition={{ duration: dur.sheet, ease }} />
+          style={{ stroke: color }} initial={{ pathLength: 0 }} animate={{ pathLength: 1 }} {...drawOnce} />
       );
     });
     dayLabels = (
@@ -171,7 +171,7 @@ export function Lead({ reads, dataset, onRetry }: { reads: Reads | null; dataset
         <section id="pot" aria-labelledby="pot-title" className="min-w-0 scroll-mt-28">
           <div className="flex flex-wrap items-center gap-2">
             <h2 id="pot-title" tabIndex={-1} className="mr-auto text-sm font-medium text-ink-2 outline-none">Paper pot</h2>
-            <Pill variant="outline" className="text-blue">paper</Pill>
+            <Pill variant="outline" className="text-warning-foreground">paper</Pill>
           </div>
           {sl && !sl.ok && <div className="mt-3"><PanelError msg={sl.msg} onRetry={onRetry} /></div>}
           {pot === null && !(sl && !sl.ok) && <span className="mt-4 block h-12 w-48 rounded-md bg-track" aria-hidden />}
@@ -185,7 +185,7 @@ export function Lead({ reads, dataset, onRetry }: { reads: Reads | null; dataset
                   </ProgressCircle>
                 </div>
               </div>
-              <p id="pot-change" className={"mt-2 font-mono text-sm tabular-nums " + (change > 0 ? "text-dot-green" : change < 0 ? "text-unread" : "text-ink-2")}>
+              <p id="pot-change" className={"mt-2 font-mono text-sm tabular-nums " + (change > 0 ? "text-success-foreground" : change < 0 ? "text-unread" : "text-ink-2")}>
                 {(change >= 0 ? "+" : "-") + "$" + Math.abs(change).toFixed(2) + " against the $" + start.toFixed(2) + " start (paper)"}
               </p>
               <p id="stage-line" className="mt-3 text-sm text-ink-2">
@@ -201,7 +201,7 @@ export function Lead({ reads, dataset, onRetry }: { reads: Reads | null; dataset
       <section id="chart-card" aria-labelledby="chart-title" className="min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
         <div className="flex flex-wrap items-center gap-2">
           <h2 id="chart-title" className="mr-auto text-sm font-medium text-ink-2">Paper equity over the collected tape</h2>
-          <Pill variant="outline" className="text-blue">paper</Pill>
+          <Pill variant="outline" className="text-warning-foreground">paper</Pill>
         </div>
         {reads && !reads.equity.ok && <div className="mt-3"><PanelError msg={reads.equity.msg} onRetry={onRetry} /></div>}
         <div className="mt-4"><Trace eq={eq} start={start} traded={traded} settled={settled} /></div>
@@ -218,7 +218,7 @@ export function Lead({ reads, dataset, onRetry }: { reads: Reads | null; dataset
             {({ isExpanded }: { isExpanded: boolean }) => (
               <>
                 <ExpandableTrigger aria-expanded={isExpanded} aria-controls="report"
-                  className="flex min-h-11 w-full cursor-pointer items-center justify-between gap-3 rounded-md border border-hairline px-4 text-left outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-board focus-visible:ring-2 focus-visible:ring-blue">
+                  className="flex min-h-11 w-full cursor-pointer items-center justify-between gap-3 rounded-md border border-hairline px-4 text-left outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) hover:bg-board focus-visible:ring-2 focus-visible:ring-blue">
                   <span className="text-sm text-ink-2">The full report, verbatim</span>
                   <span className="text-sm font-medium text-ink">{isExpanded ? "Collapse report" : "Show full report"}</span>
                 </ExpandableTrigger>

@@ -13,9 +13,9 @@ type Found<T> = Read<T> | null;
 
 function SearchField({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
   return (
-    <InputGroup className="max-w-sm">
+    <InputGroup className="!h-11 max-w-sm">
       <InputGroupAddon><Search className="size-4 text-icon" strokeWidth={1.5} aria-hidden /></InputGroupAddon>
-      <InputGroupInput type="search" aria-label={label} placeholder={label} value={value} onChange={(e) => onChange(e.target.value)} className="min-h-11 md:min-h-0" />
+      <InputGroupInput type="search" aria-label={label} placeholder={label} value={value} onChange={(e) => onChange(e.target.value)} className="!h-11" />
     </InputGroup>
   );
 }
@@ -24,10 +24,10 @@ function SearchField({ label, value, onChange }: { label: string; value: string;
 const WRAP = "h-auto max-w-full whitespace-normal py-1 text-left leading-snug";
 function VerdictPill({ verdict, fixture }: { verdict: string; fixture: boolean }) {
   if (fixture && verdict.startsWith("PROVEN")) {
-    return <Pill variant="outline" className={WRAP + " text-blue"}>meets the bar on the example tape (not forward evidence)</Pill>;
+    return <Pill variant="outline" className={WRAP + " text-warning-foreground"}>meets the bar on the example tape (not forward evidence)</Pill>;
   }
   if (verdict.startsWith("PROVEN")) {
-    return <Pill variant="outline" className={WRAP + " text-dot-green"}><PillStatus><PillIndicator variant="success" />{verdict}</PillStatus></Pill>;
+    return <Pill variant="outline" className={WRAP + " text-success-foreground"}><PillStatus><PillIndicator variant="success" />{verdict}</PillStatus></Pill>;
   }
   if (verdict.startsWith("NOT PROVEN")) {
     return <Pill variant="outline" className={WRAP + " text-unread"}><PillStatus><PillIndicator variant="error" />{verdict}</PillStatus></Pill>;
@@ -44,7 +44,7 @@ export function Strategies({ read, libraryErrors, dataset, onRetry }: { read: Fo
     <section id="strategies" aria-labelledby="strategies-title" className="min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
       <div className="flex flex-wrap items-center gap-2">
         <h2 id="strategies-title" tabIndex={-1} className="mr-auto text-sm font-medium text-ink-2 outline-none">Strategies against the promotion standard</h2>
-        <Pill variant="outline" className="text-blue">paper</Pill>
+        <Pill variant="outline" className="text-warning-foreground">paper</Pill>
       </div>
       {read && !read.ok && <div className="mt-3"><PanelError msg={read.msg} onRetry={onRetry} /></div>}
       <p className="mt-3 max-w-[70ch] text-sm text-ink-2">A strategy is proven only after 100 forward windows, both chronological halves positive, and +3.5 cents per contract after fees. Until then it is unproven, and the verdict says so.</p>

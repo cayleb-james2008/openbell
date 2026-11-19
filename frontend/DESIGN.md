@@ -104,3 +104,12 @@ Pinned-hook status: `.loop/checks/equity.sh` `http` rule updated in its own comm
 - Vaul "Sections" sheet: NO NEED HERE. The section row already scrolls in one line at 390 px; a sheet would add a tap to reach the same tabs.
 - Not done in round 2: Hallmark sloplint still reports FAILs (see the round-2 hand-over); contrast and tap-target measurements not run; LOCAL-EDITS.md not created (no part edits made).
 - Checks rewritten in their own commits (theme.sh, equity.sh labelled-SVG rule), each with the reason in its message.
+
+## Round 3 status
+- Trail: compact rows (~36 px), the Slots and Strategy verdicts groups behind one disclosure row each with a one-line summary counted from the report's own text. Only "Slot N" lines count as slots.
+- Vaul: "no need here" for the section tabs (one scroll row at 390 px). The legend stays in a Popover/Dialog, not a drawer, so Vaul is not used.
+- Theme overrides (src/theme.css, by hand): --raised light gets a hue (zero chroma was a REFLEX); --input is set to a 3:1 edge colour in both themes. src/tokens.css resets the default palette and shadows, and maps the few palette names the parts use to role tokens.
+- Copied parts: every hand edit is in rune/used/LOCAL-EDITS.md and sync-used.mjs skips those files.
+- Measured (fixture and live, 320/390/768/1440, light and dark): 0 small-text contrast failures under 4.5:1, 0 controls under 44 px, 0 focusable controls without a visible ring, 0 sideways overflow.
+- Hallmark lint: 2 FAIL and 9 WARN remain. FAIL: the ring-offset literal in Tailwind's own base rule; the `.transition` candidate, which the five motion parts create with their `transition=` prop names. WARN: dark-variant background classes of the card table variant, which the app never renders.
+- Open defect: the verdict pills in the strategies table show a line through their text in the render. Not yet traced.

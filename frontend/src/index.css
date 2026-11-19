@@ -1,4 +1,9 @@
 @import "tailwindcss";
+/* The two notes quote class names as text; they are not markup and must not generate CSS. */
+@source not "../../rune/used/LOCAL-EDITS.md";
+@source not "../DESIGN.md";
+@source not "../../rune/used/motion.ts";
+@source not "./motionProps.ts";
 /* Tokens: the house roles (tokens.css), then this app's Hallmark theme values (theme.css), then its fonts. */
 @import "./tokens.css";
 @import "./theme.css";
@@ -32,9 +37,9 @@
 }
 
 /* Vaul ignores prefers-reduced-motion: its sheet and overlay travel with CSS *animations* (slideFromBottom,
-   slideToBottom, fadeIn, fadeOut) and a transform transition. The earlier override here (until 2026-11-10)
+   slideToBottom, fadeIn, fadeOut) and a transform motion. The earlier override here (until 2026-11-10)
    matched [vaul-drawer], an attribute vaul 1.x does not set (it sets data-vaul-drawer), and cut only the
-   transition, so the 500 ms slide kept running. Both durations are cut on the real attributes. */
+   motion, so the 500 ms slide kept running. Both durations are cut on the real attributes. */
 @media (prefers-reduced-motion: reduce) {
   [data-vaul-drawer], [data-vaul-overlay] { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
@@ -48,4 +53,15 @@
   table.stack td[data-label]::before { content: attr(data-label); color: var(--ink-2); text-align: left; flex: none; font-size: 14px; }
   table.stack td.stack-first { justify-content: flex-start; font-weight: 500; font-size: 16px; }
   table.stack td.stack-first::before { content: none; }
+}
+
+/* Hallmark floor: the page never scrolls sideways; headings balance their lines. */
+html, body { overflow-x: clip; }
+h1, h2, h3, h4 { text-wrap: balance; }
+:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+/* The bare utility moves only colour, opacity and transform, so a focus ring never fades in. */
+@utility transition {
+  transition-property: color, background-color, border-color, opacity, transform;
+  transition-timing-function: var(--ease-house);
+  transition-duration: var(--dur-press);
 }

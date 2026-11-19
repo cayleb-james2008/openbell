@@ -44,6 +44,8 @@ function singleFile(): Plugin {
         const css = fs.readFileSync(path.join(dist, href.replace(/^\.?\//, "")), "utf8");
         return `<style>${css}</style>`;
       });
+      // The Hallmark stamp is the first line of the page CSS (the lint reads that line); the critique follows it.
+      html = html.replace(/<style>/, "<style>/* Hallmark: app openbell, shape: app screen, genre: modern-minimal, theme: console (material only, faces from the owner), critique: one instrument surface, the report read line by line as the audit trail */\n");
       const out = path.resolve(root, "../assets/index.html");
       fs.writeFileSync(out, html);
       console.log(`single file: ${out} (${(html.length / 1024).toFixed(0)} kB)`);
