@@ -8,6 +8,7 @@
 //! paper against collected forward data, and a strategy is only "proven"
 //! when it passes the desk's promotion standard on forward evidence.
 
+mod open;
 mod update;
 
 use serde_json::json;
@@ -2424,6 +2425,21 @@ fn seed_strategy_library(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The one friendly start-up message: where the desk is, where its tape lives, and what updates do.
+fn start_banner(url: &str, data_dir: &Path, updates: update::Mode, opened: bool) -> String {
+    let updates = match updates {
+        update::Mode::Off => "off",
+        update::Mode::Notify => "notify (tells you when a release is ready)",
+        update::Mode::Auto => "auto (installs a release and restarts when idle)",
+    };
+    let browser = if opened { "opening it in your browser" } else { "open that address in a browser" };
+    format!(
+        "\n  OpenBell {}\n  Your desk:  {url}  ({browser})\n  Tape:       {}\n  Updates:    {updates}\n  Shadow mode: no order path exists in this build.\n",
+        env!("CARGO_PKG_VERSION"),
+        data_dir.display()
+    )
+}
+
 /// The first port from `start` (at most DEFAULT_PORT_SPAN above it) that `bind` accepts.
 fn bind_free_port<F>(start: u16, bind: F) -> Option<(TcpListener, u16)>
 where
@@ -2505,7 +2521,7 @@ fn main() {
     let app = Arc::new(App {
         tape_cache: std::sync::Mutex::new(None),
         analysis_cache: std::sync::Mutex::new(None),
-        data_dir,
+        data_dir: data_dir.clone(),
         strategies_dir,
         paper_pot,
         collect_secs,
@@ -2527,7 +2543,13 @@ fn main() {
             }),
     };
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(DEFAULT_PORT);
-    println!("openbell-rs listening on http://127.0.0.1:{port} (shadow mode — no order path exists)");
+    let url = format!("http://127.0.0.1:{port}");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let opening = open::wanted(&args, &get_env, std::env::consts::OS);
+    if opening {
+        open::open_in_browser(&url);
+    }
+    println!("{}", start_banner(&url, &data_dir, updater().cfg.mode, opening));
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -3616,5 +3638,12 @@ mod tests {
         assert!(std::fs::read_to_string(dir.join("favourite_late.rn")).unwrap().contains("mine"), "an existing folder is left alone");
         std::fs::remove_dir_all(&dir).ok();
     }
-}
 
+    #[test]
+    fn the_start_banner_names_the_address_version_tape_and_updates() {
+        let b = start_banner("http://127.0.0.1:8475", Path::new("/data/ob"), update::Mode::Auto, true);
+        assert!(b.contains("OpenBell ") && b.contains(env!("CARGO_PKG_VERSION")));
+        assert!(b.contains("http://127.0.0.1:8475") && b.contains("/data/ob"));
+        assert!(b.contains("auto (installs") && b.contains("opening it in your browser") && b.contains("no order path"));
+    }
+}
