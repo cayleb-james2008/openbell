@@ -282,8 +282,7 @@
     *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
   }
   @media (max-width: 720px) {
-    .paper-note { display: none; }
-    .jump { margin-left: 0; flex-wrap: nowrap; overflow-x: auto; max-width: 100%; scrollbar-width: none; }
+    .jump { margin-left: 0; }
     .jump a { white-space: nowrap; }
     .report-head { font-size: 19px; }
     .pot-figure { font-size: 30px; }
@@ -301,9 +300,34 @@
     #strategies td.empty-row { display: block; }
     button { min-height: 44px; }
   }
+  [hidden] { display: none !important; }
+  .purpose { max-width: 1280px; margin: 0 auto; padding: 12px 16px 0; }
+  .purpose p { margin: 0; color: var(--ink-2); font-size: 14px; line-height: 20px; max-width: 70ch; }
+  .seg-caption { margin: 0; color: var(--ink-2); font-size: 13px; line-height: 20px; max-width: 46ch; }
+  .panel-error {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 0 0 16px; padding: 12px 16px;
+    background: var(--err-bg); color: var(--ink); border: 1px solid var(--err); border-radius: 8px; font-size: 13px;
+  }
+  .note-list { margin: 8px 0 0; padding-left: 16px; color: var(--ink-2); font-size: 13px; }
+  .note-list li { margin: 4px 0; }
+  .tag-example { background: var(--warn-bg); color: var(--warn); }
+  .pill-example { background: var(--venue-bg); color: var(--venue-fg); }
+  body[data-source="live"] .ex-tag { display: none; }
+  .live-group, .live-content { display: contents; }
+  .live-head {
+    order: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    margin-bottom: 16px; padding: 8px 12px; border: 1px dashed var(--hairline); border-radius: 12px;
+  }
+  .live-title { margin: 0; font-size: 14px; font-weight: 500; color: var(--ink-2); }
+  @media (min-width: 900px) { .live-group, .live-content { display: block; } }
+  @media (max-width: 400px) {
+    #strategies td { flex-wrap: wrap; }
+    #strategies td .bar-cell { min-width: 0; flex: 1 1 100%; justify-content: flex-start; }
+    #strategies td .pill { white-space: normal; text-align: left; max-width: 100%; }
+  }
 </style>
 </head>
-<body>
+<body data-source="live">
 <header class="top">
   <div class="top-in">
     <div class="wordmark">
@@ -327,11 +351,13 @@
   </div>
 </header>
 
+<div class="purpose"><p id="purpose">A paper-trading desk for Kalshi’s 15-minute crypto markets: it collects the venue’s public data, tests strategies on paper, and reports what happened. It never places orders.</p></div>
 <div class="bar">
   <div class="seg" role="group" aria-label="Which tape the paper figures use">
     <button type="button" id="seg-live" aria-pressed="true">Live tape</button>
     <button type="button" id="seg-fixture" aria-pressed="false">Fixture</button>
   </div>
+  <p class="seg-caption" id="seg-caption">Live tape: what the collector recorded. Fixture: example data written for tests.</p>
   <nav class="jump" aria-label="Jump to a section">
     <a href="#report-card">Report</a>
     <a href="#pot">Paper pot</a>
@@ -354,6 +380,12 @@
     <button id="retryBtn" type="button" class="btn-quiet">Retry</button>
   </div>
 
+  <div class="live-group" id="live-group">
+    <div class="live-head" id="live-head" hidden>
+      <p class="live-title">Live desk, not the example tape</p>
+      <button type="button" class="btn-quiet" id="live-toggle" aria-expanded="false" aria-controls="live-content">Show</button>
+    </div>
+    <div class="live-content" id="live-content">
   <div class="dash-top">
     <div class="dash-l">
   <section class="card" id="report-card" aria-labelledby="report-title">
@@ -361,6 +393,7 @@
       <h2 class="card-title" id="report-title">Daily report</h2>
       <span class="tags"><span class="tag tag-venue">venue</span><span class="tag tag-tape">tape</span></span>
     </div>
+    <p class="panel-error" data-err="report" hidden></p>
     <p class="report-head" id="report-head"><span class="sk" style="display:block;width:70%;height:24px"></span></p>
   </section>
 
@@ -368,6 +401,7 @@
     <div class="card-head">
       <h2 class="card-title" id="report-body-title">The rest of the report, verbatim</h2>
     </div>
+    <p class="panel-error" data-err="report" hidden></p>
     <div class="report-wrap" id="report-wrap">
       <pre class="report-body" id="report"><span class="sk" style="display:block;height:120px"></span></pre>
     </div>
@@ -381,6 +415,7 @@
       <h2 class="card-title" id="account-title">Venue account</h2>
       <span class="tags"><span class="tag tag-venue">venue</span></span>
     </div>
+    <p class="panel-error" data-err="home" hidden></p>
     <div class="stats">
       <div class="stat"><div class="k">Balance</div><div class="v" id="balance">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
       <div class="stat"><div class="k">Day P&amp;L</div><div class="v" id="pnl">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
@@ -391,12 +426,16 @@
   </section>
 
     </div>
+    </div>
+  </div>
+    </div>
   </div>
   <section class="card" id="pot" aria-labelledby="pot-title">
     <div class="card-head">
       <h2 class="card-title" id="pot-title">Paper pot</h2>
-      <span class="tags"><span class="tag tag-paper">paper</span></span>
+      <span class="tags"><span class="tag tag-example ex-tag">example tape</span><span class="tag tag-paper">paper</span></span>
     </div>
+    <p class="panel-error" data-err="slots" hidden></p>
     <div class="pot-top">
       <div>
         <div class="pot-figure" id="pot-figure" aria-live="polite"><span class="sk" style="display:inline-block;width:160px;height:36px"></span></div>
@@ -414,8 +453,9 @@
   <section class="card" id="chart-card" aria-labelledby="chart-title">
     <div class="card-head">
       <h2 class="card-title" id="chart-title">Paper equity over the collected tape</h2>
-      <span class="tags"><span class="tag tag-paper">paper</span></span>
+      <span class="tags"><span class="tag tag-example ex-tag">example tape</span><span class="tag tag-paper">paper</span></span>
     </div>
+    <p class="panel-error" data-err="equity" hidden></p>
     <div id="chart" role="img" aria-label="Paper equity curves"><div class="sk" style="height:150px"></div></div>
     <p class="note" id="chart-note"></p>
     <div id="legend" class="series-legend"></div>
@@ -426,7 +466,9 @@
       <h2 class="card-title" id="tape-title">Collector, the forward tape</h2>
       <span class="tags"><span class="tag tag-tape">tape</span></span>
     </div>
+    <p class="panel-error" data-err="home" hidden></p>
     <div class="state-line"><span class="dot" id="c-dot" aria-hidden="true"></span><span id="c-note">Checking the tape.</span></div>
+    <p class="why" id="c-fail" hidden></p>
     <div class="stats">
       <div class="stat"><div class="k">Tape lines</div><div class="v" id="c-snaps">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
       <div class="stat"><div class="k">Markets seen</div><div class="v" id="c-markets">…</div><div class="src"><span class="tag tag-tape">tape</span></div></div>
@@ -440,17 +482,20 @@
   <section class="card" id="slots-card" aria-labelledby="slots-title">
       <div class="card-head">
         <h2 class="card-title" id="slots-title">Slots, paper only</h2>
-        <span class="tags"><span class="tag tag-paper">paper</span></span>
+        <span class="tags"><span class="tag tag-example ex-tag">example tape</span><span class="tag tag-paper">paper</span></span>
       </div>
+    <p class="panel-error" data-err="slots" hidden></p>
       <div class="slots" id="slots"><div class="sk" style="height:140px"></div><div class="sk" style="height:140px"></div><div class="sk" style="height:140px"></div></div>
       <p class="note" id="slots-note"></p>
+      <ul class="note-list" id="slot-notes" hidden></ul>
     </section>
 
     <section class="card" id="strategies" aria-labelledby="strategies-title">
     <div class="card-head">
       <h2 class="card-title" id="strategies-title">Strategies against the promotion standard</h2>
-      <span class="tags"><span class="tag tag-paper">paper</span></span>
+      <span class="tags"><span class="tag tag-example ex-tag">example tape</span><span class="tag tag-paper">paper</span></span>
     </div>
+    <p class="panel-error" data-err="strategies" hidden></p>
     <p class="why" style="margin:0 0 12px">A strategy is proven only after 100 forward windows, both chronological halves positive, and +3.5 cents per contract after fees. Until then it is unproven, and the verdict says so.</p>
     <div class="table-wrap">
       <table>
@@ -466,6 +511,7 @@
       <h2 class="card-title" id="markets-title">Collected markets</h2>
       <span class="tags"><span class="tag tag-tape">tape</span></span>
     </div>
+    <p class="panel-error" data-err="markets" hidden></p>
     <button type="button" class="toggle" id="markets-toggle" aria-expanded="false" aria-controls="markets-panel">
       <span id="markets-count">Collected tape, loading</span>
       <svg class="ic chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
@@ -523,7 +569,6 @@ function ageWords(age) {
 }
 const dayLabel = (x) => new Date(x * 1000).toISOString().slice(0, 10);
 let dataset = new URLSearchParams(location.search).get('dataset') === 'fixture' ? 'fixture' : 'live';
-let everLoaded = false;
 let reportExpanded = false;
 let reportBody = null;
 const REPORT_PREVIEW_LINES = 6;
@@ -535,19 +580,7 @@ async function getJson(url, opts) {
   return r.json();
 }
 
-async function load() {
-  const errBox = $('load-error');
-  try {
-    await loadAll();
-    everLoaded = true;
-    errBox.classList.remove('show');
-  } catch (e) {
-    $('load-error-text').textContent = everLoaded
-      ? 'The desk could not finish loading (' + e.message + '). The figures on screen are the last good ones. Retry, or check that the openbell-rs process is still running.'
-      : 'The desk could not load (' + e.message + '). Nothing has loaded yet. Check that openbell-rs is running on this address, then Retry.';
-    errBox.classList.add('show');
-  }
-}
+async function load() { await loadAll(); }
 
 function renderAccount(a) {
   setValue('balance', a.balance === null ? null : money(a.balance));
@@ -584,7 +617,11 @@ function renderTape(c) {
   setValue('c-conflicts', c.conflicting_settlements);
   setValue('c-age', ageWords(c.newest_snapshot_age_secs));
   const failed = c.series_failed_last_pass;
-  const failNote = failed + ' of ' + c.series_total + ' series failed on the last pass';
+  const names = c.series_failed_names || [];
+  const failNote = failed + ' of ' + c.series_total + ' market reads failed on the last pass';
+  $('chip').title = names.length ? 'Failed series: ' + names.join(', ') : 'Collector health';
+  $('c-fail').hidden = !failed;
+  $('c-fail').textContent = failed ? (names.length ? 'Failed series: ' + names.join(', ') + '. ' : '') + 'Some markets were not recorded on that pass; the next pass retries.' : '';
   const healthy = c.collecting && c.dropped_lines === 0 && c.conflicting_settlements === 0 && !failed;
   $('c-dot').className = 'dot ' + (c.collecting ? (healthy ? 'ok' : 'warn') : 'err');
   $('c-note').textContent = c.snapshots_on_disk === 0
@@ -599,7 +636,7 @@ function renderTape(c) {
 }
 
 function renderPot(slots, eq, home) {
-  const settled = home.collector.settled_windows;
+  const settled = home && home.collector ? home.collector.settled_windows : null;
   const pot = slots.paper_equity_dollars;
   const start = slots.paper_pot_start;
   $('pot-figure').textContent = money(pot);
@@ -607,7 +644,7 @@ function renderPot(slots, eq, home) {
   $('pot-change').textContent = (change >= 0 ? '+' : '-') + '$' + Math.abs(change).toFixed(2) + ' against the $' + start.toFixed(2) + ' start (paper)';
   $('pot-change').className = 'pot-change ' + (change > 0 ? 'pos' : change < 0 ? 'neg' : '');
 
-  const target = (slots.stage_target || home.stage_target || {}).target_dollars || 1000;
+  const target = (slots.stage_target || (home && home.stage_target) || {}).target_dollars || 1000;
   const pct = Math.max(0, Math.min(100, pot / target * 100));
   $('stage-fill').style.transform = 'scaleX(' + (pct / 100).toFixed(4) + ')';
   $('stage-track').setAttribute('aria-valuenow', pct.toFixed(1));
@@ -616,6 +653,7 @@ function renderPot(slots, eq, home) {
     ? 'Stage target (paper): ' + money(pot) + ' of the ' + money(target) + ' stage-one target, reached on paper. Paper only, not venue money.'
     : 'Stage target (paper): ' + money(pot) + ' of the ' + money(target) + ' stage-one target, ' + pct.toFixed(1) + '% of the way, ' + money(target - pot) + ' to go. Paper only, not venue money.';
 
+  if (!eq) return;
   const chart = $('chart');
   const allSeries = [{ strategy: 'paper pot', points: eq.pot, headline: true }, ...eq.series.filter(s => s.points.length)];
   const flat = allSeries.flatMap(s => s.points);
@@ -665,7 +703,7 @@ function renderPot(slots, eq, home) {
   } else {
     const empty = el('div', 'empty-chart');
     empty.textContent = traded === 0
-      ? 'No paper trades yet, so there is no pot line. The line starts at the first window a slot stakes on. The tape has ' + settled + ' settled window' + (settled === 1 ? '' : 's') + ', and no slot has traded in them yet.'
+      ? 'No paper trades yet, so there is no pot line. The line starts at the first window a slot stakes on. ' + (settled === null ? 'The tape count is unavailable right now.' : 'The tape has ' + settled + ' settled window' + (settled === 1 ? '' : 's') + ', and no slot has traded in them yet.') + ''
       : 'Not enough collected tape to draw the curve yet. Two points are needed.';
     chart.replaceChildren(empty);
     $('chart-note').textContent = '';
@@ -715,6 +753,9 @@ function renderSlots(slotsData) {
     strip.append(el('p', 'unavailable', 'No slots yet. The strategy library in strategies/ is empty, so there is nothing to score. Add a .rn file there and reload.'));
   }
   $('slots-note').textContent = 'Paper simulation: the pot is re-split evenly across ' + slotsData.slots.length + ' slots each window. Three consecutive losing windows retire a slot’s strategy and rotate the next one in. Paper only, not venue money.';
+  const notes = slotsData.notes || [];
+  $('slot-notes').replaceChildren(...notes.map((n) => el('li', null, n)));
+  $('slot-notes').hidden = !notes.length;
 }
 
 function renderMarkets(markets) {
@@ -769,14 +810,16 @@ function renderStrategies(strats) {
     trk.setAttribute('aria-valuemin', '0'); trk.setAttribute('aria-valuemax', String(need)); trk.setAttribute('aria-valuenow', String(s.windows_traded));
     trk.setAttribute('aria-label', s.strategy + ' windows traded');
     const f = el('div', 'fill'); f.style.transform = 'scaleX(' + frac.toFixed(4) + ')'; trk.append(f);
-    wrap.append(trk, el('span', 'count', s.windows_traded + ' of ' + need));
+    const winTxt = s.windows_traded >= need ? s.windows_traded + ' windows (' + need + ' needed)' : s.windows_traded + ' of ' + need;
+    wrap.append(trk, el('span', 'count', winTxt));
     cellBar.append(wrap);
     tr.append(cellBar);
     tr.append(el('td', 'mono', s.mean_cents_per_contract === null ? '-' : s.mean_cents_per_contract.toFixed(2)));
     tr.children[3].dataset.label = 'Mean cents per contract';
     const vtd = el('td');
     vtd.dataset.label = 'Verdict';
-    vtd.append(el('span', pillFor(s.verdict), s.verdict));
+    if (dataset === 'fixture' && s.verdict.startsWith('PROVEN')) vtd.append(el('span', 'pill pill-example', 'meets the bar on the example tape (not forward evidence)'));
+    else vtd.append(el('span', pillFor(s.verdict), s.verdict));
     tr.append(vtd);
     sb.append(tr);
   }
@@ -788,26 +831,68 @@ function renderStrategies(strats) {
 }
 
 async function loadAll() {
-  const [home, slots, eq, markets, strats, report] = await Promise.all([
-    getJson('/api/home'),
-    getJson('/api/slots' + dsQuery()),
-    getJson('/api/equity' + dsQuery()),
-    getJson('/api/markets'),
-    getJson('/api/strategies' + dsQuery()),
-    getJson('/api/report'),
-  ]);
-  renderAccount(home.account);
-  renderTape(home.collector);
-  renderPot(slots, eq, home);
-  renderSlots(slots);
-  renderStrategies(strats);
-  renderLibraryErrors(home.library_errors);
-  renderMarkets(markets);
-  const lines = report.report.split('\n');
-  $('report-head').textContent = lines[0];
-  reportBody = lines.slice(1).join('\n');
-  applyReport();
+  // Each read is independent: a failed read shows an error in its own panel and the rest stays current.
+  const urls = { home: '/api/home', slots: '/api/slots' + dsQuery(), equity: '/api/equity' + dsQuery(),
+    markets: '/api/markets', strategies: '/api/strategies' + dsQuery(), report: '/api/report' };
+  const names = Object.keys(urls);
+  const got = {};
+  await Promise.all(names.map(async (k) => {
+    try { got[k] = { ok: true, v: await getJson(urls[k]) }; }
+    catch (e) { got[k] = { ok: false, msg: e.message }; }
+  }));
+  const allFailed = names.every((k) => !got[k].ok);
+  $('load-error').classList.toggle('show', allFailed);
+  if (allFailed) {
+    $('chip-dot').className = 'dot err';
+    $('chip-text').textContent = 'Collector: unavailable';
+    $('load-error-text').textContent = 'The desk could not load: none of its six reads answered (' + got.home.msg + '). Check that openbell-rs is running on this address, then Retry.';
+  }
+  for (const k of names) setPanelError(k, got[k].ok ? null : got[k].msg);
+  if (allFailed) return;
+  const v = (k) => (got[k].ok ? got[k].v : null);
+  const home = v('home'), slots = v('slots'), eq = v('equity'), markets = v('markets'), strats = v('strategies'), report = v('report');
+  if (home) {
+    renderAccount(home.account);
+    renderTape(home.collector);
+    renderLibraryErrors(home.library_errors);
+  } else {
+    $('chip-dot').className = 'dot err';
+    $('chip-text').textContent = 'Collector: unavailable';
+  }
+  if (slots) { renderPot(slots, eq, home); renderSlots(slots); }
+  else if (!$('pot-figure').textContent.trim()) setValue('pot-figure', null);
+  if (strats) renderStrategies(strats);
+  if (markets) renderMarkets(markets);
+  if (report) {
+    const lines = report.report.split('\n');
+    $('report-head').textContent = lines[0];
+    reportBody = lines.slice(1).join('\n');
+    applyReport();
+  }
 }
+
+function setPanelError(key, msg) {
+  document.querySelectorAll('[data-err]').forEach((p) => {
+    if (p.dataset.err !== key) return;
+    if (!msg) { p.hidden = true; p.replaceChildren(); return; }
+    const b = el('button', 'btn-quiet', 'Retry');
+    b.type = 'button';
+    b.addEventListener('click', load);
+    p.replaceChildren(document.createTextNode('This part did not load (' + msg + '). The rest of the page is unaffected. '), b);
+    p.hidden = false;
+    p.closest('section').querySelectorAll('.sk').forEach((n) => n.remove());
+  });
+}
+
+let liveOpen = false;
+function syncSource() {
+  document.body.dataset.source = dataset;
+  $('live-head').hidden = dataset !== 'fixture';
+  $('live-content').hidden = dataset === 'fixture' && !liveOpen;
+  $('live-toggle').setAttribute('aria-expanded', String(liveOpen));
+  $('live-toggle').textContent = liveOpen ? 'Hide' : 'Show';
+}
+$('live-toggle').addEventListener('click', () => { liveOpen = !liveOpen; syncSource(); });
 
 async function collect() {
   try { await fetch('/api/collect', { method: 'POST' }); } catch (e) { /* load() reports the failure */ }
@@ -822,6 +907,7 @@ function setDataset(next) {
   const url = new URL(location.href);
   if (next === 'fixture') url.searchParams.set('dataset', 'fixture'); else url.searchParams.delete('dataset');
   history.replaceState(null, '', url);
+  syncSource();
   load();
 }
 $('seg-live').addEventListener('click', () => setDataset('live'));
