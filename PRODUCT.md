@@ -45,3 +45,4 @@ chart serve it.
 - Light and dark themes, toggle in settings, dark is the default.
 - Icons are drawn symbols, never letters, never emoji.
 - No order placement exists in this build, in any form.
+- Besides the collector's public market GET, the only outbound traffic is the release check against GitHub (off with `OPENBELL_UPDATE_MODE=off`). Installing a release is the operator's action, from this machine only.
