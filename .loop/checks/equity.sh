@@ -48,7 +48,10 @@ done
 # SVG (no external chart library), and labels the figures paper.
 page=$(curl -s "http://127.0.0.1:$PORT/")
 echo "$page" | grep -q '/api/equity' || { echo "FAIL: the page never fetches /api/equity"; exit 1; }
-echo "$page" | grep -q '<svg' || { echo "FAIL: the page builds no SVG chart"; exit 1; }
+# The chart is an SVG the bundle builds at run time: the labelled-SVG intent is the img role, its aria-label
+# naming the paper equity curves, and the viewBox the bundle gives every SVG chart.
+echo "$page" | grep -q 'Paper equity curves' && echo "$page" | grep -q 'viewBox' \
+  && echo "$page" | grep -qE 'role.{1,4}img' || { echo "FAIL: the page builds no labelled SVG chart"; exit 1; }
 echo "$page" | grep -qi 'paper' || { echo "FAIL: the chart is not labelled paper"; exit 1; }
 # Only a loaded resource counts (src/href/url()/@import to http(s)). The React bundle carries the
 # harmless SVG namespace string http://www.w3.org/2000/svg, so a bare http:// match is not a fetch.
