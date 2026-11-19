@@ -390,7 +390,7 @@ impl Updater {
 
     fn fetch_latest(&self) -> Result<Release, String> {
         let url = format!("{}/repos/{}/releases/latest", self.cfg.api, self.cfg.repo);
-        let body = http_get(&url, MAX_JSON_BYTES, false)?;
+        let body = http_get(&url, MAX_JSON_BYTES, self.cfg.api == DEFAULT_API)?;
         let v: Value = serde_json::from_slice(&body).map_err(|e| format!("release answer was not JSON: {e}"))?;
         parse_release(&v, self.cfg.bin)
     }
@@ -494,9 +494,11 @@ fn install(cfg: &Config, rel: &Release) -> Result<(), String> {
             return Err(format!("the release file is {n} bytes, over the {MAX_ASSET_BYTES} byte limit"));
         }
     }
+    // against the real GitHub API every hop of every download must stay on GitHub's own hosts
+    let github_only = cfg.api == DEFAULT_API;
     let expected = match (&rel.digest, &rel.sums_url) {
         (_, Some(u)) => {
-            let sums = String::from_utf8_lossy(&http_get(u, MAX_JSON_BYTES, false)?).to_string();
+            let sums = String::from_utf8_lossy(&http_get(u, MAX_JSON_BYTES, github_only)?).to_string();
             let h = hash_from_sums(&sums, &rel.asset_name).ok_or_else(|| format!("SHA256SUMS has no entry for {}", rel.asset_name))?;
             if let Some(d) = &rel.digest {
                 if *d != h {
@@ -508,7 +510,7 @@ fn install(cfg: &Config, rel: &Release) -> Result<(), String> {
         (Some(d), None) => d.clone(),
         (None, None) => return Err("the release has no checksum, so it will not be installed".to_string()),
     };
-    let bytes = http_get(&rel.asset_url, MAX_ASSET_BYTES, false)?;
+    let bytes = http_get(&rel.asset_url, MAX_ASSET_BYTES, github_only)?;
     if let Some(n) = rel.asset_size {
         if bytes.len() as u64 != n {
             return Err(format!("downloaded {} bytes, the release says {n}", bytes.len()));
@@ -952,6 +954,39 @@ mod tests {
         // Refused before any request is made.
         assert!(http_get("https://example.com/x", 10, true).unwrap_err().contains("refusing to fetch"));
         assert!(http_get("http://127.0.0.1:1/x", 10, true).unwrap_err().contains("refusing to fetch"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn updating_through_the_real_github_api_refuses_every_other_host() {
+        // The rule must be wired in, not only exist: with the default API, an update whose
+        // files are anywhere but GitHub is refused before any request, and nothing changes.
+        let dir = tmp("ghonly");
+        let exe = fake_exe(&dir, "0.2.0");
+        let before = std::fs::read(&exe).unwrap();
+        let cfg = Config {
+            bin: "openbell-rs",
+            current: "0.2.0",
+            repo: "o/r".to_string(),
+            api: DEFAULT_API.to_string(),
+            mode: Mode::Notify,
+            exe: exe.clone(),
+            allow_dev: false,
+            may_apply: true,
+        };
+        let rel = Release {
+            version: "0.3.0".into(),
+            url: String::new(),
+            notes: String::new(),
+            asset_name: asset_name("openbell-rs"),
+            asset_url: "http://127.0.0.1:1/dl/a".into(),
+            asset_size: None,
+            sums_url: Some("http://127.0.0.1:1/dl/SHA256SUMS".into()),
+            digest: None,
+        };
+        let e = install(&cfg, &rel).unwrap_err();
+        assert!(e.contains("refusing to fetch"), "{e}");
+        assert_eq!(std::fs::read(&exe).unwrap(), before);
     }
 
     #[cfg(unix)]
