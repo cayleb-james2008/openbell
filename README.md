@@ -71,7 +71,7 @@ says why.
 ## The collector
 
 A background pass collects Kalshi's **public** market data — the only
-outbound call in the program is an unauthenticated GET of public markets —
+venue call in the program is an unauthenticated GET of public markets (the release check in "Versions and updates" is the only other outbound call) —
 for five 15-minute series (BTC, ETH, SOL, XRP, DOGE) and appends each pass to
 a local tape in a single write, so a reader never sees a torn half-pass. The
 home screen shows the collector's health next to everything else: tape
@@ -176,6 +176,7 @@ every change.
 
 - `src/main.rs` — the whole server: collector, shadow scorer, slot system,
   report, and the HTTP API.
+- `src/update.rs` — the release check and self-update.
 - `strategies/*.rn` — the strategy library (Rune).
 - `assets/index.html` — the desk's single page: a purpose line and a "How to
   read this" line, account, collector health, the paper equity chart, the
