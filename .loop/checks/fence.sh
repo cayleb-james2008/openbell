@@ -43,10 +43,25 @@ ncmd=$(grep -c 'Command::new' src/main.rs)
 # Direct dependencies are ALLOWLISTED, not denylisted (round-2
 # adversarial: a denylist waved socket2 + ed25519-dalek straight
 # through — an unlisted crate is exactly the hole). The app's
-# direct deps are rune + serde + serde_json, nothing else, ever.
+# direct deps are rune + serde + serde_json, plus sha2 (checksums for the
+# self-update in src/update.rs, added in 0.2.0 at the owner's request),
+# nothing else, ever.
 deps=$(awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f && /^[a-z]/ {split($0,a,"="); gsub(/ /,"",a[1]); print a[1]}' Cargo.toml | sort | tr '\n' ' ')
-if [ "$deps" != "rune serde serde_json " ]; then
-  echo "FAIL: Cargo.toml direct dependencies are [$deps], expected exactly [rune serde serde_json]"; fail=1
+if [ "$deps" != "rune serde serde_json sha2 " ]; then
+  echo "FAIL: Cargo.toml direct dependencies are [$deps], expected exactly [rune serde serde_json sha2]"; fail=1
+fi
+# The self-update (src/update.rs) is the second and last place a process
+# may start: curl for the GitHub release check and download, the downloaded
+# build run once with --version to prove it, and the relaunch after the
+# user restarts (the relaunch has a Unix and a Windows form). Pinned to exactly those call sites, no request
+# bodies or methods, and no host other than GitHub's API in the file.
+nupd=$(grep -c 'Command::new' src/update.rs)
+[ "$nupd" = "4" ] || { echo "FAIL: src/update.rs has $nupd Command::new call sites, expected exactly 4 (curl, --version proof, relaunch on Unix, relaunch on Windows)"; fail=1; }
+if grep -n '"-X"\|"--data"\|"-d"\|"--upload-file"\|"-T"' src/update.rs >/dev/null; then
+  echo "FAIL: HTTP method/body flags present in src/update.rs"; fail=1
+fi
+if grep -no 'https\?://[A-Za-z0-9.-]*' src/update.rs | grep -v 'https\?://$\|api.github.com\|127.0.0.1\|localhost\|example.com\|https://x$\|http://x$' | grep -q .; then
+  echo "FAIL: src/update.rs names a host other than GitHub's"; fail=1
 fi
 # The process surface is pinned to this file's exact shape: the
 # plain import line, and exactly two Command tokens in the whole
