@@ -10,6 +10,8 @@
 
 mod update;
 
+use serde_json::json;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Write};
@@ -197,6 +199,7 @@ static SERIES_FAILED_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::ne
 /// the API can say so instead of returning a cheerful 200 with 0.
 fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
     let _guard = COLLECT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _pass = PassGuard::new();
     let _ = std::fs::create_dir_all(data_dir);
     let path = data_dir.join("snapshots.jsonl");
     // Build the whole pass in memory and append it in one write: a
@@ -2246,6 +2249,7 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                     .iter()
                     .map(|(file, error)| serde_json::json!({ "file": file, "error": error }))
                     .collect::<Vec<_>>(),
+                "version": env!("CARGO_PKG_VERSION"),
                 "mode": "shadow — this build never places orders",
                 "series": SERIES,
             });
@@ -2438,6 +2442,7 @@ fn main() {
         .map(|h| h.trim().to_ascii_lowercase())
         .filter(|h| !h.is_empty())
         .collect();
+    updater().start_background();
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind failed");
     println!("openbell-rs listening on http://127.0.0.1:{port} (shadow mode — no order path exists)");
     for stream in listener.incoming() {
@@ -2453,11 +2458,12 @@ fn main() {
                             let _ = stream.write_all(resp.as_bytes());
                             return;
                         }
+                        let host = headers.iter().find(|(n, _)| n == "host").map(|(_, v)| v.as_str()).unwrap_or("");
                         let response = match refuse_request(&method, &headers, body.len(), &allowed_hosts) {
                             Some((status, message)) => {
                                 json_response(status, &serde_json::json!({ "error": message }).to_string())
                             }
-                            None => handle(&app, &method, &path),
+                            None => update_response(&method, &path, host).unwrap_or_else(|| handle(&app, &method, &path)),
                         };
                         let _ = stream.write_all(response.as_bytes());
                     }
@@ -2468,6 +2474,99 @@ fn main() {
     }
 }
 
+/// Self-update state, one per process: the production entry starts its
+/// background checks; tests get a quiet one that never calls out.
+static UPDATER: std::sync::OnceLock<std::sync::Arc<update::Updater>> = std::sync::OnceLock::new();
+
+fn updater() -> &'static std::sync::Arc<update::Updater> {
+    UPDATER.get_or_init(|| {
+        update::Updater::from_env("OPENBELL", "openbell-rs", env!("CARGO_PKG_VERSION"), "cayleb-james2008/openbell", true)
+    })
+}
+
+/// Collection passes in progress, so an update restart never lands mid-pass.
+static PASSES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct PassGuard;
+
+impl PassGuard {
+    fn new() -> PassGuard {
+        PASSES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        PassGuard
+    }
+}
+
+impl Drop for PassGuard {
+    fn drop(&mut self) {
+        PASSES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Only this machine may replace the program: its Host must be a loopback
+/// name. A name listed in OPENBELL_ALLOWED_HOSTS may read the desk, not update it.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    matches!(authority_host(&host), "localhost" | "127.0.0.1" | "[::1]")
+}
+
+/// Why a restart is refused, if it is; `None` means it may go ahead.
+fn restart_refusal(staged: bool, pass_running: bool) -> Option<&'static str> {
+    if !staged {
+        Some("no update is waiting for a restart")
+    } else if pass_running {
+        Some("a collection pass is still running; restart when it has finished")
+    } else {
+        None
+    }
+}
+
+/// The version and self-update routes. Returns None for any other path.
+fn update_response(method: &str, path: &str, host: &str) -> Option<String> {
+    let up = updater();
+    Some(match (method, path) {
+        ("GET", "/api/version") => json_response(
+            200,
+            &json!({ "name": "openbell-rs", "version": env!("CARGO_PKG_VERSION") }).to_string(),
+        ),
+        ("GET", "/api/update") => json_response(200, &up.snapshot().to_string()),
+        ("POST", "/api/update/check") => json_response(200, &up.check_now().to_string()),
+        ("POST", "/api/update/apply") | ("POST", "/api/update/restart") => {
+            if !is_loopback_host(host) {
+                return Some(json_response(
+                    403,
+                    &json!({ "error": "updating is only allowed from this machine, not through a shared address" }).to_string(),
+                ));
+            }
+            if path == "/api/update/apply" {
+                match up.apply() {
+                    Ok(v) => {
+                        let mut snap = up.snapshot();
+                        snap["applied"] = json!(v);
+                        json_response(200, &snap.to_string())
+                    }
+                    Err(e) => json_response(409, &json!({ "error": e }).to_string()),
+                }
+            } else if let Some(e) = restart_refusal(
+                up.snapshot()["staged"].is_string(),
+                PASSES_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            ) {
+                json_response(409, &json!({ "error": e }).to_string())
+            } else {
+                let restarter = up.clone();
+                std::thread::spawn(move || {
+                    // Give the answer below time to leave before this process is replaced.
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    if let Err(e) = restarter.restart() {
+                        eprintln!("openbell-rs: restart failed: {e}");
+                    }
+                });
+                json_response(200, &json!({ "restarting": true }).to_string())
+            }
+        }
+        _ => return None,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2475,6 +2574,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
 
     #[test]
     fn extension_keeps_untouched_window_fingerprints() {
@@ -3308,6 +3408,70 @@ mod tests {
             c["lines_on_disk"].as_u64().unwrap(),
             c["snapshots_on_disk"].as_u64().unwrap() + c["dropped_lines"].as_u64().unwrap()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn body_json(resp: &str) -> (u16, serde_json::Value) {
+        let status: u16 = resp.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let body = resp.split_once("\r\n\r\n").unwrap().1;
+        (status, serde_json::from_str(body).unwrap())
+    }
+
+    #[test]
+    fn version_endpoint_names_the_running_build() {
+        let (status, v) = body_json(&update_response("GET", "/api/version", "127.0.0.1:8472").unwrap());
+        assert_eq!(status, 200);
+        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.2.0")));
+    }
+
+    #[test]
+    fn update_snapshot_has_its_shape_before_anything_is_fetched() {
+        let (status, u) = body_json(&update_response("GET", "/api/update", "localhost:8472").unwrap());
+        assert_eq!(status, 200);
+        for key in ["name", "current", "mode", "repo", "platform", "checked_at", "available", "latest", "notes", "release_url", "error", "staged", "can_apply", "dev_build"] {
+            assert!(u.get(key).is_some(), "missing {key}: {u}");
+        }
+        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!("0.2.0"), json!(false)));
+        assert!(u["checked_at"].is_null(), "nothing is fetched until a check is asked for");
+        assert_eq!(u["staged"], Value::Null);
+    }
+
+    #[test]
+    fn apply_and_restart_are_refused_from_any_host_but_this_machine() {
+        for path in ["/api/update/apply", "/api/update/restart"] {
+            for host in ["lan-desk.local:8472", "openbell.example", ""] {
+                let (status, body) = body_json(&update_response("POST", path, host).unwrap());
+                assert_eq!(status, 403, "{path} via {host:?}: {body}");
+            }
+        }
+        // A name listed in OPENBELL_ALLOWED_HOSTS may read, but never update.
+        assert!(!is_loopback_host("lan-desk.local"));
+        assert!(is_loopback_host("127.0.0.1:8472") && is_loopback_host("[::1]:8472") && is_loopback_host("LOCALHOST"));
+    }
+
+    #[test]
+    fn restart_needs_a_staged_update_and_no_running_pass() {
+        let (status, body) = body_json(&update_response("POST", "/api/update/restart", "127.0.0.1:8472").unwrap());
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(restart_refusal(false, false), Some("no update is waiting for a restart"));
+        assert!(restart_refusal(true, true).unwrap().contains("collection pass"));
+        assert_eq!(restart_refusal(true, false), None);
+    }
+
+    #[test]
+    fn home_reports_the_version() {
+        let dir = std::env::temp_dir().join(format!("ob-version-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: dir.clone(),
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        let (_, home) = body_json(&handle(&app, "GET", "/api/home"));
+        assert_eq!(home["version"], json!("0.2.0"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
