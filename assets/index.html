@@ -71,11 +71,12 @@
     max-width: 1280px; margin: 0 auto; padding: 8px 16px; min-height: 56px;
     display: flex; align-items: center; gap: 12px 20px; flex-wrap: wrap;
   }
+  #chip-text { overflow-wrap: anywhere; min-width: 0; }
   .wordmark { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 16px; letter-spacing: -0.01em; margin-right: auto; }
   .wordmark svg { color: var(--ink); }
   .paper-note { display: inline-flex; align-items: center; gap: 8px; color: var(--ink-2); font-size: 13px; }
   .chip {
-    display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px;
+    display: inline-flex; align-items: center; gap: 8px; min-height: 32px; max-width: 100%; padding: 8px 12px; line-height: 20px;
     border: 1px solid var(--hairline); border-radius: 999px; font-size: 13px; color: var(--ink-2);
     background: var(--surface);
   }
@@ -146,6 +147,7 @@
   }
   .card-head { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; justify-content: space-between; margin-bottom: 12px; }
   .card-title { font-size: 14px; font-weight: 500; color: var(--ink-2); margin: 0; }
+  .card-title:focus { outline: 2px solid var(--ink-2); outline-offset: 4px; }
   .tags { display: inline-flex; gap: 8px; flex-wrap: wrap; }
   .tag {
     display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 6px;
@@ -252,6 +254,8 @@
   .toggle[aria-expanded="true"] .chev { transform: rotate(180deg); }
   .panel-body { margin-top: 12px; }
   .panel-body[hidden] { display: none; }
+  .collect-status { margin: 0; font-size: 13px; color: var(--err); flex-basis: 100%; }
+  .collect-status:empty { display: none; }
   .panel-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
 
   /* example tape + errors */
@@ -403,7 +407,7 @@
     <div class="dash-l">
   <section class="card" id="report-card" aria-labelledby="report-title">
     <div class="card-head">
-      <h2 class="card-title" id="report-title">Daily report</h2>
+      <h2 class="card-title" id="report-title" tabindex="-1">Daily report</h2>
       <span class="tags"><span class="tag tag-venue">venue</span><span class="tag tag-tape">tape</span></span>
     </div>
     <p class="panel-error" data-err="report" hidden></p>
@@ -425,7 +429,7 @@
     <div class="dash-r">
   <section class="card" id="account" aria-labelledby="account-title">
     <div class="card-head">
-      <h2 class="card-title" id="account-title">Venue account</h2>
+      <h2 class="card-title" id="account-title" tabindex="-1">Venue account</h2>
       <span class="tags"><span class="tag tag-venue">venue</span></span>
     </div>
     <p class="panel-error" data-err="home" hidden></p>
@@ -436,6 +440,7 @@
       <div class="stat"><div class="k">Capital at risk</div><div class="v" id="risk">…</div><div class="src"><span class="tag tag-venue">venue</span></div></div>
     </div>
     <p class="why" id="account-note"></p>
+    <p class="why">Account figures need a Kalshi API key on the machine running OpenBell; without one they stay unavailable. Market data below does not need it.</p>
   </section>
 
     </div>
@@ -533,6 +538,7 @@
     <div class="panel-body" id="markets-panel" hidden>
       <div class="panel-actions">
         <p class="note" style="margin:0" id="markets-note"></p>
+        <p class="collect-status" id="collect-status" role="status"></p>
         <button type="button" class="btn-primary" id="collect-btn">Collect now</button>
       </div>
       <div class="table-wrap">
@@ -929,18 +935,29 @@ function syncSource() {
 }
 $('live-toggle').addEventListener('click', () => { liveOpen = !liveOpen; syncSource(); });
 document.querySelectorAll('a[data-live-link]').forEach((a) => a.addEventListener('click', (ev) => {
-  if (dataset !== 'fixture') return;
   ev.preventDefault();
-  if (!liveOpen) { liveOpen = true; syncSource(); }
-  $('live-title').focus({ preventScroll: true });
-  document.querySelector(a.getAttribute('href')).scrollIntoView({ block: 'start' });
+  const target = document.querySelector(a.getAttribute('href'));
+  if (dataset === 'fixture' && !liveOpen) { liveOpen = true; syncSource(); }
+  target.querySelector('h2').focus({ preventScroll: true });
+  target.scrollIntoView({ block: 'start' });
 }));
 
 async function collect() {
   const b = $('collect-btn');
+  const status = $('collect-status');
   b.disabled = true;
   b.textContent = 'Collecting…';
-  try { await fetch('/api/collect', { method: 'POST' }); } catch (e) { /* load() reports the failure */ }
+  status.textContent = '';
+  let problem = '';
+  try {
+    const r = await fetch('/api/collect', { method: 'POST' });
+    const body = await r.json().catch(() => null);
+    if (!r.ok) problem = (body && body.error) || ('the desk answered ' + r.status);
+    else if (body && body.error) problem = body.error;
+  } catch (e) {
+    problem = e.message;
+  }
+  if (problem) status.textContent = 'Could not collect right now. Nothing was written. Try again in a minute. Server said: ' + problem;
   b.disabled = false;
   b.textContent = 'Collect now';
   load();
