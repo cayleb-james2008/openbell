@@ -46,6 +46,9 @@ function singleFile(): Plugin {
       });
       // The Hallmark stamp is the first line of the page CSS (the lint reads that line); the critique follows it.
       html = html.replace(/<style>/, "<style>/* Hallmark: app openbell, shape: app screen, genre: modern-minimal, theme: console (material only, faces from the owner), critique: one instrument surface, the report read line by line as the audit trail */\n");
+      // Tailwind 4.3 emits a fixed #fff for the ring offset in its base rule; the app has no other place to change it, so the
+      // generated declaration is rewritten to the surface token here (after Tailwind, before the single file is written).
+      html = html.replace(/--tw-ring-offset-color:\s*#fff\b/g, "--tw-ring-offset-color:var(--surface)");
       const out = path.resolve(root, "../assets/index.html");
       fs.writeFileSync(out, html);
       console.log(`single file: ${out} (${(html.length / 1024).toFixed(0)} kB)`);

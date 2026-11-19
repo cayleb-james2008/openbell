@@ -8,6 +8,7 @@ import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/in
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { type Dataset, type Market, type Read, type Strategy } from "@/lib/desk";
 import { PanelError } from "@/Panels";
+import { useWide } from "@/lib/media";
 
 type Found<T> = Read<T> | null;
 
@@ -21,7 +22,7 @@ function SearchField({ label, value, onChange }: { label: string; value: string;
 }
 
 // A verdict is a sentence the server wrote: it wraps to as many lines as it needs, at every width, and is never clipped.
-const WRAP = "!h-auto !rounded-chip max-w-full whitespace-normal py-1 text-left leading-snug";
+const WRAP = "!h-auto !rounded-chip max-w-full whitespace-normal py-1 text-left text-xs leading-snug md:text-sm";
 function VerdictPill({ verdict, fixture }: { verdict: string; fixture: boolean }) {
   if (fixture && verdict.startsWith("PROVEN")) {
     return <Pill variant="outline" className={WRAP + " text-warning-foreground"}>meets the bar on the example tape (not forward evidence)</Pill>;
@@ -71,14 +72,14 @@ export function Strategies({ read, libraryErrors, dataset, onRetry }: { read: Fo
                   <TableRow key={s.strategy}>
                     <TableCell data-label="Strategy" className="stack-first c-name max-w-56 font-mono"><span className="block break-words md:truncate" title={s.strategy}>{s.strategy}</span></TableCell>
                     <TableCell data-label="Side" className="c-side font-mono">{s.side}</TableCell>
-                    <TableCell data-label="Windows traded" className="stack-break c-windows min-w-0">
+                    <TableCell data-label="Windows traded" className="c-windows min-w-0">
                       <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 md:justify-start">
                         <Tracker data={Array.from({ length: 10 }, (_, i) => ({ key: i, color: (i + 1) * need / 10 <= done ? "bg-info-foreground" : "bg-track", tooltip: "Windows " + (i * need / 10 + 1) + " to " + ((i + 1) * need / 10) }))} className="h-2 w-28" />
                         <span className="font-mono text-sm text-ink-2">{label}</span>
                       </div>
                     </TableCell>
                     <TableCell data-label="Mean cents" className="c-mean text-right font-mono tabular-nums">{s.mean_cents_per_contract === null ? "-" : s.mean_cents_per_contract.toFixed(2)}</TableCell>
-                    <TableCell data-label="Verdict" className="stack-break c-verdict min-w-0 max-w-md"><VerdictPill verdict={s.verdict} fixture={dataset === "fixture"} /></TableCell>
+                    <TableCell data-label="Verdict" className="c-verdict min-w-0 max-w-md"><VerdictPill verdict={s.verdict} fixture={dataset === "fixture"} /></TableCell>
                   </TableRow>
                 );
               })}
@@ -108,7 +109,9 @@ export function Markets({ read, onRetry }: { read: Found<Market[]>; onRetry: () 
   const [q, setQ] = useState("");
   const all = read && read.ok ? read.v : null;
   const needle = q.trim().toLowerCase();
-  const shown = all ? all.filter((m) => m.ticker.toLowerCase().includes(needle)).slice(0, 40) : [];
+  const wide = useWide();
+  const cap = wide ? 40 : 8;
+  const shown = all ? all.filter((m) => m.ticker.toLowerCase().includes(needle)).slice(0, cap) : [];
   const total = all ? all.length : null;
   const dash = (v: number | null | undefined) => (v === null || v === undefined ? "-" : String(v));
   return (
@@ -125,7 +128,7 @@ export function Markets({ read, onRetry }: { read: Found<Market[]>; onRetry: () 
       <div id="markets-panel" className="mt-4" hidden={!open}>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <SearchField label="Search markets" value={q} onChange={setQ} />
-          <p id="markets-note" className="text-sm text-ink-2">{total !== null && total > 40 ? "Showing the first 40 of " + total + " collected markets." : ""}</p>
+          <p id="markets-note" className="text-sm text-ink-2">{total !== null && total > cap ? "Showing the first " + cap + " of " + total + " collected markets." : ""}</p>
         </div>
         <div className="mt-4 min-w-0 overflow-x-auto">
           <Table className="stack md:min-w-[600px]">

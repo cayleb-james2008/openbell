@@ -8,11 +8,12 @@ import { SlidingNumber } from "@/components/ui/sliding-number";
 import { drawOnce } from "@/motionProps";
 import { type Dataset, type Equity, type Read, type Reads, type Slots, dayLabel, money, moneyWhole } from "@/lib/desk";
 import { PanelError } from "@/Panels";
+import { useWide } from "@/lib/media";
 import { AuditTrail, splitVerdict } from "@/Trail";
 
 const ok = <T,>(r: Read<T> | undefined): T | null => (r && r.ok ? r.v : null);
 const SERIES_COLORS = ["var(--info-foreground)", "var(--success-foreground)", "var(--ink-2)", "var(--destructive-foreground)"];
-const H = 184, PADL = 64, PADR = 8, PADT = 10, PADB = 26;
+const PADL = 64, PADR = 8, PADT = 10, PADB = 26;
 
 function useWidth() {
   const ref = useRef<HTMLDivElement>(null);
@@ -28,13 +29,14 @@ function useWidth() {
 }
 
 function PotFigure({ pot }: { pot: number }) {
+  const wide = useWide();
   const cents = Math.round(Math.abs(pot) * 100);
   const whole = Math.floor(cents / 100);
   const frac = String(cents % 100).padStart(2, "0");
   return (
     <div id="pot-figure" className="flex flex-nowrap items-baseline whitespace-nowrap font-mono text-[clamp(2.25rem,5.6vw,3.75rem)] leading-none font-normal tabular-nums text-ink">
       <span className="shrink-0">{pot < 0 ? "-$" : "$"}</span>
-      <span className="inline-flex shrink-0 whitespace-nowrap"><SlidingNumber value={whole} /></span>
+      <span className="inline-flex shrink-0 whitespace-nowrap">{wide ? <SlidingNumber value={whole} /> : whole}</span>
       <span className="shrink-0 text-[0.5em] text-ink-2">.{frac}</span>
     </div>
   );
@@ -42,6 +44,7 @@ function PotFigure({ pot }: { pot: number }) {
 
 function Trace({ eq, start, traded, settled }: { eq: Equity | null; start: number; traded: number; settled: number | null }) {
   const [ref, width] = useWidth();
+  const H = useWide() ? 184 : 150;
   const allSeries: { strategy: string; points: [number, number][]; headline?: boolean }[] = eq
     ? [{ strategy: "paper pot", points: eq.pot, headline: true }, ...eq.series.filter((s) => s.points.length)]
     : [];

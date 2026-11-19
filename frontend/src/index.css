@@ -62,15 +62,14 @@
 @media (max-width: 767px) {
   table.stack, table.stack tbody, table.stack tr, table.stack td { display: block; width: 100%; }
   table.stack thead { display: none; }
-  table.stack tr { display: flex; flex-wrap: wrap; align-items: center; column-gap: 12px; row-gap: 8px; border-bottom: 1px solid var(--hairline); padding: 12px 0; }
+  table.stack tr { display: flex; flex-wrap: wrap; align-items: center; column-gap: 12px; row-gap: 8px; border-bottom: 1px solid var(--hairline); padding: 8px 0; }
   table.stack td { display: flex; align-items: center; gap: 8px; border: 0; padding: 0; min-width: 0; width: auto; text-align: left; white-space: normal; font-size: 14px; }
   table.stack td::before { content: none; }
   table.stack td.stack-first { font-weight: 500; font-size: 16px; }
   table.stack td.stack-break { flex-basis: 100%; }
   table.stack td.c-name { flex: 1 1 0; }
   table.stack td.c-status, table.stack td.c-mean { margin-left: auto; }
-  table.stack td.c-verdict { order: 2; }
-  table.stack td.c-windows, table.stack td.c-mean { order: 3; }
+  table.stack td.c-verdict { max-width: 60%; }
   table.stack td.c-name span { overflow-wrap: break-word; }
 }
 
