@@ -42,7 +42,7 @@ export function Strategies({ read, libraryErrors, dataset, onRetry }: { read: Fo
   const needle = q.trim().toLowerCase();
   const shown = all ? all.filter((s) => s.strategy.toLowerCase().includes(needle)) : [];
   return (
-    <section id="strategies" aria-labelledby="strategies-title" className="min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
+    <section id="strategies" aria-labelledby="strategies-title" className="min-w-0 scroll-mt-28 bg-surface p-4 md:p-5 lg:p-6">
       <div className="flex flex-wrap items-center gap-2">
         <h2 id="strategies-title" tabIndex={-1} className="mr-auto text-sm font-medium text-ink-2 outline-none">Strategies against the promotion standard</h2>
         <Pill variant="outline" className="text-warning-foreground">paper</Pill>
@@ -73,12 +73,12 @@ export function Strategies({ read, libraryErrors, dataset, onRetry }: { read: Fo
                     <TableCell data-label="Strategy" className="stack-first c-name max-w-56 font-mono"><span className="block break-words md:truncate" title={s.strategy}>{s.strategy}</span></TableCell>
                     <TableCell data-label="Side" className="c-side font-mono">{s.side}</TableCell>
                     <TableCell data-label="Windows traded" className="c-windows min-w-0">
-                      <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 md:justify-start">
-                        <Tracker data={Array.from({ length: 10 }, (_, i) => ({ key: i, color: (i + 1) * need / 10 <= done ? "bg-info-foreground" : "bg-track", tooltip: "Windows " + (i * need / 10 + 1) + " to " + ((i + 1) * need / 10) }))} className="h-2 w-28" />
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                        <Tracker data={Array.from({ length: 10 }, (_, i) => ({ key: i, color: (i + 1) * need / 10 <= done ? "bg-info-foreground" : "bg-track", tooltip: "Windows " + (i * need / 10 + 1) + " to " + ((i + 1) * need / 10) }))} className="h-2 w-24 md:w-28" />
                         <span className="font-mono text-sm text-ink-2">{label}</span>
                       </div>
                     </TableCell>
-                    <TableCell data-label="Mean cents" className="c-mean text-right font-mono tabular-nums">{s.mean_cents_per_contract === null ? "-" : s.mean_cents_per_contract.toFixed(2)}</TableCell>
+                    <TableCell data-label="Mean cents" className="c-mean text-right font-mono tabular-nums"><span className="text-ink-2 md:hidden">Mean cents per contract </span>{s.mean_cents_per_contract === null ? "-" : s.mean_cents_per_contract.toFixed(2)}</TableCell>
                     <TableCell data-label="Verdict" className="c-verdict min-w-0 max-w-md"><VerdictPill verdict={s.verdict} fixture={dataset === "fixture"} /></TableCell>
                   </TableRow>
                 );
@@ -110,12 +110,12 @@ export function Markets({ read, onRetry }: { read: Found<Market[]>; onRetry: () 
   const all = read && read.ok ? read.v : null;
   const needle = q.trim().toLowerCase();
   const wide = useWide();
-  const cap = wide ? 40 : 8;
+  const cap = wide ? 40 : 4;
   const shown = all ? all.filter((m) => m.ticker.toLowerCase().includes(needle)).slice(0, cap) : [];
   const total = all ? all.length : null;
   const dash = (v: number | null | undefined) => (v === null || v === undefined ? "-" : String(v));
   return (
-    <section id="markets-card" aria-labelledby="markets-title" className="min-w-0 scroll-mt-28 bg-surface p-5 lg:p-6">
+    <section id="markets-card" aria-labelledby="markets-title" className="min-w-0 scroll-mt-28 bg-surface p-4 md:p-5 lg:p-6">
       <div className="flex flex-wrap items-center gap-2">
         <h2 id="markets-title" tabIndex={-1} className="mr-auto text-sm font-medium text-ink-2 outline-none">Collected markets</h2>
         <Pill variant="outline" className="text-ink-2">tape</Pill>

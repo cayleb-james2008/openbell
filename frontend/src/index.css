@@ -57,23 +57,30 @@
   [data-vaul-drawer], [data-vaul-overlay] { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
 
-/* Phone (under 768 px): a table row becomes a short block of lines, no page overflow. Slots: line 1 slot, name and status;
-   line 2 strikes, P&L, equity. Strategies: line 1 name and side; line 2 verdict; line 3 windows and mean cents. */
+/* Phone (under 768 px): a table row is a short run of lines, never a squeezed table. Each line is one flex row. A zero-height
+   break item (the row's ::after, order 1) starts line 2 after the identifier, so the readings wrap only between readings.
+   Slots: line 1 slot, strategy, status; line 2 strikes, stint P&L, equity. Strategies: line 1 name and side; line 2 Tracker and
+   reading and mean; line 3 verdict, full width. Names wrap only at hyphens; a verdict is never clipped. */
 @media (max-width: 767px) {
   table.stack, table.stack tbody, table.stack tr, table.stack td { display: block; width: 100%; }
   table.stack thead { display: none; }
-  table.stack tr { display: flex; flex-wrap: wrap; align-items: center; column-gap: 12px; row-gap: 8px; border-bottom: 1px solid var(--hairline); padding: 8px 0; }
-  table.stack td { display: flex; align-items: center; gap: 8px; border: 0; padding: 0; min-width: 0; width: auto; text-align: left; white-space: normal; font-size: 14px; }
+  table.stack tr { display: flex; flex-wrap: wrap; align-items: center; column-gap: 8px; row-gap: 4px; border-bottom: 1px solid var(--hairline); padding: 8px 0; }
+  table.stack tr::after { content: ""; order: 1; flex: 0 0 100%; height: 0; }
+  table.stack td { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; border: 0; padding: 0; width: auto; min-width: 0; max-width: none; text-align: left; white-space: normal; overflow-wrap: normal; word-break: normal; font-size: 14px; }
   table.stack td::before { content: none; }
   table.stack td.stack-first { font-weight: 500; font-size: 16px; }
-  table.stack td.stack-break { flex-basis: 100%; }
   table.stack td.c-name { flex: 1 1 0; }
-  table.stack td.c-status, table.stack td.c-mean { margin-left: auto; }
-  table.stack td.c-verdict { max-width: 60%; }
-  table.stack td.c-name span { overflow-wrap: break-word; }
+  table.stack td.c-name > span { overflow-wrap: normal; word-break: normal; }
+  table.stack td.c-side, table.stack td.c-status { flex: 0 0 auto; margin-left: auto; }
+  table.stack td.c-side { border: 1px solid var(--hairline); border-radius: 6px; padding: 2px 8px; font-size: 13px; }
+  table.stack td.c-windows, table.stack td.c-strikes { order: 2; }
+  table.stack td.c-mean, table.stack td.c-pnl { order: 3; }
+  table.stack td.c-verdict, table.stack td.c-equity { order: 4; }
+  table.stack td.c-verdict { flex: 1 1 100%; }
+  table.stack td.c-strikes, table.stack td.c-pnl, table.stack td.c-equity, table.stack td.c-mean { white-space: nowrap; }
 }
 
 /* The page never scrolls sideways; headings balance their lines; every control shows a visible focus ring. */
 html, body { overflow-x: clip; }
 h1, h2, h3, h4 { text-wrap: balance; }
-:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }

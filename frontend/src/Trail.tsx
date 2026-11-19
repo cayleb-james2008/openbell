@@ -104,17 +104,20 @@ const TAG_CLASS: Record<NonNullable<TrailRow["tag"]>, string> = {
 };
 
 function RowItem({ r }: { r: TrailRow }) {
+  // Phone: the label and time on one line, the value beneath and wrapping. Desktop: label | value | time in three columns.
+  // Only the Collector value clips (with its full text in the title); the verbatim report keeps every line whole.
+  const clip = r.label === "Collector";
   return (
-    <li className={"flex min-w-0 items-center gap-2 py-1.5 pr-1 text-sm md:grid md:min-h-9 md:grid-cols-[minmax(0,13rem)_minmax(0,1fr)_auto] md:gap-x-4 " + (r.depth ? "pl-8" : "pl-4")}>
-      <div className="flex min-w-0 max-w-[45%] shrink-0 items-center gap-2 md:max-w-none">
-        <span className="min-w-0 truncate font-medium text-ink" title={r.label}>{r.label}</span>
+    <li className={"grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-0.5 py-1.5 pr-1 text-sm md:grid-cols-[minmax(0,13rem)_minmax(0,1fr)_auto] md:gap-x-4 md:py-1.5 md:min-h-9 " + (r.depth ? "pl-8" : "pl-4")}>
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 md:flex-nowrap">
+        <span className="min-w-0 font-medium text-ink break-words md:truncate" title={r.label}>{r.label}</span>
         {r.tag && <Pill variant="outline" className={"h-auto shrink-0 py-0 " + TAG_CLASS[r.tag]}>{r.tag}</Pill>}
       </div>
-      <div className="min-w-0 flex-1 truncate md:flex-none" title={[r.value, r.note].filter(Boolean).join(" — ")}>
+      {r.time && <time dateTime={r.time} className="order-1 justify-self-end font-mono text-xs tabular-nums text-info-foreground md:order-2 md:text-sm md:text-right">{r.time}</time>}
+      <div className={"order-2 col-span-2 min-w-0 md:order-1 md:col-span-1 " + (clip ? "truncate" : "break-words md:truncate")} title={[r.value, r.note].filter(Boolean).join(" — ")}>
         {r.value ? <span className="font-mono tabular-nums text-ink">{r.value}</span> : <span className="text-ink-2">-</span>}
         {r.note && <span className="ml-2 text-ink-2">{r.note}</span>}
       </div>
-      {r.time && <time dateTime={r.time} className="hidden font-mono text-sm tabular-nums text-info-foreground md:block md:text-right">{r.time}</time>}
     </li>
   );
 }
@@ -131,9 +134,9 @@ export function AuditTrail({ lines }: { lines: string[] }) {
             {({ isExpanded }: { isExpanded: boolean }) => (
               <>
                 <ExpandableTrigger aria-expanded={isExpanded}
-                  className="flex min-h-11 w-full cursor-pointer items-center justify-between gap-3 rounded-md py-1 pr-1 text-left outline-none transition-[background-color] duration-(--dur-press) ease-(--ease-house) hover:bg-board focus-visible:ring-2 focus-visible:ring-blue">
-                  <span className="min-w-0 font-medium text-ink">{it.title}</span>
-                  <span className="min-w-0 truncate text-sm text-ink-2">{it.summary}</span>
+                  className="flex min-h-11 w-full cursor-pointer flex-wrap items-center justify-between gap-x-3 gap-y-0.5 rounded-md py-1 pr-1 text-left outline-none transition-[background-color] duration-(--dur-press) ease-(--ease-house) hover:bg-board focus-visible:ring-2 focus-visible:ring-ring">
+                  <span className="min-w-0 font-medium break-words text-ink">{it.title}</span>
+                  <span className="basis-full text-sm break-words text-ink-2 md:basis-auto md:min-w-0 md:truncate">{it.summary}</span>
                 </ExpandableTrigger>
                 <ExpandableContent preset="fade">
                   <ul className="ml-1 border-l border-hairline">
