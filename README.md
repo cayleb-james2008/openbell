@@ -155,22 +155,43 @@ Updating is refused for a cargo-built binary, from any Host other than a loopbac
 
 ## Running it
 
+Nothing has to be set up. Start the desk and it opens in your browser:
+
 ```sh
-cargo run            # serves the desk on $PORT (default 8472)
+cargo run            # or the installed openbell-rs
 ```
 
-Environment: `OPENBELL_DATA` (tape directory), `OPENBELL_STRATEGIES`
-(strategy library directory), `OPENBELL_COLLECT_SECS` (collector interval),
-`OPENBELL_PAPER_POT` (paper pot for the slot simulation, default $100 —
-always labelled a simulation parameter, never venue money),
-`OPENBELL_ALLOWED_HOSTS` (extra host names allowed past the same-site guard,
-see above), `PORT` (default 8472).
+It serves `http://127.0.0.1:8472`. If that port is busy the desk takes the next
+free one (up to 8492) and prints its address. Without any variable set, the tape
+lives in the platform's data folder: `$XDG_DATA_HOME/openbell` or
+`~/.local/share/openbell` on Linux, `~/Library/Application Support/openbell` on
+macOS, `%APPDATA%\openbell` on Windows. The five built-in strategies are written to
+`strategies/` inside that folder, once. A checkout keeps working: an
+`openbell-data` or `strategies` folder in the current directory is used when it
+is there.
+
+The browser opens once at start. It does not open with `--no-open`,
+`OPENBELL_NO_OPEN=1`, `--service` or a service manager (`INVOCATION_ID` set), or
+on Linux when there is no display. A failure to open is silent; the start-up
+banner always prints the address.
+
+Environment (all optional):
+
+| Var | Default |
+| --- | --- |
+| `OPENBELL_DATA` | the platform data folder above |
+| `OPENBELL_STRATEGIES` | `strategies/` in the data folder (`./strategies` when it exists) |
+| `OPENBELL_COLLECT_SECS` | `60` (the collector's interval, 5 to 3600 seconds) |
+| `OPENBELL_PAPER_POT` | `100` (paper pot for the slot simulation, always labelled a simulation parameter, never venue money) |
+| `OPENBELL_ALLOWED_HOSTS` | none (extra host names allowed past the same-site guard, see above) |
+| `PORT` | `8472`, then the next free port up to 8492; an explicit `PORT` is used exactly, and the start fails if it is busy |
+| `OPENBELL_NO_OPEN` | unset (`1` keeps the browser closed) |
 
 ## Checks
 
 `cargo test` runs the unit tests and the `--version` integration test. `bash .loop/verify` builds the binary, runs
 the Rust tests, and runs the
-check kit: the order-path fence, slot rotation and reconciliation against
+check kit (including `first_run.sh`: the port fallback, the opener's skip rules and the built-in library): the order-path fence, slot rotation and reconciliation against
 independent recomputation, collector health counted both ways, the equity
 curve reconciled against the slot report, the daily report's honesty
 assertions, the strategy-library mutation isolation, and both themes. The
