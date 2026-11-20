@@ -8,6 +8,7 @@
 //! paper against collected forward data, and a strategy is only "proven"
 //! when it passes the desk's promotion standard on forward evidence.
 
+mod open;
 mod update;
 
 use serde_json::json;
@@ -55,7 +56,7 @@ fn parse_iso_z(s: &str) -> Option<i64> {
     // Range-checked: an unchecked parse computes a confident epoch
     // for "2026-13-45T99:99:99Z", and a wrong epoch silently
     // reorders the compounding.
-    if !(1..=12).contains(&mo) || !(0..=23).contains(&hh) || !(0..=59).contains(&mm) || ss < 0 || ss > 60 {
+    if !(1..=12).contains(&mo) || !(0..=23).contains(&hh) || !(0..=59).contains(&mm) || !(0..=60).contains(&ss) {
         return None;
     }
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
@@ -285,7 +286,7 @@ fn append_tape(path: &Path, body: &str) -> std::io::Result<()> {
 /// neighbours. Returns (snapshots, lines in the file).
 fn parse_tape_bytes(bytes: &[u8]) -> (Vec<Snapshot>, usize) {
     let mut lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
-    if lines.last().map_or(false, |l| l.is_empty()) {
+    if lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
     let snaps = lines
@@ -390,7 +391,7 @@ impl Strategy {
         });
         if let Some((len, mtime)) = cache_key {
             let guard = STRAT_CACHE.lock().unwrap();
-            if let Some((p, l, t, unit, runtime, name, side)) =
+            if let Some((_p, _l, _t, unit, runtime, name, side)) =
                 guard.iter().find(|(p, l, t, ..)| p == path && *l == len && *t == mtime)
             {
                 let (unit, runtime, name, side) = (
@@ -628,9 +629,9 @@ struct ScoreReport {
 /// Results from a scan the aggregate deadline cut short are never
 /// cached — they are a function of the budget state, not of the
 /// window, and caching them would poison later passes.
-static ENTRY_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<(u64, u64), Option<f64>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+type EntryCache = std::sync::Mutex<std::collections::HashMap<(u64, u64), Option<f64>>>;
+static ENTRY_CACHE: std::sync::LazyLock<EntryCache> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// The scan-resume cache: for each (strategy, window) the longest
 /// prefix of the window's snapshots a completed scan has covered,
@@ -645,11 +646,10 @@ static ENTRY_CACHE: std::sync::LazyLock<
 /// strategies of Rune calls per recompute). A scan the deadline
 /// cut short updates neither cache: its result is a function of
 /// the budget state, not of the window.
-static PREFIX_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<
-        std::collections::HashMap<(u64, String), (usize, u64, Option<f64>)>,
-    >,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+type PrefixCache =
+    std::sync::Mutex<std::collections::HashMap<(u64, String), (usize, u64, Option<f64>)>>;
+static PREFIX_CACHE: std::sync::LazyLock<PrefixCache> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 fn window_fingerprint(snaps: &[Snapshot]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -667,6 +667,7 @@ fn window_fingerprint(snaps: &[Snapshot]) -> u64 {
 /// The entry a strategy would have taken in one window: the ask on its
 /// side at the first snapshot (in fetch order) where its Rune
 /// `allow_entry` says yes. None when it never enters.
+#[cfg(test)]
 fn window_entry(strat: &Strategy, snaps: &[Snapshot]) -> Option<f64> {
     window_entry_keyed(strat, None, snaps, window_fingerprint(snaps))
 }
@@ -789,6 +790,7 @@ fn facts_fingerprint(snaps: &[Snapshot]) -> u64 {
     h.finish()
 }
 
+#[cfg(test)]
 fn window_facts(snaps: &[Snapshot]) -> WindowFacts {
     window_facts_keyed(snaps, facts_fingerprint(snaps))
 }
@@ -852,10 +854,12 @@ fn group_windows(snapshots: &[Snapshot]) -> BTreeMap<String, Vec<Snapshot>> {
     windows
 }
 
+#[cfg(test)]
 fn score_strategy(strat: &Strategy, snapshots: &[Snapshot], standard: Standard) -> ScoreReport {
     score_strategy_windows(strat, &group_windows(snapshots), standard)
 }
 
+#[cfg(test)]
 fn score_strategy_windows(
     strat: &Strategy,
     windows: &BTreeMap<String, Vec<Snapshot>>,
@@ -1066,10 +1070,12 @@ struct SlotSimulation {
     trades: Vec<Trade>,
 }
 
+#[cfg(test)]
 fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f64) -> SlotSimulation {
     simulate_slots_windows(strategies, &group_windows(snapshots), paper_pot)
 }
 
+#[cfg(test)]
 fn simulate_slots_windows(
     strategies: &[Strategy],
     grouped: &BTreeMap<String, Vec<Snapshot>>,
@@ -1309,7 +1315,8 @@ fn simulate_slots_windows_fps(
 /// equity curve — the data behind the chart. Points are (epoch, value)
 /// in chronological order; each strategy series starts at 0 and the pot
 /// series starts at the paper pot.
-fn equity_curves(sim: &SlotSimulation) -> (Vec<(i64, f64)>, Vec<(String, Vec<(i64, f64)>)>) {
+type EquitySeries = Vec<(String, Vec<(i64, f64)>)>;
+fn equity_curves(sim: &SlotSimulation) -> (Vec<(i64, f64)>, EquitySeries) {
     let mut pot: Vec<(i64, f64)> = Vec::new();
     let mut per: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
     let mut pot_now = sim.paper_pot_start;
@@ -1845,7 +1852,7 @@ impl App {
         let bytes = std::fs::read(path).unwrap_or_default();
         let (snaps, total_lines) = parse_tape_bytes(&bytes);
         let (seam_offset, seam_line) = seam_of(&String::from_utf8_lossy(&bytes), 0);
-        let ends_newline = bytes.last().map_or(true, |b| *b == b'\n');
+        let ends_newline = bytes.last().is_none_or(|b| *b == b'\n');
         let mut markets = std::collections::HashSet::new();
         let mut results_by_ticker = std::collections::HashMap::new();
         fold_health(&snaps, &mut markets, &mut results_by_ticker);
@@ -1970,7 +1977,7 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
             // instead of silently corrupting the order.
             let out_of_order = w
                 .last()
-                .map_or(false, |last| s.fetched_at < last.fetched_at);
+                .is_some_and(|last| s.fetched_at < last.fetched_at);
             w.push(s.clone());
             if out_of_order {
                 w.sort_by_key(|x| x.fetched_at);
@@ -2006,9 +2013,9 @@ fn collector_health(app: &App) -> serde_json::Value {
     let newest = view.newest_fetched_at;
     let now = now_unix();
     let age = newest.map(|n| (now - n).max(0));
-    let future_dated = newest.map_or(false, |n| n > now + 300);
+    let future_dated = newest.is_some_and(|n| n > now + 300);
     let collecting = !future_dated
-        && age.map_or(false, |a| a <= (app.collect_secs.max(60) * 2) as i64);
+        && age.is_some_and(|a| a <= (app.collect_secs.max(60) * 2) as i64);
     serde_json::json!({
         "snapshots_on_disk": view.snaps.len(),
         "lines_on_disk": view.total_lines,
@@ -2143,7 +2150,8 @@ fn refuse_request(
     None
 }
 
-fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String, Vec<(String, String)>)> {
+type RawRequest = (String, String, String, Vec<(String, String)>);
+fn read_request(stream: &mut std::net::TcpStream) -> Option<RawRequest> {
     // One deadline for the whole request: a per-read timeout alone
     // is defeated by a client dripping a byte just under it.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -2368,23 +2376,110 @@ fn handle(app: &App, method: &str, path: &str) -> String {
     }
 }
 
+/// The default desk port, and how many ports above it a busy default may use.
+const DEFAULT_PORT: u16 = 8472;
+const DEFAULT_PORT_SPAN: u16 = 20;
+
+/// The strategy library built into the binary, so a first run has the five shapes without a checkout.
+const BUILT_IN_STRATEGIES: [(&str, &str); 5] = [
+    ("favourite_floor.rn", include_str!("../strategies/favourite_floor.rn")),
+    ("favourite_late.rn", include_str!("../strategies/favourite_late.rn")),
+    ("longshot_late.rn", include_str!("../strategies/longshot_late.rn")),
+    ("mid_window_momentum.rn", include_str!("../strategies/mid_window_momentum.rn")),
+    ("no_favourite.rn", include_str!("../strategies/no_favourite.rn")),
+];
+
+/// The platform's standard data folder for OpenBell, or None when the home folder is unknown.
+fn platform_data_dir(os: &str, get: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    const APP: &str = "openbell";
+    match os {
+        "macos" => get("HOME").map(|h| PathBuf::from(h).join("Library/Application Support").join(APP)),
+        "windows" => get("APPDATA").filter(|a| !a.is_empty()).map(|a| PathBuf::from(a).join(APP)),
+        _ => get("XDG_DATA_HOME")
+            .filter(|x| x.starts_with('/'))
+            .or_else(|| get("HOME").map(|h| format!("{h}/.local/share")))
+            .map(|base| PathBuf::from(base).join(APP)),
+    }
+}
+
+/// Where the tape goes when OPENBELL_DATA is unset: the folder this desk already
+/// uses in the current directory when there is one, else the platform's folder.
+fn default_data_dir(os: &str, get: &dyn Fn(&str) -> Option<String>, existing_here: bool) -> PathBuf {
+    if existing_here {
+        return PathBuf::from("./openbell-data");
+    }
+    platform_data_dir(os, get).unwrap_or_else(|| PathBuf::from("./openbell-data"))
+}
+
+/// Where the strategy library goes when OPENBELL_STRATEGIES is unset.
+fn default_strategies_dir(data_dir: &Path, existing_here: bool) -> PathBuf {
+    if existing_here {
+        PathBuf::from("./strategies")
+    } else {
+        data_dir.join("strategies")
+    }
+}
+
+/// Writes the built-in library into `dir`, only when `dir` does not exist yet.
+fn seed_strategy_library(dir: &Path) -> std::io::Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    for (name, source) in BUILT_IN_STRATEGIES {
+        std::fs::write(dir.join(name), source)?;
+    }
+    Ok(())
+}
+
+/// The one friendly start-up message: where the desk is, where its tape lives, and what updates do.
+fn start_banner(url: &str, data_dir: &Path, updates: update::Mode, opened: bool) -> String {
+    let updates = match updates {
+        update::Mode::Off => "off",
+        update::Mode::Notify => "notify (tells you when a release is ready)",
+        update::Mode::Auto => "auto (installs a release and restarts when idle)",
+    };
+    let browser = if opened { "opening it in your browser" } else { "open that address in a browser" };
+    format!(
+        "\n  OpenBell {}\n  Your desk:  {url}  ({browser})\n  Tape:       {}\n  Updates:    {updates}\n  Shadow mode: no order path exists in this build.\n",
+        env!("CARGO_PKG_VERSION"),
+        data_dir.display()
+    )
+}
+
+/// The first port from `start` (at most DEFAULT_PORT_SPAN above it) that `bind` accepts.
+fn bind_free_port<F>(start: u16, bind: F) -> Option<(TcpListener, u16)>
+where
+    F: Fn(u16) -> std::io::Result<TcpListener>,
+{
+    (start..=start.saturating_add(DEFAULT_PORT_SPAN)).find_map(|p| bind(p).ok().map(|l| (l, p)))
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref().is_some_and(|a| a == "--version" || a == "-V") {
         println!("openbell-rs {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    let port: u16 = match std::env::var("PORT") {
-        Ok(p) => p.parse().unwrap_or_else(|_| {
+    // An explicit PORT is a promise: it is used exactly, or the start fails loudly.
+    let explicit_port: Option<u16> = std::env::var("PORT").ok().map(|p| {
+        p.parse().unwrap_or_else(|_| {
             panic!("PORT is set to '{p}', which is not a valid port — refusing to silently fall back to 8472")
-        }),
-        Err(_) => 8472,
-    };
-    let data_dir = std::env::var("OPENBELL_DATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./openbell-data"));
-    let strategies_dir = std::env::var("OPENBELL_STRATEGIES")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./strategies"));
+        })
+    });
+    let get_env = |k: &str| std::env::var(k).ok();
+    let data_dir = std::env::var("OPENBELL_DATA").map(PathBuf::from).unwrap_or_else(|_| {
+        default_data_dir(std::env::consts::OS, &get_env, Path::new("openbell-data").is_dir())
+    });
+    let strategies_dir = std::env::var("OPENBELL_STRATEGIES").map(PathBuf::from).unwrap_or_else(|_| {
+        let here = Path::new("strategies").is_dir();
+        let dir = default_strategies_dir(&data_dir, here);
+        if !here {
+            if let Err(e) = seed_strategy_library(&dir) {
+                eprintln!("openbell-rs: cannot write the strategy library to {}: {e}", dir.display());
+            }
+        }
+        dir
+    });
     let paper_pot: f64 = std::env::var("OPENBELL_PAPER_POT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -2433,7 +2528,7 @@ fn main() {
     let app = Arc::new(App {
         tape_cache: std::sync::Mutex::new(None),
         analysis_cache: std::sync::Mutex::new(None),
-        data_dir,
+        data_dir: data_dir.clone(),
         strategies_dir,
         paper_pot,
         collect_secs,
@@ -2445,8 +2540,23 @@ fn main() {
         .filter(|h| !h.is_empty())
         .collect();
     updater().start_background();
-    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind failed");
-    println!("openbell-rs listening on http://127.0.0.1:{port} (shadow mode — no order path exists)");
+    let listener = match explicit_port {
+        Some(p) => TcpListener::bind(("127.0.0.1", p))
+            .unwrap_or_else(|e| panic!("PORT {p} is not free ({e}); choose another PORT")),
+        None => bind_free_port(DEFAULT_PORT, |p| TcpListener::bind(("127.0.0.1", p)))
+            .map(|(l, _)| l)
+            .unwrap_or_else(|| {
+                panic!("ports {DEFAULT_PORT} to {} are all busy; set PORT to a free port", DEFAULT_PORT + DEFAULT_PORT_SPAN)
+            }),
+    };
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(DEFAULT_PORT);
+    let url = format!("http://127.0.0.1:{port}");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let opening = open::wanted(&args, &get_env, std::env::consts::OS);
+    if opening {
+        open::open_in_browser(&url);
+    }
+    println!("{}", start_banner(&url, &data_dir, updater().cfg.mode, opening));
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -3482,5 +3592,65 @@ mod tests {
         assert_eq!(home["version"], json!("0.2.0"));
         std::fs::remove_dir_all(&dir).ok();
     }
-}
 
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let owned: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |k: &str| owned.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn data_dir_follows_the_platform_standard_when_unset() {
+        assert_eq!(platform_data_dir("linux", &env_of(&[("HOME", "/home/u")])), Some(PathBuf::from("/home/u/.local/share/openbell")));
+        assert_eq!(platform_data_dir("linux", &env_of(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "/data")])), Some(PathBuf::from("/data/openbell")));
+        // a relative XDG_DATA_HOME is ignored, as the XDG spec says
+        assert_eq!(platform_data_dir("linux", &env_of(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "rel")])), Some(PathBuf::from("/home/u/.local/share/openbell")));
+        assert_eq!(platform_data_dir("macos", &env_of(&[("HOME", "/Users/u")])), Some(PathBuf::from("/Users/u/Library/Application Support/openbell")));
+        assert_eq!(platform_data_dir("windows", &env_of(&[("APPDATA", r"C:\Users\u\AppData\Roaming")])), Some(PathBuf::from(r"C:\Users\u\AppData\Roaming").join("openbell")));
+        assert_eq!(platform_data_dir("linux", &env_of(&[])), None);
+    }
+
+    #[test]
+    fn an_existing_repo_folder_keeps_its_tape_and_env_wins() {
+        let get = env_of(&[("HOME", "/home/u")]);
+        assert_eq!(default_data_dir("linux", &get, true), PathBuf::from("./openbell-data"), "a tape already in this folder is not orphaned");
+        assert_eq!(default_data_dir("linux", &get, false), PathBuf::from("/home/u/.local/share/openbell"));
+        assert_eq!(default_data_dir("linux", &env_of(&[]), false), PathBuf::from("./openbell-data"), "no home at all: the old default");
+        assert_eq!(default_strategies_dir(Path::new("/d"), true), PathBuf::from("./strategies"));
+        assert_eq!(default_strategies_dir(Path::new("/d"), false), PathBuf::from("/d/strategies"));
+    }
+
+    #[test]
+    fn a_busy_default_port_falls_back_to_the_next_free_one() {
+        let (_held, p) = bind_free_port(8472, |p| {
+            if p < 8475 {
+                Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+            } else {
+                TcpListener::bind(("127.0.0.1", 0))
+            }
+        })
+        .expect("a free port within the span");
+        assert_eq!(p, 8475, "the first free port from the default");
+        assert!(bind_free_port(8472, |_| Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))).is_none(), "every port in the span busy");
+        assert_eq!(DEFAULT_PORT_SPAN, 20, "the fallback reaches at most +20");
+    }
+
+    #[test]
+    fn the_built_in_strategy_library_seeds_an_empty_folder_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("ob-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        seed_strategy_library(&dir).unwrap();
+        assert_eq!(load_strategies(&dir).len(), 5, "all five shapes load from the seeded folder");
+        std::fs::write(dir.join("favourite_late.rn"), "pub fn name() { \"mine\" }\n").unwrap();
+        seed_strategy_library(&dir).unwrap();
+        assert!(std::fs::read_to_string(dir.join("favourite_late.rn")).unwrap().contains("mine"), "an existing folder is left alone");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_start_banner_names_the_address_version_tape_and_updates() {
+        let b = start_banner("http://127.0.0.1:8475", Path::new("/data/ob"), update::Mode::Auto, true);
+        assert!(b.contains("OpenBell ") && b.contains(env!("CARGO_PKG_VERSION")));
+        assert!(b.contains("http://127.0.0.1:8475") && b.contains("/data/ob"));
+        assert!(b.contains("auto (installs") && b.contains("opening it in your browser") && b.contains("no order path"));
+    }
+}
