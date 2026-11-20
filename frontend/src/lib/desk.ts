@@ -35,7 +35,10 @@ export type Slot = {
   paper_pnl_dollars: number;
   rotated_to?: string;
 };
+export type Trade = { close_epoch: number; contracts: number; pnl_dollars: number; price: number; slot: number; strategy: string };
 export type Slots = {
+  trades?: Trade[];
+  trades_truncated?: boolean;
   paper_equity_dollars: number;
   paper_pot_start: number;
   slots: Slot[];
@@ -58,7 +61,12 @@ export type Strategy = {
   strategy: string;
   side: string;
   windows_traded: number;
-  standard?: { min_windows: number };
+  windows_settled?: number;
+  windows_conflicted?: number;
+  call_failures?: number;
+  first_half_cents?: number | null;
+  second_half_cents?: number | null;
+  standard?: { min_windows: number; min_mean_cents?: number };
   mean_cents_per_contract: number | null;
   verdict: string;
 };
