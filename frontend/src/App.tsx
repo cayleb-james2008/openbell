@@ -12,19 +12,18 @@ import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/
 import { sectionGlide } from "@/motionProps";
 import { type Dataset, type Read, type Home, useDesk } from "@/lib/desk";
 import { useWide } from "@/lib/media";
-import { Lead } from "@/Lead";
-import { AccountPanel, SlotsPanel, TapeHealth } from "@/Panels";
+import { ReportLine, ReportTrail } from "@/Lead";
+import { AccountPanel, Readings, SlotsPanel } from "@/Panels";
 import { Markets, Strategies } from "@/Lists";
 import { UpdateStrip, VersionRow, useUpdates } from "@/Update";
 
 const SECTIONS = [
   { id: "report", label: "Report", target: "report-card" },
-  { id: "pot", label: "Paper pot", target: "pot" },
-  { id: "tape", label: "Tape health", target: "tape" },
-  { id: "account", label: "Venue account", target: "account" },
+  { id: "readings", label: "Readings", target: "readings" },
   { id: "slots", label: "Slots", target: "slots-card" },
   { id: "strategies", label: "Strategies", target: "strategies" },
   { id: "markets", label: "Markets", target: "markets-card" },
+  { id: "account", label: "Venue account", target: "account" },
 ] as const;
 
 const PURPOSE = "A paper-trading desk for Kalshi’s 15-minute crypto markets: it collects the venue’s public data, tests strategies on paper, and reports what happened. It never places orders.";
@@ -187,7 +186,7 @@ function Shell() {
         </nav>
       </header>
 
-      <p className="mx-auto max-w-[1280px] px-4 pt-3 text-sm text-ink-2">{PURPOSE}</p>
+      <p className="mx-auto max-w-[1280px] px-4 pt-3 text-sm text-ink-2"><span className="block max-w-[90ch]">{PURPOSE}</span></p>
 
       <main id="top" className="mx-auto grid max-w-[1280px] grid-cols-[minmax(0,1fr)] gap-4 px-4 pb-10 pt-4">
         <p className="sr-only" aria-live="polite">{fixture ? "Showing the example tape" : "Showing the live tape"}</p>
@@ -206,14 +205,13 @@ function Shell() {
 
         {/* One instrument surface: bands divided by 1px rules on the hairline ground. */}
         <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-px overflow-hidden rounded-[10px] border border-hairline bg-hairline">
-          <Lead reads={reads} dataset={dataset} onRetry={load} />
-          <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-px bg-hairline lg:grid-cols-2">
-            <TapeHealth read={reads?.home ?? null} onRetry={load} onCollected={load} />
-            <AccountPanel read={reads?.home ?? null} onRetry={load} />
-          </div>
-          <SlotsPanel read={reads?.slots ?? null} onRetry={load} notes={ok(reads?.slots ?? undefined)?.notes} />
-          <Strategies read={reads?.strategies ?? null} libraryErrors={home?.library_errors ?? []} dataset={dataset} onRetry={load} />
+          <ReportLine read={reads?.report ?? null} onRetry={load} />
+          <Readings home={reads?.home ?? null} slots={reads?.slots ?? null} equity={reads?.equity ?? null} onRetry={load} onCollected={load} />
+          <SlotsPanel read={reads?.slots ?? null} equity={ok(reads?.equity ?? undefined)} onRetry={load} notes={ok(reads?.slots ?? undefined)?.notes} />
+          <Strategies read={reads?.strategies ?? null} slots={ok(reads?.slots ?? undefined)} equity={ok(reads?.equity ?? undefined)} libraryErrors={home?.library_errors ?? []} dataset={dataset} onRetry={load} />
           <Markets read={reads?.markets ?? null} onRetry={load} />
+          <AccountPanel read={reads?.home ?? null} onRetry={load} />
+          <ReportTrail read={reads?.report ?? null} />
         </div>
       </main>
 
