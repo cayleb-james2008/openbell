@@ -51,6 +51,12 @@
   }
 }
 
+/* Vaul ships a 500 ms slide. A modal that outlives the key that dismissed it reads as a stuck control: measured 544-561 ms
+   from Escape to gone, and the gate's own 600 ms allowance sat inside the noise. The drawer travels at the house's enter
+   token instead (250 ms), which is inside its own "UI under 300 ms" rule and leaves a dismissal plainly finished. Kept above
+   the reduced-motion block so the cut below still wins there. */
+[data-vaul-drawer], [data-vaul-overlay] { animation-duration: var(--dur-enter) !important; transition-duration: var(--dur-enter) !important; }
+
 /* Vaul ignores prefers-reduced-motion: its sheet and overlay travel with CSS *animations* (slideFromBottom,
    slideToBottom, fadeIn, fadeOut) and a transform motion. The earlier override here (until 2026-11-10)
    matched [vaul-drawer], an attribute vaul 1.x does not set (it sets data-vaul-drawer), and cut only the
