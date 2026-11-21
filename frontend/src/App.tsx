@@ -145,8 +145,8 @@ function Shell() {
             <span className="mr-1">OpenBell</span>
             <HowToRead />
           </div>
-          <Pill variant="outline" className="!h-7 flex-1 sm:flex-none text-ink-2" title="Paper only: this build places no orders"><PillStatus><PillIndicator variant="info" />Paper only</PillStatus><span className="hidden sm:inline">This build places no orders</span></Pill>
-          <Pill id="chip" variant="outline" className="!h-7 flex-1 sm:flex-none max-w-full text-ink-2" title="Collector health">
+          <Pill variant="outline" className="!h-auto min-h-7 text-ink-2" title="Paper only: this build places no orders"><PillStatus><PillIndicator variant="info" />Paper only</PillStatus><span className="hidden sm:inline">This build places no orders</span></Pill>
+          <Pill id="chip" variant="outline" className="!h-auto min-h-7 max-w-full text-ink-2" title="Collector health">
             <span id="chip-dot" aria-hidden="true" className={"size-2 rounded-full " + cw.dot} />
             <span id="chip-text" className="min-w-0 break-words">{allFailed ? "Collector: unavailable" : cw.short}</span>
           </Pill>
@@ -198,7 +198,7 @@ function Shell() {
         )}
         {allFailed && (
           <div id="load-error" role="alert" className="flex flex-wrap items-center gap-3 rounded-[10px] border border-unread/40 bg-unread/10 px-4 py-3 text-sm text-ink">
-            <span id="load-error-text" className="min-w-0 flex-1 basis-64">The desk could not load: none of its six reads answered ({failMsg}). Check that openbell-rs is running on this address, then Retry.</span>
+            <span id="load-error-text" className="min-w-0 flex-1 basis-64">OpenBell did not answer, so nothing on this page is current. Check that OpenBell is still running, then Retry. <span className="text-ink-2">(First error: {failMsg}.)</span></span>
             <Button id="retryBtn" variant="outline" className="min-h-11" onClick={load}>Retry</Button>
           </div>
         )}

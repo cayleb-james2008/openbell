@@ -56,7 +56,7 @@ export function Strategies({ read, slots, equity, libraryErrors, dataset, onRetr
   const all = read && read.ok ? read.v : null;
   const needle = q.trim().toLowerCase();
   const shown = (all ?? []).filter((s) => {
-    if (!s.strategy.toLowerCase().includes(needle)) return false;
+    if (!String(s.strategy ?? "").toLowerCase().includes(needle)) return false;
     if (filter === "Proven") return s.verdict.startsWith("PROVEN");
     if (filter === "Not proven") return s.verdict.startsWith("NOT PROVEN");
     if (filter === "Waiting for evidence") return !s.verdict.startsWith("PROVEN") && !s.verdict.startsWith("NOT PROVEN");
@@ -133,7 +133,7 @@ export function Strategies({ read, slots, equity, libraryErrors, dataset, onRetr
                       <button type="button" data-strategy-row ref={(el) => { rowRefs.current[i] = el; }} onFocus={() => setSel(i)} onClick={() => { setSel(i); setOpen(s.strategy); }}
                         aria-label={"Open " + s.strategy}
                         className="-mx-2 inline-flex min-h-11 max-w-full cursor-pointer items-center rounded-md px-2 text-left font-mono text-ink outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">
-                        <span className="break-words">{s.strategy}</span>
+                        <span className="[overflow-wrap:anywhere]">{s.strategy}</span>
                       </button>
                     </TableCell>
                     <TableCell data-label="Side" className="c-side font-mono">{s.side}</TableCell>
@@ -233,7 +233,7 @@ export function Markets({ read, onRetry }: { read: Found<Market[]>; onRetry: () 
   const [q, setQ] = useState("");
   const all = read && read.ok ? read.v : null;
   const needle = q.trim().toLowerCase();
-  const shown = all ? all.filter((m) => m.ticker.toLowerCase().includes(needle)).slice().sort((a, b) => b.close_time.localeCompare(a.close_time)) : [];
+  const shown = all ? all.filter((m) => String(m.ticker ?? "").toLowerCase().includes(needle)).slice().sort((a, b) => String(b.close_time ?? "").localeCompare(String(a.close_time ?? ""))) : [];
   const c = (p: number | null | undefined) => (p === null || p === undefined ? "-" : Math.round(p * 100) + "¢");
   const grid = "grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-1 md:grid-cols-[minmax(0,2fr)_150px_minmax(0,1.6fr)_70px_80px] md:items-center";
   return (
@@ -256,7 +256,7 @@ export function Markets({ read, onRetry }: { read: Found<Market[]>; onRetry: () 
           <Virtuoso style={{ height: Math.min(360, shown.length * 64 + 8) }} data={shown} itemContent={(_, m) => (
             <div role="row" className={grid + " border-b border-hairline py-2.5 text-sm"}>
               <span role="cell" className="min-w-0 break-all font-mono text-ink">{m.ticker}</span>
-              <span role="cell" className="font-mono whitespace-nowrap text-ink-2 md:order-none">{m.close_time.replace("T", " ").slice(0, 16)}</span>
+              <span role="cell" className="font-mono whitespace-nowrap text-ink-2 md:order-none">{String(m.close_time ?? "").replace("T", " ").slice(0, 16)}</span>
               <span role="cell" className="col-span-2 min-w-0 md:col-span-1">
                 <span className="flex h-2 w-full overflow-hidden rounded-full bg-track" role="img" aria-label={m.last_price === null ? "No last price" : "Last yes price " + c(m.last_price)}>
                   {m.last_price !== null && <span className="h-full bg-dot-blue" style={{ width: Math.max(0, Math.min(100, m.last_price * 100)) + "%" }} />}
