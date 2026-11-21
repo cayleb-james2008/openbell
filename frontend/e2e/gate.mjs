@@ -81,7 +81,7 @@ for (const m of measures) ok(`measure ${m.data} ${m.size} ${m.theme}`, m.docOver
   // standing line: the tally the page opens with must agree with the table filters above, and never count the example tape as forward-proven
   const tally = (await p.locator('#standing-detail li').evaluateAll(ls => ls.map(l => l.innerText.replace(/\s+/g, ' ').trim())))
   ok('standing line: fixture pass is not forward-proven, tally matches the Proven / Not proven / Waiting filters (2 / 1 / 2)',
-    (await p.locator('#standing-figure').innerText()).trim() === '0 of 5' && tally.length === 3 && /^2 pass on the example tape only$/.test(tally[0]) && /^1 not proven$/.test(tally[1]) && /^2 below 100 traded windows$/.test(tally[2]), JSON.stringify(tally))
+    (await p.locator('#standing-figure').innerText()).trim() === '0 of 5' && tally.length === 3 && /^2 passed on the example tape only$/.test(tally[0]) && /^1 not proven$/.test(tally[1]) && /^2 below 100 traded windows$/.test(tally[2]), JSON.stringify(tally))
   // keyboard: j / k / Enter
   await p.locator('body').click({ position: { x: 5, y: 300 } })
   await p.keyboard.press('j'); await p.waitForTimeout(100)
@@ -119,7 +119,7 @@ for (const m of measures) ok(`measure ${m.data} ${m.size} ${m.theme}`, m.docOver
   // tape switch
   await p.locator('#seg-live').click(); await p.waitForTimeout(1200)
   ok('live tape switch', !p.url().includes('dataset=fixture') && await p.locator('text=Example tape.').count() === 0)
-  ok('standing line on the live tape: 0 of 5, all below 100 traded windows', (await p.locator('#standing').innerText()).replace(/\s+/g, ' ').includes('0 of 5 strategies proven on forward evidence 5 below 100 traded windows'))
+  ok('standing line on the live tape: 0 of 5, all below 100 traded windows', (await p.locator('#standing').innerText()).replace(/\s+/g, ' ').includes('Strategies proven on forward evidence 0 of 5 5 below 100 traded windows'))
   // theme
   await p.getByRole('button', { name: 'Dark appearance' }).click()
   ok('theme toggles', (await p.evaluate(() => document.documentElement.dataset.theme)) === 'dark')
