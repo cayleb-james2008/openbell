@@ -205,7 +205,7 @@ function Shell() {
 
         {/* One instrument surface: bands divided by 1px rules on the hairline ground. */}
         <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-px overflow-hidden rounded-[10px] border border-hairline bg-hairline">
-          <ReportLine read={reads?.report ?? null} onRetry={load} />
+          <ReportLine read={reads?.report ?? null} onRetry={load} strategies={reads?.strategies ?? null} dataset={dataset} />
           <Readings home={reads?.home ?? null} slots={reads?.slots ?? null} equity={reads?.equity ?? null} onRetry={load} onCollected={load} />
           <SlotsPanel read={reads?.slots ?? null} equity={ok(reads?.equity ?? undefined)} onRetry={load} notes={ok(reads?.slots ?? undefined)?.notes} />
           <Strategies read={reads?.strategies ?? null} slots={ok(reads?.slots ?? undefined)} equity={ok(reads?.equity ?? undefined)} libraryErrors={home?.library_errors ?? []} dataset={dataset} onRetry={load} />

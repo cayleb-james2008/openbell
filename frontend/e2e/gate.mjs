@@ -65,6 +65,7 @@ for (const m of measures) ok(`measure ${m.data} ${m.size} ${m.theme}`, m.docOver
   const { ctx, p } = await open(1440, 900)
   await p.goto(FX); await ready(p)
   ok('fixture banner', await p.locator('text=Example tape.').count() === 1)
+  ok('standing line adds no step at 1440: it, the pot, Collect now and all five slots sit on the first screen at load', await p.evaluate(() => ['#standing', '#pot-figure', '#pot-change', '#collect-btn', '#slots-card tbody tr:nth-child(5)'].every(s => { const r = document.querySelector(s)?.getBoundingClientRect(); return !!r && r.top >= 0 && r.bottom <= innerHeight })))
   ok('no row highlighted at rest', await p.locator('#strategies tr[aria-selected="true"]').count() === 0)
   ok('five strategies', await rowsShown(p) === 5, String(await rowsShown(p)))
   for (const [f, n] of [['Proven', 2], ['Not proven', 1], ['Waiting for evidence', 2], ['All', 5]]) {
@@ -77,6 +78,10 @@ for (const m of measures) ok(`measure ${m.data} ${m.size} ${m.theme}`, m.docOver
   ok('search empty state', await p.locator('#strategies [role=status]').innerText().then(t => /No strategy matches/.test(t)))
   await p.getByRole('button', { name: 'Show all strategies' }).click(); await p.waitForTimeout(150)
   ok('show all restores', await rowsShown(p) === 5)
+  // standing line: the tally the page opens with must agree with the table filters above, and never count the example tape as forward-proven
+  const tally = (await p.locator('#standing-detail li').evaluateAll(ls => ls.map(l => l.innerText.replace(/\s+/g, ' ').trim())))
+  ok('standing line: fixture pass is not forward-proven, tally matches the Proven / Not proven / Waiting filters (2 / 1 / 2)',
+    (await p.locator('#standing-figure').innerText()).trim() === '0 of 5' && tally.length === 3 && /^2 pass on the example tape only$/.test(tally[0]) && /^1 not proven$/.test(tally[1]) && /^2 below 100 traded windows$/.test(tally[2]), JSON.stringify(tally))
   // keyboard: j / k / Enter
   await p.locator('body').click({ position: { x: 5, y: 300 } })
   await p.keyboard.press('j'); await p.waitForTimeout(100)
@@ -114,6 +119,7 @@ for (const m of measures) ok(`measure ${m.data} ${m.size} ${m.theme}`, m.docOver
   // tape switch
   await p.locator('#seg-live').click(); await p.waitForTimeout(1200)
   ok('live tape switch', !p.url().includes('dataset=fixture') && await p.locator('text=Example tape.').count() === 0)
+  ok('standing line on the live tape: 0 of 5, all below 100 traded windows', (await p.locator('#standing').innerText()).replace(/\s+/g, ' ').includes('0 of 5 strategies proven on forward evidence 5 below 100 traded windows'))
   // theme
   await p.getByRole('button', { name: 'Dark appearance' }).click()
   ok('theme toggles', (await p.evaluate(() => document.documentElement.dataset.theme)) === 'dark')
@@ -139,6 +145,7 @@ for (const m of measures) ok(`measure ${m.data} ${m.size} ${m.theme}`, m.docOver
   await p.route('**/api/strategies*', r => r.fulfill({ status: 500, body: 'no' }))
   await p.goto(FX); await ready(p)
   ok('one read failing shows its own error', await p.locator('#strategies [role=alert]').count() === 1 && await p.locator('#slots-card table').count() === 1)
+  ok('standing line says the strategy state is unavailable, with no figure', (await p.locator('#standing-label').innerText()) === 'Strategy state unavailable' && await p.locator('#standing-figure').count() === 0)
   await p.screenshot({ path: `${OUT}/error-strategies-1440.png` })
   await p.unroute('**/api/strategies*')
   await p.locator('#strategies [role=alert] button').click(); await p.waitForTimeout(1200)
@@ -161,6 +168,7 @@ for (const m of measures) ok(`measure ${m.data} ${m.size} ${m.theme}`, m.docOver
   await p.goto(FX); await ready(p); await p.waitForTimeout(400)
   ok('empty library message', (await p.locator('#strategies').innerText()).includes('No strategies in the library'))
   ok('empty tape message', (await p.locator('#markets-card').innerText()).includes('No snapshots collected yet'))
+  ok('standing line names the empty library', (await p.locator('#standing-label').innerText()).includes('No strategies in the library') && await p.locator('#standing-figure').count() === 0)
   await ctx.close()
 }
 {
@@ -171,10 +179,18 @@ for (const m of measures) ok(`measure ${m.data} ${m.size} ${m.theme}`, m.docOver
   await p.screenshot({ path: `${OUT}/loading-1440.png` })
   await ctx.close()
 }
+{
+  const { ctx, p } = await open(1440, 900)
+  await p.route('**/api/strategies*', async r => { await new Promise(s => setTimeout(s, 2500)); r.continue() })
+  await p.goto(FX); await p.waitForTimeout(600)
+  ok('standing line loads as a skeleton, not a claim', await p.locator('span#standing[aria-hidden]').count() === 1 && await p.locator('#standing-figure').count() === 0)
+  await ctx.close()
+}
 // 4. phone: drawer from the bottom, how to read as a dialog
 {
   const { ctx, p } = await open(390, 844)
   await p.goto(FX); await ready(p)
+  ok('standing line adds no step at 390: it and the whole pot reading (figure, change, trace, stage target) sit on the first screen', await p.evaluate(() => ['#standing', '#pot-figure', '#pot-change', '#pot svg', '#stage-figure', '#stage-line'].every(s => { const r = document.querySelector(s)?.getBoundingClientRect(); return !!r && r.top >= 0 && r.bottom <= innerHeight })))
   await p.getByRole('button', { name: 'Open favourite-floor' }).click(); await p.waitForTimeout(800)
   const box = await p.locator('[data-strategy-drawer]').boundingBox()
   ok('phone drawer rises from the bottom', !!box && box.y > 50 && Math.round(box.width) === 390, JSON.stringify(box))
