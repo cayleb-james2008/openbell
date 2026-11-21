@@ -2,8 +2,8 @@
 
 `npm run check:ui`, run from `frontend/`, builds the frontend and the binary. It then starts OpenBell on a free port against the seeded tapes in `fixtures/data` and runs two scripts, each on fresh data:
 
-- `gate.mjs`: the Ledger gate, 54 checks. It measures the live and fixture tapes at 1440, 768, 390 and 320 px in light and dark. It then covers filters, search, keyboard, drawer, collect, sections, the error, empty and loading states, the phone layout, console errors and reduced motion.
-- `replay.mjs`: worst-case data fed in through `page.route` mocks, 8 checks.
+- `gate.mjs`: the Ledger gate, 61 checks. It measures the live and fixture tapes at 1440, 768, 390 and 320 px in light and dark. It then covers filters, search, keyboard, drawer, collect, sections, the error, empty and loading states, the phone layout, console errors and reduced motion.
+- `replay.mjs`: worst-case data fed in through `page.route` mocks, 16 checks.
 
 No run touches the network. The collector's `curl` is replaced on the app's PATH by `fixtures/kalshi-curl.mjs`, which answers market reads with one recorded public pass (`fixtures/kalshi-markets.json`) and fails anything else. The updater is off. The check fails unless every check passes and each script ran its full count. It stops everything it started, also when interrupted.
 
