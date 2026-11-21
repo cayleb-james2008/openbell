@@ -2,6 +2,8 @@
 /* The two notes quote class names as text; they are not markup and must not generate CSS. */
 @source not "../../rune/used/LOCAL-EDITS.md";
 @source not "../DESIGN.md";
+/* The UI checks in ../e2e quote class names in selectors and style overrides; they are not markup. */
+@source not "../e2e";
 @source not "../../rune/used/motion.ts";
 /* Five motion parts are scanned by name only: their motion prop name is not a class, so they are excluded from the scan and their static classes are listed here. */
 @source inline("&& (!bounds.height) (integerDigits.length */ /** // 0% 1) 10 100% 9, === @/lib/utils Enter ExpandableCard ExpandableCardContent ExpandableCardFooter ExpandableCardHeader ExpandableTrigger Math.pow(10, SlidingNumberProps SlidingNumberProps) Toggle [integerPart, [mask-clip:padding-box,border-box] [mask-composite:intersect]");
