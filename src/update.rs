@@ -540,9 +540,9 @@ fn install(cfg: &Config, rel: &Release) -> Result<(), String> {
     Ok(())
 }
 
-/// The process-group signal used to stop a hung proof child and anything it
-/// started. Declared here rather than run through `/bin/kill`, so no process
-/// spawn is added (the fence pins the spawns in this file).
+// The process-group signal used to stop a hung proof child and anything it
+// started. Declared here rather than run through `/bin/kill`, so no process
+// spawn is added (the fence pins the spawns in this file).
 #[cfg(unix)]
 extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;

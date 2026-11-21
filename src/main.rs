@@ -56,7 +56,7 @@ fn parse_iso_z(s: &str) -> Option<i64> {
     // Range-checked: an unchecked parse computes a confident epoch
     // for "2026-13-45T99:99:99Z", and a wrong epoch silently
     // reorders the compounding.
-    if !(1..=12).contains(&mo) || !(0..=23).contains(&hh) || !(0..=59).contains(&mm) || ss < 0 || ss > 60 {
+    if !(1..=12).contains(&mo) || !(0..=23).contains(&hh) || !(0..=59).contains(&mm) || !(0..=60).contains(&ss) {
         return None;
     }
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
@@ -286,7 +286,7 @@ fn append_tape(path: &Path, body: &str) -> std::io::Result<()> {
 /// neighbours. Returns (snapshots, lines in the file).
 fn parse_tape_bytes(bytes: &[u8]) -> (Vec<Snapshot>, usize) {
     let mut lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
-    if lines.last().map_or(false, |l| l.is_empty()) {
+    if lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
     let snaps = lines
@@ -391,7 +391,7 @@ impl Strategy {
         });
         if let Some((len, mtime)) = cache_key {
             let guard = STRAT_CACHE.lock().unwrap();
-            if let Some((p, l, t, unit, runtime, name, side)) =
+            if let Some((_p, _l, _t, unit, runtime, name, side)) =
                 guard.iter().find(|(p, l, t, ..)| p == path && *l == len && *t == mtime)
             {
                 let (unit, runtime, name, side) = (
@@ -629,9 +629,9 @@ struct ScoreReport {
 /// Results from a scan the aggregate deadline cut short are never
 /// cached — they are a function of the budget state, not of the
 /// window, and caching them would poison later passes.
-static ENTRY_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<(u64, u64), Option<f64>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+type EntryCache = std::sync::Mutex<std::collections::HashMap<(u64, u64), Option<f64>>>;
+static ENTRY_CACHE: std::sync::LazyLock<EntryCache> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// The scan-resume cache: for each (strategy, window) the longest
 /// prefix of the window's snapshots a completed scan has covered,
@@ -646,11 +646,10 @@ static ENTRY_CACHE: std::sync::LazyLock<
 /// strategies of Rune calls per recompute). A scan the deadline
 /// cut short updates neither cache: its result is a function of
 /// the budget state, not of the window.
-static PREFIX_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<
-        std::collections::HashMap<(u64, String), (usize, u64, Option<f64>)>,
-    >,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+type PrefixCache =
+    std::sync::Mutex<std::collections::HashMap<(u64, String), (usize, u64, Option<f64>)>>;
+static PREFIX_CACHE: std::sync::LazyLock<PrefixCache> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 fn window_fingerprint(snaps: &[Snapshot]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -668,6 +667,7 @@ fn window_fingerprint(snaps: &[Snapshot]) -> u64 {
 /// The entry a strategy would have taken in one window: the ask on its
 /// side at the first snapshot (in fetch order) where its Rune
 /// `allow_entry` says yes. None when it never enters.
+#[cfg(test)]
 fn window_entry(strat: &Strategy, snaps: &[Snapshot]) -> Option<f64> {
     window_entry_keyed(strat, None, snaps, window_fingerprint(snaps))
 }
@@ -790,6 +790,7 @@ fn facts_fingerprint(snaps: &[Snapshot]) -> u64 {
     h.finish()
 }
 
+#[cfg(test)]
 fn window_facts(snaps: &[Snapshot]) -> WindowFacts {
     window_facts_keyed(snaps, facts_fingerprint(snaps))
 }
@@ -853,10 +854,12 @@ fn group_windows(snapshots: &[Snapshot]) -> BTreeMap<String, Vec<Snapshot>> {
     windows
 }
 
+#[cfg(test)]
 fn score_strategy(strat: &Strategy, snapshots: &[Snapshot], standard: Standard) -> ScoreReport {
     score_strategy_windows(strat, &group_windows(snapshots), standard)
 }
 
+#[cfg(test)]
 fn score_strategy_windows(
     strat: &Strategy,
     windows: &BTreeMap<String, Vec<Snapshot>>,
@@ -1067,10 +1070,12 @@ struct SlotSimulation {
     trades: Vec<Trade>,
 }
 
+#[cfg(test)]
 fn simulate_slots(strategies: &[Strategy], snapshots: &[Snapshot], paper_pot: f64) -> SlotSimulation {
     simulate_slots_windows(strategies, &group_windows(snapshots), paper_pot)
 }
 
+#[cfg(test)]
 fn simulate_slots_windows(
     strategies: &[Strategy],
     grouped: &BTreeMap<String, Vec<Snapshot>>,
@@ -1310,7 +1315,8 @@ fn simulate_slots_windows_fps(
 /// equity curve — the data behind the chart. Points are (epoch, value)
 /// in chronological order; each strategy series starts at 0 and the pot
 /// series starts at the paper pot.
-fn equity_curves(sim: &SlotSimulation) -> (Vec<(i64, f64)>, Vec<(String, Vec<(i64, f64)>)>) {
+type EquitySeries = Vec<(String, Vec<(i64, f64)>)>;
+fn equity_curves(sim: &SlotSimulation) -> (Vec<(i64, f64)>, EquitySeries) {
     let mut pot: Vec<(i64, f64)> = Vec::new();
     let mut per: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
     let mut pot_now = sim.paper_pot_start;
@@ -1846,7 +1852,7 @@ impl App {
         let bytes = std::fs::read(path).unwrap_or_default();
         let (snaps, total_lines) = parse_tape_bytes(&bytes);
         let (seam_offset, seam_line) = seam_of(&String::from_utf8_lossy(&bytes), 0);
-        let ends_newline = bytes.last().map_or(true, |b| *b == b'\n');
+        let ends_newline = bytes.last().is_none_or(|b| *b == b'\n');
         let mut markets = std::collections::HashSet::new();
         let mut results_by_ticker = std::collections::HashMap::new();
         fold_health(&snaps, &mut markets, &mut results_by_ticker);
@@ -1971,7 +1977,7 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
             // instead of silently corrupting the order.
             let out_of_order = w
                 .last()
-                .map_or(false, |last| s.fetched_at < last.fetched_at);
+                .is_some_and(|last| s.fetched_at < last.fetched_at);
             w.push(s.clone());
             if out_of_order {
                 w.sort_by_key(|x| x.fetched_at);
@@ -2007,9 +2013,9 @@ fn collector_health(app: &App) -> serde_json::Value {
     let newest = view.newest_fetched_at;
     let now = now_unix();
     let age = newest.map(|n| (now - n).max(0));
-    let future_dated = newest.map_or(false, |n| n > now + 300);
+    let future_dated = newest.is_some_and(|n| n > now + 300);
     let collecting = !future_dated
-        && age.map_or(false, |a| a <= (app.collect_secs.max(60) * 2) as i64);
+        && age.is_some_and(|a| a <= (app.collect_secs.max(60) * 2) as i64);
     serde_json::json!({
         "snapshots_on_disk": view.snaps.len(),
         "lines_on_disk": view.total_lines,
@@ -2144,7 +2150,8 @@ fn refuse_request(
     None
 }
 
-fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String, Vec<(String, String)>)> {
+type RawRequest = (String, String, String, Vec<(String, String)>);
+fn read_request(stream: &mut std::net::TcpStream) -> Option<RawRequest> {
     // One deadline for the whole request: a per-read timeout alone
     // is defeated by a client dripping a byte just under it.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
