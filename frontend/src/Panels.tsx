@@ -14,7 +14,7 @@ import { Spark } from "@/Spark";
 export function PanelError({ msg, onRetry }: { msg: string; onRetry: () => void }) {
   return (
     <div role="alert" className="flex flex-wrap items-center gap-3 rounded-md border border-unread/40 bg-unread/10 px-3 py-2 text-sm text-ink">
-      <p className="min-w-0 flex-1 break-words">This part did not load ({msg}). The rest of the page is unaffected.</p>
+      <p className="min-w-0 flex-1 break-words">This part did not load ({msg}). Retry asks the desk again.</p>
       <Button variant="outline" size="sm" className="min-h-11" onClick={onRetry}>Retry</Button>
     </div>
   );
@@ -55,17 +55,22 @@ export function Readings({ home, slots, equity, onRetry, onCollected }: {
     setCollecting(true);
     setStatus("");
     let problem = "";
+    let partial: string[] = [];
     try {
       const r = await fetch("/api/collect", { method: "POST" });
       const body = await r.json().catch(() => null);
       if (!r.ok) problem = (body && body.error) || "the desk answered " + r.status;
-      else if (body && body.error) problem = body.error;
+      else if (body && typeof body.error === "string") problem = body.error;
+      else if (body && Array.isArray(body.errors)) partial = body.errors.map(String);
     } catch (e) {
       problem = e instanceof Error ? e.message : String(e);
     }
     if (problem) {
       setStatus("Could not collect right now. Nothing was written. Try again in a minute. Server said: " + problem);
       toast.error("Collect failed. Nothing was written.");
+    } else if (partial.length) {
+      setStatus("Collected one pass, but " + partial.length + (partial.length === 1 ? " market read" : " market reads") + " failed: " + partial.join("; "));
+      toast.warning("Collected one pass; " + partial.length + (partial.length === 1 ? " read" : " reads") + " failed.");
     } else {
       toast.success("Collected one pass into the tape.");
     }
@@ -79,7 +84,7 @@ export function Readings({ home, slots, equity, onRetry, onCollected }: {
   const word = !c ? "Checking" : c.snapshots_on_disk === 0 ? "Empty" : !c.collecting ? "Stale" : healthy ? "Healthy" : "Collecting";
   const dot = !c ? "bg-track" : c.collecting ? (healthy ? "bg-info-foreground" : "bg-dot-amber") : "bg-unread";
   const pot = s ? s.paper_equity_dollars : null;
-  const start = s ? s.paper_pot_start : 0;
+  const start = s ? s.paper_pot_start ?? 0 : 0;
   const target = (s?.stage_target ?? h?.stage_target)?.target_dollars ?? 1000;
   const pct = pot === null ? 0 : Math.max(0, Math.min(100, (pot / target) * 100));
   const change = pot === null ? 0 : pot - start;
@@ -145,7 +150,7 @@ export function Readings({ home, slots, equity, onRetry, onCollected }: {
             )}
             <p id="c-age" className={small}>newest {c ? ageWords(c.newest_snapshot_age_secs) : "unavailable"}</p>
           </div>
-          <Button id="collect-btn" className="min-h-11 self-start" disabled={collecting} onClick={collect}>{collecting ? "Collecting…" : "Collect now"}</Button>
+          {h && <Button id="collect-btn" className="min-h-11 self-start" disabled={collecting} onClick={collect}>{collecting ? "Collecting…" : "Collect now"}</Button>}
         </div>
         <div className={cell}>
           <p className={label}>Venue balance<span className="text-xs text-info-foreground">venue</span></p>
@@ -246,7 +251,7 @@ export function SlotsPanel({ read, equity, onRetry, notes }: { read: Read<Slots>
                 return (
                   <TableRow key={(r.retired ? "r" : "s") + r.slot} className={r.retired ? "text-ink-2" : undefined}>
                     <TableCell data-label="Slot" className="stack-first c-slot font-mono">{r.slot + 1}</TableCell>
-                    <TableCell data-label="Strategy" className="c-name max-w-56 font-mono"><span className="block break-words md:truncate" title={r.strategy}>{r.strategy}</span></TableCell>
+                    <TableCell data-label="Strategy" className="c-name max-w-56 font-mono"><span className="block [overflow-wrap:anywhere] md:truncate" title={r.strategy}>{r.strategy}</span></TableCell>
                     <TableCell data-label="Status" className="c-status">
                       <Pill variant="outline" className={"h-auto " + (r.retired ? "text-ink-2" : "text-success-foreground")}>
                         <PillStatus className="border-r-0 pr-0"><PillIndicator variant={r.retired ? "warning" : "success"} />{r.retired ? "retired" : r.status ?? "active"}</PillStatus>
