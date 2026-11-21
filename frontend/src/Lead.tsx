@@ -62,22 +62,23 @@ export function standingLine(read: Read<Strategy[]> | null, dataset: Dataset): S
     // Names only for a real forward pass: that is the news. The example tape's passes are named in the table.
     const names = example ? [] : proven.map((s) => String(s?.strategy ?? "")).filter(Boolean);
     const shown = names.slice(0, 2).join(" and ") + (names.length > 2 ? " and " + (names.length - 2) + " more" : "");
-    rows.push({ n: proven.length, text: example ? "pass on the example tape only" : "proven" + (shown ? " — " + shown : "") });
+    rows.push({ n: proven.length, text: example ? "passed on the example tape only" : "proven" + (shown ? " — " + shown : "") });
   }
   if (failed.length) rows.push({ n: failed.length, text: "not proven" });
   if (short) rows.push({ n: short, text: sameNeed ? "below " + needs[0] + " traded windows" : "waiting for evidence" });
   // The figure is the tally the desk exists to answer. A fixture pass is never counted as forward-proven.
-  return { figure: (example ? 0 : proven.length) + " of " + all.length, label: "strategies proven on forward evidence", rows, news: !example && proven.length > 0 };
+  return { figure: (example ? 0 : proven.length) + " of " + all.length, label: "Strategies proven on forward evidence", rows, news: !example && proven.length > 0 };
 }
 
 export function Standing({ read, dataset }: { read: Read<Strategy[]> | null; dataset: Dataset }) {
   const line = standingLine(read, dataset);
   if (!line) return <span id="standing" className="block h-9 w-2/3 rounded-sm bg-track max-lg:order-3" aria-hidden />;
   return (
-    <div id="standing" role="group" aria-label="Proven strategies" className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-y-1 max-lg:order-3">
+    // A hairline sets the line apart from the day's P&L above it, and it leads with its subject, so it reads as a measure of the library, not as part of the P&L.
+    <div id="standing" role="group" aria-label="Proven strategies" className="-mt-0.5 grid min-w-0 grid-cols-[minmax(0,1fr)] gap-y-1 border-t border-hairline pt-1 max-lg:order-3 lg:mt-1 lg:pt-2">
       <p className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1 md:gap-x-2.5">
-        {line.figure && <span id="standing-figure" className="font-mono text-lg leading-none tabular-nums text-ink md:text-xl">{line.figure}</span>}
         <span id="standing-label" className={(line.figure ? "text-sm text-ink-2" : "text-[15px] font-medium text-ink") + " min-w-0"}>{line.label}</span>
+        {line.figure && <span id="standing-figure" className="font-mono text-lg leading-none tabular-nums text-ink md:text-xl">{line.figure}</span>}
       </p>
       {line.rows.length > 0 && (
         // On a phone the breakdown shows only when a forward pass is the news: otherwise the figure alone answers, and the pot stays on the first screen.
