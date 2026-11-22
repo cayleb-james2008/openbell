@@ -1500,7 +1500,7 @@ fn fmt_money(v: f64) -> String {
     if v < 0.0 {
         format!("-${:.2}", v.abs())
     } else {
-        format!("${:.2}", v)
+        format!("${v:.2}")
     }
 }
 
@@ -2898,11 +2898,11 @@ mod tests {
         // Windows with a tradeable snapshot 240s before close
         // (yes_ask 0.70 / no_ask 0.32), settled per `results`.
         let mut snaps = Vec::new();
-        for i in 0..n {
+        for (i, &res) in results.iter().enumerate().take(n) {
             let close = format!("2026-11-17T{:02}:00:00Z", 10 + i);
             let close_epoch = parse_iso_z(&close).unwrap();
             snaps.push(snap(&format!("W{i}"), close_epoch - 240, &close, "", Some(0.70), Some(0.32)));
-            snaps.push(snap(&format!("W{i}"), close_epoch + 60, &close, results[i], None, None));
+            snaps.push(snap(&format!("W{i}"), close_epoch + 60, &close, res, None, None));
         }
         snaps
     }
@@ -2926,7 +2926,7 @@ mod tests {
         assert_eq!(strategies.len(), 1);
         let mut snaps = Vec::new();
         for i in 0..2 {
-            let close = format!("2026-11-17T1{}:00:00Z", i);
+            let close = format!("2026-11-17T1{i}:00:00Z");
             let close_epoch = parse_iso_z(&close).unwrap();
             snaps.push(snap(&format!("W{i}"), close_epoch - 240, &close, "", Some(0.70), Some(0.32)));
             snaps.push(snap(&format!("W{i}"), close_epoch + 60, &close, "yes", None, None));
@@ -3209,7 +3209,6 @@ mod tests {
             .unwrap();
         let view = app.tape(&tape);
         assert_eq!((view.snaps.len(), view.total_lines), (2, 3), "garbage line counted, not parsed");
-        let snaps = &view.snaps;
         // Append-only growth: the held parse extends by the tail.
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new().append(true).open(&tape).unwrap();
@@ -3538,8 +3537,8 @@ mod tests {
     fn version_endpoint_names_the_running_build() {
         let (status, v) = body_json(&update_response("GET", "/api/version", "127.0.0.1:8472").unwrap());
         assert_eq!(status, 200);
-        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.2.0")));
-        assert_eq!(v["release_url"], json!("https://github.com/cayleb-james2008/openbell/releases/tag/v0.2.0"));
+        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.3.0")));
+        assert_eq!(v["release_url"], json!("https://github.com/cayleb-james2008/openbell/releases/tag/v0.3.0"));
     }
 
     #[test]
@@ -3549,7 +3548,7 @@ mod tests {
         for key in ["name", "current", "mode", "repo", "platform", "checked_at", "available", "latest", "notes", "release_url", "error", "staged", "can_apply", "dev_build"] {
             assert!(u.get(key).is_some(), "missing {key}: {u}");
         }
-        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!("0.2.0"), json!(false)));
+        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!("0.3.0"), json!(false)));
         assert!(u["checked_at"].is_null(), "nothing is fetched until a check is asked for");
         assert_eq!(u["staged"], Value::Null);
     }
@@ -3589,7 +3588,7 @@ mod tests {
             analysis_cache: std::sync::Mutex::new(None),
         };
         let (_, home) = body_json(&handle(&app, "GET", "/api/home"));
-        assert_eq!(home["version"], json!("0.2.0"));
+        assert_eq!(home["version"], json!("0.3.0"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
