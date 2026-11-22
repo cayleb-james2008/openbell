@@ -248,6 +248,13 @@ for (const m of measures) {
   const lightLum = await lum()
   await p.locator('#settings-btn').click(); await p.waitForTimeout(400)
   ok('Settings Vaul sheet opens with Appearance Light/Dark', await p.locator('[data-settings-drawer]').isVisible() && await p.locator('#themeBtn').isVisible())
+  const liveSettingsOk =
+    (await p.locator('#settings-live-config').isVisible()) &&
+    (await p.locator('#live-api-key-id').count()) === 1 &&
+    (await p.locator('#live-pem-path').count()) === 1 &&
+    (await p.locator('#rail-max-contracts').count()) === 1 &&
+    (await p.locator('#save-live-config-btn').count()) === 1
+  ok('Settings Vaul sheet includes Kalshi API & Hard Risk Rails configuration panel', liveSettingsOk)
   await p.locator('#themeBtn').getByRole('button', { name: 'Dark', exact: true }).click(); await p.waitForTimeout(250)
   const darkLum = await lum()
   ok('Dark switch inside Settings updates <html data-theme>, localStorage, and darkens page bg',
@@ -281,6 +288,22 @@ for (const m of measures) {
   ok('standing line counts 0 forward-proven on example tape across full library',
     stratTotal >= 5 && (await p.locator('#standing-figure').textContent()).trim() === `0 of ${stratTotal}` && tally.some(t => /passed on the example tape only/.test(t)),
     `total=${stratTotal} tally=${JSON.stringify(tally)}`)
+
+  // v0.8.0: zero outdated "paper-only / no orders" claims + Live Account Strip, Order Ticket, Risk Rails & Kill Switch
+  const noStalePaperOnly = await p.evaluate(() => !/paper-only|no orders|zero order paths|zero live order paths|places no orders/i.test(document.body.innerText))
+  ok('zero outdated paper-only or no-orders copy across desk chrome (v0.8.0)', noStalePaperOnly)
+  await p.locator('#toggle-live-ticket-btn').click(); await p.waitForTimeout(200)
+  const liveTicketOk =
+    (await p.locator('#live-account-strip').isVisible()) &&
+    (await p.locator('#trading-mode-paper').isVisible()) &&
+    (await p.locator('#trading-mode-live').isVisible()) &&
+    (await p.locator('#kill-switch-btn').isVisible()) &&
+    (await p.locator('#live-order-ticket').isVisible()) &&
+    (await p.locator('#live-risk-rails-check [data-risk-rail]').count()) === 7
+  ok('Live Kalshi Account Strip, Order Ticket, 7 Hard Risk Rails & Emergency Kill Switch render', liveTicketOk)
+  await p.locator('#live-account-strip').scrollIntoViewIfNeeded(); await p.waitForTimeout(150)
+  await p.screenshot({ path: `${OUT}/live-desk-1440-light.png` })
+  await p.locator('#toggle-live-ticket-btn').click(); await p.waitForTimeout(150)
 
   // Live 15m Tape: Auto-Collector strip (Off / 60s / 180s + 200-window Readiness Gate bar), dynamic series chips, Price & Spread crosshair, Market Inspector
   const autoCollectorOk =
@@ -389,7 +412,7 @@ for (const m of measures) {
     `${dlMd.suggestedFilename()} | ${dlCsv.suggestedFilename()}`)
   await p.locator('#report-body').getByText('Show full report').click(); await p.waitForTimeout(400)
   ok('full daily report expands in place', await p.locator('#report').isVisible())
-  ok('read-only Venue Account panel renders', await p.locator('#account').isVisible())
+  ok('Connected Kalshi Account panel renders', await p.locator('#account').isVisible())
   const slotsM = await p.evaluate(MEASURE)
   ok('Slot Desk passes full geometry, contrast & SVG checks at 1440',
     slotsM.docOverflow <= 0 && slotsM.lowContrast === 0 && slotsM.svgBad === 0 && slotsM.smallTargets === 0,
@@ -525,10 +548,41 @@ for (const m of measures) {
   await ctx.close()
 }
 
-// 5. v0.7.0 API Wire-Contract E2E (proves live SSE, Auto-Collector Schedule, Tournament, Recalibration, Scale Plan, Calibration, Monte Carlo, Walk-Forward, Validate, Backtest & Export wiring)
+// 5. v0.8.0 API Wire-Contract E2E (proves live Kalshi v2 Account/Config/Arm/Order/Cancel/Kill-Switch + CSRF, SSE, Auto-Collector Schedule, Tournament, Recalibration, Scale Plan, Calibration, Monte Carlo, Walk-Forward, Validate, Backtest & Export wiring)
 {
   const { ctx, p } = await open(1440, 900)
   const hits = new Set()
+  let csrfChecked = 0
+  const checkCsrf = r => {
+    const h = r.request().headers()
+    if (h['x-openbell-csrf'] === '1' && (h['content-type'] || '').includes('application/json')) csrfChecked++
+  }
+  let liveState = {
+    configured: false,
+    environment: 'demo',
+    api_base_url: 'https://demo-api.kalshi.co/trade-api/v2',
+    key_id_masked: null,
+    key_path_configured: false,
+    connected: false,
+    mode: 'paper',
+    live_armed: false,
+    killed: false,
+    kill_reason: null,
+    rails: {
+      max_order_contracts: 25,
+      max_order_dollars: 25,
+      max_daily_loss_dollars: 50,
+      max_open_exposure_dollars: 100,
+      allowed_ticker_prefix: 'KX',
+    },
+    daily_realized_loss_dollars: 0,
+    open_exposure_dollars: 5.5,
+    orders_placed_today: 0,
+    last_error: null,
+  }
+  let liveOrders = [
+    { order_id: 'ord-demo-1', client_order_id: 'ob-1', ticker: 'KXBTC15M-MOCK', action: 'buy', side: 'yes', status: 'resting', count: 5, remaining_count: 5, price_cents: 55, created_time: '2026-11-22T09:00:00Z' },
+  ]
   let schedState = {
     enabled: false,
     interval_secs: 60,
@@ -557,8 +611,8 @@ for (const m of measures) {
   await p.route('**/api/home', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.7.0'
-    j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan', 'tournament', 'auto_collector']
+    j.version = '0.8.0'
+    j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan', 'tournament', 'auto_collector', 'live_kalshi', 'risk_rails']
     j.collector = {
       ...j.collector,
       auto_collect_enabled: schedState.enabled,
@@ -568,6 +622,117 @@ for (const m of measures) {
       readiness_progress_pct: 70,
     }
     return r.fulfill({ response: res, body: JSON.stringify(j) })
+  })
+  await p.route('**/api/live/status*', r => {
+    hits.add('live-status')
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(liveState) })
+  })
+  await p.route('**/api/live/account*', r => {
+    hits.add('live-account')
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        configured: liveState.configured,
+        connected: liveState.connected,
+        balance_dollars: liveState.configured ? 1250.0 : null,
+        portfolio_value_dollars: liveState.configured ? 1312.5 : null,
+        daily_pnl_dollars: liveState.configured ? 18.25 : null,
+        note: liveState.configured ? 'Connected to Kalshi v2 Demo.' : 'Not configured.',
+      }),
+    })
+  })
+  await p.route('**/api/live/positions*', r => {
+    hits.add('live-positions')
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        positions: liveState.configured
+          ? [{ ticker: 'KXBTC15M-MOCK', side: 'yes', position: 10, market_exposure_dollars: 5.5, realized_pnl_dollars: 2.1, resting_orders_count: 1 }]
+          : [],
+      }),
+    })
+  })
+  await p.route('**/api/live/orders/*', r => {
+    if (r.request().method() === 'DELETE') {
+      checkCsrf(r)
+      hits.add('live-cancel')
+      const id = r.request().url().split('/').pop()
+      liveOrders = liveOrders.filter(o => o.order_id !== id)
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, order_id: id }) })
+    }
+    return r.continue()
+  })
+  await p.route('**/api/live/orders', r => {
+    hits.add('live-orders')
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ orders: liveState.configured ? liveOrders : [] }) })
+  })
+  await p.route('**/api/live/fills*', r => {
+    hits.add('live-fills')
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        fills: liveState.configured
+          ? [{ trade_id: 'fill-1', order_id: 'ord-0', ticker: 'KXBTC15M-MOCK', action: 'buy', side: 'yes', count: 10, price_cents: 55, fee_dollars: 0.17, created_time: '2026-11-22T08:55:00Z' }]
+          : [],
+      }),
+    })
+  })
+  await p.route('**/api/live/config*', r => {
+    checkCsrf(r)
+    hits.add('live-config')
+    const b = JSON.parse(r.request().postData() || '{}')
+    liveState = {
+      ...liveState,
+      configured: true,
+      connected: true,
+      environment: b.environment || 'demo',
+      key_id_masked: 'demo-key-…89ab',
+      key_path_configured: true,
+      rails: b.rails || liveState.rails,
+    }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(liveState) })
+  })
+  await p.route('**/api/live/arm*', r => {
+    checkCsrf(r)
+    hits.add('live-arm')
+    liveState = { ...liveState, live_armed: true, killed: false, mode: 'live' }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(liveState) })
+  })
+  await p.route('**/api/live/disarm*', r => {
+    checkCsrf(r)
+    hits.add('live-disarm')
+    liveState = { ...liveState, live_armed: false, mode: 'paper' }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(liveState) })
+  })
+  await p.route('**/api/live/order', r => {
+    checkCsrf(r)
+    hits.add('live-order')
+    const b = JSON.parse(r.request().postData() || '{}')
+    const ord = {
+      order_id: 'ord-demo-2',
+      client_order_id: b.client_order_id || 'ob-2',
+      ticker: b.ticker,
+      action: b.action,
+      side: b.side,
+      status: 'resting',
+      count: b.count,
+      remaining_count: b.count,
+      price_cents: b.price_cents,
+      created_time: '2026-11-22T09:05:00Z',
+    }
+    liveOrders = [ord, ...liveOrders]
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, order: ord }) })
+  })
+  await p.route('**/api/live/kill-switch*', r => {
+    checkCsrf(r)
+    hits.add('live-kill')
+    const n = liveOrders.length
+    liveOrders = []
+    liveState = { ...liveState, live_armed: false, killed: true, kill_reason: 'operator_kill_switch', mode: 'paper' }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, disarmed: true, cancelled_count: n, errors: [], status: liveState }) })
   })
   await p.route('**/api/collector/status*', r => {
     hits.add('collector-status')
@@ -819,6 +984,30 @@ for (const m of measures) {
   })
 
   await p.goto(BASE); await ready(p); await p.waitForTimeout(450)
+  // Full Live Kalshi v2 flow: Settings Config -> Arm Confirmation Modal -> Submit Order -> Cancel Order -> Kill Switch
+  await p.locator('#settings-btn').click(); await p.waitForTimeout(350)
+  await p.locator('#live-api-key-id').fill('demo-key-123456789ab')
+  await p.locator('#live-pem-path').fill('/tmp/mock-kalshi-demo.pem')
+  await p.locator('#save-live-config-btn').click(); await p.waitForTimeout(450)
+  await p.getByRole('button', { name: 'Close settings', exact: true }).click(); await p.waitForTimeout(500)
+  const balanceShown = (await p.locator('#live-balance-val').innerText()).includes('$1250.00') ||
+    (await p.locator('#live-balance-val').innerText()).includes('$1,250.00')
+  await p.locator('#trading-mode-live').click(); await p.waitForTimeout(300)
+  await p.locator('#arm-live-checkbox').check()
+  await p.locator('#confirm-arm-live-btn').click(); await p.waitForTimeout(400)
+  const armedPillOk = (await p.locator('#live-mode-pill').innerText()).includes('Live Armed')
+  await p.locator('#live-ticket-ticker').fill('KXBTC15M-MOCK')
+  await p.locator('#live-ticket-count').fill('5')
+  await p.locator('#live-ticket-price').fill('55')
+  await p.waitForTimeout(100)
+  await p.locator('#submit-live-order-btn').click(); await p.waitForTimeout(300)
+  await p.locator('#live-account-strip').scrollIntoViewIfNeeded(); await p.waitForTimeout(150)
+  await p.screenshot({ path: `${OUT}/live-armed-1440-light.png` })
+  await p.locator('[data-cancel-order="ord-demo-1"]').click(); await p.waitForTimeout(250)
+  await p.locator('#kill-switch-btn').click(); await p.waitForTimeout(300)
+  const disarmedAfterKill = (await p.locator('#live-mode-pill').innerText()).includes('Paper Mode')
+  await p.locator('#toggle-live-ticket-btn').click(); await p.waitForTimeout(150)
+
   await p.locator('#auto-collector-strip [data-collector-mode="60"]').click(); await p.waitForTimeout(250)
   const schedUpdated = (await p.locator('#auto-collector-status-pill').innerText()).includes('Auto · 60s') &&
     (await p.locator('#readiness-progress').innerText()).includes('140 / 200')
@@ -833,6 +1022,10 @@ for (const m of measures) {
   const evGateText = await p.locator('#ev-gate-impact').innerText()
   const tournamentText = await p.locator('#quant-tournament').innerText()
   const serverEngineShown =
+    balanceShown &&
+    armedPillOk &&
+    disarmedAfterKill &&
+    csrfChecked >= 5 &&
     schedUpdated &&
     (await p.locator('#quant-calibration').innerText()).includes('Server Quant Engine') &&
     (await p.locator('#quant-scale-planner').innerText()).includes('Server Scale Engine') &&
@@ -844,9 +1037,9 @@ for (const m of measures) {
     scorecardText.includes('-0.65c/ct') &&
     scorecardText.includes('3.10%') &&
     evGateText.includes('+$8.60')
-  ok('v0.7.0 live API contract integrates SSE, auto-collector schedule, tournament, recalibration, scale-plan, validate, backtest, export, calibration, walkforward & montecarlo',
-    ['sse', 'collector-status', 'collector-schedule', 'tournament', 'recalibration', 'scale-plan', 'calibration', 'walkforward', 'montecarlo', 'validate', 'backtest', 'export'].every(k => hits.has(k)) && serverEngineShown,
-    `hits=${[...hits].sort().join(',')} serverEngine=${serverEngineShown} sched=${schedUpdated}`)
+  ok('v0.8.0 live API contract integrates Kalshi v2 config/arm/order/cancel/kill-switch + CSRF, SSE, auto-collector, tournament, recalibration, scale-plan, validate, backtest, export, calibration, walkforward & montecarlo',
+    ['live-status', 'live-account', 'live-positions', 'live-orders', 'live-fills', 'live-config', 'live-arm', 'live-order', 'live-cancel', 'live-kill', 'sse', 'collector-status', 'collector-schedule', 'tournament', 'recalibration', 'scale-plan', 'calibration', 'walkforward', 'montecarlo', 'validate', 'backtest', 'export'].every(k => hits.has(k)) && serverEngineShown,
+    `hits=${[...hits].sort().join(',')} csrf=${csrfChecked} bal=${balanceShown} armed=${armedPillOk} kill=${disarmedAfterKill} serverEngine=${serverEngineShown}`)
   await ctx.close()
 }
 

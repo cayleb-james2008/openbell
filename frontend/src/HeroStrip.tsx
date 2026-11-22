@@ -291,7 +291,7 @@ export function HeroStrip({
               {dataset === "fixture" ? "Paper Compounding Curve (Example Tape)" : "Paper Compounding Curve"}
             </h2>
             <span className="font-mono text-xs text-ink-3">
-              <span className="hidden sm:inline">Hover to inspect · </span>Paper only
+              <span className="hidden sm:inline">Hover to inspect · </span>Paper sim
             </span>
           </div>
           <HeroEquityChart

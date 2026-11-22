@@ -4,6 +4,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { Command } from "cmdk";
 import {
   Activity,
+  AlertOctagon,
   BarChart3,
   Code2,
   Dices,
@@ -53,6 +54,8 @@ export function CommandPalette({
   onCollect,
   onExportReport,
   onReseedMonteCarlo,
+  onOpenOrderTicket,
+  onKillSwitch,
   onOpenSettings,
 }: {
   open: boolean;
@@ -69,6 +72,8 @@ export function CommandPalette({
   onCollect: () => void;
   onExportReport: (format: "md" | "csv") => void;
   onReseedMonteCarlo: () => void;
+  onOpenOrderTicket: () => void;
+  onKillSwitch: () => void;
   onOpenSettings: () => void;
 }) {
   const closeAnd = (fn: () => void) => {
@@ -87,7 +92,7 @@ export function CommandPalette({
         >
           <Dialog.Title className="sr-only">OpenBell Command Palette</Dialog.Title>
           <Dialog.Description className="sr-only">
-            Jump to any 15-minute market ticker, strategy, slot, Quant Lab panel, or paper-only desk action.
+            Jump to any 15-minute market ticker, strategy, slot, Quant Lab panel, live order ticket, or desk action.
           </Dialog.Description>
 
           <Command label="OpenBell Command Palette" className="flex flex-col">
@@ -276,9 +281,31 @@ export function CommandPalette({
               </Command.Group>
 
               <Command.Group
-                heading="Paper Desk Actions"
+                heading="Desk & Live Kalshi Actions"
                 className="mb-2 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-ink-3"
               >
+                <Command.Item
+                  value="Open Live Kalshi Order Ticket Positions Orders Fills"
+                  onSelect={() => closeAnd(onOpenOrderTicket)}
+                  className="flex min-h-11 cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-2 text-sm text-ink outline-none data-[selected=true]:bg-blue-soft sm:min-h-9"
+                >
+                  <span className="flex items-center gap-2">
+                    <SlidersHorizontal className="size-4 text-info-foreground" aria-hidden />
+                    <span>Open Live Order Ticket &amp; Portfolio</span>
+                  </span>
+                  <span className="mono text-xs text-ink-3">Kalshi v2</span>
+                </Command.Item>
+                <Command.Item
+                  value="Emergency Kill Switch cancel all resting orders disarm live"
+                  onSelect={() => closeAnd(onKillSwitch)}
+                  className="flex min-h-11 cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-2 text-sm text-destructive-foreground outline-none data-[selected=true]:bg-blue-soft sm:min-h-9"
+                >
+                  <span className="flex items-center gap-2">
+                    <AlertOctagon className="size-4 text-destructive-foreground" aria-hidden />
+                    <span>Emergency Kill Switch (Cancel All &amp; Disarm)</span>
+                  </span>
+                  <span className="mono text-xs text-destructive-foreground">Kill Switch</span>
+                </Command.Item>
                 <Command.Item
                   value="Collect live Kalshi tape now"
                   onSelect={() => closeAnd(onCollect)}
@@ -422,7 +449,7 @@ export function CommandPalette({
             </Command.List>
 
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline bg-board/60 px-3.5 py-2 text-xs text-ink-3">
-              <span>Paper-only navigation · Zero order paths</span>
+              <span>Live Kalshi Connected Trading &amp; Quant Desk</span>
               <span className="flex items-center gap-1.5">
                 <Kbd>↑↓</Kbd>
                 <span>navigate</span>

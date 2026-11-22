@@ -1,6 +1,6 @@
-// OpenBell v0.5.0 — Institutional Kalshi 15-Minute Quant Research & Paper Compounding Desk.
+// OpenBell v0.8.0 — Live Kalshi Connected Trading & 15-Minute Quant Desk.
 // Light default + full Dark inside Settings Vaul sheet ONLY (#67); opaque sticky header (zero backdrop-blur);
-// 4-tab workbench (Live 15m Tape, Rune Strategies, Slot Desk, Quant Lab) + Cmd+K Command Palette + strict paper-only invariant.
+// Live Kalshi v2 account/positions/orders/fills + Hard Risk Rails + Emergency Kill Switch + 4-tab workbench + Cmd+K.
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MotionConfig } from "motion/react";
 import { Bell, RefreshCw, Search, Settings, X } from "lucide-react";
@@ -32,7 +32,21 @@ import {
   setCollectorSchedule,
   useDesk,
 } from "@/lib/desk";
+import {
+  type LiveConfigPayload,
+  type LiveDeskBundle,
+  type LiveOrderPayload,
+  armLiveTrading,
+  cancelLiveOrder,
+  defaultLiveStatus,
+  disarmLiveTrading,
+  fetchLiveBundle,
+  saveLiveConfig,
+  submitLiveOrder,
+  triggerKillSwitch,
+} from "@/lib/live";
 import { HeroStrip } from "@/HeroStrip";
+import { LiveAccountStrip, LiveDeskWorkspace } from "@/LiveTradingPanel";
 import { TapeTab } from "@/TapeTab";
 import { StrategiesTab } from "@/StrategiesTab";
 import { SlotsTab } from "@/SlotsTab";
@@ -96,6 +110,25 @@ function Shell() {
   const [reseedSignal, setReseedSignal] = useState(0);
   const [collectorStatus, setCollectorStatus] = useState<CollectorScheduleStatus | null>(null);
   const [updatingSchedule, setUpdatingSchedule] = useState(false);
+  const [liveBundle, setLiveBundle] = useState<LiveDeskBundle>(() => ({
+    status: defaultLiveStatus("client"),
+    account: {
+      configured: false,
+      connected: false,
+      balanceDollars: null,
+      portfolioValueDollars: null,
+      dailyPnlDollars: null,
+      note: "Configure Kalshi v2 API credentials in Desk Settings to connect.",
+    },
+    positions: [],
+    orders: [],
+    fills: [],
+  }));
+  const [liveBusy, setLiveBusy] = useState(false);
+  const [savingLiveConfig, setSavingLiveConfig] = useState(false);
+  const [liveWorkspaceOpen, setLiveWorkspaceOpen] = useState(false);
+  const [ticketTicker, setTicketTicker] = useState<string | null>(null);
+  const [ticketPriceCents, setTicketPriceCents] = useState<number | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const { reads, load, stream } = useDesk(dataset);
@@ -110,7 +143,7 @@ function Shell() {
   const allFailed = !!reads && Object.values(reads).every((r) => !r.ok);
   const failMsg = reads && !reads.home.ok ? reads.home.msg : "";
   const isFixture = dataset === "fixture";
-  const versionText = home?.version || upd.version?.version || "0.7.0";
+  const versionText = home?.version || upd.version?.version || "0.8.0";
 
   const validMarkets = useMemo(
     () => (markets ? markets.filter((m): m is Market => !!m && typeof m === "object") : []),
@@ -246,6 +279,111 @@ function Shell() {
     void refreshCollectorStatus();
   }, [refreshCollectorStatus]);
 
+  const refreshLive = useCallback(async () => {
+    const next = await fetchLiveBundle(home);
+    setLiveBundle(next);
+  }, [home]);
+
+  useEffect(() => {
+    void refreshLive();
+  }, [refreshLive]);
+
+  const handleSaveLiveConfig = useCallback(
+    async (payload: LiveConfigPayload) => {
+      setSavingLiveConfig(true);
+      try {
+        const nextStatus = await saveLiveConfig(payload, home);
+        setLiveBundle((prev) => ({ ...prev, status: nextStatus }));
+        toast.success(`Saved Kalshi ${nextStatus.environment.toUpperCase()} API & hard risk rails.`);
+        await refreshLive();
+      } catch (e) {
+        toast.error(`Could not save Kalshi config: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setSavingLiveConfig(false);
+      }
+    },
+    [home, refreshLive],
+  );
+
+  const handleArmLive = useCallback(async () => {
+    setLiveBusy(true);
+    try {
+      const nextStatus = await armLiveTrading(home);
+      setLiveBundle((prev) => ({ ...prev, status: nextStatus }));
+      setLiveWorkspaceOpen(true);
+      toast.warning(`Live Kalshi ${nextStatus.environment.toUpperCase()} trading ARMED with hard risk rails.`);
+      await refreshLive();
+    } catch (e) {
+      toast.error(`Arm failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setLiveBusy(false);
+    }
+  }, [home, refreshLive]);
+
+  const handleDisarmLive = useCallback(async () => {
+    setLiveBusy(true);
+    try {
+      const nextStatus = await disarmLiveTrading(home);
+      setLiveBundle((prev) => ({ ...prev, status: nextStatus }));
+      toast.success("Returned to Paper Mode (live order routing disarmed).");
+      await refreshLive();
+    } catch (e) {
+      toast.error(`Disarm failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setLiveBusy(false);
+    }
+  }, [home, refreshLive]);
+
+  const handleSubmitLiveOrder = useCallback(
+    async (payload: LiveOrderPayload) => {
+      setLiveBusy(true);
+      try {
+        const res = await submitLiveOrder(payload, home);
+        toast.success(
+          `Order ${res.orderId} submitted (${payload.action.toUpperCase()} ${payload.count} ${payload.side.toUpperCase()} @ ${payload.price_cents}c).`,
+        );
+        await refreshLive();
+      } catch (e) {
+        toast.error(`Order blocked: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setLiveBusy(false);
+      }
+    },
+    [home, refreshLive],
+  );
+
+  const handleCancelLiveOrder = useCallback(
+    async (orderId: string) => {
+      setLiveBusy(true);
+      try {
+        await cancelLiveOrder(orderId, home);
+        toast.success(`Cancelled resting order ${orderId}.`);
+        await refreshLive();
+      } catch (e) {
+        toast.error(`Cancel failed: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setLiveBusy(false);
+      }
+    },
+    [home, refreshLive],
+  );
+
+  const handleKillSwitch = useCallback(async () => {
+    setLiveBusy(true);
+    try {
+      const res = await triggerKillSwitch(home);
+      setLiveBundle((prev) => ({ ...prev, status: res.status }));
+      toast.error(
+        `Emergency Kill Switch triggered — disarmed live trading and cancelled ${res.cancelledCount} resting order${res.cancelledCount === 1 ? "" : "s"}.`,
+      );
+      await refreshLive();
+    } catch (e) {
+      toast.error(`Kill switch error: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setLiveBusy(false);
+    }
+  }, [home, refreshLive]);
+
   const handleSelectSchedule = useCallback(
     async (enabled: boolean, intervalSecs: number) => {
       setUpdatingSchedule(true);
@@ -293,13 +431,37 @@ function Shell() {
                 </div>
               </div>
               <Pill
+                id="live-mode-pill"
                 variant="outline"
-                className="hidden min-h-7 px-2.5 py-0.5 text-xs text-ink-2 sm:inline-flex"
-                title="Paper only: this build places no orders"
+                className={
+                  "hidden min-h-7 px-2.5 py-0.5 text-xs sm:inline-flex " +
+                  (liveBundle.status.liveArmed
+                    ? liveBundle.status.environment === "prod"
+                      ? "border-dot-red text-destructive-foreground"
+                      : "border-dot-amber text-warning-foreground"
+                    : "text-ink-2")
+                }
+                title={
+                  liveBundle.status.liveArmed
+                    ? `Live Kalshi ${liveBundle.status.environment.toUpperCase()} order routing ARMED with hard risk rails`
+                    : "Kalshi v2 connected desk · Disarmed (Paper Mode)"
+                }
               >
                 <PillStatus className="border-r-0 pr-0">
-                  <PillIndicator variant="info" />
-                  Paper-only · No orders
+                  <PillIndicator
+                    variant={
+                      liveBundle.status.killed
+                        ? "error"
+                        : liveBundle.status.liveArmed
+                          ? liveBundle.status.environment === "prod"
+                            ? "error"
+                            : "warning"
+                          : "info"
+                    }
+                  />
+                  {liveBundle.status.liveArmed
+                    ? `Kalshi ${liveBundle.status.environment.toUpperCase()} · Live Armed`
+                    : "Kalshi v2 · Paper Mode"}
                 </PillStatus>
               </Pill>
             </div>
@@ -473,6 +635,35 @@ function Shell() {
             collectingNow={collectingNow}
           />
 
+          {/* Live Kalshi v2 Connected Account Strip, Paper/Live Switcher & Emergency Kill Switch */}
+          <LiveAccountStrip
+            bundle={liveBundle}
+            busy={liveBusy}
+            workspaceOpen={liveWorkspaceOpen}
+            onToggleWorkspace={() => setLiveWorkspaceOpen((v) => !v)}
+            onArmConfirm={() => void handleArmLive()}
+            onDisarm={() => void handleDisarmLive()}
+            onKillSwitch={() => void handleKillSwitch()}
+            onRefresh={() => void refreshLive()}
+            onOpenSettings={() => setSettingsOpen(true)}
+          />
+
+          {liveWorkspaceOpen && (
+            <LiveDeskWorkspace
+              bundle={liveBundle}
+              markets={validMarkets}
+              prefillTicker={ticketTicker}
+              prefillPriceCents={ticketPriceCents}
+              busy={liveBusy}
+              onSubmitOrder={handleSubmitLiveOrder}
+              onCancelOrder={handleCancelLiveOrder}
+              onRequestArm={() => {
+                document.getElementById("trading-mode-live")?.click();
+              }}
+              onOpenSettings={() => setSettingsOpen(true)}
+            />
+          )}
+
           {/* 4-Tab Institutional Quant Workbench: COSS UI Tabs + Motion Primitives AnimatedBackground */}
           <section aria-label="Quant research workbench" className="space-y-3">
             <Tabs value={tab} onValueChange={(v) => setTab(v as DeskTabId)}>
@@ -591,6 +782,12 @@ function Shell() {
                     setTab("quant");
                     setQuantFocus("scorecard");
                   }}
+                  onTradeMarket={(ticker, askCents) => {
+                    setTicketTicker(ticker);
+                    setTicketPriceCents(askCents);
+                    setLiveWorkspaceOpen(true);
+                    document.getElementById("live-account-strip")?.scrollIntoView({ behavior: "smooth", block: "start" });
+                  }}
                   onRetry={load}
                   onCollect={runCollect}
                   collectingNow={collectingNow}
@@ -622,6 +819,12 @@ function Shell() {
                   equityRead={reads?.equity}
                   homeRead={reads?.home}
                   reportRead={reads?.report}
+                  liveBundle={liveBundle}
+                  onOpenOrderTicket={() => {
+                    setLiveWorkspaceOpen(true);
+                    document.getElementById("live-account-strip")?.scrollIntoView({ behavior: "smooth", block: "start" });
+                  }}
+                  onOpenSettings={() => setSettingsOpen(true)}
                   dataset={dataset}
                   search={search}
                   onRetry={load}
@@ -647,13 +850,13 @@ function Shell() {
 
         <footer className="mt-auto border-t border-hairline bg-surface">
           <div className="mx-auto flex max-w-[1360px] flex-wrap items-center justify-between gap-2 px-4 py-3 text-xs text-ink-2 sm:px-6">
-            <span className="mono">OpenBell v{versionText} · Paper-only Kalshi 15m research desk · Zero order paths</span>
+            <span className="mono">OpenBell v{versionText} · Live Kalshi Connected Trading &amp; Quant Desk · Hard Risk Rails</span>
             <button
               type="button"
               onClick={() => setSettingsOpen(true)}
               className="inline-flex min-h-11 cursor-pointer items-center rounded-md px-2 text-xs font-medium text-ink underline-offset-4 hover:underline sm:min-h-8"
             >
-              Settings, Appearance &amp; Updates
+              Settings, API Keys &amp; Risk Rails
             </button>
           </div>
         </footer>
@@ -694,6 +897,11 @@ function Shell() {
             setQuantFocus("montecarlo");
             setReseedSignal((n) => n + 1);
           }}
+          onOpenOrderTicket={() => {
+            setLiveWorkspaceOpen(true);
+            document.getElementById("live-account-strip")?.scrollIntoView({ behavior: "smooth", block: "start" });
+          }}
+          onKillSwitch={() => void handleKillSwitch()}
           onOpenSettings={() => setSettingsOpen(true)}
         />
 
@@ -706,6 +914,9 @@ function Shell() {
           collectorStatus={collectorStatus}
           updatingSchedule={updatingSchedule}
           onSelectSchedule={(en, sec) => void handleSelectSchedule(en, sec)}
+          liveStatus={liveBundle.status}
+          savingLiveConfig={savingLiveConfig}
+          onSaveLiveConfig={handleSaveLiveConfig}
           collectingNow={collectingNow}
           onCollect={runCollect}
           upd={upd}

@@ -6,7 +6,9 @@ import { SegmentedControl, SegmentedControlItem } from "@/components/ui/segmente
 import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
 import { useWide } from "@/lib/media";
 import { type CollectorScheduleStatus, type Home, ageWords, isNum } from "@/lib/desk";
+import type { LiveConfigPayload, LiveStatus } from "@/lib/live";
 import { AutoCollectorStrip } from "@/AutoCollectorStrip";
+import { LiveSettingsSection } from "@/LiveTradingPanel";
 import { VersionRow, type UpdatesHandle } from "@/Update";
 
 export function SettingsSheet({
@@ -18,6 +20,9 @@ export function SettingsSheet({
   collectorStatus,
   updatingSchedule,
   onSelectSchedule,
+  liveStatus,
+  savingLiveConfig,
+  onSaveLiveConfig,
   collectingNow,
   onCollect,
   upd,
@@ -30,6 +35,9 @@ export function SettingsSheet({
   collectorStatus: CollectorScheduleStatus | null;
   updatingSchedule: boolean;
   onSelectSchedule: (enabled: boolean, intervalSecs: number) => void;
+  liveStatus: LiveStatus;
+  savingLiveConfig: boolean;
+  onSaveLiveConfig: (payload: LiveConfigPayload) => Promise<void>;
   collectingNow: boolean;
   onCollect: () => void;
   upd: UpdatesHandle;
@@ -58,7 +66,7 @@ export function SettingsSheet({
             <div>
               <Drawer.Title className="text-base font-semibold text-ink">Desk Settings</Drawer.Title>
               <Drawer.Description className="text-xs text-ink-2">
-                Appearance, live Kalshi collector health, updates, and provenance tags.
+                Appearance, Kalshi API credentials, risk rails, collector schedule, and updates.
               </Drawer.Description>
             </div>
             <Button
@@ -104,6 +112,13 @@ export function SettingsSheet({
                 ))}
               </SegmentedControl>
             </section>
+
+            {/* Kalshi v2 API Credentials & Hard Risk Rails */}
+            <LiveSettingsSection
+              status={liveStatus}
+              saving={savingLiveConfig}
+              onSaveConfig={onSaveLiveConfig}
+            />
 
             {/* Live Kalshi Collector & Cadence */}
             <section aria-labelledby="settings-collector-heading" className="space-y-3 border-t border-hairline pt-5">
@@ -214,7 +229,7 @@ export function SettingsSheet({
                     </Pill>
                   </dt>
                   <dd className="text-ink-2">
-                    Shadow compounding simulation scored over collected tape. Paper only: this binary has zero order-placement code.
+                    Shadow compounding simulation scored over collected tape alongside live Kalshi v2 order routing.
                   </dd>
                 </div>
               </dl>
