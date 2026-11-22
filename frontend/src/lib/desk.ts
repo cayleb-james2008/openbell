@@ -217,6 +217,12 @@ export function supportsV070(home: Home | null, capability?: string): boolean {
   return semverAtLeast(home.version, [0, 7, 0]);
 }
 
+export function supportsV080(home: Home | null, capability?: string): boolean {
+  if (!home) return false;
+  if (capability && hasCapability(home.capabilities, capability)) return true;
+  return semverAtLeast(home.version, [0, 8, 0]);
+}
+
 export type CollectorScheduleStatus = {
   enabled: boolean;
   intervalSecs: number;
@@ -726,7 +732,7 @@ export function buildLocalCsvReport(slots: Slots | null, reportText: string): st
     reportText
       .split("\n")
       .map((l) => l.trim())
-      .find((l) => l.length > 0) || "OpenBell paper-only daily report";
+      .find((l) => l.length > 0) || "OpenBell Kalshi 15m daily desk report";
   const lines: string[] = [
     `# ${firstLine.replace(/[\r\n]+/g, " ")}`,
     "record_type,slot,strategy,status,strikes,windows_traded,price_cents,contracts,pnl_dollars,equity_dollars,close_epoch_utc",
@@ -847,7 +853,7 @@ export async function exportDailyReport(
 
   const content =
     format === "md"
-      ? (reportText || "# OpenBell Paper-Only Daily Report\n\nNo report text loaded yet.\n")
+      ? (reportText || "# OpenBell Daily Desk Report\n\nNo report text loaded yet.\n")
       : buildLocalCsvReport(slots, reportText);
   triggerFileDownload(fallbackName, content, mime);
   return { filename: fallbackName, source: "client", bytes: content.length };

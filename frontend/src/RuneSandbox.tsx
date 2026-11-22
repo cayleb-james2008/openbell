@@ -213,7 +213,7 @@ export function RuneSandbox({
           <div className="overflow-hidden rounded-lg border border-hairline bg-board">
             <div className="flex items-center justify-between border-b border-hairline bg-surface px-3 py-1.5 font-mono text-xs text-ink-3">
               <span>{loadedFrom === "template" ? "sandbox.rn" : `${loadedFrom}.rn`}</span>
-              <span>{lineCount} lines · whole-cent paper only</span>
+              <span>{lineCount} lines · whole-cent sim</span>
             </div>
             <div className="flex">
               <div

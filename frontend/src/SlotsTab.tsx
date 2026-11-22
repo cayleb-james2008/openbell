@@ -25,6 +25,8 @@ import {
   moneySigned,
 } from "@/lib/desk";
 
+import type { LiveDeskBundle } from "@/lib/live";
+
 function StrikeTracker({ strikes = 0 }: { strikes?: number }) {
   const n = isNum(strikes) ? Math.min(3, Math.max(0, Math.round(strikes))) : 0;
   const data: TrackerBlockProps[] = [0, 1, 2].map((i) => ({
@@ -46,6 +48,9 @@ export function SlotsTab({
   equityRead,
   homeRead,
   reportRead,
+  liveBundle,
+  onOpenOrderTicket,
+  onOpenSettings,
   dataset,
   search,
   onRetry,
@@ -54,6 +59,9 @@ export function SlotsTab({
   equityRead?: Read<Equity>;
   homeRead?: Read<Home>;
   reportRead?: Read<Report>;
+  liveBundle: LiveDeskBundle;
+  onOpenOrderTicket: () => void;
+  onOpenSettings: () => void;
   dataset: Dataset;
   search: string;
   onRetry: () => void;
@@ -422,33 +430,55 @@ export function SlotsTab({
         </div>
 
         <div id="account" className="rounded-[10px] border border-hairline bg-surface p-4 lg:col-span-5">
-          <div className="flex items-center justify-between gap-2">
-            <h3 className="text-sm font-semibold text-ink">Venue Account (Read-only)</h3>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold text-ink">Connected Kalshi Account</h3>
             <ProvenanceTag kind="venue" />
           </div>
-          {home?.account ? (
+          {liveBundle.status.configured || home?.account ? (
             <>
               <dl className="mt-3 grid grid-cols-3 gap-2">
                 <div className="rounded-lg border border-hairline bg-board p-2.5">
-                  <dt className="text-xs text-ink-3">Balance</dt>
-                  <dd className="mono mt-1 text-xs font-semibold text-ink">{money(home.account.balance)}</dd>
-                </div>
-                <div className="rounded-lg border border-hairline bg-board p-2.5">
-                  <dt className="text-xs text-ink-3">Day P&amp;L</dt>
-                  <dd className="mono mt-1 text-xs font-semibold text-ink">{moneySigned(home.account.day_pnl)}</dd>
-                </div>
-                <div className="rounded-lg border border-hairline bg-board p-2.5">
-                  <dt className="text-xs text-ink-3">Positions</dt>
+                  <dt className="text-xs text-ink-3">Cash Balance</dt>
                   <dd className="mono mt-1 text-xs font-semibold text-ink">
-                    {Array.isArray(home.account.open_positions) ? home.account.open_positions.length : "unavailable"}
+                    {money(liveBundle.account.balanceDollars ?? home?.account.balance ?? null)}
+                  </dd>
+                </div>
+                <div className="rounded-lg border border-hairline bg-board p-2.5">
+                  <dt className="text-xs text-ink-3">Portfolio / Day</dt>
+                  <dd className="mono mt-1 text-xs font-semibold text-ink">
+                    {liveBundle.account.portfolioValueDollars !== null
+                      ? money(liveBundle.account.portfolioValueDollars)
+                      : moneySigned(home?.account.day_pnl ?? null)}
+                  </dd>
+                </div>
+                <div className="rounded-lg border border-hairline bg-board p-2.5">
+                  <dt className="text-xs text-ink-3">Pos / Orders</dt>
+                  <dd className="mono mt-1 text-xs font-semibold text-ink">
+                    {liveBundle.status.configured
+                      ? `${liveBundle.positions.length} / ${liveBundle.orders.length}`
+                      : Array.isArray(home?.account.open_positions)
+                        ? home.account.open_positions.length
+                        : "unavailable"}
                   </dd>
                 </div>
               </dl>
-              <p className="mt-3 text-xs text-ink-2">{home.account.note}</p>
+              <p className="mt-3 text-xs text-ink-2">
+                {liveBundle.status.configured
+                  ? `${liveBundle.status.environment.toUpperCase()} · ${liveBundle.status.liveArmed ? "Live Armed" : "Disarmed (Paper Mode)"} · ${liveBundle.account.note}`
+                  : home?.account.note || "Configure Kalshi v2 API credentials in Settings to connect."}
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <Button variant="outline" className="min-h-11 px-3 text-xs sm:min-h-8" onClick={onOpenOrderTicket}>
+                  Open Order Ticket
+                </Button>
+                <Button variant="outline" className="min-h-11 px-3 text-xs sm:min-h-8" onClick={onOpenSettings}>
+                  API &amp; Risk Rails
+                </Button>
+              </div>
             </>
           ) : (
             <p className="mt-3 text-xs text-ink-2">
-              {homeRead && !homeRead.ok ? `Venue state unavailable (${homeRead.msg}).` : "Checking venue account…"}
+              {homeRead && !homeRead.ok ? `Venue state unavailable (${homeRead.msg}).` : "Checking Kalshi account…"}
             </p>
           )}
         </div>

@@ -243,6 +243,7 @@ export function TapeTab({
   updatingSchedule,
   onSelectSchedule,
   onOpenScorecard,
+  onTradeMarket,
   onRetry,
   onCollect,
   collectingNow,
@@ -258,6 +259,7 @@ export function TapeTab({
   updatingSchedule: boolean;
   onSelectSchedule: (enabled: boolean, intervalSecs: number) => void;
   onOpenScorecard: () => void;
+  onTradeMarket?: (ticker: string, yesAskCents: number | null) => void;
   onRetry: () => void;
   onCollect: () => void;
   collectingNow: boolean;
@@ -468,6 +470,20 @@ export function TapeTab({
             </div>
             <div className="flex items-center gap-2">
               <span className="hidden text-xs text-ink-3 sm:inline">Hover chart for bid/ask &amp; spread</span>
+              {onTradeMarket && (
+                <Button
+                  variant="outline"
+                  className="min-h-11 px-3 text-xs sm:min-h-8"
+                  onClick={() => {
+                    const askCents = isNum(featuredMarket.yes_ask)
+                      ? Math.min(99, Math.max(1, Math.round(featuredMarket.yes_ask * 100)))
+                      : null;
+                    onTradeMarket(featuredTicker, askCents);
+                  }}
+                >
+                  Trade
+                </Button>
+              )}
               <Button
                 variant="outline"
                 className="min-h-11 px-3 text-xs sm:min-h-8"
@@ -509,7 +525,7 @@ export function TapeTab({
           <div>
             <p className="text-sm font-semibold text-ink">No snapshots collected yet</p>
             <p className="mt-1 text-xs text-ink-2">
-              OpenBell reads public Kalshi 15m crypto quotes with zero order permissions. Pull the first live pass to populate the tape.
+              OpenBell collects live Kalshi 15m crypto quotes for charting, backtesting, and live order staging. Pull the first pass to populate the tape.
             </p>
           </div>
           <Button variant="default" className="min-h-11 gap-2" disabled={collectingNow} onClick={onCollect}>

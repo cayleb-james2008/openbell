@@ -501,7 +501,7 @@ export function ScalePlannerPanel({
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-2.5 text-xs text-ink-3">
-            <span>Paper research desk — zero live order paths</span>
+            <span>Quant scaling engine · hard risk rails enforced on live orders</span>
             <span className="mono">
               {plan?.source === "server" ? "Server Scale Engine" : "Client scale fallback"}
             </span>
