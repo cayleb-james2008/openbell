@@ -282,7 +282,13 @@ for (const m of measures) {
     stratTotal >= 5 && (await p.locator('#standing-figure').textContent()).trim() === `0 of ${stratTotal}` && tally.some(t => /passed on the example tape only/.test(t)),
     `total=${stratTotal} tally=${JSON.stringify(tally)}`)
 
-  // Live 15m Tape: dynamic series chips + inline Price & Spread crosshair + Market Inspector drawer
+  // Live 15m Tape: Auto-Collector strip (Off / 60s / 180s + 200-window Readiness Gate bar), dynamic series chips, Price & Spread crosshair, Market Inspector
+  const autoCollectorOk =
+    (await p.locator('#auto-collector-strip [data-collector-mode="off"]').count()) === 1 &&
+    (await p.locator('#auto-collector-strip [data-collector-mode="60"]').count()) === 1 &&
+    (await p.locator('#auto-collector-strip [data-collector-mode="180"]').count()) === 1 &&
+    (await p.locator('#readiness-progress [role="progressbar"]').count()) === 1
+  ok('Live 15m Tape renders Auto-Collector Off/60s/180s controls and 200-window Readiness Gate bar', autoCollectorOk)
   const chipsPresent = await Promise.all(['All', 'BTC', 'ETH', 'SOL', 'XRP'].map(s => p.locator(`[data-series-chip="${s}"]`).count()))
   ok('Live 15m Tape shows dynamic multi-series chips (All, BTC, ETH, SOL, XRP)', chipsPresent.every(c => c === 1), JSON.stringify(chipsPresent))
   const inlineSvg = p.locator('#tape-inline-chart svg[role=img]').first()
@@ -415,6 +421,25 @@ for (const m of measures) {
   await p.locator('#quant-scale-planner').scrollIntoViewIfNeeded(); await p.waitForTimeout(150)
   await p.screenshot({ path: `${OUT}/scale-planner-1440-light.png` })
 
+  // Strategy Tournament, Optimal 4-Slot Lineup, 12x12 Correlation Matrix SVG & Edge-by-Regime Heatmap SVG
+  const tournamentRows = await p.locator('#tournament-table [data-tournament-row]').count()
+  ok('Quant Lab renders 12-strategy OOS Tournament leaderboard and Optimal 4-Slot Lineup',
+    tournamentRows >= 12 && (await p.locator('#tournament-lineup').isVisible()),
+    `rows=${tournamentRows}`)
+  await p.locator('#quant-tournament').scrollIntoViewIfNeeded(); await p.waitForTimeout(150)
+  await p.screenshot({ path: `${OUT}/tournament-1440-light.png` })
+
+  const corrCells = await p.locator('#correlation-matrix-svg [data-corr-cell]').count()
+  ok('Quant Lab renders 12x12 Strategy Return Correlation Heatmap SVG with readout',
+    corrCells >= 144 && (await p.locator('#corr-hover-readout').isVisible()),
+    `cells=${corrCells}`)
+  const regCells = await p.locator('#regime-heatmap-svg [data-regime-cell]').count()
+  ok('Quant Lab renders 5x4 Edge-by-Regime Heatmap SVG with Wilson CI readout',
+    regCells === 20 && (await p.locator('#regime-hover-readout').isVisible()),
+    `cells=${regCells}`)
+  await p.locator('#quant-correlation').scrollIntoViewIfNeeded(); await p.waitForTimeout(150)
+  await p.screenshot({ path: `${OUT}/correlation-regime-1440-light.png` })
+
   const recalChartOk =
     (await p.locator('[data-recalibration-chart] svg[role=img]').count()) === 1 &&
     (await p.locator('#recal-brier').innerText()).includes('->') &&
@@ -500,16 +525,101 @@ for (const m of measures) {
   await ctx.close()
 }
 
-// 5. v0.6.0 API Wire-Contract E2E (proves live SSE, Recalibration, Scale Plan, Calibration, Monte Carlo, Walk-Forward, Validate, Backtest & Export wiring)
+// 5. v0.7.0 API Wire-Contract E2E (proves live SSE, Auto-Collector Schedule, Tournament, Recalibration, Scale Plan, Calibration, Monte Carlo, Walk-Forward, Validate, Backtest & Export wiring)
 {
   const { ctx, p } = await open(1440, 900)
   const hits = new Set()
+  let schedState = {
+    enabled: false,
+    interval_secs: 60,
+    effective_interval_secs: 60,
+    min_interval_secs: 30,
+    max_interval_secs: 900,
+    backoff_secs: 0,
+    rate_limited: false,
+    consecutive_errors: 0,
+    in_flight: false,
+    runs_total: 2,
+    last_run_epoch: 1700000900,
+    next_run_epoch: null,
+    next_run_in_secs: null,
+    last_written: 12,
+    last_deduped: 40,
+    last_error: null,
+    settled_windows: 140,
+    readiness_target_windows: 200,
+    readiness_progress_pct: 70,
+    snapshots_on_disk: 520,
+    markets_seen: 140,
+    series: ['KXBTC15M', 'KXETH15M', 'KXSOL15M', 'KXXRP15M'],
+    mode: 'public_readonly_get',
+  }
   await p.route('**/api/home', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.6.0'
-    j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan']
+    j.version = '0.7.0'
+    j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan', 'tournament', 'auto_collector']
+    j.collector = {
+      ...j.collector,
+      auto_collect_enabled: schedState.enabled,
+      auto_collect_interval_secs: schedState.interval_secs,
+      auto_collect_backoff_secs: schedState.backoff_secs,
+      readiness_target_windows: 200,
+      readiness_progress_pct: 70,
+    }
     return r.fulfill({ response: res, body: JSON.stringify(j) })
+  })
+  await p.route('**/api/collector/status*', r => {
+    hits.add('collector-status')
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(schedState) })
+  })
+  await p.route('**/api/collector/schedule*', async r => {
+    hits.add('collector-schedule')
+    const reqBody = JSON.parse(r.request().postData() || '{}')
+    schedState = { ...schedState, enabled: Boolean(reqBody.enabled), interval_secs: Number(reqBody.interval_secs) || 60, effective_interval_secs: Number(reqBody.interval_secs) || 60 }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(schedState) })
+  })
+  await p.route('**/api/analytics/tournament*', r => {
+    hits.add('tournament')
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        slippage_cents: 1,
+        is_fraction: 0.6,
+        oos_fraction: 0.4,
+        oos_windows_total: 96,
+        honesty_note: 'Ranked strictly on OOS (40%) tape after fees + 1c slippage.',
+        rankings: [
+          { rank: 1, strategy: 'late-favourite-edge', side: 'yes', oos_windows: 48, is_windows: 72, oos_win_rate: 0.812, oos_net_expectancy_cents: 3.45, oos_net_pnl_dollars: 16.56, oos_sharpe: 1.92, oos_max_drawdown_pct: 4.1, oos_positive: true, series_breakdown: [{ series: 'BTC', windows: 28, win_rate: 0.82, net_expectancy_cents: 3.8, net_pnl_dollars: 10.6 }, { series: 'ETH', windows: 20, win_rate: 0.8, net_expectancy_cents: 2.9, net_pnl_dollars: 5.9 }] },
+          { rank: 2, strategy: 'mid-band-reversion', side: 'no', oos_windows: 42, is_windows: 64, oos_win_rate: 0.643, oos_net_expectancy_cents: 1.85, oos_net_pnl_dollars: 7.77, oos_sharpe: 1.24, oos_max_drawdown_pct: 6.2, oos_positive: true, series_breakdown: [{ series: 'SOL', windows: 42, win_rate: 0.64, net_expectancy_cents: 1.85, net_pnl_dollars: 7.77 }] },
+          { rank: 3, strategy: 'spread-squeeze-no', side: 'no', oos_windows: 35, is_windows: 52, oos_win_rate: 0.514, oos_net_expectancy_cents: -1.10, oos_net_pnl_dollars: -3.85, oos_sharpe: -0.45, oos_max_drawdown_pct: 11.8, oos_positive: false, series_breakdown: [] },
+        ],
+        optimal_lineup: {
+          strategies: ['late-favourite-edge', 'mid-band-reversion'],
+          max_correlation_limit: 0.65,
+          max_pairwise_abs_corr: 0.22,
+          positive_candidate_count: 2,
+          combined_oos_expectancy_cents: 2.65,
+          is_fallback: true,
+          honesty_note: 'Honest fallback: only 2 of 3 strategies pass positive OOS expectancy after fees + 1c slippage.',
+        },
+        correlation_matrix: {
+          strategies: ['late-favourite-edge', 'mid-band-reversion', 'spread-squeeze-no'],
+          matrix: [[1.0, 0.22, -0.35], [0.22, 1.0, 0.71], [-0.35, 0.71, 1.0]],
+          shared_windows: [[48, 30, 24], [30, 42, 20], [24, 20, 35]],
+          threshold: 0.65,
+        },
+        regime_heatmap: {
+          price_buckets: ['10-30c', '30-50c', '50-70c', '70-90c', '90-99c'],
+          time_buckets: ['>600s', '300-600s', '120-300s', '<120s'],
+          cells: [
+            { price_bucket: '70-90c', time_bucket: '120-300s', n: 32, wins: 27, realised_win_rate: 0.844, avg_fee_cents: 1.3, net_expectancy_cents: 3.9, wilson_lower_95: 0.68, wilson_upper_95: 0.93, low_sample: false },
+            { price_bucket: '50-70c', time_bucket: '<120s', n: 14, wins: 7, realised_win_rate: 0.5, avg_fee_cents: 1.7, net_expectancy_cents: -2.4, wilson_lower_95: 0.27, wilson_upper_95: 0.73, low_sample: true },
+          ],
+        },
+      }),
+    })
   })
   await p.route('**/api/analytics/recalibration*', r => {
     hits.add('recalibration')
@@ -709,6 +819,9 @@ for (const m of measures) {
   })
 
   await p.goto(BASE); await ready(p); await p.waitForTimeout(450)
+  await p.locator('#auto-collector-strip [data-collector-mode="60"]').click(); await p.waitForTimeout(250)
+  const schedUpdated = (await p.locator('#auto-collector-status-pill').innerText()).includes('Auto · 60s') &&
+    (await p.locator('#readiness-progress').innerText()).includes('140 / 200')
   await p.locator('#tab-strategies').click(); await p.waitForTimeout(150)
   await p.locator('#open-sandbox-btn').click(); await p.waitForTimeout(150)
   await p.locator('#sandbox-validate-btn').click(); await p.waitForTimeout(150)
@@ -718,18 +831,22 @@ for (const m of measures) {
   await p.locator('#tab-quant').click(); await p.waitForTimeout(450)
   const scorecardText = await p.locator('#readiness-scorecard').innerText()
   const evGateText = await p.locator('#ev-gate-impact').innerText()
+  const tournamentText = await p.locator('#quant-tournament').innerText()
   const serverEngineShown =
+    schedUpdated &&
     (await p.locator('#quant-calibration').innerText()).includes('Server Quant Engine') &&
     (await p.locator('#quant-scale-planner').innerText()).includes('Server Scale Engine') &&
     (await p.locator('#quant-recalibration').innerText()).includes('Server PAV Engine') &&
+    tournamentText.includes('Server Tournament Engine') &&
+    tournamentText.includes('2/4 slots qualified') &&
     (await p.locator('#scale-req-equal').innerText()).trim() === 'N/A' &&
     scorecardText.includes('240 trades') &&
     scorecardText.includes('-0.65c/ct') &&
     scorecardText.includes('3.10%') &&
     evGateText.includes('+$8.60')
-  ok('v0.6.0 live API contract integrates SSE, recalibration, scale-plan, validate, backtest, export, calibration, walkforward & montecarlo',
-    ['sse', 'recalibration', 'scale-plan', 'calibration', 'walkforward', 'montecarlo', 'validate', 'backtest', 'export'].every(k => hits.has(k)) && serverEngineShown,
-    `hits=${[...hits].sort().join(',')} serverEngine=${serverEngineShown}`)
+  ok('v0.7.0 live API contract integrates SSE, auto-collector schedule, tournament, recalibration, scale-plan, validate, backtest, export, calibration, walkforward & montecarlo',
+    ['sse', 'collector-status', 'collector-schedule', 'tournament', 'recalibration', 'scale-plan', 'calibration', 'walkforward', 'montecarlo', 'validate', 'backtest', 'export'].every(k => hits.has(k)) && serverEngineShown,
+    `hits=${[...hits].sort().join(',')} serverEngine=${serverEngineShown} sched=${schedUpdated}`)
   await ctx.close()
 }
 

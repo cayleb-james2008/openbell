@@ -16,6 +16,11 @@ export type Collector = {
   series_failed_names?: string[] | null;
   series_total?: number | null;
   collect_interval_secs?: number | null;
+  auto_collect_enabled?: boolean | null;
+  auto_collect_interval_secs?: number | null;
+  auto_collect_backoff_secs?: number | null;
+  readiness_target_windows?: number | null;
+  readiness_progress_pct?: number | null;
 };
 
 export type Account = {
@@ -206,6 +211,135 @@ export function supportsV060(home: Home | null, capability?: string): boolean {
   return semverAtLeast(home.version, [0, 6, 0]);
 }
 
+export function supportsV070(home: Home | null, capability?: string): boolean {
+  if (!home) return false;
+  if (capability && hasCapability(home.capabilities, capability)) return true;
+  return semverAtLeast(home.version, [0, 7, 0]);
+}
+
+export type CollectorScheduleStatus = {
+  enabled: boolean;
+  intervalSecs: number;
+  effectiveIntervalSecs: number;
+  backoffSecs: number;
+  rateLimited: boolean;
+  consecutive429s: number;
+  passesCompleted: number;
+  nextRunInSecs: number | null;
+  lastPassEpoch: number | null;
+  lastError: string | null;
+  settledWindows: number;
+  readinessTargetWindows: number;
+  source: "server" | "client";
+};
+
+function pickDeskNum(o: Record<string, unknown>, keys: string[]): number | null {
+  for (const k of keys) {
+    if (isNum(o[k])) return o[k] as number;
+  }
+  return null;
+}
+
+export function normalizeCollectorStatus(
+  raw: unknown,
+  home: Home | null,
+  fallbackSettled: number,
+  source: "server" | "client" = "server",
+): CollectorScheduleStatus {
+  const o = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const hc = home?.collector;
+  const enabled = Boolean(o.enabled ?? o.auto_collect ?? hc?.auto_collect_enabled ?? false);
+  const intervalSecs =
+    pickDeskNum(o, ["interval_secs", "schedule_interval_secs"]) ??
+    (hc && isNum(hc.auto_collect_interval_secs) ? hc.auto_collect_interval_secs : 60);
+  const backoffSecs =
+    pickDeskNum(o, ["backoff_secs", "current_backoff_secs"]) ??
+    (hc && isNum(hc.auto_collect_backoff_secs) ? hc.auto_collect_backoff_secs : 0);
+  const effectiveIntervalSecs =
+    pickDeskNum(o, ["effective_interval_secs"]) ?? Math.max(intervalSecs, backoffSecs || intervalSecs);
+  const consecutive429s = pickDeskNum(o, ["consecutive_429s", "consecutive_errors", "rate_limit_hits", "backoff_level"]) ?? 0;
+  const rateLimited = Boolean(o.rate_limited ?? (backoffSecs > intervalSecs || (o.rate_limited === undefined && backoffSecs > 0)));
+  const settledFromHome = hc && isNum(hc.settled_windows) ? hc.settled_windows : fallbackSettled;
+  const settledWindows = pickDeskNum(o, ["settled_windows", "windows_settled"]) ?? settledFromHome;
+  const readinessTargetWindows =
+    pickDeskNum(o, ["readiness_target_windows", "target_windows"]) ??
+    (hc && isNum(hc.readiness_target_windows) ? hc.readiness_target_windows : 200);
+  return {
+    enabled,
+    intervalSecs: Math.max(30, Math.min(900, Math.round(intervalSecs))),
+    effectiveIntervalSecs: Math.max(30, Math.round(effectiveIntervalSecs)),
+    backoffSecs: Math.max(0, Math.round(backoffSecs)),
+    rateLimited,
+    consecutive429s: Math.max(0, Math.round(consecutive429s)),
+    passesCompleted: Math.max(0, Math.round(pickDeskNum(o, ["runs_total", "passes_completed", "passes", "runs_completed"]) ?? 0)),
+    nextRunInSecs: pickDeskNum(o, ["next_run_in_secs", "seconds_until_next_run"]),
+    lastPassEpoch: pickDeskNum(o, ["last_run_epoch", "last_pass_epoch"]),
+    lastError: typeof o.last_error === "string" && o.last_error.trim() ? o.last_error.trim() : null,
+    settledWindows: Math.max(0, Math.round(settledWindows)),
+    readinessTargetWindows: Math.max(1, Math.round(readinessTargetWindows)),
+    source,
+  };
+}
+
+export async function fetchCollectorStatus(
+  home: Home | null,
+  fallbackSettled: number,
+): Promise<CollectorScheduleStatus> {
+  if (supportsV070(home, "collector_schedule") || supportsV070(home, "auto_collector")) {
+    try {
+      const r = await fetch("/api/collector/status");
+      if (r.ok) {
+        return normalizeCollectorStatus(await r.json(), home, fallbackSettled, "server");
+      }
+    } catch {
+      /* fallback below */
+    }
+  }
+  return normalizeCollectorStatus(
+    {
+      enabled: false,
+      interval_secs: 60,
+      settled_windows: fallbackSettled,
+      readiness_target_windows: 200,
+    },
+    home,
+    fallbackSettled,
+    "client",
+  );
+}
+
+export async function setCollectorSchedule(
+  enabled: boolean,
+  intervalSecs: number,
+  home: Home | null,
+  fallbackSettled: number,
+): Promise<CollectorScheduleStatus> {
+  const clamped = Math.max(30, Math.min(900, Math.round(intervalSecs)));
+  if (supportsV070(home, "collector_schedule") || supportsV070(home, "auto_collector")) {
+    const r = await fetch("/api/collector/schedule", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled, interval_secs: clamped }),
+    });
+    if (!r.ok) {
+      const errBody = (await r.json().catch(() => ({}))) as { error?: string };
+      throw new Error(errBody.error || `Collector schedule answered ${r.status}`);
+    }
+    return normalizeCollectorStatus(await r.json(), home, fallbackSettled, "server");
+  }
+  return normalizeCollectorStatus(
+    {
+      enabled,
+      interval_secs: clamped,
+      settled_windows: fallbackSettled,
+      readiness_target_windows: 200,
+    },
+    home,
+    fallbackSettled,
+    "client",
+  );
+}
+
 export async function getJson(url: string, init?: RequestInit): Promise<unknown> {
   const r = await fetch(url, init);
   if (!r.ok) throw new Error(`${url} answered ${r.status}`);
@@ -295,10 +429,15 @@ export function useDesk(dataset: Dataset) {
       }));
       try {
         const parsed = JSON.parse(ev.data) as {
+          type?: string;
           markets?: Market[];
           snapshot?: Market;
           snapshots_written?: number;
         };
+        if (parsed.type === "schedule" || parsed.type === "collect") {
+          scheduleReload();
+          return;
+        }
         if (Array.isArray(parsed.markets)) {
           setReads((prev) =>
             prev ? { ...prev, markets: { ok: true, v: parsed.markets as Market[] } } : prev,

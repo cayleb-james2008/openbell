@@ -1,4 +1,4 @@
-# Role Coverage — OpenBell v0.6.0
+# Role Coverage — OpenBell v0.7.0
 
 Every library of the eight in the House Frontend stack answers for its role in OpenBell (`0` "no need here" rows). `frontend/scripts/sync-used.mjs` maintains `rune/used/MANIFEST.md` from actual imports in `frontend/src/`.
 

@@ -17,6 +17,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
 import { sectionGlide } from "@/motionProps";
 import {
+  type CollectorScheduleStatus,
   type Dataset,
   type Home,
   type Market,
@@ -26,7 +27,9 @@ import {
   ageWords,
   computeStanding,
   exportDailyReport,
+  fetchCollectorStatus,
   isNum,
+  setCollectorSchedule,
   useDesk,
 } from "@/lib/desk";
 import { HeroStrip } from "@/HeroStrip";
@@ -91,6 +94,8 @@ function Shell() {
   const [sandboxSignal, setSandboxSignal] = useState(0);
   const [quantFocus, setQuantFocus] = useState<QuantSectionId | null>(null);
   const [reseedSignal, setReseedSignal] = useState(0);
+  const [collectorStatus, setCollectorStatus] = useState<CollectorScheduleStatus | null>(null);
+  const [updatingSchedule, setUpdatingSchedule] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const { reads, load, stream } = useDesk(dataset);
@@ -105,7 +110,7 @@ function Shell() {
   const allFailed = !!reads && Object.values(reads).every((r) => !r.ok);
   const failMsg = reads && !reads.home.ok ? reads.home.msg : "";
   const isFixture = dataset === "fixture";
-  const versionText = home?.version || upd.version?.version || "0.6.0";
+  const versionText = home?.version || upd.version?.version || "0.7.0";
 
   const validMarkets = useMemo(
     () => (markets ? markets.filter((m): m is Market => !!m && typeof m === "object") : []),
@@ -230,6 +235,35 @@ function Shell() {
   const settledCount = useMemo(
     () => validMarkets.filter((m) => m.result === "yes" || m.result === "no").length,
     [validMarkets],
+  );
+
+  const refreshCollectorStatus = useCallback(async () => {
+    const next = await fetchCollectorStatus(home, settledCount);
+    setCollectorStatus(next);
+  }, [home, settledCount]);
+
+  useEffect(() => {
+    void refreshCollectorStatus();
+  }, [refreshCollectorStatus]);
+
+  const handleSelectSchedule = useCallback(
+    async (enabled: boolean, intervalSecs: number) => {
+      setUpdatingSchedule(true);
+      try {
+        const next = await setCollectorSchedule(enabled, intervalSecs, home, settledCount);
+        setCollectorStatus(next);
+        toast.success(
+          enabled
+            ? `Auto-collector set to every ${next.intervalSecs}s (public read-only GET).`
+            : "Background auto-collector paused.",
+        );
+      } catch (e) {
+        toast.error(`Could not update auto-collector: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setUpdatingSchedule(false);
+      }
+    },
+    [home, settledCount],
   );
 
   const searchPlaceholder =
@@ -550,6 +584,13 @@ function Shell() {
                   dataset={dataset}
                   search={search}
                   stream={stream}
+                  collectorStatus={collectorStatus}
+                  updatingSchedule={updatingSchedule}
+                  onSelectSchedule={(en, sec) => void handleSelectSchedule(en, sec)}
+                  onOpenScorecard={() => {
+                    setTab("quant");
+                    setQuantFocus("scorecard");
+                  }}
                   onRetry={load}
                   onCollect={runCollect}
                   collectingNow={collectingNow}
@@ -593,6 +634,7 @@ function Shell() {
                   home={home}
                   marketsRead={reads?.markets}
                   slotsRead={reads?.slots}
+                  strategiesRead={reads?.strategies}
                   search={search}
                   focusSection={quantFocus}
                   reseedSignal={reseedSignal}
@@ -661,6 +703,9 @@ function Shell() {
           theme={theme}
           onThemeChange={pickTheme}
           home={home}
+          collectorStatus={collectorStatus}
+          updatingSchedule={updatingSchedule}
+          onSelectSchedule={(en, sec) => void handleSelectSchedule(en, sec)}
           collectingNow={collectingNow}
           onCollect={runCollect}
           upd={upd}

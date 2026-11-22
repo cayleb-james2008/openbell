@@ -10,12 +10,14 @@ import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
 import { CalibrationReliabilityChart, MonteCarloFanChart, ProvenanceTag } from "@/Charts";
 import { ScalePlannerPanel } from "@/ScalePlannerPanel";
 import { RecalibrationPanel } from "@/RecalibrationPanel";
+import { TournamentPanel } from "@/TournamentPanel";
 import {
   type Dataset,
   type Home,
   type Market,
   type Read,
   type Slots,
+  type Strategy,
   money,
   moneySigned,
 } from "@/lib/desk";
@@ -35,6 +37,9 @@ function fmtRatio(v: number | null): string {
 export type QuantSectionId =
   | "scale"
   | "scorecard"
+  | "tournament"
+  | "correlation"
+  | "regime"
   | "recalibration"
   | "calibration"
   | "montecarlo"
@@ -45,6 +50,7 @@ export function QuantLabTab({
   home,
   marketsRead,
   slotsRead,
+  strategiesRead,
   search,
   focusSection,
   reseedSignal,
@@ -54,6 +60,7 @@ export function QuantLabTab({
   home: Home | null;
   marketsRead?: Read<Market[]>;
   slotsRead?: Read<Slots>;
+  strategiesRead?: Read<Strategy[]>;
   search: string;
   focusSection?: QuantSectionId | null;
   reseedSignal?: number;
@@ -69,6 +76,9 @@ export function QuantLabTab({
 
   const scaleRef = useRef<HTMLDivElement>(null);
   const scorecardRef = useRef<HTMLDivElement>(null);
+  const tournamentRef = useRef<HTMLDivElement>(null);
+  const correlationRef = useRef<HTMLDivElement>(null);
+  const regimeRef = useRef<HTMLDivElement>(null);
   const recalRef = useRef<HTMLDivElement>(null);
   const calRef = useRef<HTMLDivElement>(null);
   const mcRef = useRef<HTMLDivElement>(null);
@@ -77,6 +87,10 @@ export function QuantLabTab({
   const markets = useMemo(
     () => (marketsRead?.ok ? marketsRead.v.filter((m): m is Market => !!m && typeof m === "object") : []),
     [marketsRead],
+  );
+  const strategies = useMemo(
+    () => (strategiesRead?.ok ? strategiesRead.v.filter((s): s is Strategy => !!s && typeof s === "object") : []),
+    [strategiesRead],
   );
   const slots = slotsRead?.ok ? slotsRead.v : null;
 
@@ -123,13 +137,19 @@ export function QuantLabTab({
         ? scaleRef.current
         : sec === "scorecard"
           ? scorecardRef.current
-          : sec === "recalibration"
-            ? recalRef.current
-            : sec === "calibration"
-              ? calRef.current
-              : sec === "montecarlo"
-                ? mcRef.current
-                : wfRef.current;
+          : sec === "tournament"
+            ? tournamentRef.current
+            : sec === "correlation"
+              ? correlationRef.current
+              : sec === "regime"
+                ? regimeRef.current
+                : sec === "recalibration"
+                  ? recalRef.current
+                  : sec === "calibration"
+                    ? calRef.current
+                    : sec === "montecarlo"
+                      ? mcRef.current
+                      : wfRef.current;
     node?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
 
@@ -175,6 +195,9 @@ export function QuantLabTab({
           [
             ["scale", "$500/Day Scale Planner"],
             ["scorecard", "5-Gate Scorecard"],
+            ["tournament", "Tournament"],
+            ["correlation", "12×12 Corr"],
+            ["regime", "Regime Map"],
             ["recalibration", "Isotonic PAV"],
             ["calibration", "Calibration"],
             ["montecarlo", "Monte Carlo"],
@@ -200,6 +223,19 @@ export function QuantLabTab({
         slots={slots}
         panelRef={scaleRef}
         scorecardRef={scorecardRef}
+      />
+
+      {/* OOS Strategy Tournament, Optimal Uncorrelated 4-Slot Lineup, 12x12 Correlation & Edge-by-Regime Heatmap */}
+      <TournamentPanel
+        dataset={dataset}
+        home={home}
+        strategies={strategies}
+        markets={markets}
+        slots={slots}
+        search={search}
+        tournamentRef={tournamentRef}
+        correlationRef={correlationRef}
+        regimeRef={regimeRef}
       />
 
       {/* PAV Isotonic Probability Recalibration & EV-After-Fees Entry Gate */}
