@@ -226,7 +226,7 @@ function StrategyInspector({
                 <div className="rounded-lg border border-hairline bg-board/50 p-3.5">
                   <div className="mb-2 flex items-center justify-between text-xs">
                     <span className="font-semibold text-ink">Cumulative Paper P&amp;L Curve</span>
-                    <span className="mono text-ink-3">Paper only · Fee-adjusted</span>
+                    <span className="mono text-ink-3">Paper sim · Fee-adjusted</span>
                   </div>
                   <StrategyEquityChart
                     points={points}
