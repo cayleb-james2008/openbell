@@ -290,7 +290,9 @@ export function HeroStrip({
             <h2 className="text-sm font-semibold text-ink">
               {dataset === "fixture" ? "Paper Compounding Curve (Example Tape)" : "Paper Compounding Curve"}
             </h2>
-            <span className="font-mono text-xs text-ink-3">Hover to inspect checkpoints · Paper only</span>
+            <span className="font-mono text-xs text-ink-3">
+              <span className="hidden sm:inline">Hover to inspect · </span>Paper only
+            </span>
           </div>
           <HeroEquityChart
             points={potPoints}

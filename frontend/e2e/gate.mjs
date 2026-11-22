@@ -161,6 +161,27 @@ for (const m of measures) {
   ok('no Light/Dark buttons visible on top bar at rest',
     (await p.locator('header').getByRole('button', { name: 'Dark', exact: true }).count()) === 0 &&
     (await p.locator('header').getByRole('button', { name: 'Light', exact: true }).count()) === 0)
+  ok('sticky header uses opaque surface with zero backdrop blur',
+    await p.locator('header').evaluate(el => {
+      const s = getComputedStyle(el)
+      return (!s.backdropFilter || s.backdropFilter === 'none') && (!s.webkitBackdropFilter || s.webkitBackdropFilter === 'none')
+    }))
+  // Verify #desk-search placeholder fits comfortably across all 3 tabs at 1440px
+  const phFits = []
+  for (const tid of ['#tab-tape', '#tab-strategies', '#tab-slots']) {
+    await p.locator(tid).click(); await p.waitForTimeout(100)
+    const info = await p.locator('#desk-search').evaluate(el => {
+      const s = getComputedStyle(el)
+      const cx = document.createElement('canvas').getContext('2d')
+      cx.font = `${s.fontWeight} ${s.fontSize} ${s.fontFamily}`
+      const textW = cx.measureText(el.placeholder).width
+      const availW = el.clientWidth - parseFloat(s.paddingLeft) - parseFloat(s.paddingRight)
+      return { ph: el.placeholder, textW: Math.round(textW), availW: Math.round(availW), ok: textW <= availW }
+    })
+    phFits.push(info)
+  }
+  await p.locator('#tab-tape').click(); await p.waitForTimeout(100)
+  ok('search placeholder fits without mid-word clipping on all 3 tabs', phFits.every(x => x.ok), JSON.stringify(phFits))
   ok('live mode shows zero Example fixture pill', (await p.locator('text=Example fixture').count()) === 0)
   const lum = () => p.evaluate(() => {
     const cx = document.createElement('canvas').getContext('2d')
