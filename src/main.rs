@@ -122,9 +122,30 @@ fn dollars(v: &serde_json::Value, key: &str) -> Option<f64> {
     v.get(key).and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok())
 }
 
-fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize), String> {
+fn active_series() -> Vec<String> {
+    if let Ok(raw) = std::env::var("OPENBELL_SERIES") {
+        let mut parsed: Vec<String> = Vec::new();
+        for tok in raw.split(',') {
+            let s = tok.trim().to_ascii_uppercase();
+            if !s.is_empty()
+                && s.len() <= 32
+                && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                && !parsed.contains(&s)
+            {
+                parsed.push(s);
+            }
+        }
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    SERIES.iter().map(|s| (*s).to_string()).collect()
+}
+
+fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize, bool), String> {
     let url = format!("{API_BASE}/markets?series_ticker={series}&status={status}&limit=100");
     let mut last_err = "venue response had no markets array".to_string();
+    let mut hit_rate_limit = false;
     for attempt in 0..4u32 {
         let out = Command::new("curl")
             // -q first: never read the user's ~/.curlrc.
@@ -150,6 +171,7 @@ fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize), S
                 .and_then(|c| c.as_str())
                 .unwrap_or("");
             if code == "too_many_requests" {
+                hit_rate_limit = true;
                 last_err = "venue response had no markets array (too_many_requests)".to_string();
                 if attempt < 3 {
                     let wait_ms = 750u64 << attempt;
@@ -192,9 +214,68 @@ fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize), S
                 last_price: dollars(m, "last_price_dollars"),
             });
         }
-        return Ok((snaps, skipped));
+        return Ok((snaps, skipped, hit_rate_limit));
     }
     Err(last_err)
+}
+
+/// Bounded in-process SSE broadcast hub for live collector events.
+const MAX_SSE_CLIENTS: usize = 64;
+
+struct TapeHub {
+    senders: std::sync::Mutex<Vec<std::sync::mpsc::SyncSender<String>>>,
+}
+
+impl TapeHub {
+    fn new() -> Self {
+        Self {
+            senders: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn subscribe(&self) -> Option<std::sync::mpsc::Receiver<String>> {
+        let mut guard = self.senders.lock().unwrap_or_else(|p| p.into_inner());
+        // Drop closed subscribers before enforcing the concurrent cap.
+        guard.retain(|tx| !matches!(tx.try_send(String::new()), Err(std::sync::mpsc::TrySendError::Disconnected(_))));
+        if guard.len() >= MAX_SSE_CLIENTS {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(32);
+        guard.push(tx);
+        Some(rx)
+    }
+
+    fn publish(&self, payload: String) {
+        let mut guard = self.senders.lock().unwrap_or_else(|p| p.into_inner());
+        guard.retain(|tx| {
+            !matches!(
+                tx.try_send(payload.clone()),
+                Err(std::sync::mpsc::TrySendError::Disconnected(_))
+            )
+        });
+    }
+}
+
+static TAPE_HUB: std::sync::OnceLock<TapeHub> = std::sync::OnceLock::new();
+
+fn tape_hub() -> &'static TapeHub {
+    TAPE_HUB.get_or_init(TapeHub::new)
+}
+
+/// Already-recorded settled snapshot keys on disk `(ticker, status, result)` so
+/// repeat passes do not duplicate hundreds of immutable historical settlements.
+fn existing_settled_keys(path: &Path) -> std::collections::HashSet<(String, String, String)> {
+    let mut keys = std::collections::HashSet::new();
+    let Ok(bytes) = std::fs::read(path) else {
+        return keys;
+    };
+    let (snaps, _) = parse_tape_bytes(&bytes);
+    for s in snaps {
+        if !s.result.is_empty() {
+            keys.insert((s.ticker, s.status, s.result));
+        }
+    }
+    keys
 }
 
 /// One collector pass over every series the desk trades: open markets (the
@@ -213,54 +294,58 @@ static SERIES_FAILED_LAST_PASS: std::sync::atomic::AtomicUsize =
 /// The series tickers behind that count, in SERIES order, each once.
 static SERIES_FAILED_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Run one pass. Ok carries (snapshots written, per-series errors);
+/// Run one pass. Ok carries (snapshots written, deduplicated count, per-series errors);
 /// a pass that wrote nothing BECAUSE everything failed is Err, so
 /// the API can say so instead of returning a cheerful 200 with 0.
-fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
+fn collect_once(data_dir: &Path) -> Result<(usize, usize, Vec<String>), String> {
     let _guard = COLLECT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let _pass = PassGuard::new();
     let _ = std::fs::create_dir_all(data_dir);
     let path = data_dir.join("snapshots.jsonl");
-    // Build the whole pass in memory and append it in one write: a
-    // reader of the tape (the report, the health count) then sees the
-    // pass whole or not at all, never a torn half-pass.
-    let mut buf = String::new();
-    let mut written = 0;
+    let series_list = active_series();
+    let existing_settled = existing_settled_keys(&path);
+    let mut pass_snaps: Vec<Snapshot> = Vec::new();
+    let mut seen_in_pass: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
     let mut errors: Vec<String> = Vec::new();
     let mut failed_series: Vec<String> = Vec::new();
-    let pace_ms: u64 = std::env::var("OPENBELL_COLLECT_PACE_MS")
+    let mut pace_ms: u64 = std::env::var("OPENBELL_COLLECT_PACE_MS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(250)
         .min(5000);
     let mut call_idx = 0usize;
-    for series in SERIES {
+    for series in &series_list {
         for status in ["open", "settled"] {
             if call_idx > 0 && pace_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(pace_ms));
             }
             call_idx += 1;
             match fetch_markets(series, status) {
-                Ok((snaps, skipped)) => {
+                Ok((snaps, skipped, rate_limited)) => {
+                    if rate_limited && pace_ms > 0 {
+                        pace_ms = (pace_ms.saturating_mul(2)).clamp(400, 1200);
+                    }
                     if skipped > 0 {
                         errors.push(format!(
                             "{series}/{status}: skipped {skipped} invalid record(s)"
                         ));
                         if !failed_series.iter().any(|f| f == series) {
-                            failed_series.push(series.to_string());
+                            failed_series.push(series.clone());
                         }
                     }
-                    for snap in &snaps {
-                        buf.push_str(&serde_json::to_string(snap).unwrap());
-                        buf.push('\n');
-                        written += 1;
+                    for snap in snaps {
+                        let key = (snap.ticker.clone(), snap.status.clone(), snap.result.clone());
+                        if seen_in_pass.insert(key) {
+                            pass_snaps.push(snap);
+                        }
                     }
                 }
                 Err(e) => {
                     eprintln!("collect {series}/{status}: {e}");
                     errors.push(format!("{series}/{status}: {e}"));
                     if !failed_series.iter().any(|f| f == series) {
-                        failed_series.push(series.to_string());
+                        failed_series.push(series.clone());
                     }
                 }
             }
@@ -268,6 +353,40 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
     }
     SERIES_FAILED_LAST_PASS.store(errors.len(), std::sync::atomic::Ordering::Relaxed);
     *SERIES_FAILED_NAMES.lock().unwrap_or_else(|p| p.into_inner()) = failed_series;
+
+    // Cross-pass deduplication: skip immutable settled rows already on disk whenever
+    // this pass has at least one fresh open or newly-settled record, keeping the tape
+    // lean while still ensuring a heartbeat write when only settled records exist.
+    let dedup_enabled = std::env::var("OPENBELL_DEDUP_SETTLED").as_deref() != Ok("0");
+    let mut fresh_snaps: Vec<&Snapshot> = Vec::new();
+    let mut deduplicated = 0usize;
+    for snap in &pass_snaps {
+        if dedup_enabled
+            && !snap.result.is_empty()
+            && existing_settled.contains(&(snap.ticker.clone(), snap.status.clone(), snap.result.clone()))
+        {
+            deduplicated += 1;
+        } else {
+            fresh_snaps.push(snap);
+        }
+    }
+    let to_write: Vec<&Snapshot> = if !fresh_snaps.is_empty() {
+        fresh_snaps
+    } else {
+        deduplicated = 0;
+        pass_snaps.iter().collect()
+    };
+
+    // Build the whole pass in memory and append it in one write: a
+    // reader of the tape (the report, the health count) then sees the
+    // pass whole or not at all, never a torn half-pass.
+    let mut buf = String::new();
+    let mut written = 0usize;
+    for snap in &to_write {
+        buf.push_str(&serde_json::to_string(snap).unwrap());
+        buf.push('\n');
+        written += 1;
+    }
     if written == 0 {
         return Err(if errors.is_empty() {
             "collection wrote nothing — every series returned empty".to_string()
@@ -279,7 +398,16 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
         });
     }
     append_tape(&path, &buf).map_err(|e| e.to_string())?;
-    Ok((written, errors))
+    let event = serde_json::json!({
+        "type": "collect",
+        "snapshots_written": written,
+        "deduplicated": deduplicated,
+        "series_failed": errors.len(),
+        "ts": now_unix(),
+    })
+    .to_string();
+    tape_hub().publish(event);
+    Ok((written, deduplicated, errors))
 }
 
 /// Append one pass in a single write. A tape that ends in a torn line
@@ -1424,6 +1552,7 @@ static STRAT_CACHE: std::sync::Mutex<
     )>,
 > = std::sync::Mutex::new(Vec::new());
 
+#[allow(dead_code)]
 fn load_strategies(dir: &Path) -> Vec<Strategy> {
     load_strategies_with_errors(dir).0
 }
@@ -1677,7 +1806,7 @@ fn daily_report(app: &App) -> String {
         "Strategy verdicts (paper, forward tape; promotion needs 100+ windows, both halves positive, +3.5c/contract after fees):"
             .to_string(),
     );
-    for report in &scores {
+    for report in scores.iter() {
         lines.push(format!(
             "  {} ({}): {} windows traded, verdict — {}",
             report.strategy, report.side, report.windows_traded, report.verdict
@@ -1711,6 +1840,9 @@ struct TapeEntry {
     /// it is built once per parse and folded incrementally over
     /// appends, like everything else in this entry.
     grouped: Arc<BTreeMap<String, Vec<Snapshot>>>,
+    /// Pre-serialized `/api/markets` JSON body built once per parse/append
+    /// from the latest snapshot of each grouped ticker, sorted by close_time.
+    latest_json: Arc<String>,
     /// Every line in the file, parseable or not — the health block's
     /// dropped-line count is total minus parsed, so both numbers
     /// must come from the same read.
@@ -1731,6 +1863,12 @@ struct TapeEntry {
     /// line cannot be extended: the next pass's first byte would
     /// finish it, and the line count would be off by one.
     ends_newline: bool,
+}
+
+fn build_latest_markets_json(grouped: &BTreeMap<String, Vec<Snapshot>>) -> Arc<String> {
+    let mut latest: Vec<&Snapshot> = grouped.values().filter_map(|w| w.last()).collect();
+    latest.sort_by(|a, b| a.close_time.cmp(&b.close_time));
+    Arc::new(serde_json::to_string(&latest).unwrap_or_else(|_| "[]".to_string()))
 }
 
 /// The seam an append must continue, plus the health aggregates:
@@ -1756,6 +1894,7 @@ fn fold_health(
 struct TapeView {
     snaps: Arc<Vec<Snapshot>>,
     grouped: Arc<BTreeMap<String, Vec<Snapshot>>>,
+    latest_json: Arc<String>,
     total_lines: usize,
     markets: usize,
     settled_windows: usize,
@@ -1772,15 +1911,24 @@ fn seam_of(text: &str, base: u64) -> (u64, String) {
     }
 }
 
+type AnalysisTuple = (
+    Arc<SlotSimulation>,
+    Arc<Vec<ScoreReport>>,
+    Arc<Vec<(String, String)>>,
+    Arc<Vec<String>>,
+);
+
 struct AnalysisEntry {
     path: PathBuf,
     len: u64,
     mtime: u64,
     /// Hash of everything besides the tape that shapes the result:
-    /// the paper pot and each strategy's (name, source fingerprint).
+    /// the paper pot and each strategy file's metadata/content.
     key: u64,
-    sim: SlotSimulation,
-    scores: Vec<ScoreReport>,
+    sim: Arc<SlotSimulation>,
+    scores: Arc<Vec<ScoreReport>>,
+    lib_errors: Arc<Vec<(String, String)>>,
+    strategy_names: Arc<Vec<String>>,
 }
 
 struct App {
@@ -1795,14 +1943,11 @@ struct App {
     /// than two intervals means collection has stopped, and
     /// uncollected windows cannot be backfilled.
     collect_secs: u64,
-    tape_cache: std::sync::Mutex<Option<TapeEntry>>,
+    tape_cache: std::sync::RwLock<Option<TapeEntry>>,
     /// The computed analysis (slot simulation + per-strategy scores)
-    /// for one exact tape state. Scoring the full tape runs Rune over
-    /// every window; the result is a pure function of (tape state,
-    /// strategy sources, paper pot), so repeat requests against an
-    /// unchanged tape serve it directly, and a grown tape recomputes
-    /// with the per-window entry index doing the incremental work.
-    analysis_cache: std::sync::Mutex<Option<AnalysisEntry>>,
+    /// for one exact tape state. Shared via Arc under RwLock so 30+
+    /// concurrent readers never contend or clone thousands of trades.
+    analysis_cache: std::sync::RwLock<Option<AnalysisEntry>>,
 }
 
 fn tape_stat(path: &Path) -> Option<(u64, u64)> {
@@ -1812,10 +1957,39 @@ fn tape_stat(path: &Path) -> Option<(u64, u64)> {
             m.modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64)
+                .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0),
         )
     })
+}
+
+/// Fast fingerprint of `strategies_dir` + `paper_pot` so concurrent HTTP readers
+/// hit `analysis_cache` without compiling or cloning strategies on every request.
+fn strategies_dir_key(dir: &Path, paper_pot: f64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    paper_pot.to_bits().hash(&mut h);
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "rn").unwrap_or(false))
+            .collect();
+        paths.sort();
+        for p in paths {
+            p.file_name().hash(&mut h);
+            if let Ok(m) = std::fs::metadata(&p) {
+                m.len().hash(&mut h);
+                let mt = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                mt.hash(&mut h);
+            }
+        }
+    }
+    h.finish()
 }
 
 impl App {
@@ -1826,6 +2000,7 @@ impl App {
             TapeView {
                 snaps: e.snaps.clone(),
                 grouped: e.grouped.clone(),
+                latest_json: e.latest_json.clone(),
                 total_lines: e.total_lines,
                 markets: e.markets.len(),
                 settled_windows: e.results_by_ticker.len(),
@@ -1841,6 +2016,7 @@ impl App {
             return TapeView {
                 snaps: Arc::new(Vec::new()),
                 grouped: Arc::new(BTreeMap::new()),
+                latest_json: Arc::new("[]".to_string()),
                 total_lines: 0,
                 markets: 0,
                 settled_windows: 0,
@@ -1849,7 +2025,7 @@ impl App {
             };
         };
         {
-            let guard = self.tape_cache.lock().unwrap();
+            let guard = self.tape_cache.read().unwrap_or_else(|p| p.into_inner());
             if let Some(e) = &*guard {
                 if e.path == path && e.len == len && e.mtime == mtime {
                     return view(e);
@@ -1860,7 +2036,12 @@ impl App {
         // the seam line is still exactly where the old parse left
         // it — parse only the appended tail.
         let prev = {
-            let mut guard = self.tape_cache.lock().unwrap();
+            let mut guard = self.tape_cache.write().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = &*guard {
+                if e.path == path && e.len == len && e.mtime == mtime {
+                    return view(e);
+                }
+            }
             match &*guard {
                 Some(e) if e.path == path && len > e.len && e.len > 0 => guard.take(),
                 _ => None,
@@ -1869,7 +2050,7 @@ impl App {
         if let Some(e) = prev {
             if let Some(extended) = extend_tape(e, path, len, mtime) {
                 let out = view(&extended);
-                *self.tape_cache.lock().unwrap() = Some(extended);
+                *self.tape_cache.write().unwrap_or_else(|p| p.into_inner()) = Some(extended);
                 return out;
             }
             // Seam check failed: the file was replaced, not appended
@@ -1883,12 +2064,14 @@ impl App {
         let mut results_by_ticker = std::collections::HashMap::new();
         fold_health(&snaps, &mut markets, &mut results_by_ticker);
         let grouped = Arc::new(group_windows(&snaps));
+        let latest_json = build_latest_markets_json(&grouped);
         let entry = TapeEntry {
             path: path.to_path_buf(),
             len,
             mtime,
             snaps: Arc::new(snaps),
             grouped,
+            latest_json,
             total_lines,
             markets,
             results_by_ticker,
@@ -1897,37 +2080,34 @@ impl App {
             ends_newline,
         };
         let out = view(&entry);
-        *self.tape_cache.lock().unwrap() = Some(entry);
+        *self.tape_cache.write().unwrap_or_else(|p| p.into_inner()) = Some(entry);
         out
     }
 
+    #[allow(dead_code)]
     fn snapshots_cached(&self, path: &Path) -> Arc<Vec<Snapshot>> {
         self.tape(path).snaps
     }
 
-    /// The slot simulation and per-strategy scores over one dataset,
-    /// cached by the tape's exact state (see analysis_cache).
-    fn analysis(&self, dpath: &Path) -> (SlotSimulation, Vec<ScoreReport>) {
-        let strategies = load_strategies(&self.strategies_dir);
-        let key = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            self.paper_pot.to_bits().hash(&mut h);
-            for s in &strategies {
-                s.name.hash(&mut h);
-                s.fingerprint.hash(&mut h);
-            }
-            h.finish()
-        };
+    /// The slot simulation, per-strategy scores, and library load errors over one
+    /// dataset, cached by the exact tape + strategy-dir state under RwLock.
+    fn analysis_shared(&self, dpath: &Path) -> AnalysisTuple {
+        let key = strategies_dir_key(&self.strategies_dir, self.paper_pot);
         let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
         {
-            let guard = self.analysis_cache.lock().unwrap();
+            let guard = self.analysis_cache.read().unwrap_or_else(|p| p.into_inner());
             if let Some(e) = &*guard {
                 if e.path == dpath && e.len == len && e.mtime == mtime && e.key == key {
-                    return (e.sim.clone(), e.scores.clone());
+                    return (
+                        e.sim.clone(),
+                        e.scores.clone(),
+                        e.lib_errors.clone(),
+                        e.strategy_names.clone(),
+                    );
                 }
             }
         }
+        let (strategies, lib_errors) = load_strategies_with_errors(&self.strategies_dir);
         let view = self.tape(dpath);
         // The tape entry carries the windows already grouped —
         // built once per parse and folded over appends — so a
@@ -1938,11 +2118,26 @@ impl App {
             .values()
             .map(|s| (facts_fingerprint(s), window_fingerprint(s)))
             .collect();
-        let sim = simulate_slots_windows_fps(&strategies, &view.grouped, self.paper_pot, Some(&fps));
-        let scores: Vec<ScoreReport> = strategies
-            .iter()
-            .map(|s| score_strategy_windows_fps(s, &view.grouped, Standard::default(), Some(&fps)))
-            .collect();
+        let sim = Arc::new(simulate_slots_windows_fps(
+            &strategies,
+            &view.grouped,
+            self.paper_pot,
+            Some(&fps),
+        ));
+        let scores = Arc::new(
+            strategies
+                .iter()
+                .map(|s| score_strategy_windows_fps(s, &view.grouped, Standard::default(), Some(&fps)))
+                .collect::<Vec<_>>(),
+        );
+        let strategy_names = Arc::new(strategies.iter().map(|s| s.name.clone()).collect::<Vec<_>>());
+        let lib_errors = Arc::new(lib_errors);
+        let out = (
+            sim.clone(),
+            scores.clone(),
+            lib_errors.clone(),
+            strategy_names.clone(),
+        );
         let entry = AnalysisEntry {
             path: dpath.to_path_buf(),
             len,
@@ -1950,10 +2145,16 @@ impl App {
             key,
             sim,
             scores,
+            lib_errors,
+            strategy_names,
         };
-        let out = (entry.sim.clone(), entry.scores.clone());
-        *self.analysis_cache.lock().unwrap() = Some(entry);
+        *self.analysis_cache.write().unwrap_or_else(|p| p.into_inner()) = Some(entry);
         out
+    }
+
+    fn analysis(&self, dpath: &Path) -> (Arc<SlotSimulation>, Arc<Vec<ScoreReport>>) {
+        let (sim, scores, _, _) = self.analysis_shared(dpath);
+        (sim, scores)
     }
 }
 
@@ -2010,6 +2211,7 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
             }
         }
     }
+    e.latest_json = build_latest_markets_json(&e.grouped);
     Arc::make_mut(&mut e.snaps).extend(new_snaps);
     if !tail_buf.is_empty() {
         let (off, line) = seam_of(&String::from_utf8_lossy(&tail_buf), e.len);
@@ -2054,7 +2256,7 @@ fn collector_health(app: &App) -> serde_json::Value {
         "collecting": collecting,
         "series_failed_last_pass": SERIES_FAILED_LAST_PASS.load(std::sync::atomic::Ordering::Relaxed),
         "series_failed_names": SERIES_FAILED_NAMES.lock().unwrap_or_else(|p| p.into_inner()).clone(),
-        "series_total": SERIES.len() * 2,
+        "series_total": active_series().len() * 2,
     })
 }
 
@@ -2282,37 +2484,225 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     None
 }
 
-fn latest_markets_from(app: &App, path: &Path) -> Vec<Snapshot> {
-    let snapshots = app.snapshots_cached(path);
-    let mut latest: BTreeMap<String, Snapshot> = BTreeMap::new();
-    for snap in snapshots.iter() {
-        latest
-            .entry(snap.ticker.clone())
-            .and_modify(|e| {
-                if snap.fetched_at >= e.fetched_at {
-                    *e = snap.clone();
-                }
-            })
-            .or_insert_with(|| snap.clone());
+fn text_download_response(content_type: &str, filename: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Disposition: attachment; filename=\"{filename}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn csv_escape(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
     }
-    let mut out: Vec<Snapshot> = latest.into_values().collect();
-    out.sort_by(|a, b| a.close_time.cmp(&b.close_time));
+}
+
+/// Markdown export of the daily report. Line 1 is strictly the venue's own
+/// Day P&L line verbatim (never invented, never pushed below a heading).
+fn export_report_md(app: &App) -> String {
+    let raw = daily_report(app);
+    let line1 = raw
+        .lines()
+        .next()
+        .unwrap_or("Day P&L (venue): unavailable");
+    let health = collector_health(app);
+    let (sim, scores, _, _) = app.analysis_shared(&app.data_dir.join("snapshots.jsonl"));
+    let mut out = String::new();
+    out.push_str(line1);
+    out.push_str("\n\n## OpenBell Daily Paper Report\n\n");
+    out.push_str(&format!(
+        "- **Mode:** Shadow paper-only desk (zero order-placement paths)\n\
+         - **Paper pot:** {} (started {})\n\
+         - **Collector:** {} ({} snapshots on disk, {} markets, {} settled windows)\n\n",
+        fmt_money(sim.paper_equity_dollars),
+        fmt_money(sim.paper_pot_start),
+        if health["collecting"].as_bool().unwrap_or(false) {
+            "collecting"
+        } else {
+            "NOT collecting"
+        },
+        health["snapshots_on_disk"].as_u64().unwrap_or(0),
+        health["markets_seen"].as_u64().unwrap_or(0),
+        health["settled_windows"].as_u64().unwrap_or(0),
+    ));
+    out.push_str("## Slots (Paper)\n\n| Slot | Strategy | Status | Strikes | Stint Windows | Stint P&L | Slot P&L | Equity |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+    for s in &sim.slots {
+        out.push_str(&format!(
+            "| {} | {} | {} | {}/{} | {} | {} | {} | {} |\n",
+            s.slot + 1,
+            s.strategy,
+            s.status,
+            s.strikes,
+            STRIKE_LIMIT,
+            s.stint_windows,
+            fmt_money(s.stint_pnl_dollars),
+            fmt_money(s.paper_pnl_dollars),
+            fmt_money(s.equity_dollars),
+        ));
+    }
+    out.push_str("\n## Rune Strategy Verdicts (Paper)\n\n| Strategy | Side | Windows Traded | Mean c/Contract | Verdict |\n| --- | --- | --- | --- | --- |\n");
+    for r in scores.iter() {
+        let mean = r
+            .mean_cents_per_contract
+            .map(|m| format!("{m:+.2}c"))
+            .unwrap_or_else(|| "n/a".to_string());
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            r.strategy, r.side, r.windows_traded, mean, r.verdict
+        ));
+    }
+    out.push_str("\n## Verbatim Report\n\n```text\n");
+    out.push_str(&raw);
+    out.push_str("\n```\n");
     out
 }
 
-fn market_history_from(app: &App, path: &Path, ticker: &str) -> Vec<Snapshot> {
-    let snapshots = app.snapshots_cached(path);
-    let mut pts: Vec<Snapshot> = snapshots
-        .iter()
-        .filter(|s| s.ticker == ticker)
-        .cloned()
-        .collect();
-    pts.sort_by_key(|s| s.fetched_at);
-    let total = pts.len();
-    if total > 240 {
-        pts.drain(0..total - 240);
+/// CSV export of the daily report. Line 1 preserves the exact venue Day P&L
+/// line verbatim before the RFC-4180 CSV header and structured rows.
+fn export_report_csv(app: &App) -> String {
+    let raw = daily_report(app);
+    let line1 = raw
+        .lines()
+        .next()
+        .unwrap_or("Day P&L (venue): unavailable");
+    let health = collector_health(app);
+    let (sim, scores, _, _) = app.analysis_shared(&app.data_dir.join("snapshots.jsonl"));
+    let mut out = String::new();
+    out.push_str("# ");
+    out.push_str(line1);
+    out.push('\n');
+    out.push_str("section,name,side,windows_traded,mean_cents,paper_pnl_dollars,equity_dollars,strikes,status_or_verdict\n");
+    out.push_str(&format!(
+        "venue,day_pnl,,,,,,,{}\n",
+        csv_escape(line1)
+    ));
+    out.push_str(&format!(
+        "collector,tape,,{},,,,,{}\n",
+        health["settled_windows"].as_u64().unwrap_or(0),
+        csv_escape(&format!(
+            "collecting={} snapshots={} markets={}",
+            health["collecting"].as_bool().unwrap_or(false),
+            health["snapshots_on_disk"].as_u64().unwrap_or(0),
+            health["markets_seen"].as_u64().unwrap_or(0),
+        ))
+    ));
+    out.push_str(&format!(
+        "paper_pot,total,,,,{:.2},{:.2},,paper_only\n",
+        sim.paper_equity_dollars - sim.paper_pot_start,
+        sim.paper_equity_dollars
+    ));
+    for s in &sim.slots {
+        out.push_str(&format!(
+            "slot,{},{},{},,{:.2},{:.2},{},{}\n",
+            csv_escape(&format!("slot-{}", s.slot + 1)),
+            csv_escape(&s.strategy),
+            s.windows_traded,
+            s.paper_pnl_dollars,
+            s.equity_dollars,
+            s.strikes,
+            csv_escape(&s.status),
+        ));
     }
-    pts
+    for r in &sim.retired {
+        out.push_str(&format!(
+            "retired,{},{},{},,{:.2},,{},{}\n",
+            csv_escape(&format!("slot-{}", r.slot + 1)),
+            csv_escape(&r.strategy),
+            r.windows_traded,
+            r.paper_pnl_dollars,
+            r.strikes,
+            csv_escape(&format!("rotated_to:{}", r.rotated_to)),
+        ));
+    }
+    for st in scores.iter() {
+        let mean = st
+            .mean_cents_per_contract
+            .map(|m| format!("{m:.4}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "strategy,{},{},{},{},,,,{}\n",
+            csv_escape(&st.strategy),
+            csv_escape(&st.side),
+            st.windows_traded,
+            mean,
+            csv_escape(&st.verdict),
+        ));
+    }
+    out
+}
+
+/// True Server-Sent Events stream for `/api/tape/stream`. Emits an initial
+/// snapshot frame, then real-time `tape` frames on every collector pass plus
+/// periodic keepalive comments until the client disconnects.
+fn serve_sse_stream(stream: &mut std::net::TcpStream, app: &App) {
+    let Some(rx) = tape_hub().subscribe() else {
+        let resp = json_response(503, "{\"error\":\"too many active tape stream subscribers\"}");
+        let _ = stream.write_all(resp.as_bytes());
+        return;
+    };
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n";
+    if stream.write_all(headers.as_bytes()).is_err() {
+        return;
+    }
+    let health = collector_health(app);
+    let view = app.tape(&app.data_dir.join("snapshots.jsonl"));
+    let open_markets: Vec<&Snapshot> = view
+        .grouped
+        .values()
+        .filter_map(|w| w.last())
+        .filter(|m| m.result.is_empty() && matches!(m.status.as_str(), "open" | "active"))
+        .take(25)
+        .collect();
+    let initial = serde_json::json!({
+        "type": "snapshot",
+        "version": env!("CARGO_PKG_VERSION"),
+        "collector": health,
+        "open_markets": open_markets,
+        "series": active_series(),
+        "ts": now_unix(),
+    })
+    .to_string();
+    if stream
+        .write_all(format!("event: snapshot\ndata: {initial}\n\n").as_bytes())
+        .is_err()
+        || stream.flush().is_err()
+    {
+        return;
+    }
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(payload) => {
+                if payload.is_empty() {
+                    continue;
+                }
+                if stream
+                    .write_all(format!("event: tape\ndata: {payload}\n\n").as_bytes())
+                    .is_err()
+                    || stream.flush().is_err()
+                {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stream.write_all(b": keepalive\n\n").is_err() || stream.flush().is_err() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+fn market_history_from(app: &App, path: &Path, ticker: &str) -> Vec<Snapshot> {
+    let view = app.tape(path);
+    let Some(pts) = view.grouped.get(ticker) else {
+        return Vec::new();
+    };
+    let start = pts.len().saturating_sub(240);
+    pts[start..].to_vec()
 }
 
 fn strategy_source_for(dir: &Path, name: &str) -> Option<(String, String, String)> {
@@ -2337,7 +2727,12 @@ fn strategy_source_for(dir: &Path, name: &str) -> Option<(String, String, String
     None
 }
 
+#[allow(dead_code)]
 fn handle(app: &App, method: &str, path: &str) -> String {
+    handle_with_body(app, method, path, "")
+}
+
+fn handle_with_body(app: &App, method: &str, path: &str, _body: &str) -> String {
     let (route, query) = match path.split_once('?') {
         Some((r, q)) => (r, q),
         None => (path, ""),
@@ -2345,19 +2740,18 @@ fn handle(app: &App, method: &str, path: &str) -> String {
     match (method, route) {
         ("GET", "/") => html_response(include_str!("../assets/index.html")),
         ("GET", "/api/home") => {
-            let (sim, _) = app.analysis(&app.data_dir.join("snapshots.jsonl"));
+            let (sim, _, lib_errors, _) = app.analysis_shared(&app.data_dir.join("snapshots.jsonl"));
             let home = serde_json::json!({
                 "account": account_state(),
                 "collector": collector_health(app),
                 "stage_target": stage_progress(&sim),
-                "library_errors": load_strategies_with_errors(&app.strategies_dir)
-                    .1
+                "library_errors": lib_errors
                     .iter()
                     .map(|(file, error)| serde_json::json!({ "file": file, "error": error }))
                     .collect::<Vec<_>>(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "mode": "shadow — this build never places orders",
-                "series": SERIES,
+                "series": active_series(),
             });
             json_response(200, &home.to_string())
         }
@@ -2370,7 +2764,8 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                         .to_string(),
                 );
             }
-            json_response(200, &serde_json::to_string(&latest_markets_from(app, &dpath)).unwrap())
+            let view = app.tape(&dpath);
+            json_response(200, &view.latest_json)
         }
         ("GET", "/api/markets/history") => {
             let dpath = dataset_path(app, query);
@@ -2414,19 +2809,15 @@ fn handle(app: &App, method: &str, path: &str) -> String {
             }
         }
         ("POST", "/api/collect") => match collect_once(&app.data_dir) {
-            Ok((n, errors)) => {
-                if errors.is_empty() {
-                    json_response(200, &format!("{{\"snapshots_written\":{n}}}"))
-                } else {
-                    json_response(
-                        200,
-                        &serde_json::json!({
-                            "snapshots_written": n,
-                            "errors": errors
-                        })
-                        .to_string(),
-                    )
+            Ok((n, dedup, errors)) => {
+                let mut payload = serde_json::json!({ "snapshots_written": n });
+                if dedup > 0 {
+                    payload["deduplicated"] = serde_json::json!(dedup);
                 }
+                if !errors.is_empty() {
+                    payload["errors"] = serde_json::json!(errors);
+                }
+                json_response(200, &payload.to_string())
             }
             Err(e) => json_response(
                 502,
@@ -2442,8 +2833,9 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                         .to_string(),
                 );
             }
-            let (_, mut reports) = app.analysis(&dpath);
+            let (_, reports_arc, _, _) = app.analysis_shared(&dpath);
             let dataset = dataset_name(query);
+            let mut reports: Vec<ScoreReport> = (*reports_arc).clone();
             for report in &mut reports {
                 report.verdict = dataset_verdict(&report.verdict, &dataset);
             }
@@ -2458,8 +2850,8 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                         .to_string(),
                 );
             }
-            let (sim, _) = app.analysis(&dpath);
-            let mut body = serde_json::to_value(&sim).unwrap();
+            let (sim, _, lib_errors, _) = app.analysis_shared(&dpath);
+            let mut body = serde_json::to_value(sim.as_ref()).unwrap();
             body["stage_target"] = serde_json::to_value(stage_progress(&sim)).unwrap();
             let total = sim.trades.len();
             let shown: Vec<&Trade> =
@@ -2467,8 +2859,7 @@ fn handle(app: &App, method: &str, path: &str) -> String {
             body["trades"] = serde_json::to_value(&shown).unwrap();
             body["trades_truncated"] = serde_json::json!(total > 5000);
             body["library_errors"] = serde_json::json!(
-                load_strategies_with_errors(&app.strategies_dir)
-                    .1
+                lib_errors
                     .iter()
                     .map(|(file, error)| serde_json::json!({ "file": file, "error": error }))
                     .collect::<Vec<_>>()
@@ -2485,18 +2876,17 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                         .to_string(),
                 );
             }
-            let strategies = load_strategies(&app.strategies_dir);
-            let (sim, _) = app.analysis(&dpath);
+            let (sim, _, lib_errors, strategy_names) = app.analysis_shared(&dpath);
             let (pot, per) = equity_curves(&sim);
-            let mut series: Vec<serde_json::Value> = strategies
+            let mut series: Vec<serde_json::Value> = strategy_names
                 .iter()
-                .map(|s| {
+                .map(|name| {
                     let points = per
                         .iter()
-                        .find(|(name, _)| *name == s.name)
+                        .find(|(n, _)| n == name)
                         .map(|(_, pts)| pts.clone())
                         .unwrap_or_default();
-                    serde_json::json!({ "strategy": s.name, "points": points })
+                    serde_json::json!({ "strategy": name, "points": points })
                 })
                 .collect();
             series.sort_by(|a, b| a["strategy"].as_str().cmp(&b["strategy"].as_str()));
@@ -2504,8 +2894,7 @@ fn handle(app: &App, method: &str, path: &str) -> String {
                 "paper_pot_start": sim.paper_pot_start,
                 "pot": pot,
                 "series": series,
-                "library_errors": load_strategies_with_errors(&app.strategies_dir)
-                    .1
+                "library_errors": lib_errors
                     .iter()
                     .map(|(file, error)| serde_json::json!({ "file": file, "error": error }))
                     .collect::<Vec<_>>(),
@@ -2516,6 +2905,26 @@ fn handle(app: &App, method: &str, path: &str) -> String {
         ("GET", "/api/report") => {
             let report = daily_report(app);
             json_response(200, &serde_json::json!({ "report": report }).to_string())
+        }
+        ("GET", "/api/export/report") => {
+            let fmt = query_param(query, "format").unwrap_or_else(|| "md".to_string());
+            match fmt.to_ascii_lowercase().as_str() {
+                "md" | "markdown" => text_download_response(
+                    "text/markdown; charset=utf-8",
+                    "openbell-daily-report.md",
+                    &export_report_md(app),
+                ),
+                "csv" => text_download_response(
+                    "text/csv; charset=utf-8",
+                    "openbell-daily-report.csv",
+                    &export_report_csv(app),
+                ),
+                other => json_response(
+                    400,
+                    &serde_json::json!({ "error": format!("unsupported export format: {other} (use md or csv)") })
+                        .to_string(),
+                ),
+            }
         }
         _ => json_response(404, "{\"error\":\"not found\"}"),
     }
@@ -2654,9 +3063,13 @@ fn main() {
         let data_dir = data_dir.clone();
         std::thread::spawn(move || loop {
             match collect_once(&data_dir) {
-                Ok((n, errors)) => {
+                Ok((n, dedup, errors)) => {
                     if errors.is_empty() {
-                        println!("collector: {n} snapshots written");
+                        if dedup > 0 {
+                            println!("collector: {n} snapshots written ({dedup} settled deduplicated)");
+                        } else {
+                            println!("collector: {n} snapshots written");
+                        }
                     } else {
                         println!(
                             "collector: {n} snapshots written, {} series failed",
@@ -2671,8 +3084,8 @@ fn main() {
     }
 
     let app = Arc::new(App {
-        tape_cache: std::sync::Mutex::new(None),
-        analysis_cache: std::sync::Mutex::new(None),
+        tape_cache: std::sync::RwLock::new(None),
+        analysis_cache: std::sync::RwLock::new(None),
         data_dir: data_dir.clone(),
         strategies_dir,
         paper_pot,
@@ -2716,12 +3129,18 @@ fn main() {
                             return;
                         }
                         let host = headers.iter().find(|(n, _)| n == "host").map(|(_, v)| v.as_str()).unwrap_or("");
-                        let response = match refuse_request(&method, &headers, body.len(), &allowed_hosts) {
-                            Some((status, message)) => {
-                                json_response(status, &serde_json::json!({ "error": message }).to_string())
-                            }
-                            None => update_response(&method, &path, host).unwrap_or_else(|| handle(&app, &method, &path)),
-                        };
+                        if let Some((status, message)) = refuse_request(&method, &headers, body.len(), &allowed_hosts) {
+                            let response = json_response(status, &serde_json::json!({ "error": message }).to_string());
+                            let _ = stream.write_all(response.as_bytes());
+                            return;
+                        }
+                        let route = path.split_once('?').map(|(r, _)| r).unwrap_or(&path);
+                        if method == "GET" && route == "/api/tape/stream" {
+                            serve_sse_stream(&mut stream, &app);
+                            return;
+                        }
+                        let response = update_response(&method, &path, host)
+                            .unwrap_or_else(|| handle_with_body(&app, &method, &path, &body));
                         let _ = stream.write_all(response.as_bytes());
                     }
                 });
@@ -2862,8 +3281,8 @@ mod tests {
             strategies_dir: dir.clone(),
             paper_pot: 100.0,
             collect_secs: 60,
-            tape_cache: std::sync::Mutex::new(None),
-            analysis_cache: std::sync::Mutex::new(None),
+            tape_cache: std::sync::RwLock::new(None),
+            analysis_cache: std::sync::RwLock::new(None),
         };
         let v1 = app.tape(&path);
         let fp_b1 = window_fingerprint(&v1.grouped["KXBBB-1"]);
@@ -3347,8 +3766,8 @@ mod tests {
             strategies_dir: dir.clone(),
             paper_pot: 100.0,
             collect_secs: 60,
-            tape_cache: std::sync::Mutex::new(None),
-            analysis_cache: std::sync::Mutex::new(None),
+            tape_cache: std::sync::RwLock::new(None),
+            analysis_cache: std::sync::RwLock::new(None),
         };
         std::fs::write(&tape, format!("{}\n{}\nnot json\n", line("A", 100), line("B", 110)))
             .unwrap();
@@ -3396,8 +3815,8 @@ mod tests {
             strategies_dir: dir.clone(),
             paper_pot: 100.0,
             collect_secs: 60,
-            tape_cache: std::sync::Mutex::new(None),
-            analysis_cache: std::sync::Mutex::new(None),
+            tape_cache: std::sync::RwLock::new(None),
+            analysis_cache: std::sync::RwLock::new(None),
         };
         // A valid snapshot whose ticker holds a byte that is not UTF-8.
         let mut bad = line("Z", 105).into_bytes();
@@ -3441,8 +3860,8 @@ mod tests {
             strategies_dir: dir.clone(),
             paper_pot: 100.0,
             collect_secs: 60,
-            tape_cache: std::sync::Mutex::new(None),
-            analysis_cache: std::sync::Mutex::new(None),
+            tape_cache: std::sync::RwLock::new(None),
+            analysis_cache: std::sync::RwLock::new(None),
         };
         // A crash left a torn last line with no newline.
         std::fs::write(&tape, format!("{}\n{{\"ticker\":\"TO", line("A", 100))).unwrap();
@@ -3567,8 +3986,8 @@ mod tests {
             strategies_dir: dir.clone(),
             paper_pot: 100.0,
             collect_secs: 60,
-            tape_cache: std::sync::Mutex::new(None),
-            analysis_cache: std::sync::Mutex::new(None),
+            tape_cache: std::sync::RwLock::new(None),
+            analysis_cache: std::sync::RwLock::new(None),
         };
         let (_, body) = handle(&app, "GET", "/api/home").split_once("\r\n\r\n").map(|(h, b)| (h, b.to_string())).unwrap();
         let home: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -3590,8 +4009,8 @@ mod tests {
             strategies_dir: dir.clone(),
             paper_pot: 100.0,
             collect_secs: 60,
-            tape_cache: std::sync::Mutex::new(None),
-            analysis_cache: std::sync::Mutex::new(None),
+            tape_cache: std::sync::RwLock::new(None),
+            analysis_cache: std::sync::RwLock::new(None),
         };
         SERIES_FAILED_LAST_PASS.store(4, std::sync::atomic::Ordering::Relaxed);
         *SERIES_FAILED_NAMES.lock().unwrap() = vec!["KXBTC15M".to_string(), "KXSOL15M".to_string()];
@@ -3656,8 +4075,8 @@ mod tests {
             strategies_dir: dir.clone(),
             paper_pot: 100.0,
             collect_secs: 60,
-            tape_cache: std::sync::Mutex::new(None),
-            analysis_cache: std::sync::Mutex::new(None),
+            tape_cache: std::sync::RwLock::new(None),
+            analysis_cache: std::sync::RwLock::new(None),
         };
         let (_, body) = handle(&app, "GET", "/api/home").split_once("\r\n\r\n").map(|(h, b)| (h, b.to_string())).unwrap();
         let home: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -3729,8 +4148,8 @@ mod tests {
             strategies_dir: dir.clone(),
             paper_pot: 100.0,
             collect_secs: 60,
-            tape_cache: std::sync::Mutex::new(None),
-            analysis_cache: std::sync::Mutex::new(None),
+            tape_cache: std::sync::RwLock::new(None),
+            analysis_cache: std::sync::RwLock::new(None),
         };
         let (_, home) = body_json(&handle(&app, "GET", "/api/home"));
         assert_eq!(home["version"], json!("0.4.0"));
@@ -3775,8 +4194,8 @@ mod tests {
             strategies_dir: strat_dir,
             paper_pot: 100.0,
             collect_secs: 60,
-            tape_cache: std::sync::Mutex::new(None),
-            analysis_cache: std::sync::Mutex::new(None),
+            tape_cache: std::sync::RwLock::new(None),
+            analysis_cache: std::sync::RwLock::new(None),
         };
         let (st, body) = body_json(&handle(&app, "GET", "/api/markets/history?ticker=KXBTC15M-TEST"));
         assert_eq!(st, 200);
