@@ -1,35 +1,53 @@
-// cases.mjs: kit/replay.mjs worst-case suite for OpenBell v0.4.0.
+// cases.mjs: kit/replay.mjs worst-case suite for OpenBell v0.5.0.
 export default ({ LONG, patch, malformed, down, json }) => {
   const PASS = 'PROVEN on forward evidence (paper only - no orders placed)'
   const text = (p, sel) => p.locator(sel).textContent().catch(() => '')
+  const standingFigure = async p => (await p.locator('#standing-figure').innerText().catch(() => '')).replace(/\s+/g, ' ').trim()
+  let libCount = 12
   return [
     {
       name: 'null list entry and non-string verdicts in strategies table do not crash',
-      routes: [['**/api/strategies*', patch(j => [null, ...j.map((s, i) => i === 0 ? { ...s, verdict: null } : i === 1 ? { ...s, verdict: 99, windows_traded: null, mean_cents_per_contract: 'bad' } : s)])]],
+      routes: [['**/api/strategies*', patch(j => {
+        libCount = Array.isArray(j) ? j.length : 12
+        return [null, ...j.map((s, i) => i === 0 ? { ...s, verdict: null } : i === 1 ? { ...s, verdict: 99, windows_traded: null, mean_cents_per_contract: 'bad' } : s)]
+      })]],
       check: async p => {
         await p.locator('#tab-strategies').click(); await p.waitForTimeout(250)
         const rows = await p.locator('#strategies tbody tr button[data-strategy-row]').count()
-        if (rows !== 5) return 'expected 5 valid strategy rows, got ' + rows
-        if ((await text(p, '#standing-figure')).trim() !== '0 of 5') return 'standing: ' + await text(p, '#standing')
+        if (rows !== libCount || rows < 12) return `expected ${libCount} valid strategy rows, got ${rows}`
+        const fig = await standingFigure(p)
+        if (fig !== `0 of ${libCount}` && (await text(p, '#standing-figure')).trim() !== `0 of ${libCount}`) return 'standing: ' + fig
         return true
       },
     },
     {
       name: 'null names and standards still tally',
-      routes: [['**/api/strategies*', patch(j => [...j, { ...j[0], strategy: null, standard: null }, { ...j[0], strategy: 5, standard: { min_windows: 'many' } }])]],
-      check: async p => (await text(p, '#standing-figure')).trim() === '0 of 7' || 'figure: ' + await text(p, '#standing'),
+      routes: [['**/api/strategies*', patch(j => {
+        libCount = Array.isArray(j) ? j.length : 12
+        return [...j, { ...j[0], strategy: null, standard: null }, { ...j[0], strategy: 5, standard: { min_windows: 'many' } }]
+      })]],
+      check: async p => {
+        const want = `0 of ${libCount + 2}`
+        const fig = await standingFigure(p)
+        return (fig === want || (await text(p, '#standing-figure')).trim() === want) || 'figure: ' + fig
+      },
     },
     {
       name: 'long unbroken proven names and tickers stay inside bounds',
       path: '/',
       shot: true,
       routes: [
-        ['**/api/strategies*', patch(j => j.map((s, i) => i < 2 ? { ...s, verdict: PASS, strategy: 'strategy-' + LONG } : s))],
+        ['**/api/strategies*', patch(j => {
+          libCount = Array.isArray(j) ? j.length : 12
+          return j.map((s, i) => i < 2 ? { ...s, verdict: PASS, strategy: 'strategy-' + LONG } : s)
+        })],
         ['**/api/slots*', patch(j => ({ ...j, slots: j.slots.map((s, i) => i ? s : { ...s, strategy: 'slot-' + LONG }) }))],
         ['**/api/markets*', patch(j => j.map((m, i) => i ? m : { ...m, ticker: 'KX-' + LONG }))],
       ],
       check: async p => {
-        if ((await text(p, '#standing-figure')).trim() !== '2 of 5') return 'figure: ' + await text(p, '#standing')
+        const want = `2 of ${libCount}`
+        const fig = await standingFigure(p)
+        if (fig !== want && (await text(p, '#standing-figure')).trim() !== want) return 'figure: ' + fig
         const overflow = await p.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
         return overflow <= 0 || `doc overflow ${overflow}px`
       },
