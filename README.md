@@ -182,6 +182,7 @@ Environment (all optional):
 | `OPENBELL_DATA` | the platform data folder above |
 | `OPENBELL_STRATEGIES` | `strategies/` in the data folder (`./strategies` when it exists) |
 | `OPENBELL_COLLECT_SECS` | `60` (the collector's interval, 5 to 3600 seconds) |
+| `OPENBELL_COLLECT_PACE_MS` | `250` (inter-request pace in milliseconds across the 10 public Kalshi reads, 0 to 5000; rate-limit `too_many_requests` responses retry with bounded exponential backoff) |
 | `OPENBELL_PAPER_POT` | `100` (paper pot for the slot simulation, always labelled a simulation parameter, never venue money) |
 | `OPENBELL_ALLOWED_HOSTS` | none (extra host names allowed past the same-site guard, see above) |
 | `PORT` | `8472`, then the next free port up to 8492; an explicit `PORT` is used exactly, and the start fails if it is busy |
@@ -193,17 +194,17 @@ Environment (all optional):
 the Rust tests, and runs the 15-check hermetic and venue-proof kit (including `first_run.sh`: the port fallback, the opener's skip rules and the built-in library): the order-path fence, slot rotation and reconciliation against
 independent recomputation, collector health counted both ways, the equity
 curve reconciled against the slot report, the daily report's honesty
-assertions, the strategy-library mutation isolation, and both themes. In `frontend/`, `npm run check:ui` runs the headless Playwright gate (71 checks across 1440/768/390/320 px in light and dark) and worst-case data replay suite (18 checks). The
+assertions, the strategy-library mutation isolation, and both themes. In `frontend/`, `npm run check:ui` runs the headless Playwright gate (responsive layout, WCAG AA contrast, tap targets, Settings-only Light/Dark theme, SVG label geometry, Tape/Strategies/Slots tabs, Market & Strategy inspectors, and Update strip across 1440/768/390/320 px in light and dark) and worst-case data replay suite. The
 kit is the bar: it is expected to pass end to end, and it is re-run after
 every change.
 
 ## Layout
 
-- `src/main.rs` — the whole server: collector, shadow scorer, slot system,
-  report, and the HTTP API.
+- `src/main.rs` — the whole server: rate-limit-resilient collector, shadow scorer, slot system,
+  report, and the HTTP API (including read-only `GET /api/markets/history` and `GET /api/strategy/source`).
 - `src/open.rs` — display-aware local browser opener on startup.
 - `src/update.rs` — the release check and self-update.
 - `strategies/*.rn` — the strategy library (Rune).
-- `frontend/` & `rune/used/` — React 19 + Tailwind 4 House Frontend source, self-hosted Geist & Geist Mono `.woff2` fonts, copied House Frontend parts, and Playwright E2E checks (`frontend/e2e/`), compiled into one self-contained HTML file at `assets/index.html` and embedded into the binary.
+- `frontend/` & `rune/used/` — React 19 + Tailwind 4 House Frontend source (8/8 libraries), self-hosted Geist & Geist Mono `.woff2` fonts, copied House Frontend parts, and Playwright E2E checks (`frontend/e2e/`), compiled into one self-contained HTML file at `assets/index.html` and embedded into the binary.
 - `JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md` — product job questions, eight-library House Frontend coverage, and interaction/motion inventory.
-- `assets/index.html` — the compiled single-file desk: daily report and forward-evidence standing, six instrument readings, paper slots, keyboard-navigable strategy ledger with detail drawer (`/` search, `j`/`k`/`Enter`), virtualised market tape, venue account, and line-by-line audit trail. Light by default with a full dark theme (`Appearance` in the header).
+- `assets/index.html` — the compiled single-file Kalshi 15m quant research & paper compounding desk: top command bar with `/` global filter and live `Collect now`, Hero Telemetry & Compounding Strip (`SlidingNumber` KPI tiles, interactive paper equity curve, Tremor `Tracker` & `CategoryBar`), three-tab Trader Workbench (`Live 15m Tape` with Market Inspector, `Rune Strategies` with `j`/`k`/`Enter` Strategy Inspector & live `.rn` source disclosure, `Slot Desk` with 3-strike tracker, verbatim Daily Report, and read-only Venue Account), and Desk Settings `Vaul` sheet (Light default + full Dark `Appearance` toggle, collector cadence, self-updates, and provenance legend).

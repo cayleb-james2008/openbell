@@ -1,31 +1,28 @@
 @import "tailwindcss";
-/* The two notes quote class names as text; they are not markup and must not generate CSS. */
+/* Non-markup documentation and e2e scripts must not generate utility classes. */
 @source not "../../rune/used/LOCAL-EDITS.md";
 @source not "../DESIGN.md";
-/* The UI checks in ../e2e quote class names in selectors and style overrides; they are not markup. */
 @source not "../e2e";
 @source not "../../rune/used/motion.ts";
-/* Five motion parts are scanned by name only: their motion prop name is not a class, so they are excluded from the scan and their static classes are listed here. */
-@source inline("&& (!bounds.height) (integerDigits.length */ /** // 0% 1) 10 100% 9, === @/lib/utils Enter ExpandableCard ExpandableCardContent ExpandableCardFooter ExpandableCardHeader ExpandableTrigger Math.pow(10, SlidingNumberProps SlidingNumberProps) Toggle [integerPart, [mask-clip:padding-box,border-box] [mask-composite:intersect]");
-@source inline("[mask-image:linear-gradient(transparent,transparent),linear-gradient(CanvasText,CanvasText)] absValue absValue.toString().split( absolute and animate animated are aria-hidden= as aspect-square assistive auto between bg-blue bg-white big blur(0px) blur(16px) blur(4px) blur(8px) blur-lg blur-md blur-sm border border-transparent both button children className= client columns const counts");
-@source inline("cursor-pointer dark:shadow-[inset_0_0_1px_1px_hsl(var(--border)/0.5)] dark:sm:shadow-[inset_0_0_2px_1px_hsl(var(--border)/0.5)] data-checked data-id decimalPart decimalPart] decimalSeparator decimalSeparator?: digit digits, div duration-300 ease-in-out easeIn easeInOut easeOut edit: every exit expand export exposed false false, flex flex-col flex-grow for from function grid grid-cols-1 group");
-@source inline("group) group, group?: groupedInteger groups h-full height hidden hold horizontal i) if index index) initial inline-block inline-flex inset-0 integerDigits integerDigits.length integerDigits.map((_, integerPlaces integerValue invisible is items-center items-start justify-between know leading-none linear local max-w-[calc(100%-1rem)] md:max-w-[calc(100%-4rem)] md:p-2 md:p-4 md:rounded-3xl");
-@source inline("md:rounded-[2rem] money motion/react moving mx-auto number of once, overflow-hidden overflow-x-visible overflow-y-clip p-1 p-2 p-4 p-6 padStart padStart?: paddedInteger paddedInteger.split( parseInt(integerPart, pointer-events-none popLayout pt-0 push px-4 react react-use-measure real rect(0 ref relative render replace return ring-1 ring-border/50 rolling round rounded-[inherit] rounded-lg");
-@source inline("rounded-md running separator shadow-[inset_0_0_1px_1px_hsl(var(--border)/0.3)] shadow-md shadow-xl slide-down slide-left slide-right slide-up sm:max-w-[calc(100%-2rem)] sm:p-1.5 sm:p-3 sm:rounded-lg sm:rounded-xl sm:shadow-[inset_0_0_2px_1px_hsl(var(--border)/0.3)] so space-y-1.5 spoken spring still tabular-nums technology text. the they thousands three to transition-[opacity,transform] true type");
-@source inline("until use value value, value: vertical visible w-[1ch] w-full we z-10");
+/* Motion Primitives & Expandable use a `transition` JSX prop that Tailwind scans as `.transition` (which transitions box-shadow).
+   Exclude those files from scanning and register their exact static utility classes below. */
+@source inline("absolute aspect-square bg-blue bg-clip-text bg-[length:250%_100%,auto] bg-white border border-transparent cursor-pointer dark:shadow-[inset_0_0_1px_1px_hsl(var(--border)/0.5)] dark:sm:shadow-[inset_0_0_2px_1px_hsl(var(--border)/0.5)] flex flex-col flex-grow grid grid-cols-1 group h-full hidden inline-block inline-flex inset-0 invisible items-center items-start justify-between justify-center leading-none max-w-[calc(100%-1rem)] md:max-w-[calc(100%-4rem)] md:p-2 md:p-4 md:rounded-3xl md:rounded-[2rem] -mx-[0.2ch] mx-auto overflow-hidden overflow-x-visible overflow-y-clip p-1 p-2 p-4 p-6 pointer-events-none pt-0 px-4 relative ring-1 ring-border/50 rounded-[inherit] rounded-lg rounded-md shadow-[inset_0_0_1px_1px_hsl(var(--border)/0.3)] shadow-md shadow-xl sm:max-w-[calc(100%-2rem)] sm:p-1.5 sm:p-3 sm:rounded-lg sm:rounded-xl sm:shadow-[inset_0_0_2px_1px_hsl(var(--border)/0.3)] space-y-1.5 sr-only tabular-nums text-ink-2 text-transparent transition-[opacity,transform] visible w-[1ch] w-full z-10");
+@source inline("[background-repeat:no-repeat,padding-box] [mask-clip:padding-box,border-box] [mask-composite:intersect] [mask-image:linear-gradient(transparent,transparent),linear-gradient(CanvasText,CanvasText)] [--base-color:var(--ink-2)] [--base-gradient-color:var(--ink)] [--bg:linear-gradient(90deg,transparent_calc(50%-var(--spread)),var(--base-gradient-color),transparent_calc(50%+var(--spread)))]");
 @source not "../../rune/used/components/ui/animated-background.tsx";
 @source not "../../rune/used/components/ui/border-trail.tsx";
 @source not "../../rune/used/components/ui/text-morph.tsx";
+@source not "../../rune/used/components/ui/text-shimmer.tsx";
+@source not "../../rune/used/components/ui/sliding-number.tsx";
 @source not "../../rune/used/components/ui/expandable.tsx";
 @source not "./motionProps.ts";
-/* Tokens: the house roles (tokens.css), then this app's Hallmark theme values (theme.css), then its fonts. */
+
+/* Tokens: house roles (tokens.css), calm quant desk theme (theme.css), self-hosted Geist fonts (fonts.css). */
 @import "./tokens.css";
 @import "./theme.css";
 @import "./fonts.css";
 @source "../../rune/used";
 
-/* Tremor Raw animation block (documented install step: paste its @theme into globals.css).
-   Only the hover-card/tooltip entries that Tracker uses are kept. */
+/* Tremor Raw popover/tooltip keyframes for Tracker & CategoryBar hover states. */
 @theme {
   --animate-slide-down-and-fade: slideDownAndFade 150ms cubic-bezier(0.16, 1, 0.3, 1);
   --animate-slide-up-and-fade: slideUpAndFade 150ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -50,44 +47,78 @@
   }
 }
 
-/* Vaul ships a 500 ms slide. A modal that outlives the key that dismissed it reads as a stuck control: measured 544-561 ms
-   from Escape to gone, and the gate's own 600 ms allowance sat inside the noise. The drawer travels at the house's enter
-   token instead (250 ms), which is inside its own "UI under 300 ms" rule and leaves a dismissal plainly finished. Kept above
-   the reduced-motion block so the cut below still wins there. */
-[data-vaul-drawer], [data-vaul-overlay] { animation-duration: var(--dur-enter) !important; transition-duration: var(--dur-enter) !important; }
+/* Vaul sheets travel at the house's 250ms enter token and obey prefers-reduced-motion cleanly. */
+[data-vaul-drawer], [data-vaul-overlay] {
+  animation-duration: var(--dur-enter) !important;
+  transition-duration: var(--dur-enter) !important;
+}
 
-/* Vaul ignores prefers-reduced-motion: its sheet and overlay travel with CSS *animations* (slideFromBottom,
-   slideToBottom, fadeIn, fadeOut) and a transform motion. The earlier override here (until 2026-11-10)
-   matched [vaul-drawer], an attribute vaul 1.x does not set (it sets data-vaul-drawer), and cut only the
-   motion, so the 500 ms slide kept running. Both durations are cut on the real attributes. */
 @media (prefers-reduced-motion: reduce) {
-  [data-vaul-drawer], [data-vaul-overlay] { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  [data-vaul-drawer], [data-vaul-overlay] {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
-/* Phone (under 768 px): a table row is a short run of lines, never a squeezed table. Each line is one flex row. A zero-height
-   break item (the row's ::after, order 1) starts line 2 after the identifier, so the readings wrap only between readings.
-   Slots: line 1 slot, strategy, status; line 2 strikes, stint P&L, equity. Strategies: line 1 name and side; line 2 Tracker and
-   reading and mean; line 3 verdict, full width. Names wrap only at hyphens; a verdict is never clipped. */
+/* Phone (<768px): data tables render as compact stacked cards without horizontal squeeze or scroll. */
 @media (max-width: 767px) {
-  table.stack, table.stack tbody, table.stack tr, table.stack td { display: block; width: 100%; }
-  table.stack thead { display: none; }
-  table.stack tr { display: flex; flex-wrap: wrap; align-items: center; column-gap: 8px; row-gap: 4px; border-bottom: 1px solid var(--hairline); padding: 8px 0; }
-  table.stack tr::after { content: ""; order: 1; flex: 0 0 100%; height: 0; }
-  table.stack td { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; border: 0; padding: 0; width: auto; min-width: 0; max-width: none; text-align: left; white-space: normal; overflow-wrap: normal; word-break: normal; font-size: 14px; }
-  table.stack td::before { content: none; }
-  table.stack td.stack-first { font-weight: 500; font-size: 16px; }
-  table.stack td.c-name { flex: 1 1 0; }
-  table.stack td.c-name > span { overflow-wrap: normal; word-break: normal; }
-  table.stack td.c-side, table.stack td.c-status { flex: 0 0 auto; margin-left: auto; }
-  table.stack td.c-side { border: 1px solid var(--hairline); border-radius: 6px; padding: 2px 8px; font-size: 13px; }
-  table.stack td.c-windows, table.stack td.c-strikes { order: 2; }
-  table.stack td.c-mean, table.stack td.c-pnl { order: 3; }
-  table.stack td.c-verdict, table.stack td.c-equity { order: 4; }
-  table.stack td.c-verdict { flex: 1 1 100%; }
-  table.stack td.c-strikes, table.stack td.c-pnl, table.stack td.c-equity, table.stack td.c-mean { white-space: nowrap; }
+  table.stack, table.stack tbody, table.stack tr, table.stack td {
+    display: block;
+    width: 100%;
+  }
+  table.stack thead {
+    display: none;
+  }
+  table.stack tbody tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 10px;
+    row-gap: 6px;
+    border-bottom: 1px solid var(--hairline);
+    padding: 12px 14px;
+  }
+  table.stack tbody tr:last-child {
+    border-bottom: 0;
+  }
+  table.stack td {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    border: 0;
+    padding: 0;
+    width: auto;
+    min-width: 0;
+    max-width: 100%;
+    text-align: left;
+    white-space: normal;
+    font-size: 14px;
+  }
+  table.stack td.m-full {
+    flex: 1 1 100%;
+  }
+  table.stack td.m-grow {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+  table.stack td.m-right {
+    margin-left: auto;
+    flex: 0 0 auto;
+  }
 }
 
-/* The page never scrolls sideways; headings balance their lines; every control shows a visible focus ring. */
-html, body { overflow-x: clip; }
-h1, h2, h3, h4 { text-wrap: balance; }
-:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+html, body {
+  overflow-x: clip;
+  background-color: var(--canvas);
+  color: var(--ink);
+}
+
+h1, h2, h3, h4 {
+  text-wrap: balance;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
