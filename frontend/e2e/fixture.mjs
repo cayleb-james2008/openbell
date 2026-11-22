@@ -43,7 +43,11 @@ export function build() {
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const listening = port => new Promise(res => { const s = net.connect(port, '127.0.0.1'); s.once('connect', () => { s.destroy(); res(true) }); s.once('error', () => res(false)) })
 const freePort = () => new Promise((res, rej) => { const s = net.createServer().once('error', rej).listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => res(port)) }) })
-async function pickPort(taken) { for (;;) { const p = await freePort(); if (p !== 9230 && !taken.includes(p)) return p } }
+const canBind = port => new Promise(res => { const s = net.createServer().once('error', () => res(false)).listen(port, '127.0.0.1', () => s.close(() => res(true))) })
+async function pickPort(taken) {
+  for (let p = 18890; p <= 18899; p++) if (!taken.includes(p) && await canBind(p)) return p
+  for (;;) { const p = await freePort(); if (p !== 9230 && !taken.includes(p)) return p }
+}
 
 // Only ever signal a pid this fixture wrote, and only while its command line is still the one it started.
 function alive(name, mark) {

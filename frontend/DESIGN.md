@@ -156,4 +156,10 @@ Kept as before (see "Pinned hooks" above). `theme.sh` now reads `getItem('openbe
 The parity inventory above stands. This round changed no behaviour and no wording: the rolling digits became plain text, the phone trail shows full labels, and the Collected markets preview on phone shows 4 rows instead of 8 (the same "Showing the first N of M" note).
 
 ### What was not checked
-- Vaul (not used). A screen-reader pass on the rebuilt phone rows. The live dataset at 320 px beyond the overflow and target measures. Phone pictures were reviewed as 390 px halves, not 1:1 crops of every block. The kit's proof.sh queries the live Kalshi public API.
+- A screen-reader pass on the rebuilt phone rows. The live dataset at 320 px beyond the overflow and target measures. The kit's proof.sh queries the live Kalshi public API.
+
+## v0.3.0 alignment (2026-11-21)
+- **Typography**: Self-hosted `Geist` (`400`, `500`) and `Geist Mono` (`400–500`) `.woff2` bundled inline in `assets/index.html` (`frontend/src/fonts.css`, `theme.css`, `tokens.css`), replacing `Host Grotesk` / `Atkinson Hyperlegible Mono` for full House Frontend parity with zero external network calls.
+- **All 8 House Frontend libraries active**: Vaul `Drawer` (`StrategyDrawer` in `Lists.tsx`, `250 ms` house enter/dismiss timing) and COSS UI `Kbd` (`/` shortcut hint on search inputs) join Motion Primitives, COSS UI, Cult UI, Kibo UI, Tremor (`ProgressCircle` + `Tracker`), Sonner, and Motion (`0` "no need here" rows in `ROLE-COVERAGE.md`).
+- **Lead hierarchy & fixture badge**: Desktop separates the Daily report (`venue` / `tape`) and `Strategies proven on forward evidence` (`paper`) across a vertical 1px hairline so the promotion standing never reads as a sub-line of `Day P&L (venue): unavailable`, while preserving first-fold bounds at `1440x900` and `390x844`; `?dataset=fixture` carries an explicit in-frame `example fixture` Kibo Pill.
+- **Resilience & self-update**: Null list entries and non-string `verdict` values in `/api/strategies` render safely without crashing or `NaN`; `UpdateStrip` and `VersionRow` enforce loopback-only `Update now` / `Check for updates`, deterministic focus handoff (`Dismiss` -> `Show update`, `Update now` -> `Restart now`), and plain failure copy (`plainUpdateError` + `Details` disclosure).

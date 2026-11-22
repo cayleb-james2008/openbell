@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 const root = path.resolve(import.meta.dirname, "..");
 const used = path.resolve(root, "../rune/used");
-const HOUSE = process.env.HOUSE_SRC || "/home/cayleb/.claude/skills/house-frontend/starter/src";
+const HOUSE = process.env.HOUSE_SRC || (fs.existsSync("/home/cayleb/Work/shared-workflows/house-frontend/skill/starter/src") ? "/home/cayleb/Work/shared-workflows/house-frontend/skill/starter/src" : "/home/cayleb/.claude/skills/house-frontend/starter/src");
 const exts = ["", ".tsx", ".ts", "/index.tsx", "/index.ts"];
 const LIB = [
   [/components\/ui\/(texture-button|expandable)/, "Cult UI (cult-ui.com)", "MIT"],

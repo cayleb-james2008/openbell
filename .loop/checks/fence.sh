@@ -27,11 +27,11 @@ fi
 if grep -rn 'TcpStream::connect\|UdpSocket' src/main.rs >/dev/null; then
   echo "FAIL: outbound socket code present (only TcpListener may exist)"; fail=1
 fi
-if strings target/debug/openbell-rs | grep -q '/orders'; then
+if strings "${CARGO_TARGET_DIR:-target}/debug/openbell-rs" | grep -q '/orders'; then
   echo "FAIL: '/orders' string present in the built binary"; fail=1
 fi
 for ident in place_order create_order submit_order signed_order order_id; do
-  if strings target/debug/openbell-rs | grep -q "$ident"; then
+  if strings "${CARGO_TARGET_DIR:-target}/debug/openbell-rs" | grep -q "$ident"; then
     echo "FAIL: '$ident' present in the built binary"; fail=1
   fi
 done

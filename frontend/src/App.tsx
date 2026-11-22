@@ -10,7 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { sectionGlide } from "@/motionProps";
-import { type Dataset, type Read, type Home, useDesk } from "@/lib/desk";
+import { type Dataset, type Read, type Home, ageWords, isNum, useDesk } from "@/lib/desk";
 import { useWide } from "@/lib/media";
 import { ReportLine, ReportTrail } from "@/Lead";
 import { AccountPanel, Readings, SlotsPanel } from "@/Panels";
@@ -18,12 +18,12 @@ import { Markets, Strategies } from "@/Lists";
 import { UpdateStrip, VersionRow, useUpdates } from "@/Update";
 
 const SECTIONS = [
-  { id: "report", label: "Report", target: "report-card" },
-  { id: "readings", label: "Readings", target: "readings" },
-  { id: "slots", label: "Slots", target: "slots-card" },
-  { id: "strategies", label: "Strategies", target: "strategies" },
-  { id: "markets", label: "Markets", target: "markets-card" },
-  { id: "account", label: "Venue account", target: "account" },
+  { id: "report", label: "Report", target: "report-card", answersVia: undefined },
+  { id: "readings", label: "Readings", target: "readings", answersVia: "3" },
+  { id: "slots", label: "Slots", target: "slots-card", answersVia: "4" },
+  { id: "strategies", label: "Strategies", target: "strategies", answersVia: undefined },
+  { id: "markets", label: "Markets", target: "markets-card", answersVia: undefined },
+  { id: "account", label: "Venue account", target: "account", answersVia: "5" },
 ] as const;
 
 const PURPOSE = "A paper-trading desk for Kalshi’s 15-minute crypto markets: it collects the venue’s public data, tests strategies on paper, and reports what happened. It never places orders.";
@@ -38,19 +38,16 @@ function readTheme(): "light" | "dark" {
   return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
 }
 
-
 function collectorWords(home: Home | null): { dot: string; line: string; short: string } {
-  if (!home) return { dot: "bg-track", line: "Collector: checking", short: "Checking" };
+  if (!home || !home.collector) return { dot: "bg-track", line: "Collector: checking", short: "Checking" };
   const c = home.collector;
-  const failed = c.series_failed_last_pass ?? 0;
-  const healthy = c.collecting && c.dropped_lines === 0 && c.conflicting_settlements === 0 && !failed;
+  const failed = isNum(c.series_failed_last_pass) ? c.series_failed_last_pass : 0;
+  const dropped = isNum(c.dropped_lines) ? c.dropped_lines : 0;
+  const conflicts = isNum(c.conflicting_settlements) ? c.conflicting_settlements : 0;
+  const healthy = c.collecting && dropped === 0 && conflicts === 0 && !failed;
   const dot = c.collecting ? (healthy ? "bg-info-foreground" : "bg-dot-amber") : "bg-unread";
-  const line = c.collecting ? "Collecting, newest " + ageOf(c.newest_snapshot_age_secs) : "Not collecting";
+  const line = c.collecting ? "Collecting, newest " + ageWords(c.newest_snapshot_age_secs) : "Not collecting";
   return { dot, line, short: c.collecting ? "Collecting" : "Not collecting" };
-}
-function ageOf(age: number | null): string {
-  if (age === null) return "none yet";
-  return age < 90 ? age + "s ago" : age < 5400 ? Math.round(age / 60) + "m ago" : (age / 3600).toFixed(1) + "h ago";
 }
 
 // The tag meanings, once, in a Popover from 768 px and in a Dialog on a phone.
@@ -70,7 +67,7 @@ function HowToRead() {
   if (wide) {
     return (
       <Popover>
-        <PopoverTrigger aria-label="How to read this" className="inline-flex size-11 cursor-pointer items-center justify-center rounded-md text-ink-2 outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) hover:text-ink focus-visible:ring-2 focus-visible:ring-ring">{trigger}</PopoverTrigger>
+        <PopoverTrigger aria-label="How to read this" className="inline-flex size-11 cursor-pointer items-center justify-center rounded-md text-ink-2 outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) hover:bg-board hover:text-ink active:bg-track focus-visible:ring-2 focus-visible:ring-ring">{trigger}</PopoverTrigger>
         <PopoverContent className="w-96 rounded-[10px] border border-hairline bg-surface p-4 text-ink">
           <p className="mb-3 text-sm font-medium text-ink">How to read this</p>
           {body}
@@ -80,7 +77,7 @@ function HowToRead() {
   }
   return (
     <Dialog>
-      <DialogTrigger aria-label="How to read this" className="inline-flex size-11 cursor-pointer items-center justify-center rounded-md text-ink-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">{trigger}</DialogTrigger>
+      <DialogTrigger aria-label="How to read this" className="inline-flex size-11 cursor-pointer items-center justify-center rounded-md text-ink-2 outline-none transition-[color,background-color] duration-(--dur-press) ease-(--ease-house) hover:bg-board active:bg-track focus-visible:ring-2 focus-visible:ring-ring">{trigger}</DialogTrigger>
       <DialogContent className="rounded-[10px] border border-hairline bg-surface p-5 text-ink">
         <DialogTitle className="mb-3 text-base font-medium">How to read this</DialogTitle>
         {body}
@@ -139,19 +136,24 @@ function Shell() {
   return (
     <TooltipProvider>
       <header className="sticky top-0 z-20 border-b border-hairline bg-canvas">
-        <div className="mx-auto flex min-h-14 max-w-[1280px] flex-wrap items-center gap-x-5 gap-y-2 px-4 py-2">
+        <div className="mx-auto flex min-h-14 max-w-[1280px] flex-wrap items-center gap-x-4 gap-y-2 px-4 py-2">
           <div className="mr-auto flex items-center gap-1 text-base font-medium text-ink">
             <Bell className="size-5 text-ink" strokeWidth={1.5} aria-hidden />
             <span className="mr-1">OpenBell</span>
             <HowToRead />
           </div>
-          <Pill variant="outline" className="!h-auto min-h-7 text-ink-2" title="Paper only: this build places no orders"><PillStatus><PillIndicator variant="info" />Paper only</PillStatus><span className="hidden sm:inline">This build places no orders</span></Pill>
-          <Pill id="chip" variant="outline" className="!h-auto min-h-7 max-w-full text-ink-2" title="Collector health">
+          {fixture && (
+            <Pill variant="outline" className="hidden !h-auto min-h-7 text-warning-foreground lg:inline-flex" title="Showing example fixture data">
+              <PillStatus className="border-r-0 pr-0"><PillIndicator variant="warning" />example fixture</PillStatus>
+            </Pill>
+          )}
+          <Pill variant="outline" className="!h-auto min-h-7 text-ink-2" title="Paper only: this build places no orders"><PillStatus className="max-sm:border-r-0 max-sm:pr-0"><PillIndicator variant="info" />Paper only</PillStatus><span className="hidden sm:inline">This build places no orders</span></Pill>
+          <Pill id="chip" data-answers="3" variant="outline" className="!h-auto min-h-7 max-w-full text-ink-2" title="Collector health">
             <span id="chip-dot" aria-hidden="true" className={"size-2 rounded-full " + cw.dot} />
             <span id="chip-text" className="min-w-0 break-words">{allFailed ? "Collector: unavailable" : cw.short}</span>
           </Pill>
           <div className="flex items-center gap-2">
-            <SegmentedControl aria-label="Which tape the paper figures use">
+            <SegmentedControl id="live-group" aria-label="Which tape the paper figures use">
               {(["live", "fixture"] as const).map((d) => (
                 <SegmentedControlItem key={d} id={d === "live" ? "seg-live" : "seg-fixture"} className={segItem} aria-pressed={dataset === d} data-checked={dataset === d ? "" : undefined} onClick={() => pickDataset(d)}>
                   {d === "live" ? "Live tape" : "Fixture"}
@@ -161,7 +163,7 @@ function Shell() {
             <div id="settings">
               <SegmentedControl aria-label="Appearance" id="themeBtn">
                 {(["dark", "light"] as const).map((t) => (
-                  <SegmentedControlItem key={t} className={segItem} aria-label={t === "dark" ? "Dark appearance" : "Light appearance"} aria-pressed={theme === t} data-checked={theme === t ? "" : undefined} onClick={() => pickTheme(t)}>
+                  <SegmentedControlItem key={t} className={segItem} aria-label={t === "dark" ? "Dark" : "Light"} aria-pressed={theme === t} data-checked={theme === t ? "" : undefined} onClick={() => pickTheme(t)}>
                     {t === "dark" ? <Moon className="size-4" strokeWidth={1.5} aria-hidden /> : <Sun className="size-4" strokeWidth={1.5} aria-hidden />}
                   </SegmentedControlItem>
                 ))}
@@ -177,8 +179,8 @@ function Shell() {
             {...sectionGlide}
           >
             {SECTIONS.map((s) => (
-              <button key={s.id} type="button" data-id={s.id} aria-current={active === s.id ? "location" : undefined}
-                className="h-11 shrink-0 cursor-pointer rounded-md px-3 text-sm font-medium text-ink-2 outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) hover:text-ink focus-visible:ring-2 focus-visible:ring-ring data-[checked=true]:text-ink">
+              <button key={s.id} type="button" data-id={s.id} data-answers-via={s.answersVia} aria-current={active === s.id ? "location" : undefined}
+                className="h-11 shrink-0 cursor-pointer rounded-md px-3 text-sm font-medium text-ink-2 outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) hover:text-ink active:bg-track focus-visible:ring-2 focus-visible:ring-ring data-[checked=true]:text-ink">
                 {s.label}
               </button>
             ))}
@@ -192,8 +194,8 @@ function Shell() {
         <p className="sr-only" aria-live="polite">{fixture ? "Showing the example tape" : "Showing the live tape"}</p>
         <UpdateStrip u={upd} />
         {fixture && (
-          <div role="note" className="flex gap-3 rounded-[10px] border border-hairline bg-board px-4 py-3 text-sm text-ink-2">
-            <p><span className="font-medium text-ink">Example tape.</span> Paper figures below come from a labelled fixture of 120 settled windows written for tests. They were not collected from Kalshi. The daily report and the venue account always read the live desk.</p>
+          <div id="fixture-banner" role="note" className="flex items-start gap-2.5 rounded-[10px] border border-hairline bg-board px-4 py-2.5 text-sm text-ink-2">
+            <p className="min-w-0"><Pill variant="outline" className="mr-2 inline-flex h-auto py-0 align-baseline text-warning-foreground lg:hidden">example fixture</Pill><span className="font-medium text-ink">Example tape.</span> Paper figures below come from a labelled fixture of 120 settled windows written for tests. They were not collected from Kalshi. The daily report and the venue account always read the live desk.</p>
           </div>
         )}
         {allFailed && (

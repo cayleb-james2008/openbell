@@ -51,7 +51,7 @@ PY
 
 OPENBELL_DATA="$WORK/data" OPENBELL_STRATEGIES="$PWD/strategies" \
 OPENBELL_COLLECT_SECS=3600 PORT=$PORT \
-  ./target/debug/openbell-rs > "$WORK/server.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 40); do curl -s "http://127.0.0.1:$PORT/" >/dev/null 2>&1 && break; sleep 0.5; done
 # The startup collection pass appends real venue snapshots to the

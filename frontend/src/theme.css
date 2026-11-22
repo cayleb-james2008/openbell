@@ -44,8 +44,8 @@
   --surface: #1f1e1c;
   --hairline: #33322f;
   --input: #6e6d65;
-  --track: #262523;
-  --raised: #2a2926;
+  --track: #292825;
+  --raised: #363531;
   --ink: #faf9f5;
   --ink-2: #c8c7bd;
   --ink-3: #9d9c92;
@@ -74,13 +74,14 @@
   --destructive-foreground: #f0988e; --info-foreground: #9dc0e4; --success-foreground: #a9c188; --warning-foreground: #e7c277;
 }
 :root {
-  /* Console: type voice, radii and the heading recipe (Hallmark theme values) */
-  --font-sans: "Host Grotesk", ui-sans-serif, system-ui, sans-serif;
-  --font-heading: "Host Grotesk", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "Atkinson Hyperlegible Mono", ui-monospace, monospace;
+  /* House typography (Geist + Geist Mono), radii and heading recipe */
+  --font-sans: "Geist", ui-sans-serif, sans-serif;
+  --font-heading: "Geist", ui-sans-serif, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, monospace;
   --radius-shell: 12px; --radius-panel: 10px; --radius-dialog: 10px; --radius-card: 10px;
   --radius-segment: 6px; --radius-chip: 4px; --radius-menu: 10px; --radius: 6px;
-  --display-weight: 500; --tracking-display: -0.03em;
+  --display-weight: 500; --tracking-display: -0.025em;
+  font-synthesis: none;
 }
 h1, h2, h3, .font-heading { font-family: var(--font-heading); font-weight: var(--display-weight); letter-spacing: var(--tracking-display); }
 .num, .mono, [data-measured] { font-family: var(--font-mono); font-variant-numeric: tabular-nums slashed-zero; }

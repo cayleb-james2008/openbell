@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Expandable, ExpandableContent, ExpandableTrigger } from "@/components/ui/expandable";
-import { getJson } from "@/lib/desk";
+import { getJson, isNum } from "@/lib/desk";
 
 type Snap = {
   mode?: string;
@@ -22,12 +22,15 @@ type Version = { version: string; release_url?: string };
 
 const DISMISS_KEY = "openbell-update-dismissed";
 const CHECK_MS = 30 * 60 * 1000;
-const LOCAL = ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+
+export function isLoopbackHost(host = location.hostname): boolean {
+  return ["localhost", "127.0.0.1", "[::1]", "::1"].includes(host.toLowerCase());
+}
 
 const dismissedFor = (): string => { try { return localStorage.getItem(DISMISS_KEY) || ""; } catch { return ""; } };
 const rememberDismiss = (v: string) => { try { localStorage.setItem(DISMISS_KEY, v); } catch { /* private window: the banner just returns */ } };
 
-// Server text is mapped by substring; the raw text is kept only for the Details disclosure.
+// Server text is mapped by substring; the raw text is kept only for the Details disclosure, never URLs or OS strings in view.
 export function plainUpdateError(raw: string): string {
   const t = raw || "";
   if (/could not reach|connection/i.test(t)) return "Could not reach GitHub. Check your internet connection, then try again.";
@@ -39,7 +42,7 @@ export function plainUpdateError(raw: string): string {
 }
 
 function checkedWords(secs?: number): string {
-  if (!secs) return "";
+  if (!isNum(secs) || secs <= 0) return "";
   const mins = Math.round((Date.now() - secs * 1000) / 60000);
   if (mins < 1) return "just now";
   if (mins < 60) return mins + " min ago";
@@ -54,20 +57,31 @@ export function useUpdates() {
   const [busy, setBusy] = useState<"" | "apply" | "restart" | "check">("");
   const [raw, setRaw] = useState("");
   const [returnMsg, setReturnMsg] = useState("");
+  const [focusReq, setFocusReq] = useState<"" | "status" | "show" | "restart">("");
   const statusRef = useRef<HTMLParagraphElement>(null);
   const showRef = useRef<HTMLButtonElement>(null);
   const restartRef = useRef<HTMLButtonElement>(null);
+  const local = isLoopbackHost();
+
+  useEffect(() => {
+    if (!focusReq) return;
+    const target = focusReq === "status" ? statusRef.current : focusReq === "show" ? showRef.current : restartRef.current;
+    if (target) {
+      target.focus();
+      setFocusReq("");
+    }
+  }, [focusReq, dismissed, snap, busy]);
 
   const loadVersion = async () => {
     try {
       const v = (await getJson("/api/version")) as Version;
-      if (typeof v.version === "string") setVersion(v);
+      if (v && typeof v.version === "string") setVersion(v);
     } catch { /* no version line when the server does not answer */ }
   };
   const loadUpdate = async () => {
     try {
       const s = (await getJson("/api/update")) as Snap;
-      if (typeof s.mode === "string" && typeof s.available === "boolean") setSnap(s);
+      if (s && typeof s.mode === "string" && typeof s.available === "boolean") setSnap(s);
     } catch { /* best effort: say nothing that cannot be verified */ }
   };
   useEffect(() => {
@@ -85,13 +99,14 @@ export function useUpdates() {
 
   const check = async () => {
     setBusy("check");
+    setRaw("");
     try {
       const { ok, data } = await post("/api/update/check");
       if (!ok) throw new Error(data.error || "The check did not finish. Try again later.");
       setSnap(data);
       rememberDismiss("");
       setDismissed("");
-      setRaw("");
+      if (data.error) setRaw(data.error);
     } catch (e) {
       setRaw(e instanceof Error ? e.message : String(e));
     }
@@ -103,14 +118,16 @@ export function useUpdates() {
     setBusy("apply");
     setRaw("");
     statusRef.current?.focus();
+    setFocusReq("status");
     try {
       const { ok, data } = await post("/api/update/apply");
       if (!ok) throw new Error(data.error || "The update did not install. Try again later.");
-      const msg = "Installed " + latest + ". Restart to use it.";
+      const ver = data.staged || latest;
+      const msg = ver + " installed. Restart to use it.";
       setJustInstalled(msg);
-      setSnap({ ...data, available: false, staged: data.staged || latest });
+      setSnap({ ...data, available: false, staged: ver });
       toast.success(msg);
-      setTimeout(() => restartRef.current?.focus(), 0);
+      setFocusReq("restart");
     } catch (e) {
       const text = e instanceof Error ? e.message : String(e);
       setRaw(text);
@@ -121,6 +138,8 @@ export function useUpdates() {
 
   const restart = async () => {
     setBusy("restart");
+    setRaw("");
+    statusRef.current?.focus();
     try {
       const { ok, data } = await post("/api/update/restart");
       if (!ok) throw new Error(data.error || "OpenBell could not restart.");
@@ -159,31 +178,35 @@ export function useUpdates() {
     if (!snap?.latest) return;
     rememberDismiss(snap.latest);
     setDismissed(snap.latest);
-    setTimeout(() => showRef.current?.focus(), 0);
+    setRaw("");
+    setFocusReq("show");
   };
   const showAgain = () => {
     rememberDismiss("");
     setDismissed("");
-    setTimeout(() => statusRef.current?.focus(), 0);
+    setFocusReq("status");
   };
 
-  const notes = (snap?.notes || "").trim();
-  const staged = !!snap?.staged;
+  const notes = typeof snap?.notes === "string" ? snap.notes.trim() : "";
+  const staged = typeof snap?.staged === "string" && !!snap.staged;
   const showBanner = !!snap && (staged || (snap.available && !!snap.latest && dismissed !== snap.latest));
   const hiddenByDismiss = !!snap && !staged && snap.available && !!snap.latest && dismissed === snap.latest;
+  const checkErr = !showBanner ? (raw || snap?.error || "") : "";
 
   const resultLine = (): string => {
+    if (checkErr) return plainUpdateError(checkErr);
     if (!snap) return "";
     if (snap.mode === "off") return "Updates are off on this OpenBell.";
-    if (snap.error) return plainUpdateError(snap.error);
-    if (snap.staged) return snap.staged + " installed. Restart to use it.";
+    if (staged) return snap.staged + " installed. Restart to use it.";
     if (snap.available && snap.latest) return "Version " + snap.latest + " is available.";
-    if (!snap.checked_at) return "";
-    return "You are on the newest version (checked " + checkedWords(snap.checked_at) + ").";
+    // After a fresh start (checked_at null), show the version only — never "Not checked yet".
+    const ago = checkedWords(snap.checked_at);
+    if (!ago) return "";
+    return "You are on the newest version (checked " + ago + ").";
   };
 
   return {
-    version, snap, notes, staged, showBanner, hiddenByDismiss, busy, raw, returnMsg, justInstalled,
+    local, version, snap, notes, staged, showBanner, hiddenByDismiss, busy, raw, checkErr, returnMsg, justInstalled,
     refs: { statusRef, showRef, restartRef },
     check, apply, restart, dismiss, showAgain, resultLine,
   };
@@ -191,54 +214,72 @@ export function useUpdates() {
 
 type U = ReturnType<typeof useUpdates>;
 
+function ErrorDetails({ raw }: { raw: string }) {
+  return (
+    <Expandable expandDirection="vertical" expandBehavior="push" className="w-full">
+      <ExpandableTrigger className="min-h-11 cursor-pointer rounded-md px-1 text-sm text-ink-2 underline outline-none hover:text-ink active:bg-track focus-visible:ring-2 focus-visible:ring-ring">
+        Details
+      </ExpandableTrigger>
+      <ExpandableContent preset="fade">
+        <pre className="mt-1 whitespace-pre-wrap break-words rounded-md border border-hairline bg-board p-2.5 font-mono text-xs text-ink-2">{raw}</pre>
+      </ExpandableContent>
+    </Expandable>
+  );
+}
+
 export function UpdateStrip({ u }: { u: U }) {
-  const { snap, notes } = u;
+  const { snap, notes, local } = u;
   const busy = u.busy !== "";
   if (!snap) return null;
-  const notLocal = !LOCAL;
+  const canApplyHere = local && !!snap.can_apply;
   const title = u.staged
     ? (u.justInstalled || (snap.staged + " installed. Restart to use it."))
     : "Version " + snap.latest + " is available";
   const applying = u.busy === "apply";
   const restarting = u.busy === "restart";
+  const releaseUrl = typeof snap.release_url === "string" && /^https?:\/\//i.test(snap.release_url) ? snap.release_url : "";
   return (
     <>
-      <p className="sr-only" role="status" aria-live="polite">{u.busy === "apply" ? "Downloading and checking" : u.busy === "restart" ? "Restarting" : ""}</p>
+      <p className="sr-only" role="status" aria-live="polite">
+        {applying ? "Downloading and checking" : restarting ? "Restarting" : u.staged ? title : u.raw ? plainUpdateError(u.raw) : ""}
+      </p>
       {u.showBanner && (
-        <section aria-label="OpenBell update" className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-[10px] border border-hairline bg-surface px-4 py-2.5">
-          <p ref={u.refs.statusRef} tabIndex={-1} className="min-w-0 flex-1 basis-64 text-sm text-ink outline-none">
+        <section id="update-banner" aria-label="OpenBell update" className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-[10px] border border-hairline bg-surface px-4 py-3">
+          <p ref={u.refs.statusRef} tabIndex={-1} className="min-w-0 flex-1 basis-64 text-sm text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring">
             <span className="font-medium">{title}</span>
             {!u.staged && notes && <span className="mt-0.5 block whitespace-pre-line break-words text-sm text-ink-2">{notes}</span>}
-            {!u.staged && (
+            {!u.staged && canApplyHere && (
               <span className="mt-0.5 block text-sm text-ink-2">Update now downloads it, checks it, and replaces this app. Restart to start using it.</span>
             )}
-            {u.busy === "apply" && <span className="block text-sm text-ink-2">Downloading and checking...</span>}
-            {restarting && <span className="block text-sm text-ink-2">Restarting...</span>}
-            {u.returnMsg && <span className="block text-sm text-ink-2">{u.returnMsg}</span>}
+            {applying && <span className="mt-0.5 block text-sm text-ink-2">Downloading and checking...</span>}
+            {restarting && <span className="mt-0.5 block text-sm text-ink-2">Restarting...</span>}
+            {u.raw && <span role="alert" className="mt-1 block text-sm text-unread">{plainUpdateError(u.raw)}</span>}
+            {u.returnMsg && <span className="mt-0.5 block text-sm text-ink-2">{u.returnMsg}</span>}
           </p>
           <div className="flex flex-wrap items-center gap-2">
-            {u.staged ? (
-              <Button ref={u.refs.restartRef} variant="default" disabled={busy} onClick={u.restart}>
-                {restarting ? "Restarting..." : "Restart now"}
-              </Button>
-            ) : notLocal ? (
+            {!local ? (
               <span className="text-sm text-ink-2">To update, open OpenBell on the computer it runs on.</span>
+            ) : u.staged ? (
+              <Button ref={u.refs.restartRef} variant="default" className="min-h-11" disabled={busy} onClick={u.restart}>
+                {restarting ? "Restarting..." : u.raw ? "Try again" : "Restart now"}
+              </Button>
             ) : snap.can_apply ? (
-              <Button variant="default" disabled={busy} onClick={u.apply}>{applying ? "Downloading and checking..." : "Update now"}</Button>
+              <Button variant="default" className="min-h-11" disabled={busy} onClick={u.apply}>
+                {applying ? "Downloading and checking..." : u.raw ? "Try again" : "Update now"}
+              </Button>
             ) : (
-              <span className="text-sm text-ink-2">{snap.dev_build ? "This is a developer copy, so it does not update itself. Install a released version to get updates." : "Update from the machine OpenBell runs on."}</span>
+              <span className="text-sm text-ink-2">
+                {snap.dev_build
+                  ? "This is a developer copy, so it does not update itself. Install a released version to get updates."
+                  : "To update, open OpenBell on the computer it runs on."}
+              </span>
             )}
-            {!u.staged && snap.release_url && (
-              <Button variant="outline" render={<a href={snap.release_url} target="_blank" rel="noopener" />}>What&apos;s new</Button>
+            {!u.staged && releaseUrl && (
+              <Button variant="outline" className="min-h-11" render={<a href={releaseUrl} target="_blank" rel="noopener" />}>What&apos;s new</Button>
             )}
-            {!u.staged && <Button variant="ghost" disabled={busy} onClick={u.dismiss}>Dismiss</Button>}
+            {!u.staged && <Button variant="ghost" className="min-h-11" disabled={busy} onClick={u.dismiss}>Dismiss</Button>}
           </div>
-          {u.raw && (
-            <Expandable expandDirection="vertical" expandBehavior="push" className="w-full">
-              <ExpandableTrigger className="text-sm text-ink-2 underline">Details</ExpandableTrigger>
-              <ExpandableContent preset="fade"><pre className="mt-1 whitespace-pre-wrap break-words font-mono text-xs text-ink-2">{u.raw}</pre></ExpandableContent>
-            </Expandable>
-          )}
+          {u.raw && <ErrorDetails raw={u.raw} />}
         </section>
       )}
     </>
@@ -246,22 +287,25 @@ export function UpdateStrip({ u }: { u: U }) {
 }
 
 export function VersionRow({ u }: { u: U }) {
-  const { version, snap } = u;
+  const { version, snap, local } = u;
   if (!version) return null;
   const busy = u.busy !== "";
   const line = u.resultLine();
+  const relUrl = typeof version.release_url === "string" && /^https?:\/\//i.test(version.release_url) ? version.release_url : "";
   return (
-    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-ink-2">
-      {version.release_url
-        ? <a href={version.release_url} target="_blank" rel="noopener" className="inline-flex min-h-11 items-center rounded-md text-ink underline-offset-4 hover:underline">OpenBell {version.version}</a>
+    <div id="version-row" className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-ink-2">
+      {relUrl
+        ? <a id="version-link" href={relUrl} target="_blank" rel="noopener" className="inline-flex min-h-11 items-center rounded-md text-ink underline-offset-4 outline-none hover:underline active:bg-track focus-visible:ring-2 focus-visible:ring-ring">OpenBell {version.version}</a>
         : <span className="text-ink">OpenBell {version.version}</span>}
       {u.hiddenByDismiss && <Button ref={u.refs.showRef} variant="outline" className="min-h-11" onClick={u.showAgain}>Show update</Button>}
-      {snap && LOCAL && snap.mode !== "off" && (
-        <Button variant="outline" className="min-h-11" disabled={busy} onClick={u.check}>{u.busy === "check" ? "Checking..." : "Check for updates"}</Button>
+      {local && (!snap || snap.mode !== "off") && (
+        <Button id="check-updates" variant="outline" className="min-h-11" disabled={busy} onClick={u.check}>
+          {u.busy === "check" ? "Checking..." : u.checkErr ? "Try again" : "Check for updates"}
+        </Button>
       )}
-      {snap && !LOCAL && <span>To update, open OpenBell on the computer it runs on.</span>}
-      {line && <p role="status" className="min-w-0 break-words">{line}</p>}
-      {u.staged && u.justInstalled === "" && <p role="status">{snap?.staged} installed. Restart to use it.</p>}
+      {!local && !u.showBanner && <span>To update, open OpenBell on the computer it runs on.</span>}
+      {line && <p id="check-result" role="status" className={"min-w-0 break-words " + (u.checkErr ? "text-unread" : "")}>{line}</p>}
+      {u.checkErr && <ErrorDetails raw={u.checkErr} />}
     </div>
   );
 }

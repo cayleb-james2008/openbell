@@ -16,7 +16,6 @@
 @source not "../../rune/used/components/ui/animated-background.tsx";
 @source not "../../rune/used/components/ui/border-trail.tsx";
 @source not "../../rune/used/components/ui/text-morph.tsx";
-@source not "../../rune/used/components/ui/sliding-number.tsx";
 @source not "../../rune/used/components/ui/expandable.tsx";
 @source not "./motionProps.ts";
 /* Tokens: the house roles (tokens.css), then this app's Hallmark theme values (theme.css), then its fonts. */

@@ -21,7 +21,7 @@ chmod 444 "$WORK/data/snapshots.jsonl"
 
 OPENBELL_DATA="$WORK/data" OPENBELL_STRATEGIES="$PWD/strategies" \
 OPENBELL_COLLECT_SECS=3600 PORT=$PORT \
-  ./target/debug/openbell-rs > "$WORK/server.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s "http://127.0.0.1:$PORT/api/home" >/dev/null 2>&1 && break; sleep 0.5; done
 
@@ -59,7 +59,7 @@ printf 'not json at all\n{"ticker": "BROKEN"\n' >> "$WORK/data3/snapshots.jsonl"
 total3=$(wc -l < "$WORK/data3/snapshots.jsonl")
 OPENBELL_DATA="$WORK/data3" OPENBELL_STRATEGIES="$PWD/strategies" \
 OPENBELL_COLLECT_SECS=3600 PORT=8498 \
-  ./target/debug/openbell-rs > "$WORK/server3.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server3.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s "http://127.0.0.1:8498/api/home" >/dev/null 2>&1 && break; sleep 0.5; done
 home3=$(curl -s "http://127.0.0.1:8498/api/home")

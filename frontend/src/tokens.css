@@ -245,8 +245,8 @@
   --spacing: 0.25rem;
 
   /* Fonts. The names --font-sans, --font-mono and --font-heading are required by COSS UI. */
-  --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; /* OWNER: Geist for all text (the kit uses an Inter-style sans; the owner's font wins) */
-  --font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace; /* OWNER: ids, model names, times, counts and every figure that must line up */
+  --font-sans: "Geist", ui-sans-serif, sans-serif; /* OWNER: Geist for all text */
+  --font-mono: "Geist Mono", ui-monospace, monospace; /* OWNER: ids, model names, times, counts and every figure that must line up */
   --font-heading: var(--font-sans);
 }
 

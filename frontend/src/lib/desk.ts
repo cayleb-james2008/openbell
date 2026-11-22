@@ -134,10 +134,11 @@ export function useDesk(dataset: Dataset) {
   return { reads, load };
 }
 
-export const money = (v: number) => (v < 0 ? "-$" + Math.abs(v).toFixed(2) : "$" + v.toFixed(2));
-export const moneyWhole = (v: number) => (v < 0 ? "-$" + Math.abs(Math.round(v)) : "$" + Math.round(v));
-export function ageWords(age: number | null | undefined): string {
-  if (age === null || age === undefined) return "none yet";
+export const isNum = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+export const money = (v: unknown) => (isNum(v) ? (v < 0 ? "-$" + Math.abs(v).toFixed(2) : "$" + v.toFixed(2)) : "unavailable");
+export const moneyWhole = (v: unknown) => (isNum(v) ? (v < 0 ? "-$" + Math.abs(Math.round(v)) : "$" + Math.round(v)) : "unavailable");
+export function ageWords(age: unknown): string {
+  if (!isNum(age)) return "none yet";
   return age < 90 ? age + "s ago" : age < 5400 ? Math.round(age / 60) + "m ago" : (age / 3600).toFixed(1) + "h ago";
 }
-export const dayLabel = (x: number) => new Date(x * 1000).toISOString().slice(0, 10);
+export const dayLabel = (x: unknown) => (isNum(x) ? new Date(x * 1000).toISOString().slice(0, 10) : "—");
