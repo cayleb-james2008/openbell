@@ -2240,6 +2240,8 @@ mod tests {
             no_bid: yes_ask.map(|ya| ((1.0 - ya) * 100.0).round() / 100.0),
             no_ask,
             last_price: yes_ask,
+            yes_bid_size: 0.0,
+            no_bid_size: 0.0,
         }
     }
 
