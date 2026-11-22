@@ -206,14 +206,20 @@ fn scale_100k_ticks_2000_windows_30_concurrent_clients_under_300ms_p95() {
     std::fs::create_dir_all(&data).unwrap();
 
     // Generate 100,000 ticks across 2,000 settled 15m windows (50 ticks per window).
+    // 2026-10-01T00:00:00Z = 1_790_812_800; 2,000 * 15m = 20.83 days (Oct 1..21).
     let mut buf = String::with_capacity(24 * 1024 * 1024);
-    let base_epoch: i64 = 1_760_000_000;
+    let base_epoch: i64 = 1_790_812_800;
     let series = ["KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M", "KXDOGE15M"];
     for w in 0..2000usize {
         let ser = series[w % series.len()];
         let ticker = format!("{ser}-W{w:04}");
         let close_epoch = base_epoch + (w as i64) * 900;
-        let close_time = format!("2026-10-{:02}T{:02}:{:02}:00Z", 1 + (w / 96) % 28, (w / 4) % 24, (w % 4) * 15);
+        let close_time = format!(
+            "2026-10-{:02}T{:02}:{:02}:00Z",
+            1 + (w / 96),
+            (w / 4) % 24,
+            (w % 4) * 15
+        );
         let result = if w % 3 != 0 { "yes" } else { "no" };
         for t in 0..50usize {
             let fetched_at = close_epoch - 900 + (t as i64) * 17;
@@ -245,27 +251,98 @@ fn scale_100k_ticks_2000_windows_30_concurrent_clients_under_300ms_p95() {
     let port = free_port();
     let _srv = spawn_server(&dir, port, Some(&bin));
 
-    // Warm cache once (initial 100k-line parse + Rune scoring).
+    // Warm cache once (initial 100k-line parse + 12-strategy Rune scoring + analytics).
     let (st0, _, home0) = http_req(port, "GET", "/api/home", "");
     assert_eq!(st0, 200);
     let hj: serde_json::Value = serde_json::from_str(&home0).unwrap();
     assert_eq!(hj["collector"]["snapshots_on_disk"], 100_000);
     assert_eq!(hj["collector"]["settled_windows"], 2_000);
 
-    // 30 concurrent readers across /api/home, /api/markets, /api/markets/history, /api/export/report.
+    // Exercise & warm all 5 Quant API endpoints on the 100k-tick / 2,000-window tape.
+    let (st_cal, _, body_cal) = http_req(port, "GET", "/api/analytics/calibration", "");
+    assert_eq!(st_cal, 200, "calibration failed: {body_cal}");
+    let cal: serde_json::Value = serde_json::from_str(&body_cal).unwrap();
+    assert_eq!(cal["windows_settled"], 2_000);
+    assert_eq!(cal["market_calibration"]["buckets"].as_array().unwrap().len(), 10);
+    assert_eq!(cal["by_strategy"].as_array().unwrap().len(), 12);
+
+    let (st_wf, _, body_wf) = http_req(port, "GET", "/api/analytics/walkforward", "");
+    assert_eq!(st_wf, 200, "walkforward failed: {body_wf}");
+    let wf: serde_json::Value = serde_json::from_str(&body_wf).unwrap();
+    assert_eq!(wf["strategies"].as_array().unwrap().len(), 12);
+    assert!(wf["portfolio"]["in_sample"]["trades_count"].as_u64().unwrap() > 0);
+    assert!(wf["portfolio"]["out_of_sample"]["trades_count"].as_u64().unwrap() > 0);
+
+    let mc_req = r#"{"paths":1000,"seed":20261122}"#;
+    let (st_mc1, _, body_mc1) = http_req(port, "POST", "/api/analytics/montecarlo", mc_req);
+    let (st_mc2, _, body_mc2) = http_req(port, "POST", "/api/analytics/montecarlo", mc_req);
+    assert_eq!(st_mc1, 200, "montecarlo failed: {body_mc1}");
+    assert_eq!(st_mc2, 200);
+    assert_eq!(body_mc1, body_mc2, "seeded Monte Carlo must be byte-identical");
+    let mc: serde_json::Value = serde_json::from_str(&body_mc1).unwrap();
+    assert_eq!(mc["paths"], 1000);
+    assert!(mc["equity_bands"].as_array().unwrap().len() >= 2);
+
+    // Rune validator: valid, syntax error, and forbidden non-paper rejection.
+    let valid_src = "pub fn name() { \"sandbox-probe\" }\npub fn side() { \"yes\" }\npub fn allow_entry(ya, na, secs) { ya >= 0.55 && ya <= 0.75 && secs <= 600 }\n";
+    let (st_val_ok, _, body_val_ok) = http_req(
+        port,
+        "POST",
+        "/api/strategy/validate",
+        &serde_json::json!({ "source": valid_src }).to_string(),
+    );
+    assert_eq!(st_val_ok, 200);
+    let val_ok: serde_json::Value = serde_json::from_str(&body_val_ok).unwrap();
+    assert_eq!(val_ok["valid"], true);
+    assert_eq!(val_ok["strategy_name"], "sandbox-probe");
+
+    let (st_val_bad, _, body_val_bad) = http_req(
+        port,
+        "POST",
+        "/api/strategy/validate",
+        &serde_json::json!({ "source": "pub fn name() { \"bad\" }\npub fn side() { \"yes\" }\npub fn allow_entry(ya, na, secs) { let u = \"https://evil.example\"; ya > 0.5 }\n" }).to_string(),
+    );
+    assert_eq!(st_val_bad, 200);
+    let val_bad: serde_json::Value = serde_json::from_str(&body_val_bad).unwrap();
+    assert_eq!(val_bad["valid"], false);
+    assert!(!val_bad["errors"].as_array().unwrap().is_empty());
+
+    // In-memory sandbox backtest over all 2,000 settled windows.
+    let bt_req = serde_json::json!({ "source": valid_src, "paths": 1000, "seed": 42 }).to_string();
+    let (st_bt, _, body_bt) = http_req(port, "POST", "/api/backtest", &bt_req);
+    assert_eq!(st_bt, 200, "backtest failed: {body_bt}");
+    let bt: serde_json::Value = serde_json::from_str(&body_bt).unwrap();
+    assert_eq!(bt["validation"]["valid"], true);
+    assert_eq!(bt["windows_evaluated"], 2_000);
+    assert!(bt["score"]["windows_traded"].as_u64().unwrap() > 100);
+    assert!(bt["monte_carlo"]["paths"] == 1000);
+
+    // 30 concurrent readers across core + Quant endpoints under 300ms p95 budget.
     let mut handles = Vec::new();
     for i in 0..30usize {
+        let bt_payload = bt_req.clone();
         handles.push(std::thread::spawn(move || {
-            let path = match i % 4 {
-                0 => "/api/home".to_string(),
-                1 => "/api/markets".to_string(),
-                2 => format!("/api/markets/history?ticker=KXBTC15M-W{:04}", (i * 5) % 2000),
-                _ => "/api/export/report?format=md".to_string(),
+            let (method, path, payload) = match i % 7 {
+                0 => ("GET", "/api/home".to_string(), String::new()),
+                1 => ("GET", "/api/markets".to_string(), String::new()),
+                2 => (
+                    "GET",
+                    format!("/api/markets/history?ticker=KXBTC15M-W{:04}", (i * 5) % 2000),
+                    String::new(),
+                ),
+                3 => ("GET", "/api/analytics/calibration".to_string(), String::new()),
+                4 => ("GET", "/api/analytics/walkforward".to_string(), String::new()),
+                5 => (
+                    "POST",
+                    "/api/analytics/montecarlo".to_string(),
+                    r#"{"paths":1000,"seed":20261122}"#.to_string(),
+                ),
+                _ => ("POST", "/api/backtest".to_string(), bt_payload),
             };
             let t0 = Instant::now();
-            let (st, _, body) = http_req(port, "GET", &path, "");
+            let (st, _, body) = http_req(port, method, &path, &payload);
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            assert_eq!(st, 200, "failed {path}: {body}");
+            assert_eq!(st, 200, "failed {method} {path}: {body}");
             ms
         }));
     }

@@ -1919,6 +1919,14 @@ type AnalysisTuple = (
     Arc<Vec<String>>,
 );
 
+type AnalyticsTuple = (
+    Arc<String>,
+    Arc<String>,
+    Arc<Vec<f64>>,
+    Arc<std::collections::HashMap<String, Vec<f64>>>,
+    f64,
+);
+
 struct AnalysisEntry {
     path: PathBuf,
     len: u64,
@@ -1931,6 +1939,21 @@ struct AnalysisEntry {
     lib_errors: Arc<Vec<(String, String)>>,
     strategy_names: Arc<Vec<String>>,
 }
+
+struct AnalyticsCacheEntry {
+    path: PathBuf,
+    len: u64,
+    mtime: u64,
+    key: u64,
+    dataset: String,
+    calibration_json: Arc<String>,
+    walkforward_json: Arc<String>,
+    portfolio_returns: Arc<Vec<f64>>,
+    strategy_returns: Arc<std::collections::HashMap<String, Vec<f64>>>,
+    paper_pot_start: f64,
+}
+
+const BACKTEST_CACHE_CAP: usize = 16;
 
 struct App {
     data_dir: PathBuf,
@@ -1949,6 +1972,33 @@ struct App {
     /// for one exact tape state. Shared via Arc under RwLock so 30+
     /// concurrent readers never contend or clone thousands of trades.
     analysis_cache: std::sync::RwLock<Option<AnalysisEntry>>,
+    /// Serialises cold analysis misses so 30 concurrent readers share
+    /// one computation instead of piling onto the CPU simultaneously.
+    analysis_compute_lock: std::sync::Mutex<()>,
+    /// Cached calibration + walk-forward JSON payloads and extracted
+    /// chronological returns for instant Quant Lab & Monte Carlo reads.
+    analytics_cache: std::sync::RwLock<Option<AnalyticsCacheEntry>>,
+    analytics_compute_lock: std::sync::Mutex<()>,
+    /// Small bounded cache for repeated in-memory sandbox backtests over
+    /// an unchanged tape + identical source/config hash.
+    backtest_cache: std::sync::RwLock<Vec<(u64, Arc<String>)>>,
+}
+
+impl App {
+    fn new(data_dir: PathBuf, strategies_dir: PathBuf, paper_pot: f64, collect_secs: u64) -> Self {
+        Self {
+            data_dir,
+            strategies_dir,
+            paper_pot,
+            collect_secs,
+            tape_cache: std::sync::RwLock::new(None),
+            analysis_cache: std::sync::RwLock::new(None),
+            analysis_compute_lock: std::sync::Mutex::new(()),
+            analytics_cache: std::sync::RwLock::new(None),
+            analytics_compute_lock: std::sync::Mutex::new(()),
+            backtest_cache: std::sync::RwLock::new(Vec::new()),
+        }
+    }
 }
 
 fn tape_stat(path: &Path) -> Option<(u64, u64)> {
@@ -2108,6 +2158,23 @@ impl App {
                 }
             }
         }
+        let _compute_guard = self
+            .analysis_compute_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        {
+            let guard = self.analysis_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = &*guard {
+                if e.path == dpath && e.len == len && e.mtime == mtime && e.key == key {
+                    return (
+                        e.sim.clone(),
+                        e.scores.clone(),
+                        e.lib_errors.clone(),
+                        e.strategy_names.clone(),
+                    );
+                }
+            }
+        }
         let (strategies, lib_errors) = load_strategies_with_errors(&self.strategies_dir);
         let view = self.tape(dpath);
         // The tape entry carries the windows already grouped —
@@ -2156,6 +2223,154 @@ impl App {
     fn analysis(&self, dpath: &Path) -> (Arc<SlotSimulation>, Arc<Vec<ScoreReport>>) {
         let (sim, scores, _, _) = self.analysis_shared(dpath);
         (sim, scores)
+    }
+
+    /// Cached Calibration + Walk-Forward JSON payloads plus extracted chronological
+    /// window returns so Quant Lab & Monte Carlo stay sub-millisecond under 30+ clients.
+    fn analytics_shared(&self, dpath: &Path, dataset: &str) -> AnalyticsTuple {
+        let key = strategies_dir_key(&self.strategies_dir, self.paper_pot);
+        let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
+        {
+            let guard = self.analytics_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = &*guard {
+                if e.path == dpath
+                    && e.len == len
+                    && e.mtime == mtime
+                    && e.key == key
+                    && e.dataset == dataset
+                {
+                    return (
+                        e.calibration_json.clone(),
+                        e.walkforward_json.clone(),
+                        e.portfolio_returns.clone(),
+                        e.strategy_returns.clone(),
+                        e.paper_pot_start,
+                    );
+                }
+            }
+        }
+        let _compute_guard = self
+            .analytics_compute_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        {
+            let guard = self.analytics_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = &*guard {
+                if e.path == dpath
+                    && e.len == len
+                    && e.mtime == mtime
+                    && e.key == key
+                    && e.dataset == dataset
+                {
+                    return (
+                        e.calibration_json.clone(),
+                        e.walkforward_json.clone(),
+                        e.portfolio_returns.clone(),
+                        e.strategy_returns.clone(),
+                        e.paper_pot_start,
+                    );
+                }
+            }
+        }
+
+        let (sim, _, _, _) = self.analysis_shared(dpath);
+        let view = self.tape(dpath);
+        let (strategies, _) = load_strategies_with_errors(&self.strategies_dir);
+
+        let cal = analytics::calibration_from_windows(&view.grouped, &strategies);
+        let mut cal_val = serde_json::to_value(&cal).unwrap_or_else(|_| serde_json::json!({}));
+        cal_val["dataset"] = serde_json::json!(dataset);
+        let calibration_json = Arc::new(cal_val.to_string());
+
+        let wf = analytics::walk_forward_from_desk(&view.grouped, &strategies, &sim);
+        let portfolio_returns = Arc::new(wf.portfolio.window_returns.clone());
+        let mut strat_map = std::collections::HashMap::with_capacity(wf.strategies.len());
+        for s in &wf.strategies {
+            strat_map.insert(s.strategy.clone(), s.split.window_returns.clone());
+        }
+        let strategy_returns = Arc::new(strat_map);
+        let mut wf_val = serde_json::to_value(&wf).unwrap_or_else(|_| serde_json::json!({}));
+        wf_val["dataset"] = serde_json::json!(dataset);
+        let walkforward_json = Arc::new(wf_val.to_string());
+        let paper_pot_start = sim.paper_pot_start;
+
+        let out = (
+            calibration_json.clone(),
+            walkforward_json.clone(),
+            portfolio_returns.clone(),
+            strategy_returns.clone(),
+            paper_pot_start,
+        );
+        let entry = AnalyticsCacheEntry {
+            path: dpath.to_path_buf(),
+            len,
+            mtime,
+            key,
+            dataset: dataset.to_string(),
+            calibration_json,
+            walkforward_json,
+            portfolio_returns,
+            strategy_returns,
+            paper_pot_start,
+        };
+        *self.analytics_cache.write().unwrap_or_else(|p| p.into_inner()) = Some(entry);
+        out
+    }
+
+    /// Run an in-memory sandbox backtest with bounded caching keyed on
+    /// `(tape_stat, dataset, source, config)` so repeated requests stay fast
+    /// while edits compile & score fresh immediately.
+    fn sandbox_backtest_cached(
+        &self,
+        dpath: &Path,
+        dataset: &str,
+        source: &str,
+        cfg: analytics::BacktestConfig,
+    ) -> Arc<String> {
+        use std::hash::{Hash, Hasher};
+        let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        dpath.hash(&mut h);
+        len.hash(&mut h);
+        mtime.hash(&mut h);
+        dataset.hash(&mut h);
+        source.hash(&mut h);
+        cfg.paper_pot_start.to_bits().hash(&mut h);
+        cfg.risk_fraction.to_bits().hash(&mut h);
+        cfg.min_windows.hash(&mut h);
+        cfg.min_mean_cents.to_bits().hash(&mut h);
+        cfg.monte_carlo_paths.hash(&mut h);
+        cfg.monte_carlo_seed.hash(&mut h);
+        cfg.max_trades_returned.hash(&mut h);
+        let cache_key = h.finish();
+
+        {
+            let guard = self.backtest_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some((_, cached)) = guard.iter().find(|(k, _)| *k == cache_key) {
+                return cached.clone();
+            }
+        }
+
+        let view = self.tape(dpath);
+        let mut res =
+            analytics::validate_and_backtest_rune_source_with_config(source, &view.grouped, cfg);
+        if let Some(score) = res.score.as_mut() {
+            score.verdict = dataset_verdict(&score.verdict, dataset);
+        }
+        let mut val = serde_json::to_value(&res).unwrap_or_else(|_| serde_json::json!({}));
+        val["dataset"] = serde_json::json!(dataset);
+        let payload = Arc::new(val.to_string());
+
+        if res.validation.valid {
+            let mut guard = self.backtest_cache.write().unwrap_or_else(|p| p.into_inner());
+            if !guard.iter().any(|(k, _)| *k == cache_key) {
+                if guard.len() >= BACKTEST_CACHE_CAP {
+                    guard.remove(0);
+                }
+                guard.push((cache_key, payload.clone()));
+            }
+        }
+        payload
     }
 }
 
@@ -2728,12 +2943,29 @@ fn strategy_source_for(dir: &Path, name: &str) -> Option<(String, String, String
     None
 }
 
+fn resolve_dataset(app: &App, query: &str, body_dataset: Option<&str>) -> (String, PathBuf) {
+    let qname = dataset_name(query);
+    if qname != "live" {
+        return (qname, dataset_path(app, query));
+    }
+    if let Some(raw) = body_dataset {
+        let name: String = raw
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        if !name.is_empty() && name != "live" {
+            return (name.clone(), app.data_dir.join(format!("{name}-snapshots.jsonl")));
+        }
+    }
+    ("live".to_string(), app.data_dir.join("snapshots.jsonl"))
+}
+
 #[allow(dead_code)]
 fn handle(app: &App, method: &str, path: &str) -> String {
     handle_with_body(app, method, path, "")
 }
 
-fn handle_with_body(app: &App, method: &str, path: &str, _body: &str) -> String {
+fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
     let (route, query) = match path.split_once('?') {
         Some((r, q)) => (r, q),
         None => (path, ""),
@@ -2927,6 +3159,190 @@ fn handle_with_body(app: &App, method: &str, path: &str, _body: &str) -> String 
                 ),
             }
         }
+        ("GET", "/api/analytics/calibration") => {
+            let dpath = dataset_path(app, query);
+            let dataset = dataset_name(query);
+            if dataset != "live" && !dpath.exists() {
+                return json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
+                        .to_string(),
+                );
+            }
+            let (cal_json, _, _, _, _) = app.analytics_shared(&dpath, &dataset);
+            json_response(200, &cal_json)
+        }
+        ("GET", "/api/analytics/walkforward") => {
+            let dpath = dataset_path(app, query);
+            let dataset = dataset_name(query);
+            if dataset != "live" && !dpath.exists() {
+                return json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
+                        .to_string(),
+                );
+            }
+            let (_, wf_json, _, _, _) = app.analytics_shared(&dpath, &dataset);
+            json_response(200, &wf_json)
+        }
+        ("POST", "/api/analytics/montecarlo") => {
+            let parsed: serde_json::Value = if body.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                match serde_json::from_str::<serde_json::Value>(body) {
+                    Ok(v) if v.is_object() => v,
+                    Ok(_) => {
+                        return json_response(
+                            400,
+                            "{\"error\":\"Monte Carlo request body must be a JSON object\"}",
+                        );
+                    }
+                    Err(e) => {
+                        return json_response(
+                            400,
+                            &serde_json::json!({ "error": format!("invalid JSON body: {e}") })
+                                .to_string(),
+                        );
+                    }
+                }
+            };
+            let (dataset, dpath) =
+                resolve_dataset(app, query, parsed.get("dataset").and_then(|v| v.as_str()));
+            if dataset != "live" && !dpath.exists() {
+                return json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
+                        .to_string(),
+                );
+            }
+            let (_, _, portfolio_returns, strategy_returns, default_pot) =
+                app.analytics_shared(&dpath, &dataset);
+            let paths = parsed
+                .get("paths")
+                .and_then(|v| v.as_u64())
+                .map(|p| (p as usize).clamp(10, 5_000))
+                .unwrap_or(1_000);
+            let seed = parsed
+                .get("seed")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20_261_122);
+            let start_equity = parsed
+                .get("start_equity")
+                .or_else(|| parsed.get("paper_pot_start"))
+                .and_then(|v| v.as_f64())
+                .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0e9)
+                .unwrap_or(default_pot);
+            let strat_req = parsed
+                .get("strategy")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "portfolio" && *s != "all");
+            let (strategy_label, returns_slice): (&str, &[f64]) = match strat_req {
+                None => ("portfolio", portfolio_returns.as_slice()),
+                Some(name) => match strategy_returns.get(name) {
+                    Some(v) => (name, v.as_slice()),
+                    None => {
+                        return json_response(
+                            404,
+                            &serde_json::json!({ "error": format!("no such strategy: {name}") })
+                                .to_string(),
+                        );
+                    }
+                },
+            };
+            let mc =
+                analytics::run_monte_carlo_with_equity(returns_slice, start_equity, paths, seed);
+            let mut val = serde_json::to_value(&mc).unwrap_or_else(|_| serde_json::json!({}));
+            val["dataset"] = serde_json::json!(dataset);
+            val["strategy"] = serde_json::json!(strategy_label);
+            json_response(200, &val.to_string())
+        }
+        ("POST", "/api/strategy/validate") => {
+            let parsed: serde_json::Value = match serde_json::from_str::<serde_json::Value>(body) {
+                Ok(v) if v.is_object() => v,
+                _ => {
+                    return json_response(
+                        400,
+                        "{\"error\":\"expected JSON body with a string \\\"source\\\" field\"}",
+                    );
+                }
+            };
+            let Some(source) = parsed.get("source").and_then(|v| v.as_str()) else {
+                return json_response(
+                    400,
+                    "{\"error\":\"expected JSON body with a string \\\"source\\\" field\"}",
+                );
+            };
+            let res = analytics::validate_rune_source(source);
+            json_response(
+                200,
+                &serde_json::to_string(&res).unwrap_or_else(|_| "{}".to_string()),
+            )
+        }
+        ("POST", "/api/backtest") => {
+            let parsed: serde_json::Value = match serde_json::from_str::<serde_json::Value>(body) {
+                Ok(v) if v.is_object() => v,
+                _ => {
+                    return json_response(
+                        400,
+                        "{\"error\":\"expected JSON body with a string \\\"source\\\" field\"}",
+                    );
+                }
+            };
+            let Some(source) = parsed.get("source").and_then(|v| v.as_str()) else {
+                return json_response(
+                    400,
+                    "{\"error\":\"expected JSON body with a string \\\"source\\\" field\"}",
+                );
+            };
+            let (dataset, dpath) =
+                resolve_dataset(app, query, parsed.get("dataset").and_then(|v| v.as_str()));
+            if dataset != "live" && !dpath.exists() {
+                return json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
+                        .to_string(),
+                );
+            }
+            let mut cfg = analytics::BacktestConfig {
+                paper_pot_start: app.paper_pot,
+                ..analytics::BacktestConfig::default()
+            };
+            if let Some(pot) = parsed
+                .get("paper_pot_start")
+                .or_else(|| parsed.get("start_equity"))
+                .and_then(|v| v.as_f64())
+                .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0e9)
+            {
+                cfg.paper_pot_start = pot;
+            }
+            if let Some(rf) = parsed
+                .get("risk_fraction")
+                .and_then(|v| v.as_f64())
+                .filter(|v| v.is_finite())
+            {
+                cfg.risk_fraction = rf.clamp(0.01, 1.0);
+            }
+            if let Some(paths) = parsed
+                .get("monte_carlo_paths")
+                .or_else(|| parsed.get("paths"))
+                .and_then(|v| v.as_u64())
+            {
+                cfg.monte_carlo_paths = (paths as usize).min(5_000);
+            }
+            if let Some(seed) = parsed
+                .get("monte_carlo_seed")
+                .or_else(|| parsed.get("seed"))
+                .and_then(|v| v.as_u64())
+            {
+                cfg.monte_carlo_seed = seed;
+            }
+            if let Some(max_t) = parsed.get("max_trades_returned").and_then(|v| v.as_u64()) {
+                cfg.max_trades_returned = (max_t as usize).min(5_000);
+            }
+            let payload = app.sandbox_backtest_cached(&dpath, &dataset, source, cfg);
+            json_response(200, &payload)
+        }
         _ => json_response(404, "{\"error\":\"not found\"}"),
     }
 }
@@ -3091,14 +3507,12 @@ fn main() {
         });
     }
 
-    let app = Arc::new(App {
-        tape_cache: std::sync::RwLock::new(None),
-        analysis_cache: std::sync::RwLock::new(None),
-        data_dir: data_dir.clone(),
+    let app = Arc::new(App::new(
+        data_dir.clone(),
         strategies_dir,
         paper_pot,
         collect_secs,
-    });
+    ));
     let allowed_hosts: Vec<String> = std::env::var("OPENBELL_ALLOWED_HOSTS")
         .unwrap_or_default()
         .split(',')
@@ -3284,14 +3698,7 @@ mod tests {
             text.push_str(&line("KXBBB-1", 1000 + i, if i == 49 { "no" } else { "" }));
         }
         std::fs::write(&path, &text).unwrap();
-        let app = App {
-            data_dir: dir.clone(),
-            strategies_dir: dir.clone(),
-            paper_pot: 100.0,
-            collect_secs: 60,
-            tape_cache: std::sync::RwLock::new(None),
-            analysis_cache: std::sync::RwLock::new(None),
-        };
+        let app = App::new(dir.clone(), dir.clone(), 100.0, 60);
         let v1 = app.tape(&path);
         let fp_b1 = window_fingerprint(&v1.grouped["KXBBB-1"]);
         let fp_a1 = window_fingerprint(&v1.grouped["KXAAA-1"]);
@@ -3769,14 +4176,7 @@ mod tests {
             serde_json::to_string(&snap(t, at, "2030-01-01T01:00:00Z", "", Some(0.5), Some(0.5)))
                 .unwrap()
         };
-        let app = App {
-            data_dir: dir.clone(),
-            strategies_dir: dir.clone(),
-            paper_pot: 100.0,
-            collect_secs: 60,
-            tape_cache: std::sync::RwLock::new(None),
-            analysis_cache: std::sync::RwLock::new(None),
-        };
+        let app = App::new(dir.clone(), dir.clone(), 100.0, 60);
         std::fs::write(&tape, format!("{}\n{}\nnot json\n", line("A", 100), line("B", 110)))
             .unwrap();
         let view = app.tape(&tape);
@@ -3818,14 +4218,7 @@ mod tests {
             serde_json::to_string(&snap(t, at, "2030-01-01T01:00:00Z", "", Some(0.5), Some(0.5)))
                 .unwrap()
         };
-        let app = App {
-            data_dir: dir.clone(),
-            strategies_dir: dir.clone(),
-            paper_pot: 100.0,
-            collect_secs: 60,
-            tape_cache: std::sync::RwLock::new(None),
-            analysis_cache: std::sync::RwLock::new(None),
-        };
+        let app = App::new(dir.clone(), dir.clone(), 100.0, 60);
         // A valid snapshot whose ticker holds a byte that is not UTF-8.
         let mut bad = line("Z", 105).into_bytes();
         let z = bad.iter().position(|c| *c == b'Z').unwrap();
@@ -3863,14 +4256,7 @@ mod tests {
             serde_json::to_string(&snap(t, at, "2030-01-01T01:00:00Z", "", Some(0.5), Some(0.5)))
                 .unwrap()
         };
-        let app = App {
-            data_dir: dir.clone(),
-            strategies_dir: dir.clone(),
-            paper_pot: 100.0,
-            collect_secs: 60,
-            tape_cache: std::sync::RwLock::new(None),
-            analysis_cache: std::sync::RwLock::new(None),
-        };
+        let app = App::new(dir.clone(), dir.clone(), 100.0, 60);
         // A crash left a torn last line with no newline.
         std::fs::write(&tape, format!("{}\n{{\"ticker\":\"TO", line("A", 100))).unwrap();
         let view = app.tape(&tape);
@@ -3989,14 +4375,7 @@ mod tests {
         bytes.extend_from_slice(b"{\"ticker\":\"broken\n");
         bytes.extend_from_slice(format!("{}\n", line("B", now)).as_bytes());
         std::fs::write(dir.join("snapshots.jsonl"), &bytes).unwrap();
-        let app = App {
-            data_dir: dir.clone(),
-            strategies_dir: dir.clone(),
-            paper_pot: 100.0,
-            collect_secs: 60,
-            tape_cache: std::sync::RwLock::new(None),
-            analysis_cache: std::sync::RwLock::new(None),
-        };
+        let app = App::new(dir.clone(), dir.clone(), 100.0, 60);
         let (_, body) = handle(&app, "GET", "/api/home").split_once("\r\n\r\n").map(|(h, b)| (h, b.to_string())).unwrap();
         let home: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(home["collector"]["snapshots_on_disk"], 2, "only valid snapshots are counted");
@@ -4012,14 +4391,7 @@ mod tests {
     fn failed_series_are_named_on_the_home_block() {
         let dir = std::env::temp_dir().join(format!("ob-names-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let app = App {
-            data_dir: dir.clone(),
-            strategies_dir: dir.clone(),
-            paper_pot: 100.0,
-            collect_secs: 60,
-            tape_cache: std::sync::RwLock::new(None),
-            analysis_cache: std::sync::RwLock::new(None),
-        };
+        let app = App::new(dir.clone(), dir.clone(), 100.0, 60);
         SERIES_FAILED_LAST_PASS.store(4, std::sync::atomic::Ordering::Relaxed);
         *SERIES_FAILED_NAMES.lock().unwrap() = vec!["KXBTC15M".to_string(), "KXSOL15M".to_string()];
         let (_, body) = handle(&app, "GET", "/api/home").split_once("\r\n\r\n").map(|(h, b)| (h, b.to_string())).unwrap();
@@ -4078,14 +4450,7 @@ mod tests {
         bytes.extend_from_slice(b"{\"ticker\": \"malformed\"\n");
         bytes.extend_from_slice(format!("{}\n", line("B", now)).as_bytes());
         std::fs::write(dir.join("snapshots.jsonl"), &bytes).unwrap();
-        let app = App {
-            data_dir: dir.clone(),
-            strategies_dir: dir.clone(),
-            paper_pot: 100.0,
-            collect_secs: 60,
-            tape_cache: std::sync::RwLock::new(None),
-            analysis_cache: std::sync::RwLock::new(None),
-        };
+        let app = App::new(dir.clone(), dir.clone(), 100.0, 60);
         let (_, body) = handle(&app, "GET", "/api/home").split_once("\r\n\r\n").map(|(h, b)| (h, b.to_string())).unwrap();
         let home: serde_json::Value = serde_json::from_str(&body).unwrap();
         let c = &home["collector"];
@@ -4151,14 +4516,7 @@ mod tests {
     fn home_reports_the_version() {
         let dir = std::env::temp_dir().join(format!("ob-version-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let app = App {
-            data_dir: dir.clone(),
-            strategies_dir: dir.clone(),
-            paper_pot: 100.0,
-            collect_secs: 60,
-            tape_cache: std::sync::RwLock::new(None),
-            analysis_cache: std::sync::RwLock::new(None),
-        };
+        let app = App::new(dir.clone(), dir.clone(), 100.0, 60);
         let (_, home) = body_json(&handle(&app, "GET", "/api/home"));
         assert_eq!(home["version"], json!("0.4.0"));
         std::fs::remove_dir_all(&dir).ok();
@@ -4197,14 +4555,7 @@ mod tests {
         .unwrap();
         let strat_dir = dir.join("strategies");
         seed_strategy_library(&strat_dir).unwrap();
-        let app = App {
-            data_dir: dir.clone(),
-            strategies_dir: strat_dir,
-            paper_pot: 100.0,
-            collect_secs: 60,
-            tape_cache: std::sync::RwLock::new(None),
-            analysis_cache: std::sync::RwLock::new(None),
-        };
+        let app = App::new(dir.clone(), strat_dir, 100.0, 60);
         let (st, body) = body_json(&handle(&app, "GET", "/api/markets/history?ticker=KXBTC15M-TEST"));
         assert_eq!(st, 200);
         let pts = body["points"].as_array().unwrap();
