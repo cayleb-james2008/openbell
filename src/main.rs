@@ -12,6 +12,7 @@ mod analytics;
 mod open;
 mod recalibration;
 mod scaling;
+mod tournament;
 mod update;
 
 use serde_json::json;
