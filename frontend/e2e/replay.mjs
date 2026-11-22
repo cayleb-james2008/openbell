@@ -30,6 +30,8 @@ async function openPage(w, url, routes) {
 }
 const json = (r, body, status = 200) => r.fulfill({ status, contentType: 'application/json', body: typeof body === 'string' ? body : JSON.stringify(body) })
 const patch = (fn) => async r => { const res = await r.fetch(); const j = await res.json(); r.fulfill({ response: res, body: JSON.stringify(fn(j)) }) }
+const baseStrategies = await fetch(BASE + 'api/strategies?dataset=fixture').then(r => r.json())
+const baseCount = Array.isArray(baseStrategies) ? baseStrategies.length : 5
 
 for (const w of [1440, 390]) {
   {
@@ -58,7 +60,7 @@ for (const w of [1440, 390]) {
       ['**/api/strategies*', patch(j => [...j, { ...j[0], strategy: null, standard: null }, { ...j[0], strategy: 5, standard: { min_windows: 'many' } }])],
     ])
     ok(`openbell ${w}: null names and standards still tally in standing tile`,
-      !p.errs.length && (await p.locator('#standing-figure').textContent().catch(() => '')).trim() === '0 of 7',
+      !p.errs.length && (await p.locator('#standing-figure').textContent().catch(() => '')).trim() === `0 of ${baseCount + 2}`,
       p.errs.join('|'))
     await ctx.close()
   }
@@ -68,7 +70,7 @@ for (const w of [1440, 390]) {
       ['**/api/strategies*', patch(j => j.map((s, i) => i < 2 ? { ...s, verdict: PASS, strategy: 'strategy-' + LONG } : s))],
     ])
     ok(`openbell ${w}: long unbroken proven names stay inside standing tile`,
-      (await p.locator('#standing-figure').textContent().catch(() => '')).trim() === '2 of 5' &&
+      (await p.locator('#standing-figure').textContent().catch(() => '')).trim() === `2 of ${baseCount}` &&
       (await p.locator('#standing-detail').textContent().catch(() => '')).includes('2 proven: strategy-x') &&
       (await clipped(p)) === 0,
       'clipped=' + await clipped(p))
@@ -94,7 +96,7 @@ for (const w of [1440, 390]) {
     await p.locator('#tab-strategies').click(); await p.waitForTimeout(300)
     const bodyTxt = await p.locator('body').innerText().catch(() => '')
     ok(`openbell ${w}: null entry and non-string verdict render without crash or NaN`,
-      !p.errs.length && (await p.locator('#strategies tbody tr button[data-strategy-row]').count()) === 5 && !/\bNaN\b|\bundefined\b/.test(bodyTxt),
+      !p.errs.length && (await p.locator('#strategies tbody tr button[data-strategy-row]').count()) === baseCount && !/\bNaN\b|\bundefined\b/.test(bodyTxt),
       p.errs.join('|'))
     await ctx.close()
   }

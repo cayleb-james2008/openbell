@@ -1,8 +1,9 @@
-// Rune Strategies workbench tab: ranked leaderboard with null/malformed guards, j/k/Enter keyboard navigation,
-// Tremor SparkAreaChart + Tracker evidence bar, and Vaul Strategy Inspector with Cult UI Expandable Rune script source.
+// Rune Strategies workbench tab: ranked leaderboard for all 12+ Rune strategies with null/malformed guards,
+// j/k/Enter keyboard navigation, Tremor SparkAreaChart + Tracker evidence bar, Vaul Strategy Inspector
+// with Cult UI Expandable Rune source, and Interactive Rune Sandbox Editor + Backtester.
 import { useEffect, useMemo, useState } from "react";
 import { Drawer } from "vaul";
-import { ChevronDown, Code2, X } from "lucide-react";
+import { ChevronDown, Code2, Play, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -10,9 +11,13 @@ import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
 import { Tracker, type TrackerBlockProps } from "@/components/Tracker/Tracker";
 import { Expandable, ExpandableContent, ExpandableTrigger } from "@/components/ui/expandable";
 import { StrategyEquityChart, TremorSpark, validPoints, type Point } from "@/Charts";
+import { RuneSandbox } from "@/RuneSandbox";
 import { useWide } from "@/lib/media";
 import {
+  type Dataset,
   type Equity,
+  type Home,
+  type Market,
   type Read,
   type Slots,
   type Strategy,
@@ -97,6 +102,7 @@ function StrategyInspector({
   points,
   trades,
   tradesTruncated,
+  onOpenInSandbox,
   onClose,
 }: {
   strategy: Strategy | null;
@@ -104,6 +110,7 @@ function StrategyInspector({
   points: Point[];
   trades: Trade[];
   tradesTruncated: boolean;
+  onOpenInSandbox: (name: string) => void;
   onClose: () => void;
 }) {
   const wide = useWide();
@@ -171,6 +178,18 @@ function StrategyInspector({
               </div>
 
               <div className="flex-1 space-y-5 overflow-y-auto px-5 py-5">
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-hairline bg-board/60 px-3.5 py-2.5">
+                  <span className="text-xs text-ink-2">Modify thresholds and score on tape in memory</span>
+                  <Button
+                    variant="outline"
+                    className="min-h-11 gap-1.5 px-3 text-xs sm:min-h-8"
+                    onClick={() => onOpenInSandbox(name)}
+                  >
+                    <Play className="size-3.5" aria-hidden />
+                    <span>Edit in Sandbox</span>
+                  </Button>
+                </div>
+
                 <dl className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
                   <div className="rounded-lg border border-hairline bg-board p-3">
                     <dt className="text-xs text-ink-3">Paper Net P&amp;L</dt>
@@ -284,28 +303,60 @@ export function StrategiesTab({
   strategiesRead,
   slotsRead,
   equityRead,
+  marketsRead,
+  home,
+  dataset,
   search,
   onRetry,
   isActiveTab,
+  jumpStrategy,
+  sandboxSignal,
+  onClearJump,
 }: {
   strategiesRead?: Read<Strategy[]>;
   slotsRead?: Read<Slots>;
   equityRead?: Read<Equity>;
+  marketsRead?: Read<Market[]>;
+  home: Home | null;
+  dataset: Dataset;
   search: string;
   onRetry: () => void;
   isActiveTab: boolean;
+  jumpStrategy?: string | null;
+  sandboxSignal?: number;
+  onClearJump?: () => void;
 }) {
   const [filter, setFilter] = useState<VerdictFilter>("all");
   const [activeIdx, setActiveIdx] = useState<number>(-1);
   const [openName, setOpenName] = useState<string | null>(null);
+  const [sandboxOpen, setSandboxOpen] = useState(false);
+  const [sandboxInitName, setSandboxInitName] = useState<string | null>(null);
 
   const slots = slotsRead?.ok ? slotsRead.v : null;
   const equity = equityRead?.ok ? equityRead.v : null;
+  const markets = useMemo(
+    () => (marketsRead?.ok ? marketsRead.v.filter((m): m is Market => !!m && typeof m === "object") : []),
+    [marketsRead],
+  );
 
   const validRows = useMemo(() => {
     if (!strategiesRead || !strategiesRead.ok) return [];
     return strategiesRead.v.filter((s): s is Strategy => !!s && typeof s === "object");
   }, [strategiesRead]);
+
+  useEffect(() => {
+    if (jumpStrategy && validRows.some((s) => cleanStr(s.strategy, "") === jumpStrategy)) {
+      setFilter("all");
+      setOpenName(jumpStrategy);
+      onClearJump?.();
+    }
+  }, [jumpStrategy, validRows, onClearJump]);
+
+  useEffect(() => {
+    if (sandboxSignal && sandboxSignal > 0) {
+      setSandboxOpen(true);
+    }
+  }, [sandboxSignal]);
 
   const pnlByStrategy = useMemo(() => {
     const map = new Map<string, number>();
@@ -411,7 +462,7 @@ export function StrategiesTab({
   }, [openName, slots]);
 
   return (
-    <section id="strategies" aria-label="Rune strategies leaderboard" className="space-y-3">
+    <section id="strategies" aria-label="Rune strategies leaderboard and sandbox" className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2.5">
         <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Filter strategies by verdict">
           {(
@@ -441,10 +492,36 @@ export function StrategiesTab({
             </button>
           ))}
         </div>
-        <span className="hidden text-xs text-ink-3 sm:inline">
-          Use <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">j</kbd>/<kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">k</kbd> and <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">Enter</kbd> to inspect any Rune script
-        </span>
+
+        <div className="flex flex-wrap items-center gap-2.5">
+          <span className="hidden text-xs text-ink-3 lg:inline">
+            Use <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">j</kbd>/<kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">k</kbd> and <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">Enter</kbd>
+          </span>
+          <Button
+            id="open-sandbox-btn"
+            variant={sandboxOpen ? "default" : "outline"}
+            className="min-h-11 gap-1.5 px-3 text-xs font-medium sm:min-h-9"
+            aria-expanded={sandboxOpen}
+            onClick={() => setSandboxOpen((v) => !v)}
+          >
+            <Code2 className="size-3.5" aria-hidden />
+            <span>{sandboxOpen ? "Close Rune Sandbox" : "Rune Sandbox"}</span>
+          </Button>
+        </div>
       </div>
+
+      {/* Interactive Rune Strategy Sandbox Editor & Backtest Panel */}
+      {sandboxOpen && (
+        <RuneSandbox
+          strategies={validRows}
+          markets={markets}
+          slots={slots}
+          home={home}
+          dataset={dataset}
+          initialStrategyName={sandboxInitName}
+          onClose={() => setSandboxOpen(false)}
+        />
+      )}
 
       {!strategiesRead ? (
         <div className="rounded-[10px] border border-hairline bg-surface p-6">
@@ -563,6 +640,11 @@ export function StrategiesTab({
         points={openStrategy ? pointsByStrategy.get(cleanStr(openStrategy.strategy, "")) || [] : []}
         trades={openTrades}
         tradesTruncated={!!slots?.trades_truncated}
+        onOpenInSandbox={(name) => {
+          setOpenName(null);
+          setSandboxInitName(name);
+          setSandboxOpen(true);
+        }}
         onClose={() => setOpenName(null)}
       />
     </section>

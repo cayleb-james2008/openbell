@@ -1,6 +1,7 @@
-// gate.mjs: OpenBell v0.4.0 quant desk gate (live & fixture tapes, Settings-only Light/Dark theme, SVG label geometry,
-// Tape / Strategies / Slots tabs, Market & Strategy Vaul inspectors, and Update strip).
-// /api/collect is stubbed in the browser so this offline suite never touches the network; live Kalshi E2E runs separately.
+// gate.mjs: OpenBell v0.5.0 institutional quant desk gate (4 tabs, opaque header, Settings-only Light/Dark,
+// #desk-search non-truncation on all 4 tabs, 390px no-orphan wrap, Cmd+K palette, keyboard 1-4,
+// interactive price+spread crosshair, Rune Sandbox validate+backtest, Slot Desk equity+drawdown+export,
+// Quant Lab calibration/Monte Carlo/walk-forward, v0.5.0 wire-contract E2E, and Update strip).
 import { BASE, OUT as E2E_OUT, launch, report } from './fixture.mjs'
 import fs from 'node:fs'
 
@@ -69,7 +70,6 @@ const MEASURE = () => {
     })
     .map(e => e.tagName + '.' + String(e.className?.baseVal ?? e.className).slice(0, 40) + ' r=' + Math.round(e.getBoundingClientRect().right))
     .slice(0, 5)
-  // SVG text label geometry (matches ultra-design probe.mjs)
   const svgs = [...document.querySelectorAll('svg')].filter(s => vis(s) && s.querySelector('text'))
   const svgOut = [], svgOverlap = [], svgSmall = []
   for (const s of svgs) {
@@ -109,6 +109,58 @@ const MEASURE = () => {
   }
 }
 
+// Mechanical 1-word orphan wrap detector for 390px mobile prose & headings
+const ORPHAN_WRAPS = () => {
+  const vis = el => {
+    const r = el.getBoundingClientRect()
+    const s = getComputedStyle(el)
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'
+  }
+  const orphans = []
+  const candidates = [...document.querySelectorAll('h1,h2,h3,h4,p,button,[role=tab]')].filter(el => {
+    if (!vis(el) || el.closest('[aria-hidden="true"]') || el.closest('pre') || el.closest('table')) return false
+    if (el.classList.contains('mono') || el.classList.contains('font-mono') || el.classList.contains('truncate')) return false
+    const txt = (el.innerText || '').trim().replace(/\s+/g, ' ')
+    return txt.split(' ').length >= 4 && !txt.includes('KX')
+  })
+  for (const el of candidates) {
+    // Only inspect leaf-ish prose blocks whose text comes directly or via inline spans
+    if (el.querySelector('div,p,ul,table,svg')) continue
+    const range = document.createRange()
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+    const words = []
+    let node
+    while ((node = walker.nextNode())) {
+      const text = node.textContent || ''
+      const re = /\S+/g
+      let m
+      while ((m = re.exec(text))) {
+        range.setStart(node, m.index)
+        range.setEnd(node, m.index + m[0].length)
+        const rect = range.getBoundingClientRect()
+        if (rect.width > 0 && rect.height > 0) {
+          words.push({ word: m[0], top: Math.round(rect.top / 4) * 4 })
+        }
+      }
+    }
+    if (words.length < 4) continue
+    const lines = new Map()
+    for (const w of words) {
+      const arr = lines.get(w.top) || []
+      arr.push(w.word)
+      lines.set(w.top, arr)
+    }
+    if (lines.size >= 2) {
+      const sortedTops = [...lines.keys()].sort((a, b) => a - b)
+      const lastLine = lines.get(sortedTops[sortedTops.length - 1])
+      if (lastLine && lastLine.length === 1 && lastLine[0].length <= 14) {
+        orphans.push(`${el.tagName}:"${(el.innerText || '').trim().slice(0, 60)}" -> [${lastLine[0]}]`)
+      }
+    }
+  }
+  return orphans
+}
+
 const errs = []
 const checks = []
 const ok = (name, pass, detail = '') => {
@@ -142,6 +194,10 @@ for (const [dn, url] of [['live', BASE], ['fixture', FX]]) {
       m.size = vn; m.theme = theme; m.data = dn
       measures.push(m)
       if (vn === '1440' || vn === '390') await p.screenshot({ path: `${OUT}/${dn}-${vn}-${theme}.png` })
+      if (dn === 'fixture' && vn === '1440' && theme === 'dark') {
+        await p.locator('#tab-quant').click(); await p.waitForTimeout(450)
+        await p.screenshot({ path: `${OUT}/quant-lab-1440-dark.png` })
+      }
       await ctx.close()
     }
   }
@@ -154,7 +210,7 @@ for (const m of measures) {
   )
 }
 
-// 2. Settings-only Light/Dark switch (#67) with opposite browser colorScheme + luminance check
+// 2. Settings-only Light/Dark switch (#67), opaque header, & #desk-search non-truncation on ALL 4 tabs
 {
   const { ctx, p } = await open(1440, 900, 'light')
   await p.goto(BASE); await ready(p); await p.waitForTimeout(500)
@@ -166,10 +222,9 @@ for (const m of measures) {
       const s = getComputedStyle(el)
       return (!s.backdropFilter || s.backdropFilter === 'none') && (!s.webkitBackdropFilter || s.webkitBackdropFilter === 'none')
     }))
-  // Verify #desk-search placeholder fits comfortably across all 3 tabs at 1440px
   const phFits = []
-  for (const tid of ['#tab-tape', '#tab-strategies', '#tab-slots']) {
-    await p.locator(tid).click(); await p.waitForTimeout(100)
+  for (const tid of ['#tab-tape', '#tab-strategies', '#tab-slots', '#tab-quant']) {
+    await p.locator(tid).click(); await p.waitForTimeout(120)
     const info = await p.locator('#desk-search').evaluate(el => {
       const s = getComputedStyle(el)
       const cx = document.createElement('canvas').getContext('2d')
@@ -181,7 +236,7 @@ for (const m of measures) {
     phFits.push(info)
   }
   await p.locator('#tab-tape').click(); await p.waitForTimeout(100)
-  ok('search placeholder fits without mid-word clipping on all 3 tabs', phFits.every(x => x.ok), JSON.stringify(phFits))
+  ok('search placeholder fits without mid-word clipping on all 4 tabs', phFits.every(x => x.ok), JSON.stringify(phFits))
   ok('live mode shows zero Example fixture pill', (await p.locator('text=Example fixture').count()) === 0)
   const lum = () => p.evaluate(() => {
     const cx = document.createElement('canvas').getContext('2d')
@@ -205,10 +260,10 @@ for (const m of measures) {
   await ctx.close()
 }
 
-// 3. Workbench tabs, Live 15m Tape inspector, Rune Strategies inspector, Slot Desk & Daily Report (desktop)
+// 3. Full 4-tab Workbench E2E: Tape + Price/Spread Crosshair, Rune Sandbox + Backtest, Slot Desk + Drawdown + Export, Quant Lab, Cmd+K & 1-4 shortcuts
 {
   const { ctx, p } = await open(1440, 900)
-  await p.goto(FX); await ready(p); await p.waitForTimeout(500)
+  await p.goto(FX); await ready(p); await p.waitForTimeout(550)
   ok('fixture notice visible only on ?dataset=fixture', (await p.locator('text=Example tape.').count()) === 1)
   ok('hero telemetry strip + Collect now sit above the fold at 1440', await p.evaluate(() =>
     ['#pot-figure', '#standing', '#markets-kpi', '#snapshots-kpi', '#collect-btn'].every(s => {
@@ -220,13 +275,27 @@ for (const m of measures) {
     return document.fonts.check('14px "Geist"') && [...document.fonts].some(f => f.family.includes('Geist Mono') && f.status === 'loaded')
   })
   ok('self-hosted Geist and Geist Mono woff2 loaded', fontsOk)
-  // Standing line honesty on fixture
+  const stratPayload = await p.evaluate(() => fetch('/api/strategies?dataset=fixture').then(r => r.json()))
+  const stratTotal = Array.isArray(stratPayload) ? stratPayload.length : 0
   const tally = await p.locator('#standing-detail li').evaluateAll(ls => ls.map(l => l.innerText.replace(/\s+/g, ' ').trim()))
-  ok('standing line counts 0 of 5 forward-proven on example tape',
-    (await p.locator('#standing-figure').textContent()).trim() === '0 of 5' && tally.some(t => /passed on the example tape only/.test(t)),
-    JSON.stringify(tally))
+  ok('standing line counts 0 forward-proven on example tape across full library',
+    stratTotal >= 5 && (await p.locator('#standing-figure').textContent()).trim() === `0 of ${stratTotal}` && tally.some(t => /passed on the example tape only/.test(t)),
+    `total=${stratTotal} tally=${JSON.stringify(tally)}`)
 
-  // Live 15m Tape: search via '/' shortcut + Market Inspector Vaul drawer
+  // Live 15m Tape: dynamic series chips + inline Price & Spread crosshair + Market Inspector drawer
+  const chipsPresent = await Promise.all(['All', 'BTC', 'ETH', 'SOL', 'XRP'].map(s => p.locator(`[data-series-chip="${s}"]`).count()))
+  ok('Live 15m Tape shows dynamic multi-series chips (All, BTC, ETH, SOL, XRP)', chipsPresent.every(c => c === 1), JSON.stringify(chipsPresent))
+  const inlineSvg = p.locator('#tape-inline-chart svg[role=img]').first()
+  const ibox = await inlineSvg.boundingBox()
+  if (ibox) {
+    await p.mouse.move(ibox.x + ibox.width * 0.4, ibox.y + ibox.height * 0.4)
+    await p.waitForTimeout(120)
+  }
+  const crossTxt = await p.locator('#tape-inline-chart [data-market-crosshair-tooltip]').innerText().catch(() => '')
+  ok('interactive SVG price+spread chart crosshair shows YES/NO bid/ask, implied prob & spread',
+    /YES\s+\S+\/\S+/.test(crossTxt) && /NO\s+\S+\/\S+/.test(crossTxt) && /Prob\s+[\d.]+%/.test(crossTxt) && /Spread\s+\d+c/.test(crossTxt),
+    crossTxt)
+
   await p.locator('body').click({ position: { x: 5, y: 300 } })
   ok('global search kbd hint shows /', (await p.locator('header kbd').first().innerText().catch(() => '')).trim() === '/')
   await p.keyboard.press('/'); await p.waitForTimeout(100)
@@ -240,15 +309,42 @@ for (const m of measures) {
   await p.keyboard.press('Escape'); await p.waitForTimeout(450)
   await p.locator('#desk-search').fill(''); await p.waitForTimeout(150)
 
-  // Rune Strategies tab + filters + j/k/Enter + Strategy Inspector with Cult UI Expandable Rune source
-  await p.locator('#tab-strategies').click(); await p.waitForTimeout(300)
-  ok('five strategies in Rune Strategies leaderboard', (await stratRows(p)) === 5, String(await stratRows(p)))
-  for (const [f, n] of [['Proven (2)', 2], ['Rejected (1)', 1], ['Testing (2)', 2], ['All (5)', 5]]) {
-    await p.getByRole('button', { name: f, exact: true }).click(); await p.waitForTimeout(150)
-    ok(`strategy filter ${f}`, (await stratRows(p)) === n, String(await stratRows(p)))
+  // Keyboard shortcuts 1-4 switch all 4 tabs cleanly
+  await p.locator('body').click({ position: { x: 5, y: 300 } })
+  await p.keyboard.press('4'); await p.waitForTimeout(200)
+  const k4Ok = await p.locator('#quant-lab').isVisible()
+  await p.keyboard.press('3'); await p.waitForTimeout(200)
+  const k3Ok = await p.locator('#slots-card').isVisible()
+  await p.keyboard.press('2'); await p.waitForTimeout(200)
+  const k2Ok = await p.locator('#strategies').isVisible()
+  ok('keyboard shortcuts 2/3/4 switch Rune Strategies, Slot Desk & Quant Lab tabs', k4Ok && k3Ok && k2Ok)
+
+  // Rune Strategies tab + filters + Sandbox Editor + Validate + Backtest + j/k/Enter + Inspector
+  ok('Rune Strategies leaderboard renders full strategy library', (await stratRows(p)) === stratTotal && stratTotal >= 5, String(await stratRows(p)))
+  const filterBtns = await p.locator('#strategies [role="group"][aria-label="Filter strategies by verdict"] button').evaluateAll(bs =>
+    bs.map(b => ({ label: b.innerText.trim(), n: Number((b.innerText.match(/\((\d+)\)/) || [])[1] || 0) })),
+  )
+  for (const { label, n } of [...filterBtns.slice(1), filterBtns[0]]) {
+    await p.getByRole('button', { name: label, exact: true }).click(); await p.waitForTimeout(150)
+    ok(`strategy filter ${label.split(' ')[0]}`, (await stratRows(p)) === n, `${label} -> ${await stratRows(p)}`)
   }
+
+  // Interactive Rune Strategy Sandbox Editor & Backtest on Tape
+  await p.locator('#open-sandbox-btn').click(); await p.waitForTimeout(250)
+  ok('Rune Strategy Sandbox editor opens inline', await p.locator('#rune-sandbox #rune-editor').isVisible())
+  await p.locator('#sandbox-validate-btn').click(); await p.waitForTimeout(250)
+  ok('Validate Rune reports compile diagnostics', (await p.locator('#sandbox-diagnostics').innerText()).includes('Compile passed'))
+  await p.locator('#sandbox-backtest-btn').click(); await p.waitForTimeout(350)
+  const sbTxt = await p.locator('[data-sandbox-results]').innerText()
+  ok('Backtest on Tape renders paper P&L, Sharpe, Max Drawdown & Brier',
+    sbTxt.includes('Paper Net P&L') && sbTxt.includes('Sharpe') && sbTxt.includes('Max Drawdown') && sbTxt.includes('Brier Score'),
+    sbTxt.slice(0, 120))
+  await p.screenshot({ path: `${OUT}/strategies-sandbox-1440.png` })
+  await p.locator('#open-sandbox-btn').click(); await p.waitForTimeout(150)
+
   await p.locator('#desk-search').fill('late'); await p.waitForTimeout(150)
-  ok('global search filters strategies', (await stratRows(p)) === 2, String(await stratRows(p)))
+  const lateMatches = await stratRows(p)
+  ok('global search filters strategies', lateMatches >= 2 && lateMatches < stratTotal, String(lateMatches))
   await p.locator('#desk-search').fill('zzz'); await p.waitForTimeout(150)
   ok('empty search shows clear status', /No strategy matches/.test(await p.locator('#strategies [role=status]').innerText()))
   await p.locator('#desk-search').fill(''); await p.waitForTimeout(150)
@@ -272,12 +368,61 @@ for (const m of measures) {
   await p.keyboard.press('Escape'); await p.waitForTimeout(450)
   ok('Escape closes Strategy Inspector', (await p.locator('[data-strategy-drawer]').count()) === 0)
 
-  // Slot Desk tab + Daily Report Expandable + Venue Account
-  await p.locator('#tab-slots').click(); await p.waitForTimeout(300)
+  // Slot Desk tab: Equity + Drawdown Underwater subplot, Stint Attribution, 3-strike tracker, Export .md/.csv, Expandable Report, Venue Account
+  await p.locator('#tab-slots').click(); await p.waitForTimeout(350)
   ok('Slot Desk renders active slots with 3-strike tracker', (await p.locator('#slots-card tbody tr').count()) >= 5)
+  const ddSvg = p.locator('[data-slot-equity-dd] svg[role=img]').first()
+  ok('Slot Desk renders compounding equity + drawdown underwater SVG & stint attribution',
+    (await ddSvg.count()) === 1 && (await p.locator('#stint-attribution').isVisible()))
+  const [dlMd] = await Promise.all([p.waitForEvent('download'), p.locator('#export-report-md').click()])
+  const [dlCsv] = await Promise.all([p.waitForEvent('download'), p.locator('#export-report-csv').click()])
+  ok('Slot Desk exports Daily Report in .md and .csv formats',
+    dlMd.suggestedFilename().endsWith('.md') && dlCsv.suggestedFilename().endsWith('.csv'),
+    `${dlMd.suggestedFilename()} | ${dlCsv.suggestedFilename()}`)
   await p.locator('#report-body').getByText('Show full report').click(); await p.waitForTimeout(400)
   ok('full daily report expands in place', await p.locator('#report').isVisible())
   ok('read-only Venue Account panel renders', await p.locator('#account').isVisible())
+  const slotsM = await p.evaluate(MEASURE)
+  ok('Slot Desk passes full geometry, contrast & SVG checks at 1440',
+    slotsM.docOverflow <= 0 && slotsM.lowContrast === 0 && slotsM.svgBad === 0 && slotsM.smallTargets === 0,
+    `low=${slotsM.lowContrast} svg=${slotsM.svgBad} small=${slotsM.smallTargets}`)
+  await p.screenshot({ path: `${OUT}/slots-1440-light.png` })
+
+  // Quant Lab (4th tab): Calibration Reliability SVG + Wilson error bars + Brier/ECE, Monte Carlo 1,000-path Fan + Reseed, Walk-Forward IS vs OOS
+  await p.locator('#tab-quant').click(); await p.waitForTimeout(500)
+  const brierTxt = (await p.locator('#quant-brier').innerText()).trim()
+  const eceTxt = (await p.locator('#quant-ece').innerText()).trim()
+  const wilsonCount = await p.locator('[data-calibration-chart] [data-wilson-bar]').count()
+  ok('Quant Lab renders Calibration Reliability SVG with 95% Wilson error bars, Brier & ECE',
+    wilsonCount >= 1 && /^\d+\.\d{4}$/.test(brierTxt) && /^\d+\.\d{2}%$/.test(eceTxt),
+    `wilsonBars=${wilsonCount} brier=${brierTxt} ece=${eceTxt}`)
+  const mcSeedBefore = await p.locator('#mc-seed-input').inputValue()
+  await p.locator('#mc-reseed-btn').click(); await p.waitForTimeout(300)
+  const mcSeedAfter = await p.locator('#mc-seed-input').inputValue()
+  ok('Quant Lab renders 1,000-path Monte Carlo Fan Chart and Run/Reseed updates seed',
+    (await p.locator('[data-montecarlo-chart] svg[role=img]').count()) === 1 && mcSeedAfter !== mcSeedBefore,
+    `seed ${mcSeedBefore} -> ${mcSeedAfter}`)
+  const wfRows = await p.locator('#quant-walkforward tbody tr').count()
+  const wfText = await p.locator('#quant-walkforward').innerText()
+  ok('Quant Lab renders Walk-Forward IS vs OOS table with Sharpe, Sortino, Profit Factor, Max DD & Fee Drag',
+    wfRows >= 2 && wfText.includes('IS (') && wfText.includes('OOS (') && wfText.includes('Portfolio'),
+    `rows=${wfRows}`)
+  const quantM = await p.evaluate(MEASURE)
+  ok('Quant Lab passes full geometry, contrast & SVG checks at 1440',
+    quantM.docOverflow <= 0 && quantM.lowContrast === 0 && quantM.svgBad === 0 && quantM.smallTargets === 0,
+    `low=${quantM.lowContrast}(${quantM.lowSample.join('|')}) svg=${quantM.svgBad}(${quantM.svgDetail.join('|')}) small=${quantM.smallTargets}`)
+  await p.screenshot({ path: `${OUT}/quant-lab-1440-light.png` })
+
+  // Global Command Palette (Ctrl+K / Cmd+K)
+  await p.keyboard.press('Control+k'); await p.waitForTimeout(250)
+  ok('Ctrl+K opens global Command Palette', await p.locator('[data-command-palette]').isVisible())
+  await p.screenshot({ path: `${OUT}/cmdk-1440-light.png` })
+  await p.locator('[data-command-palette] input').fill('favourite-late'); await p.waitForTimeout(200)
+  await p.keyboard.press('Enter'); await p.waitForTimeout(600)
+  ok('Command Palette jumps directly to Rune strategy inspector',
+    (await p.locator('[data-command-palette]').count()) === 0 && (await drawerTitle(p)) === 'favourite-late',
+    await drawerTitle(p))
+  await p.keyboard.press('Escape'); await p.waitForTimeout(400)
 
   // Collect now (stubbed)
   await p.locator('#collect-btn').focus(); await p.keyboard.press('Enter')
@@ -290,7 +435,143 @@ for (const m of measures) {
   await ctx.close()
 }
 
-// 4. Error, empty, and loading states
+// 4. 390x844 mobile sweep across ALL 4 tabs: zero overflow, zero 1-word orphan wraps, 44px targets, bottom Settings sheet
+{
+  const { ctx, p } = await open(390, 844)
+  await p.goto(FX); await ready(p); await p.waitForTimeout(450)
+  const orphanIssues = []
+  const tabMeasures = []
+  for (const [tid, label] of [['#tab-tape', 'tape'], ['#tab-strategies', 'strategies'], ['#tab-slots', 'slots'], ['#tab-quant', 'quant']]) {
+    await p.locator(tid).click(); await p.waitForTimeout(350)
+    const m = await p.evaluate(MEASURE)
+    const orph = await p.evaluate(ORPHAN_WRAPS)
+    tabMeasures.push({ label, ok: m.docOverflow <= 0 && m.clipped.length === 0 && m.smallTargets === 0 && m.lowContrast === 0 && m.svgBad === 0, m })
+    for (const o of orph) orphanIssues.push(`${label}: ${o}`)
+    if (label === 'quant') await p.screenshot({ path: `${OUT}/quant-lab-390-light.png` })
+  }
+  ok('all 4 tabs pass 390x844 touch, contrast, overflow & SVG geometry',
+    tabMeasures.every(x => x.ok),
+    tabMeasures.filter(x => !x.ok).map(x => `${x.label}:overflow=${x.m.docOverflow},small=${x.m.smallTargets}(${x.m.smallSample.join('|')}),low=${x.m.lowContrast},svg=${x.m.svgBad}(${x.m.svgDetail.join('|')})`).join(' ; '))
+  ok('zero 1-word orphan wraps at 390x844 across all 4 tabs', orphanIssues.length === 0, orphanIssues.slice(0, 6).join(' | '))
+
+  await p.locator('#settings-btn').click(); await p.waitForTimeout(500)
+  const box = await p.locator('[data-settings-drawer]').boundingBox()
+  ok('phone Settings sheet rises from bottom', !!box && box.y > 40 && Math.round(box.width) === 390, JSON.stringify(box))
+  await p.screenshot({ path: `${OUT}/settings-390.png` })
+  await p.getByRole('button', { name: 'Close settings', exact: true }).click(); await p.waitForTimeout(450)
+  await ctx.close()
+}
+
+// 5. v0.5.0 API Wire-Contract E2E (proves live SSE, Calibration, Monte Carlo, Walk-Forward, Validate, Backtest & Export wiring)
+{
+  const { ctx, p } = await open(1440, 900)
+  const hits = new Set()
+  await p.route('**/api/home', async r => {
+    const res = await r.fetch()
+    const j = await res.json()
+    j.version = '0.5.0'
+    j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export']
+    return r.fulfill({ response: res, body: JSON.stringify(j) })
+  })
+  await p.route('**/api/tape/stream', r => {
+    hits.add('sse')
+    return r.fulfill({
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+      body: 'event: tape\ndata: {"snapshots_written":1}\n\n',
+    })
+  })
+  await p.route('**/api/analytics/calibration*', r => {
+    hits.add('calibration')
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        brier_score: 0.165,
+        ece: 0.032,
+        total_windows: 240,
+        buckets: [
+          { bin_index: 2, low: 0.2, high: 0.3, mean_predicted: 0.25, realized_rate: 0.24, wilson_low: 0.15, wilson_high: 0.36, count: 60 },
+          { bin_index: 7, low: 0.7, high: 0.8, mean_predicted: 0.76, realized_rate: 0.78, wilson_low: 0.71, wilson_high: 0.84, count: 180 },
+        ],
+      }),
+    })
+  })
+  await p.route('**/api/analytics/walkforward*', r => {
+    hits.add('walkforward')
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        in_sample_ratio: 0.6,
+        rows: [{
+          strategy: 'Portfolio (All Slots)',
+          is_portfolio: true,
+          in_sample: { windows: 60, net_pnl_dollars: 24.5, sharpe: 1.82, sortino: 2.41, profit_factor: 1.75, max_drawdown_pct: 4.2, fee_drag_pct: 7.4, max_win_streak: 7, max_loss_streak: 2 },
+          out_of_sample: { windows: 40, net_pnl_dollars: 15.1, sharpe: 1.54, sortino: 2.05, profit_factor: 1.61, max_drawdown_pct: 5.1, fee_drag_pct: 7.9, max_win_streak: 5, max_loss_streak: 2 },
+        }],
+      }),
+    })
+  })
+  await p.route('**/api/analytics/montecarlo*', r => {
+    hits.add('montecarlo')
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        paths: 1000,
+        seed: 777,
+        start_equity: 100,
+        steps: 3,
+        percentiles: { p5: [100, 96, 94, 92], p25: [100, 101, 104, 108], p50: [100, 105, 112, 121], p75: [100, 110, 122, 136], p95: [100, 118, 138, 162] },
+        terminal: { p5: 92, p25: 108, p50: 121, p75: 136, p95: 162 },
+        dd_prob_10: 0.12,
+        dd_prob_25: 0.015,
+        elapsed_ms: 9,
+      }),
+    })
+  })
+  await p.route('**/api/strategy/validate', r => {
+    hits.add('validate')
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ valid: true, name: 'late-favourite-edge', side: 'yes', diagnostics: [{ level: 'info', message: 'Server Rune VM compile OK' }], elapsed_ms: 4 }) })
+  })
+  await p.route('**/api/backtest', r => {
+    hits.add('backtest')
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        valid: true,
+        strategy: 'late-favourite-edge',
+        side: 'yes',
+        summary: { net_pnl_dollars: 18.4, sharpe: 1.71, sortino: 2.33, max_drawdown_pct: 3.9, brier_score: 0.161, win_rate_pct: 68.0, windows_traded: 25, mean_cents_per_contract: 3.1, fee_drag_pct: 6.8 },
+        equity_curve: [[1700000000, 0], [1700000900, 18.4]],
+        trades: [{ close_epoch: 1700000900, ticker: 'KXBTC15M-MOCK', side: 'yes', price: 0.74, contracts: 5, pnl_dollars: 1.15, result: 'YES' }],
+        elapsed_ms: 11,
+      }),
+    })
+  })
+  await p.route('**/api/export/report*', r => {
+    hits.add('export')
+    return r.fulfill({ status: 200, headers: { 'Content-Type': 'text/markdown', 'Content-Disposition': 'attachment; filename="openbell-server-report.md"' }, body: '# Venue truth line 1\n' })
+  })
+
+  await p.goto(BASE); await ready(p); await p.waitForTimeout(450)
+  await p.locator('#tab-strategies').click(); await p.waitForTimeout(150)
+  await p.locator('#open-sandbox-btn').click(); await p.waitForTimeout(150)
+  await p.locator('#sandbox-validate-btn').click(); await p.waitForTimeout(150)
+  await p.locator('#sandbox-backtest-btn').click(); await p.waitForTimeout(200)
+  await p.locator('#tab-slots').click(); await p.waitForTimeout(200)
+  await Promise.all([p.waitForEvent('download'), p.locator('#export-report-md').click()])
+  await p.locator('#tab-quant').click(); await p.waitForTimeout(350)
+  const serverEngineShown = (await p.locator('#quant-calibration').innerText()).includes('Server Quant Engine')
+  ok('v0.5.0 live API contract integrates SSE, validate, backtest, export, calibration, walkforward & montecarlo',
+    ['sse', 'calibration', 'walkforward', 'montecarlo', 'validate', 'backtest', 'export'].every(k => hits.has(k)) && serverEngineShown,
+    `hits=${[...hits].sort().join(',')} serverEngine=${serverEngineShown}`)
+  await ctx.close()
+}
+
+// 6. Error, empty, and loading states
 {
   const { ctx, p } = await open(1440, 900)
   p.__allow = /50[03]/
@@ -312,7 +593,7 @@ for (const m of measures) {
   await p.locator('#tab-strategies').click(); await p.waitForTimeout(200)
   await p.unroute('**/api/strategies*')
   await p.locator('#strategies [role=alert] button').click(); await p.waitForTimeout(900)
-  ok('retry recovers strategies table', (await stratRows(p)) === 5)
+  ok('retry recovers strategies table', (await stratRows(p)) >= 5, String(await stratRows(p)))
   await ctx.close()
 }
 {
@@ -333,28 +614,16 @@ for (const m of measures) {
   await ctx.close()
 }
 
-// 5. Phone drawer direction (390x844)
-{
-  const { ctx, p } = await open(390, 844)
-  await p.goto(FX); await ready(p); await p.waitForTimeout(400)
-  await p.locator('#settings-btn').click(); await p.waitForTimeout(500)
-  const box = await p.locator('[data-settings-drawer]').boundingBox()
-  ok('phone Settings sheet rises from bottom', !!box && box.y > 40 && Math.round(box.width) === 390, JSON.stringify(box))
-  await p.screenshot({ path: `${OUT}/settings-390.png` })
-  await p.getByRole('button', { name: 'Close settings', exact: true }).click(); await p.waitForTimeout(450)
-  await ctx.close()
-}
-
-// 6. Update strip (loopback + non-loopback shared host, BANNER-FIX-BRIEF)
+// 7. Update strip (loopback + non-loopback shared host, BANNER-FIX-BRIEF)
 {
   const { ctx, p } = await open(1440, 900)
   p.__allow = /409|500/
-  let snap = { mode: 'notify', current: '0.4.0', latest: '0.5.0', available: true, can_apply: true, dev_build: false, notes: 'Faster collector.', release_url: 'https://github.com/cayleb-james2008/openbell/releases/tag/v0.5.0', checked_at: Math.floor(Date.now() / 1000) }
+  let snap = { mode: 'notify', current: '0.5.0', latest: '0.6.0', available: true, can_apply: true, dev_build: false, notes: 'Faster collector.', release_url: 'https://github.com/cayleb-james2008/openbell/releases/tag/v0.6.0', checked_at: Math.floor(Date.now() / 1000) }
   let failApply = true
   await p.route('**/api/update', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(snap) }))
   await p.route('**/api/update/apply', r => {
     if (failApply) return r.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: 'the download does not match its checksum, so it was discarded' }) })
-    snap = { ...snap, available: false, staged: '0.5.0', can_apply: false }
+    snap = { ...snap, available: false, staged: '0.6.0', can_apply: false }
     return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(snap) })
   })
   await p.goto(FX); await ready(p); await p.waitForSelector('#update-banner', { timeout: 5000 })
@@ -374,7 +643,7 @@ for (const m of measures) {
 {
   const { ctx, p } = await open(1440, 900)
   const sharedOrigin = 'http://openbell.shared:18890'
-  const snap = { mode: 'notify', current: '0.4.0', latest: '0.5.0', available: true, can_apply: true, dev_build: false, notes: 'Notes.', release_url: 'https://github.com/cayleb-james2008/openbell/releases/tag/v0.5.0', checked_at: Math.floor(Date.now() / 1000) }
+  const snap = { mode: 'notify', current: '0.5.0', latest: '0.6.0', available: true, can_apply: true, dev_build: false, notes: 'Notes.', release_url: 'https://github.com/cayleb-james2008/openbell/releases/tag/v0.6.0', checked_at: Math.floor(Date.now() / 1000) }
   await p.route(sharedOrigin + '/**', async r => {
     const u = new URL(r.request().url())
     if (u.pathname === '/api/update') return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(snap) })
@@ -389,7 +658,7 @@ for (const m of measures) {
   await ctx.close()
 }
 
-// 7. Reduced motion honored
+// 8. Reduced motion honored
 {
   const { ctx, p } = await open(1440, 900, 'light', { reducedMotion: 'reduce' })
   await p.goto(FX); await ready(p)
