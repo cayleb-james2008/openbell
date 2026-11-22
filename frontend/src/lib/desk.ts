@@ -1,4 +1,4 @@
-// OpenBell desk API reads, runtime shape/null guards, and quant formatters.
+// OpenBell desk API reads, live SSE stream (with polling fallback), runtime shape/null guards, and quant formatters.
 import { useCallback, useEffect, useRef, useState } from "react";
 
 export type Dataset = "live" | "fixture";
@@ -31,6 +31,8 @@ export type Home = {
   version?: string;
   mode?: string;
   series?: string[];
+  capabilities?: string[];
+  sse?: boolean;
   library_errors?: { file: string; error: string }[];
   stage_target?: { target_dollars: number; progress_pct?: number };
 };
@@ -56,6 +58,8 @@ export type Trade = {
   slot: number;
   strategy: string;
   ticker?: string;
+  side?: string;
+  result?: string;
 };
 
 export type StrategyTotal = {
@@ -139,6 +143,12 @@ export type Reads = {
   report: Read<Report>;
 };
 
+export type TapeStreamState = {
+  mode: "sse" | "polling" | "connecting";
+  eventCount: number;
+  lastEventAt: number | null;
+};
+
 const SHAPES: Record<keyof Reads, (x: unknown) => boolean> = {
   home: (x) => {
     const h = x as Home | null;
@@ -165,6 +175,25 @@ const SHAPES: Record<keyof Reads, (x: unknown) => boolean> = {
   report: (x) => !!x && typeof (x as Report).report === "string",
 };
 
+export function semverAtLeast(version: string | undefined, target: [number, number, number]): boolean {
+  if (typeof version !== "string") return false;
+  const m = version.trim().match(/^v?(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return false;
+  const [maj, min, pat] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  if (maj !== target[0]) return maj > target[0];
+  if (min !== target[1]) return min > target[1];
+  return pat >= target[2];
+}
+
+export function supportsV050(home: Home | null, capability?: string): boolean {
+  if (!home) return false;
+  if (capability && Array.isArray(home.capabilities)) {
+    if (home.capabilities.includes(capability)) return true;
+  }
+  if (capability === "sse" && home.sse === true) return true;
+  return semverAtLeast(home.version, [0, 5, 0]);
+}
+
 export async function getJson(url: string, init?: RequestInit): Promise<unknown> {
   const r = await fetch(url, init);
   if (!r.ok) throw new Error(`${url} answered ${r.status}`);
@@ -188,7 +217,10 @@ export async function fetchStrategySource(name: string): Promise<StrategySource>
 
 export function useDesk(dataset: Dataset) {
   const [reads, setReads] = useState<Reads | null>(null);
+  const [stream, setStream] = useState<TapeStreamState>({ mode: "polling", eventCount: 0, lastEventAt: null });
   const seq = useRef(0);
+  const sseRefreshTimer = useRef<number | null>(null);
+
   const load = useCallback(async () => {
     const mine = ++seq.current;
     const q = dataset === "fixture" ? "?dataset=fixture" : "";
@@ -221,7 +253,92 @@ export function useDesk(dataset: Dataset) {
     return () => clearInterval(id);
   }, [load]);
 
-  return { reads, load };
+  const home = reads?.home.ok ? reads.home.v : null;
+  const sseEnabled = dataset === "live" && supportsV050(home, "sse") && typeof EventSource !== "undefined";
+
+  useEffect(() => {
+    if (!sseEnabled) {
+      setStream({ mode: "polling", eventCount: 0, lastEventAt: null });
+      return;
+    }
+
+    let closed = false;
+    setStream((prev) => ({ ...prev, mode: "connecting" }));
+    const es = new EventSource("/api/tape/stream");
+
+    const scheduleReload = () => {
+      if (sseRefreshTimer.current !== null) return;
+      sseRefreshTimer.current = window.setTimeout(() => {
+        sseRefreshTimer.current = null;
+        if (!closed) void load();
+      }, 400);
+    };
+
+    const handleEvent = (ev: MessageEvent<string>) => {
+      if (closed) return;
+      setStream((prev) => ({
+        mode: "sse",
+        eventCount: prev.eventCount + 1,
+        lastEventAt: Date.now(),
+      }));
+      try {
+        const parsed = JSON.parse(ev.data) as {
+          markets?: Market[];
+          snapshot?: Market;
+          snapshots_written?: number;
+        };
+        if (Array.isArray(parsed.markets)) {
+          setReads((prev) =>
+            prev ? { ...prev, markets: { ok: true, v: parsed.markets as Market[] } } : prev,
+          );
+          return;
+        }
+        if (parsed.snapshot && typeof parsed.snapshot === "object" && parsed.snapshot.ticker) {
+          const snap = parsed.snapshot;
+          setReads((prev) => {
+            if (!prev || !prev.markets.ok) return prev;
+            const rest = prev.markets.v.filter((m) => m?.ticker !== snap.ticker);
+            return { ...prev, markets: { ok: true, v: [snap, ...rest] } };
+          });
+          return;
+        }
+        if (isNum(parsed.snapshots_written) && parsed.snapshots_written > 0) {
+          scheduleReload();
+        }
+      } catch {
+        scheduleReload();
+      }
+    };
+
+    es.onopen = () => {
+      if (!closed) {
+        setStream((prev) => ({ ...prev, mode: "sse" }));
+      }
+    };
+    es.onmessage = handleEvent;
+    es.addEventListener("tape", handleEvent as EventListener);
+    es.addEventListener("snapshot", handleEvent as EventListener);
+    es.addEventListener("collect", handleEvent as EventListener);
+
+    es.onerror = () => {
+      if (closed) return;
+      // Clean fallback to 30s polling if the stream closes or is unavailable.
+      es.close();
+      closed = true;
+      setStream((prev) => ({ ...prev, mode: "polling" }));
+    };
+
+    return () => {
+      closed = true;
+      es.close();
+      if (sseRefreshTimer.current !== null) {
+        window.clearTimeout(sseRefreshTimer.current);
+        sseRefreshTimer.current = null;
+      }
+    };
+  }, [sseEnabled, load]);
+
+  return { reads, load, stream };
 }
 
 export const isNum = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
@@ -264,23 +381,35 @@ export const dayLabel = (x: unknown): string =>
 export const timeUtcLabel = (x: unknown): string =>
   isNum(x) ? new Date(x * 1000).toISOString().slice(11, 16) + "Z" : "-";
 
-export function closeClock(iso: string | null | undefined, nowMs: number): { label: string; isOpen: boolean } {
-  if (typeof iso !== "string" || !iso) return { label: "-", isOpen: false };
+export const timeUtcFullLabel = (x: unknown): string =>
+  isNum(x) ? new Date(x * 1000).toISOString().slice(11, 19) + "Z" : "-";
+
+export function closeClock(
+  iso: string | null | undefined,
+  nowMs: number,
+): { label: string; isOpen: boolean; secsRemaining: number | null } {
+  if (typeof iso !== "string" || !iso) return { label: "-", isOpen: false, secsRemaining: null };
   const ms = Date.parse(iso);
-  if (!Number.isFinite(ms)) return { label: iso.slice(0, 16), isOpen: false };
+  if (!Number.isFinite(ms)) return { label: iso.slice(0, 16), isOpen: false, secsRemaining: null };
   const diffSec = Math.floor((ms - nowMs) / 1000);
   if (diffSec > 0) {
     if (diffSec < 3600) {
       const m = Math.floor(diffSec / 60);
       const s = diffSec % 60;
-      return { label: `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`, isOpen: true };
+      return {
+        label: `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`,
+        isOpen: true,
+        secsRemaining: diffSec,
+      };
     }
     const h = Math.floor(diffSec / 3600);
     const m = Math.floor((diffSec % 3600) / 60);
-    return { label: `${h}h ${String(m).padStart(2, "0")}m`, isOpen: true };
+    return { label: `${h}h ${String(m).padStart(2, "0")}m`, isOpen: true, secsRemaining: diffSec };
   }
-  return { label: iso.slice(5, 16).replace("T", " ") + "Z", isOpen: false };
+  return { label: iso.slice(5, 16).replace("T", " ") + "Z", isOpen: false, secsRemaining: 0 };
 }
+
+const CANONICAL_SERIES = ["BTC", "ETH", "SOL", "XRP", "DOGE"];
 
 export function seriesShort(series: string | null | undefined, ticker?: string | null): string {
   const src = (series || ticker || "").toUpperCase();
@@ -289,7 +418,30 @@ export function seriesShort(series: string | null | undefined, ticker?: string |
   if (src.includes("SOL")) return "SOL";
   if (src.includes("XRP")) return "XRP";
   if (src.includes("DOGE")) return "DOGE";
-  return src.replace(/^KX/, "").replace(/15M.*$/, "") || "15M";
+  const cleaned = src.replace(/^KX/, "").replace(/15M.*$/, "").replace(/[^A-Z0-9]/g, "");
+  return cleaned || "15M";
+}
+
+export function deriveSeriesChips(markets: Market[], homeSeries?: string[]): string[] {
+  const seen = new Set<string>(["BTC", "ETH", "SOL", "XRP"]);
+  if (Array.isArray(homeSeries)) {
+    for (const s of homeSeries) {
+      if (typeof s === "string" && s.trim()) seen.add(seriesShort(s));
+    }
+  }
+  for (const m of markets) {
+    const sym = seriesShort(m.series, m.ticker);
+    if (sym && sym !== "15M") seen.add(sym);
+  }
+  const ordered = [...seen].sort((a, b) => {
+    const ia = CANONICAL_SERIES.indexOf(a);
+    const ib = CANONICAL_SERIES.indexOf(b);
+    if (ia >= 0 && ib >= 0) return ia - ib;
+    if (ia >= 0) return -1;
+    if (ib >= 0) return 1;
+    return a.localeCompare(b);
+  });
+  return ["All", ...ordered];
 }
 
 export function marketIsOpen(m: Market): boolean {
@@ -313,6 +465,13 @@ export function impliedYesProb(m: Market): number | null {
   if (isNum(m.last_price) && m.last_price >= 0 && m.last_price <= 1) return m.last_price;
   if (ask !== null && ask >= 0 && ask <= 1) return ask;
   if (bid !== null && bid >= 0 && bid <= 1) return bid;
+  return null;
+}
+
+export function marketSpreadCents(m: Market): number | null {
+  if (isNum(m.yes_bid) && isNum(m.yes_ask) && m.yes_ask >= m.yes_bid && (m.yes_bid > 0 || m.yes_ask < 1)) {
+    return Math.round((m.yes_ask - m.yes_bid) * 100);
+  }
   return null;
 }
 
@@ -404,4 +563,141 @@ export function computeStanding(read: Read<Strategy[]> | undefined): StandingInf
     commonMinWindows,
     lines,
   };
+}
+
+function csvCell(v: unknown): string {
+  const s = v === null || v === undefined ? "" : String(v);
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+export function buildLocalCsvReport(slots: Slots | null, reportText: string): string {
+  const firstLine =
+    reportText
+      .split("\n")
+      .map((l) => l.trim())
+      .find((l) => l.length > 0) || "OpenBell paper-only daily report";
+  const lines: string[] = [
+    `# ${firstLine.replace(/[\r\n]+/g, " ")}`,
+    "record_type,slot,strategy,status,strikes,windows_traded,price_cents,contracts,pnl_dollars,equity_dollars,close_epoch_utc",
+  ];
+  if (slots) {
+    for (const s of slots.slots) {
+      lines.push(
+        [
+          "active_slot",
+          s.slot,
+          s.strategy,
+          s.status || "active",
+          `${s.strikes ?? 0}/3`,
+          s.windows_traded,
+          "",
+          "",
+          (isNum(s.stint_pnl_dollars) ? s.stint_pnl_dollars : s.paper_pnl_dollars).toFixed(2),
+          isNum(s.equity_dollars) ? s.equity_dollars.toFixed(2) : "",
+          "",
+        ]
+          .map(csvCell)
+          .join(","),
+      );
+    }
+    for (const r of slots.retired) {
+      lines.push(
+        [
+          "retired_stint",
+          r.slot,
+          r.strategy,
+          r.rotated_to ? `rotated_to:${r.rotated_to}` : "retired",
+          "3/3",
+          r.windows_traded,
+          "",
+          "",
+          (isNum(r.paper_pnl_dollars) ? r.paper_pnl_dollars : 0).toFixed(2),
+          "",
+          "",
+        ]
+          .map(csvCell)
+          .join(","),
+      );
+    }
+    for (const t of slots.trades || []) {
+      lines.push(
+        [
+          "paper_trade",
+          t.slot,
+          t.strategy,
+          "settled",
+          "",
+          1,
+          Math.round((t.price || 0) * 100),
+          t.contracts,
+          t.pnl_dollars.toFixed(2),
+          "",
+          new Date(t.close_epoch * 1000).toISOString(),
+        ]
+          .map(csvCell)
+          .join(","),
+      );
+    }
+  }
+  return lines.join("\n") + "\n";
+}
+
+function triggerFileDownload(filename: string, content: string, mime: string) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export async function exportDailyReport(
+  format: "md" | "csv",
+  dataset: Dataset,
+  home: Home | null,
+  reportText: string,
+  slots: Slots | null,
+): Promise<{ filename: string; source: "server" | "client"; bytes: number }> {
+  const day = new Date().toISOString().slice(0, 10);
+  const fallbackName = `openbell-daily-report-${day}.${format}`;
+  const mime = format === "csv" ? "text/csv;charset=utf-8" : "text/markdown;charset=utf-8";
+
+  if (supportsV050(home, "export")) {
+    try {
+      const qs = new URLSearchParams({ format });
+      if (dataset === "fixture") qs.set("dataset", "fixture");
+      const r = await fetch(`/api/export/report?${qs.toString()}`);
+      if (r.ok) {
+        const ct = (r.headers.get("content-type") || "").toLowerCase();
+        let content = "";
+        let filename = fallbackName;
+        if (ct.includes("application/json")) {
+          const j = (await r.json()) as { content?: string; report?: string; filename?: string };
+          content = typeof j.content === "string" ? j.content : typeof j.report === "string" ? j.report : "";
+          if (typeof j.filename === "string" && j.filename.trim()) filename = j.filename.trim();
+        } else {
+          content = await r.text();
+          const disp = r.headers.get("content-disposition") || "";
+          const m = disp.match(/filename="?([^";]+)"?/i);
+          if (m && m[1]) filename = m[1];
+        }
+        if (content.length > 0) {
+          triggerFileDownload(filename, content, mime);
+          return { filename, source: "server", bytes: content.length };
+        }
+      }
+    } catch {
+      /* Fall back cleanly to local export from loaded report/slots */
+    }
+  }
+
+  const content =
+    format === "md"
+      ? (reportText || "# OpenBell Paper-Only Daily Report\n\nNo report text loaded yet.\n")
+      : buildLocalCsvReport(slots, reportText);
+  triggerFileDownload(fallbackName, content, mime);
+  return { filename: fallbackName, source: "client", bytes: content.length };
 }
