@@ -2759,7 +2759,7 @@ fn export_report_md(app: &App, dpath: &Path, dataset: &str) -> String {
             fmt_money(s.equity_dollars),
         ));
     }
-    out.push_str("\n## Rune Strategy Verdicts (Paper)\n\n| Strategy | Side | Windows Traded | Mean c/Contract | Verdict |\n| --- | --- | --- | --- | --- |\n");
+    out.push_str("\n## Strategy Verdicts (Paper)\n\n| Strategy | Side | Windows Traded | Mean c/Contract | Verdict |\n| --- | --- | --- | --- | --- |\n");
     for r in scores.iter() {
         let mean = r
             .mean_cents_per_contract

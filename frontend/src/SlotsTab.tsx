@@ -287,7 +287,7 @@ export function SlotsTab({
               <TableHeader>
                 <TableRow>
                   <TableHead>Slot</TableHead>
-                  <TableHead>Rune Strategy</TableHead>
+                  <TableHead>Strategy</TableHead>
                   <TableHead>3-Strike Health</TableHead>
                   <TableHead className="text-right">Windows</TableHead>
                   <TableHead className="text-right">Stint P&amp;L</TableHead>

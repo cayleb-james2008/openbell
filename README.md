@@ -40,7 +40,7 @@ each scored against the same tape:
   counted on the home screen and in the simulation's notes, never
   silently resolved in anyone's favour.
 
-Strategies are small [Rune](https://rune-rs.github.io/) scripts in
+Strategies are small sandboxed `.rn` scripts in
 `strategies/` — the library ships twelve paper shapes (`bid_ask_imbalance`,
 `favourite_floor`, `favourite_late`, `late_convergence_cap`, `longshot_late`,
 `mean_reversion_fade`, `mid_window_momentum`, `no_favourite`,
@@ -195,21 +195,21 @@ Environment (all optional):
 
 ## Checks
 
-`cargo test` runs the unit tests (including `src/analytics.rs` exact Wilson/Brier/ECE, Walk-Forward, Monte Carlo, and 12-strategy Rune sandbox proofs), the `--version` integration test (`tests/cli.rs`), and the `v0.5.0` scale/SSE/export/Quant HTTP suite (`tests/v050_core.rs`: 100,000 ticks / 2,000 settled windows / 30 concurrent clients at `<300ms` p95), while `cargo clippy --all-targets -- -D warnings` enforces zero warnings. `bash .loop/verify` builds the binary, runs
+`cargo test` runs the unit tests (including `src/analytics.rs` exact Wilson/Brier/ECE, Walk-Forward, Monte Carlo, and 12-strategy sandbox proofs), the `--version` integration test (`tests/cli.rs`), and the `v0.5.0` scale/SSE/export/Quant HTTP suite (`tests/v050_core.rs`: 100,000 ticks / 2,000 settled windows / 30 concurrent clients at `<300ms` p95), while `cargo clippy --all-targets -- -D warnings` enforces zero warnings. `bash .loop/verify` builds the binary, runs
 the Rust tests, and runs the 16-check hermetic and venue-proof kit (including `first_run.sh`: the port fallback, the opener's skip rules and the 12-strategy built-in library): the order-path fence, slot rotation and reconciliation against
 independent recomputation, collector health counted both ways, the equity
 curve reconciled against the slot report, the daily report's honesty
-assertions, the strategy-library mutation isolation, and both themes. In `frontend/`, `npm run check:ui` runs the headless Playwright gate (responsive layout, WCAG AA contrast, tap targets, Settings-only Light/Dark theme, SVG label geometry, Tape/Strategies/Slots/Quant Lab 4-tab workbench, Rune Sandbox, Cmd+K palette, Market & Strategy inspectors, and Update strip across 1440/768/390/320 px in light and dark) and worst-case data replay suite. The
+assertions, the strategy-library mutation isolation, and both themes. In `frontend/`, `npm run check:ui` runs the headless Playwright gate (responsive layout, WCAG AA contrast, tap targets, Settings-only Light/Dark theme, SVG label geometry, Tape/Strategies/Slots/Quant Lab 4-tab workbench, Strategy Sandbox, Cmd+K palette, Market & Strategy inspectors, and Update strip across 1440/768/390/320 px in light and dark) and worst-case data replay suite. The
 kit is the bar: it is expected to pass end to end, and it is re-run after
 every change.
 
 ## Layout
 
 - `src/main.rs` — the HTTP/SSE server, rate-limit-resilient deduplicating collector, shadow scorer, slot system, daily report + `.md`/`.csv` exports (`GET /api/export/report`), live SSE tape stream (`GET /api/tape/stream`), and Quant/Sandbox routes (`GET /api/analytics/calibration`, `GET /api/analytics/walkforward`, `POST /api/analytics/montecarlo`, `POST /api/strategy/validate`, `POST /api/backtest`, `GET /api/markets/history`, `GET /api/strategy/source`) backed by `RwLock` singleflight caches.
-- `src/analytics.rs` — pure-Rust paper Quant Diagnostics Engine: 10-decile calibration with exact 95% Wilson CIs, Brier/ECE/MCE; chronological 60%/40% Walk-Forward IS vs OOS attribution with Sharpe/Sortino/Profit Factor/Max DD/Calmar/Fee Drag/Streaks; deterministic Xoshiro256++ Monte Carlo bootstrap; and in-memory paper-only Rune validator & backtester.
+- `src/analytics.rs` — pure-Rust paper Quant Diagnostics Engine: 10-decile calibration with exact 95% Wilson CIs, Brier/ECE/MCE; chronological 60%/40% Walk-Forward IS vs OOS attribution with Sharpe/Sortino/Profit Factor/Max DD/Calmar/Fee Drag/Streaks; deterministic Xoshiro256++ Monte Carlo bootstrap; and in-memory paper-only strategy validator & backtester.
 - `src/open.rs` — display-aware local browser opener on startup.
 - `src/update.rs` — the release check and self-update.
-- `strategies/*.rn` — the 12-strategy paper library (Rune).
-- `frontend/` & `rune/used/` — React 19 + Tailwind 4 House Frontend source (8/8 libraries), self-hosted Geist & Geist Mono `.woff2` fonts, copied House Frontend parts, and Playwright E2E checks (`frontend/e2e/`), compiled into one self-contained HTML file at `assets/index.html` and embedded into the binary.
+- `strategies/*.rn` — the 12-strategy paper library.
+- `frontend/` — React 19 + Tailwind 4 House Frontend source (8/8 libraries), self-hosted Geist & Geist Mono `.woff2` fonts, and Playwright E2E checks (`frontend/e2e/`), compiled into one self-contained HTML file at `assets/index.html` and embedded into the binary.
 - `JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md` — product job questions, eight-library House Frontend coverage, and interaction/motion inventory.
-- `assets/index.html` — the compiled single-file Kalshi 15m Institutional Paper Quant Desk: top command bar with `/` global filter, `Cmd+K` Command Palette, and live `Collect now`; Hero Telemetry & Compounding Strip (`SlidingNumber` KPI tiles, interactive paper equity curve, Tremor `Tracker` & `CategoryBar`); four-tab Quant Workbench (`Live 15m Tape` with SSE stream pill, inline YES/spread chart & Market Inspector; `Rune Strategies` with 12-strategy leaderboard, Strategy Inspector & interactive Rune Sandbox editor + "Backtest on Tape"; `Slot Desk` with synchronized Equity + Drawdown underwater subplot, stint attribution, 3-strike tracker, `.md`/`.csv` Report Exports, verbatim Daily Report & read-only Venue Account; `Quant Lab` with Calibration Wilson CIs, 1,000-path Monte Carlo fan & IS/OOS Walk-Forward table); and Desk Settings `Vaul` sheet (Light default + full Dark `Appearance` toggle, collector cadence, self-updates, and provenance legend).
+- `assets/index.html` — the compiled single-file Kalshi 15m Institutional Paper Quant Desk: top command bar with `/` global filter, `Cmd+K` Command Palette, and live `Collect now`; Hero Telemetry & Compounding Strip (`SlidingNumber` KPI tiles, interactive paper equity curve, Tremor `Tracker` & `CategoryBar`); four-tab Quant Workbench (`Live 15m Tape` with SSE stream pill, inline YES/spread chart & Market Inspector; `Strategies` with 12-strategy leaderboard, Strategy Inspector & interactive Strategy Sandbox editor + "Backtest on Tape"; `Slot Desk` with synchronized Equity + Drawdown underwater subplot, stint attribution, 3-strike tracker, `.md`/`.csv` Report Exports, verbatim Daily Report & read-only Venue Account; `Quant Lab` with Calibration Wilson CIs, 1,000-path Monte Carlo fan & IS/OOS Walk-Forward table); and Desk Settings `Vaul` sheet (Light default + full Dark `Appearance` toggle, collector cadence, self-updates, and provenance legend).

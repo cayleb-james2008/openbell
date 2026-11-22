@@ -133,7 +133,7 @@ export type BacktestResult = {
   source: "server" | "client";
 };
 
-export const DEFAULT_SANDBOX_RUNE = `// Paper-only Kalshi 15m Rune research strategy
+export const DEFAULT_SANDBOX_RUNE = `// Paper-only Kalshi 15m research strategy
 // Entry quotes are strictly whole-cent (0.01..=0.99); scored on paper only.
 pub fn name() {
     "late-favourite-edge"
@@ -708,9 +708,9 @@ export function validateRuneSourceClient(source: string): RuneValidationResult {
 
   // Paper-only safety checks (reject IO/network/process primitives in strategy code).
   const forbidden: [RegExp, string][] = [
-    [/\bCommand::new\b|\bstd::process\b/i, "Process execution is forbidden in paper Rune strategies."],
-    [/\bTcpStream\b|\bUdpSocket\b|\bstd::net\b|\bhttp::\b/i, "Network sockets are forbidden in paper Rune strategies."],
-    [/\bstd::fs\b|\bFile::open\b/i, "Filesystem IO is forbidden in paper Rune strategies."],
+    [/\bCommand::new\b|\bstd::process\b/i, "Process execution is forbidden in paper strategies."],
+    [/\bTcpStream\b|\bUdpSocket\b|\bstd::net\b|\bhttp::\b/i, "Network sockets are forbidden in paper strategies."],
+    [/\bstd::fs\b|\bFile::open\b/i, "Filesystem IO is forbidden in paper strategies."],
   ];
   for (const [re, msg] of forbidden) {
     if (re.test(source)) diagnostics.push({ level: "error", message: msg });
@@ -734,8 +734,8 @@ export function validateRuneSourceClient(source: string): RuneValidationResult {
       }
     }
   }
-  if (braces !== 0) diagnostics.push({ level: "error", message: "Unclosed '{' brace in Rune script." });
-  if (parens !== 0) diagnostics.push({ level: "error", message: "Unclosed '(' parenthesis in Rune script." });
+  if (braces !== 0) diagnostics.push({ level: "error", message: "Unclosed '{' brace in strategy script." });
+  if (parens !== 0) diagnostics.push({ level: "error", message: "Unclosed '(' parenthesis in strategy script." });
 
   const nameFn = extractFnBody(clean, "name");
   const sideFn = extractFnBody(clean, "side");
@@ -807,7 +807,7 @@ export function validateRuneSourceClient(source: string): RuneValidationResult {
   if (valid) {
     diagnostics.push({
       level: "info",
-      message: `Compiled paper Rune rule '${name}' (${side.toUpperCase()} side) — whole-cent bounds enforced.`,
+      message: `Compiled paper strategy '${name}' (${side.toUpperCase()} side) — whole-cent bounds enforced.`,
     });
   }
 
@@ -1352,7 +1352,7 @@ export async function validateRuneStrategy(
             diagnostics:
               diags.length > 0
                 ? diags
-                : [{ level: "info", message: "Compiled cleanly in Rune sandbox VM." }],
+                : [{ level: "info", message: "Compiled cleanly in sandbox engine." }],
             elapsedMs: Number((pickNum(raw, ["elapsed_ms"]) ?? 1).toFixed(1)),
             source: "server",
           };
@@ -1467,7 +1467,7 @@ export async function runRuneBacktest(
             diagnostics:
               diags.length > 0
                 ? diags
-                : [{ level: "info", message: `Backtested ${trades.length} settled windows in server Rune VM.` }],
+                : [{ level: "info", message: `Backtested ${trades.length} settled windows in server sandbox.` }],
             summary: {
               netPnlDollars: pickNum(sum, ["net_pnl_dollars", "paper_pnl_dollars", "net_pnl"]) ?? 0,
               sharpe: pickNum(sum, ["sharpe", "sharpe_ratio"]),

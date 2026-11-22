@@ -124,7 +124,7 @@ export function RuneSandbox({
       const res = await validateRuneStrategy(source, home);
       setValidation(res);
       if (res.valid) {
-        toast.success(`Rune syntax valid (${res.name} · ${res.side.toUpperCase()}).`);
+        toast.success(`Strategy syntax valid (${res.name} · ${res.side.toUpperCase()}).`);
       } else {
         toast.error(`Validation found ${res.diagnostics.filter((d) => d.level === "error").length} issue(s).`);
       }
@@ -152,7 +152,7 @@ export function RuneSandbox({
           `Backtest complete: ${res.summary.windowsTraded} trades, ${moneySigned(res.summary.netPnlDollars)} paper P&L.`,
         );
       } else {
-        toast.error("Backtest halted: fix Rune compile diagnostics first.");
+        toast.error("Backtest halted: fix strategy compile diagnostics first.");
       }
     } finally {
       setBacktesting(false);
@@ -170,21 +170,21 @@ export function RuneSandbox({
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <Code2 className="size-4 text-info-foreground" aria-hidden />
-            <h3 className="text-sm font-semibold text-ink">Interactive Rune Strategy Sandbox</h3>
+            <h3 className="text-sm font-semibold text-ink">Interactive Strategy Sandbox</h3>
             <ProvenanceTag kind="paper" />
           </div>
           <p className="mt-0.5 text-xs text-ink-2">
-            Edit Rune rules in memory, inspect diagnostics, and backtest on collected 15m tape windows.
+            Edit strategy rules in memory, inspect diagnostics, and backtest on collected 15m tape windows.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
           <label className="sr-only" htmlFor="sandbox-template-select">
-            Load Rune strategy template
+            Load strategy template
           </label>
           <select
             id="sandbox-template-select"
-            aria-label="Load Rune strategy template"
+            aria-label="Load strategy template"
             value={loadedFrom}
             disabled={loadingTemplate}
             onChange={(e) => void loadLibraryStrategy(e.target.value)}
@@ -226,7 +226,7 @@ export function RuneSandbox({
               </div>
               <textarea
                 id="rune-editor"
-                aria-label="Rune strategy source code"
+                aria-label="Strategy source code"
                 spellCheck={false}
                 value={source}
                 onChange={(e) => setSource(e.target.value)}
@@ -269,7 +269,7 @@ export function RuneSandbox({
               onClick={() => void handleValidate()}
             >
               <ShieldCheck className="size-3.5" aria-hidden />
-              <span>{validating ? "Validating…" : "Validate Rune"}</span>
+              <span>{validating ? "Validating…" : "Validate Strategy"}</span>
             </Button>
 
             <Button
@@ -304,7 +304,7 @@ export function RuneSandbox({
                   <span>{validation.valid ? "Compile passed" : "Compile diagnostics"}</span>
                 </span>
                 <span className="mono text-ink-3">
-                  {validation.source === "server" ? "Server Rune VM" : "Local evaluator"} · {validation.elapsedMs}ms
+                  {validation.source === "server" ? "Server Sandbox" : "Local evaluator"} · {validation.elapsedMs}ms
                 </span>
               </div>
               <ul className="mt-2 space-y-1">
@@ -336,7 +336,7 @@ export function RuneSandbox({
               <div>
                 <h4 className="text-sm font-semibold text-ink">Side-by-Side Paper Backtest Output</h4>
                 <p className="mt-1 text-xs text-ink-2">
-                  Press <strong className="font-medium text-ink">Backtest on Tape</strong> to score your Rune script against all settled 15m windows on the active tape.
+                  Press <strong className="font-medium text-ink">Backtest on Tape</strong> to score your strategy script against all settled 15m windows on the active tape.
                 </p>
               </div>
               <dl className="mt-4 grid grid-cols-2 gap-2.5 text-xs">

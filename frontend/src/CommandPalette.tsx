@@ -81,7 +81,7 @@ export function CommandPalette({
         >
           <Dialog.Title className="sr-only">OpenBell Command Palette</Dialog.Title>
           <Dialog.Description className="sr-only">
-            Jump to any 15-minute market ticker, Rune strategy, slot, Quant Lab panel, or paper-only desk action.
+            Jump to any 15-minute market ticker, strategy, slot, Quant Lab panel, or paper-only desk action.
           </Dialog.Description>
 
           <Command label="OpenBell Command Palette" className="flex flex-col">
@@ -91,7 +91,7 @@ export function CommandPalette({
                 id="cmdk-input"
                 data-cmdk-input
                 aria-label="Search tickers, strategies, slots, or Quant Lab"
-                placeholder="Jump to ticker, Rune strategy, slot, or Quant Lab…"
+                placeholder="Jump to ticker, strategy, slot, or Quant Lab…"
                 className="min-h-11 flex-1 bg-transparent text-sm text-ink placeholder:text-ink-3 outline-none focus-visible:outline-none sm:min-h-8"
               />
               <button
@@ -125,24 +125,24 @@ export function CommandPalette({
                   <Kbd>1</Kbd>
                 </Command.Item>
                 <Command.Item
-                  value="Rune Strategies leaderboard"
+                  value="Strategies leaderboard"
                   onSelect={() => closeAnd(() => onSelectTab("strategies"))}
                   className="flex min-h-11 cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-2 text-sm text-ink outline-none data-[selected=true]:bg-blue-soft sm:min-h-9"
                 >
                   <span className="flex items-center gap-2">
                     <Code2 className="size-4 text-ink-2" aria-hidden />
-                    <span>Rune Strategies</span>
+                    <span>Strategies</span>
                   </span>
                   <Kbd>2</Kbd>
                 </Command.Item>
                 <Command.Item
-                  value="Open Rune Strategy Sandbox editor backtest"
+                  value="Open Strategy Sandbox editor backtest"
                   onSelect={() => closeAnd(onOpenSandbox)}
                   className="flex min-h-11 cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-2 text-sm text-ink outline-none data-[selected=true]:bg-blue-soft sm:min-h-9"
                 >
                   <span className="flex items-center gap-2">
                     <Code2 className="size-4 text-info-foreground" aria-hidden />
-                    <span>Rune Strategy Sandbox &amp; Backtester</span>
+                    <span>Strategy Sandbox &amp; Backtester</span>
                   </span>
                   <span className="mono text-xs text-ink-3">Sandbox</span>
                 </Command.Item>
@@ -266,7 +266,7 @@ export function CommandPalette({
 
               {strategies.length > 0 && (
                 <Command.Group
-                  heading={`Rune Strategies (${strategies.length})`}
+                  heading={`Strategies (${strategies.length})`}
                   className="mb-2 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-ink-3"
                 >
                   {strategies.map((s, idx) => {

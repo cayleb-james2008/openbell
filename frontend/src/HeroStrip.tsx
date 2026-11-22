@@ -210,9 +210,9 @@ export function HeroStrip({
                 </li>
               ))}
             {standing.state === "error" && (
-              <li className="text-destructive-foreground">Strategy read failed; retry in Rune Strategies.</li>
+              <li className="text-destructive-foreground">Strategy read failed; retry in Strategies.</li>
             )}
-            {standing.state === "empty" && <li className="text-ink-3">0 Rune scripts loaded</li>}
+            {standing.state === "empty" && <li className="text-ink-3">0 strategy scripts loaded</li>}
             {standing.state === "loading" && <li className="text-ink-3">Loading strategy verdicts…</li>}
           </ul>
         </div>

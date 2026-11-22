@@ -201,7 +201,7 @@ export function SettingsSheet({
                     </Pill>
                   </dt>
                   <dd className="text-ink-2">
-                    Shadow compounding simulation scored in Rune. Paper only: this binary has zero order-placement code.
+                    Shadow compounding simulation scored over collected tape. Paper only: this binary has zero order-placement code.
                   </dd>
                 </div>
               </dl>
