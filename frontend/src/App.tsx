@@ -1,5 +1,6 @@
-// OpenBell v0.4.0 — Kalshi 15-Minute Quant Research & Paper Compounding Desk.
-// Light default + full Dark inside Settings Vaul sheet ONLY (#67); zero fixture badge in live mode (#61, #68).
+// OpenBell v0.5.0 — Institutional Kalshi 15-Minute Quant Research & Paper Compounding Desk.
+// Light default + full Dark inside Settings Vaul sheet ONLY (#67); opaque sticky header (zero backdrop-blur);
+// 4-tab workbench (Live 15m Tape, Rune Strategies, Slot Desk, Quant Lab) + Cmd+K Command Palette + strict paper-only invariant.
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MotionConfig } from "motion/react";
 import { Bell, RefreshCw, Search, Settings, X } from "lucide-react";
@@ -18,9 +19,13 @@ import { sectionGlide } from "@/motionProps";
 import {
   type Dataset,
   type Home,
+  type Market,
   type Read,
+  type Slot,
+  type Strategy,
   ageWords,
   computeStanding,
+  exportDailyReport,
   isNum,
   useDesk,
 } from "@/lib/desk";
@@ -28,10 +33,10 @@ import { HeroStrip } from "@/HeroStrip";
 import { TapeTab } from "@/TapeTab";
 import { StrategiesTab } from "@/StrategiesTab";
 import { SlotsTab } from "@/SlotsTab";
+import { QuantLabTab } from "@/QuantLabTab";
+import { CommandPalette, type DeskTabId } from "@/CommandPalette";
 import { SettingsSheet } from "@/SettingsSheet";
 import { UpdateStrip, useUpdates } from "@/Update";
-
-type TabId = "tape" | "strategies" | "slots";
 
 const ok = <T,>(r: Read<T> | undefined): T | null => (r && r.ok ? r.v : null);
 
@@ -39,9 +44,9 @@ function readDataset(): Dataset {
   return new URLSearchParams(location.search).get("dataset") === "fixture" ? "fixture" : "live";
 }
 
-function readInitialTab(): TabId {
+function readInitialTab(): DeskTabId {
   const t = new URLSearchParams(location.search).get("tab");
-  if (t === "strategies" || t === "slots" || t === "tape") return t;
+  if (t === "strategies" || t === "slots" || t === "tape" || t === "quant") return t;
   return "tape";
 }
 
@@ -75,25 +80,45 @@ function collectorBadge(home: Home | null, allFailed: boolean): { dot: string; l
 function Shell() {
   const [dataset, setDataset] = useState<Dataset>(readDataset);
   const [theme, setTheme] = useState<"light" | "dark">(readTheme);
-  const [tab, setTab] = useState<TabId>(readInitialTab);
+  const [tab, setTab] = useState<DeskTabId>(readInitialTab);
   const [search, setSearch] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [cmdOpen, setCmdOpen] = useState(false);
   const [collectingNow, setCollectingNow] = useState(false);
   const [collectNotice, setCollectNotice] = useState<{ kind: "ok" | "warn" | "err"; text: string } | null>(null);
+  const [jumpTicker, setJumpTicker] = useState<string | null>(null);
+  const [jumpStrategy, setJumpStrategy] = useState<string | null>(null);
+  const [sandboxSignal, setSandboxSignal] = useState(0);
+  const [quantFocus, setQuantFocus] = useState<"calibration" | "montecarlo" | "walkforward" | null>(null);
+  const [reseedSignal, setReseedSignal] = useState(0);
   const searchRef = useRef<HTMLInputElement>(null);
 
-  const { reads, load } = useDesk(dataset);
+  const { reads, load, stream } = useDesk(dataset);
   const upd = useUpdates();
 
   const home = ok(reads?.home);
   const slots = ok(reads?.slots);
   const markets = ok(reads?.markets);
   const strategies = ok(reads?.strategies);
+  const reportText = ok(reads?.report)?.report || "";
   const standing = useMemo(() => computeStanding(reads?.strategies), [reads?.strategies]);
   const allFailed = !!reads && Object.values(reads).every((r) => !r.ok);
   const failMsg = reads && !reads.home.ok ? reads.home.msg : "";
   const isFixture = dataset === "fixture";
-  const versionText = home?.version || upd.version?.version || "0.4.0";
+  const versionText = home?.version || upd.version?.version || "0.5.0";
+
+  const validMarkets = useMemo(
+    () => (markets ? markets.filter((m): m is Market => !!m && typeof m === "object") : []),
+    [markets],
+  );
+  const validStrategies = useMemo(
+    () => (strategies ? strategies.filter((s): s is Strategy => !!s && typeof s === "object") : []),
+    [strategies],
+  );
+  const validSlots = useMemo(
+    () => (slots ? slots.slots.filter((s): s is Slot => !!s && typeof s === "object") : []),
+    [slots],
+  );
 
   const pickTheme = (t: "light" | "dark") => {
     document.documentElement.dataset.theme = t;
@@ -157,45 +182,69 @@ function Shell() {
     }
   }, [collectingNow, load]);
 
-  // Global keyboard shortcuts: `/` focuses command filter, `1`/`2`/`3` switch workbench tabs.
+  const handlePaletteExport = useCallback(
+    async (format: "md" | "csv") => {
+      try {
+        const res = await exportDailyReport(format, dataset, home, reportText, slots);
+        toast.success(`Exported ${res.filename} (${res.bytes.toLocaleString()} bytes).`);
+      } catch (e) {
+        toast.error(`Export failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    },
+    [dataset, home, reportText, slots],
+  );
+
+  // Global keyboard shortcuts: Cmd/Ctrl+K opens Command Palette, `/` focuses filter, `1`-`4` switch tabs.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setCmdOpen((v) => !v);
+        return;
+      }
       const target = e.target as HTMLElement | null;
       const tag = target?.tagName;
       const inField = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || !!target?.isContentEditable;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      if (e.key === "/" && !inField) {
+      if (e.key === "/" && !inField && !cmdOpen && !settingsOpen) {
         e.preventDefault();
         searchRef.current?.focus();
         searchRef.current?.select();
         return;
       }
-      if (!inField && !settingsOpen) {
+      if (!inField && !settingsOpen && !cmdOpen) {
         if (e.key === "1") setTab("tape");
         else if (e.key === "2") setTab("strategies");
         else if (e.key === "3") setTab("slots");
+        else if (e.key === "4") setTab("quant");
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [settingsOpen]);
+  }, [settingsOpen, cmdOpen]);
 
   const badge = collectorBadge(home, allFailed);
-  const marketCount = markets ? markets.filter((m) => !!m && typeof m === "object").length : null;
-  const strategyCount = strategies ? strategies.filter((s) => !!s && typeof s === "object").length : null;
-  const slotCount = slots ? slots.slots.filter((s) => !!s && typeof s === "object").length : null;
+  const marketCount = markets ? validMarkets.length : null;
+  const strategyCount = strategies ? validStrategies.length : null;
+  const slotCount = slots ? validSlots.length : null;
+  const settledCount = useMemo(
+    () => validMarkets.filter((m) => m.result === "yes" || m.result === "no").length,
+    [validMarkets],
+  );
 
   const searchPlaceholder =
     tab === "tape"
       ? "Filter 15m tickers…"
       : tab === "strategies"
         ? "Filter strategies…"
-        : "Filter slots…";
+        : tab === "slots"
+          ? "Filter slots…"
+          : "Filter Quant Lab…";
 
   return (
     <TooltipProvider>
       <div className="flex min-h-dvh flex-col bg-canvas text-ink">
-        {/* Top Command & Live Collector Bar — NO Light/Dark switcher on bar (#67), NO fixture pill in live mode (#61/#68) */}
+        {/* Opaque Sticky Command & Live Collector Bar — ZERO backdrop-blur, NO Light/Dark switch (#67) */}
         <header className="sticky top-0 z-30 border-b border-hairline bg-surface">
           <div className="mx-auto flex max-w-[1360px] flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5 sm:px-6">
             {/* Brand + Paper-only provenance */}
@@ -390,25 +439,30 @@ function Shell() {
             collectingNow={collectingNow}
           />
 
-          {/* Real Trader Workbench: COSS UI Tabs + Motion Primitives AnimatedBackground glide */}
+          {/* 4-Tab Institutional Quant Workbench: COSS UI Tabs + Motion Primitives AnimatedBackground */}
           <section aria-label="Quant research workbench" className="space-y-3">
-            <Tabs value={tab} onValueChange={(v) => setTab(v as TabId)}>
+            <Tabs value={tab} onValueChange={(v) => setTab(v as DeskTabId)}>
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <TabsList variant="plain" className="w-full max-w-full bg-track p-1 sm:w-fit">
                   <AnimatedBackground
                     defaultValue={tab}
                     onValueChange={(v) => {
-                      if (v === "tape" || v === "strategies" || v === "slots") setTab(v);
+                      if (v === "tape" || v === "strategies" || v === "slots" || v === "quant") setTab(v);
                     }}
                     className="rounded-md bg-raised shadow-(--elev-raised)"
                     {...sectionGlide}
                   >
-                    <TabsTab id="tab-tape" value="tape" data-id="tape" className="min-h-11 flex-1 px-2 text-xs sm:min-h-9 sm:flex-none sm:px-3.5 sm:text-sm">
+                    <TabsTab
+                      id="tab-tape"
+                      value="tape"
+                      data-id="tape"
+                      className="min-h-11 flex-1 px-2 text-xs sm:min-h-9 sm:flex-none sm:px-3.5 sm:text-sm"
+                    >
                       <span className="inline-flex items-center gap-1.5 sm:gap-2">
                         <span className="sm:hidden">Tape</span>
                         <span className="hidden sm:inline">Live 15m Tape</span>
                         {marketCount !== null && (
-                          <Badge variant="outline" className="mono text-xs">
+                          <Badge variant="outline" className="mono hidden text-xs sm:inline-flex">
                             {marketCount}
                           </Badge>
                         )}
@@ -421,22 +475,43 @@ function Shell() {
                       className="min-h-11 flex-1 px-2 text-xs sm:min-h-9 sm:flex-none sm:px-3.5 sm:text-sm"
                     >
                       <span className="inline-flex items-center gap-1.5 sm:gap-2">
-                        <span className="sm:hidden">Strategies</span>
+                        <span className="sm:hidden">Rune</span>
                         <span className="hidden sm:inline">Rune Strategies</span>
                         {strategyCount !== null && (
-                          <Badge variant="outline" className="mono text-xs">
+                          <Badge variant="outline" className="mono hidden text-xs sm:inline-flex">
                             {strategyCount}
                           </Badge>
                         )}
                       </span>
                     </TabsTab>
-                    <TabsTab id="tab-slots" value="slots" data-id="slots" className="min-h-11 flex-1 px-2 text-xs sm:min-h-9 sm:flex-none sm:px-3.5 sm:text-sm">
+                    <TabsTab
+                      id="tab-slots"
+                      value="slots"
+                      data-id="slots"
+                      className="min-h-11 flex-1 px-2 text-xs sm:min-h-9 sm:flex-none sm:px-3.5 sm:text-sm"
+                    >
                       <span className="inline-flex items-center gap-1.5 sm:gap-2">
                         <span className="sm:hidden">Slots</span>
                         <span className="hidden sm:inline">Slot Desk</span>
                         {slotCount !== null && (
-                          <Badge variant="outline" className="mono text-xs">
+                          <Badge variant="outline" className="mono hidden text-xs sm:inline-flex">
                             {slotCount}
+                          </Badge>
+                        )}
+                      </span>
+                    </TabsTab>
+                    <TabsTab
+                      id="tab-quant"
+                      value="quant"
+                      data-id="quant"
+                      className="min-h-11 flex-1 px-2 text-xs sm:min-h-9 sm:flex-none sm:px-3.5 sm:text-sm"
+                    >
+                      <span className="inline-flex items-center gap-1.5 sm:gap-2">
+                        <span className="sm:hidden">Quant</span>
+                        <span className="hidden sm:inline">Quant Lab</span>
+                        {settledCount > 0 && (
+                          <Badge variant="outline" className="mono hidden text-xs sm:inline-flex">
+                            {settledCount}
                           </Badge>
                         )}
                       </span>
@@ -444,25 +519,42 @@ function Shell() {
                   </AnimatedBackground>
                 </TabsList>
 
-                <div className="hidden items-center gap-2 text-xs text-ink-3 md:flex">
-                  <span>Shortcuts:</span>
-                  <Kbd>/</Kbd>
-                  <span>filter</span>
-                  <Kbd>1</Kbd>
-                  <Kbd>2</Kbd>
-                  <Kbd>3</Kbd>
-                  <span>tabs</span>
+                <div className="flex items-center gap-2 text-xs text-ink-3">
+                  <Button
+                    id="cmdk-btn"
+                    variant="outline"
+                    className="min-h-11 gap-1.5 px-2.5 text-xs text-ink-2 sm:min-h-9"
+                    aria-label="Open command palette"
+                    onClick={() => setCmdOpen(true)}
+                  >
+                    <Search className="size-3.5" aria-hidden />
+                    <span>Jump</span>
+                    <Kbd>⌘K</Kbd>
+                  </Button>
+                  <div className="hidden items-center gap-1.5 lg:flex">
+                    <Kbd>/</Kbd>
+                    <span>filter</span>
+                    <Kbd>1</Kbd>
+                    <Kbd>2</Kbd>
+                    <Kbd>3</Kbd>
+                    <Kbd>4</Kbd>
+                    <span>tabs</span>
+                  </div>
                 </div>
               </div>
 
               <TabsPanel value="tape" className="mt-3">
                 <TapeTab
                   marketsRead={reads?.markets}
+                  home={home}
                   dataset={dataset}
                   search={search}
+                  stream={stream}
                   onRetry={load}
                   onCollect={runCollect}
                   collectingNow={collectingNow}
+                  jumpTicker={jumpTicker}
+                  onClearJump={() => setJumpTicker(null)}
                 />
               </TabsPanel>
 
@@ -471,19 +563,40 @@ function Shell() {
                   strategiesRead={reads?.strategies}
                   slotsRead={reads?.slots}
                   equityRead={reads?.equity}
+                  marketsRead={reads?.markets}
+                  home={home}
+                  dataset={dataset}
                   search={search}
                   onRetry={load}
                   isActiveTab={tab === "strategies"}
+                  jumpStrategy={jumpStrategy}
+                  sandboxSignal={sandboxSignal}
+                  onClearJump={() => setJumpStrategy(null)}
                 />
               </TabsPanel>
 
               <TabsPanel value="slots" className="mt-3">
                 <SlotsTab
                   slotsRead={reads?.slots}
+                  equityRead={reads?.equity}
                   homeRead={reads?.home}
                   reportRead={reads?.report}
+                  dataset={dataset}
                   search={search}
                   onRetry={load}
+                />
+              </TabsPanel>
+
+              <TabsPanel value="quant" className="mt-3">
+                <QuantLabTab
+                  dataset={dataset}
+                  home={home}
+                  marketsRead={reads?.markets}
+                  slotsRead={reads?.slots}
+                  search={search}
+                  focusSection={quantFocus}
+                  reseedSignal={reseedSignal}
+                  onClearFocus={() => setQuantFocus(null)}
                 />
               </TabsPanel>
             </Tabs>
@@ -502,6 +615,45 @@ function Shell() {
             </button>
           </div>
         </footer>
+
+        <CommandPalette
+          open={cmdOpen}
+          onOpenChange={setCmdOpen}
+          markets={validMarkets}
+          strategies={validStrategies}
+          slots={validSlots}
+          onSelectTab={(t) => setTab(t)}
+          onJumpMarket={(ticker) => {
+            setSearch("");
+            setTab("tape");
+            setJumpTicker(ticker);
+          }}
+          onJumpStrategy={(name) => {
+            setSearch("");
+            setTab("strategies");
+            setJumpStrategy(name);
+          }}
+          onOpenSandbox={() => {
+            setTab("strategies");
+            setSandboxSignal((n) => n + 1);
+          }}
+          onJumpSlot={(_slotNum, strategyName) => {
+            setTab("slots");
+            setSearch(strategyName);
+          }}
+          onJumpQuantSection={(sec) => {
+            setTab("quant");
+            setQuantFocus(sec);
+          }}
+          onCollect={() => void runCollect()}
+          onExportReport={(fmt) => void handlePaletteExport(fmt)}
+          onReseedMonteCarlo={() => {
+            setTab("quant");
+            setQuantFocus("montecarlo");
+            setReseedSignal((n) => n + 1);
+          }}
+          onOpenSettings={() => setSettingsOpen(true)}
+        />
 
         <SettingsSheet
           open={settingsOpen}

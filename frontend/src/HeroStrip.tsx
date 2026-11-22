@@ -314,15 +314,15 @@ export function HeroStrip({
             </div>
             <p className="mt-1 text-xs text-ink-2">
               {trades.length > 0
-                ? "Green = net gain after Kalshi fee model · Red = loss."
-                : "Green = YES settlement · Blue = NO settlement on recorded 15m tape."}
+                ? "Green = net gain after fees · Red = paper loss."
+                : "Green = YES settle · Blue = NO settle on 15m tape."}
             </p>
             <div className="mt-3">
               {trackerData.length > 0 ? (
                 <Tracker data={trackerData} hoverEffect />
               ) : (
                 <div className="rounded-md border border-dashed border-hairline bg-surface px-3 py-4 text-xs text-ink-2">
-                  Run <span className="font-medium text-ink">Collect now</span> to pull live Kalshi 15m series and populate recent window outcomes.
+                  Run <span className="font-medium text-ink">Collect now</span> to pull live Kalshi 15m quotes.
                 </div>
               )}
             </div>

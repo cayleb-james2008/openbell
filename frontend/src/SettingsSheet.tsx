@@ -206,7 +206,7 @@ export function SettingsSheet({
                 </div>
               </dl>
               <p className="text-xs text-ink-3">
-                Anything not obtained reads unavailable, with the reason. Press <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">/</kbd> to filter rows, <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">j</kbd>/<kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">k</kbd> to step strategies, and <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">Enter</kbd> to inspect.
+                Anything not obtained reads unavailable, with the reason. Press <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">⌘K</kbd> for quick jump, <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">/</kbd> to filter, <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">1</kbd>–<kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">4</kbd> for tabs, and <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">j</kbd>/<kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">k</kbd> to step strategies.
               </p>
             </section>
           </div>

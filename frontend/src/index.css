@@ -73,10 +73,10 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    column-gap: 10px;
-    row-gap: 6px;
+    column-gap: 12px;
+    row-gap: 8px;
     border-bottom: 1px solid var(--hairline);
-    padding: 12px 14px;
+    padding: 12px 16px;
   }
   table.stack tbody tr:last-child {
     border-bottom: 0;
@@ -85,7 +85,7 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     border: 0;
     padding: 0;
     width: auto;
@@ -99,8 +99,9 @@
     flex: 1 1 100%;
   }
   table.stack td.m-grow {
-    flex: 1 1 0;
-    min-width: 0;
+    flex: 1 1 180px;
+    min-width: 160px;
+    max-width: 100%;
   }
   table.stack td.m-right {
     margin-left: auto;
@@ -116,6 +117,10 @@ html, body {
 
 h1, h2, h3, h4 {
   text-wrap: balance;
+}
+
+p, dd, li {
+  text-wrap: pretty;
 }
 
 :focus-visible {
