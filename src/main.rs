@@ -2007,6 +2007,14 @@ struct RecalibrationCacheEntry {
     json: Arc<String>,
 }
 
+struct ScaleCtxCacheEntry {
+    path: PathBuf,
+    len: u64,
+    mtime: u64,
+    key: u64,
+    ctx: Arc<scaling::ScaleTapeContext>,
+}
+
 const BACKTEST_CACHE_CAP: usize = 16;
 const SCALE_PLAN_CACHE_CAP: usize = 32;
 
@@ -2037,6 +2045,10 @@ struct App {
     /// Cached PAV isotonic recalibration JSON payload under RwLock + singleflight.
     recalibration_cache: std::sync::RwLock<Option<RecalibrationCacheEntry>>,
     recalibration_compute_lock: std::sync::Mutex<()>,
+    /// Pre-extracted tape observations & depth for `$500/day` scale planner so
+    /// unique slider/seed requests never reload strategies or re-scan 100k ticks.
+    scale_ctx_cache: std::sync::RwLock<Option<ScaleCtxCacheEntry>>,
+    scale_ctx_compute_lock: std::sync::Mutex<()>,
     /// Bounded cache for repeated `$500/day` capital scale-plan requests.
     scale_plan_cache: std::sync::RwLock<Vec<(u64, Arc<String>)>>,
     /// Small bounded cache for repeated in-memory sandbox backtests over
@@ -2058,6 +2070,8 @@ impl App {
             analytics_compute_lock: std::sync::Mutex::new(()),
             recalibration_cache: std::sync::RwLock::new(None),
             recalibration_compute_lock: std::sync::Mutex::new(()),
+            scale_ctx_cache: std::sync::RwLock::new(None),
+            scale_ctx_compute_lock: std::sync::Mutex::new(()),
             scale_plan_cache: std::sync::RwLock::new(Vec::new()),
             backtest_cache: std::sync::RwLock::new(Vec::new()),
         }
@@ -2501,9 +2515,57 @@ impl App {
         payload
     }
 
+    /// Singleflight cached `ScaleTapeContext` built once per `(tape, strategies)`
+    /// state so unique parameter/seed scale-plan requests stay sub-25ms p95.
+    fn scale_ctx_shared(&self, dpath: &Path) -> Arc<scaling::ScaleTapeContext> {
+        let key = strategies_dir_key(&self.strategies_dir, self.paper_pot);
+        let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
+        {
+            let guard = self.scale_ctx_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = &*guard {
+                if e.path == dpath && e.len == len && e.mtime == mtime && e.key == key {
+                    return e.ctx.clone();
+                }
+            }
+        }
+        let _compute_guard = self
+            .scale_ctx_compute_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        {
+            let guard = self.scale_ctx_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = &*guard {
+                if e.path == dpath && e.len == len && e.mtime == mtime && e.key == key {
+                    return e.ctx.clone();
+                }
+            }
+        }
+
+        let (sim, _, _, _) = self.analysis_shared(dpath);
+        let view = self.tape(dpath);
+        let (strategies, _) = load_strategies_with_errors(&self.strategies_dir);
+        let median_depth = median_observed_book_depth(&view.snaps);
+        let ctx = Arc::new(scaling::build_scale_tape_context(
+            &view.grouped,
+            &strategies,
+            &sim,
+            median_depth,
+        ));
+        *self.scale_ctx_cache.write().unwrap_or_else(|p| p.into_inner()) =
+            Some(ScaleCtxCacheEntry {
+                path: dpath.to_path_buf(),
+                len,
+                mtime,
+                key,
+                ctx: ctx.clone(),
+            });
+        ctx
+    }
+
     /// Cached `$500/day` paper capital scaling & liquidity capacity planner
-    /// (`POST /api/analytics/scale-plan`), passing observed top-of-book depth
-    /// from the collected tape.
+    /// (`POST /api/analytics/scale-plan`), evaluating over the shared
+    /// `ScaleTapeContext` so unique slider/seed calls never reload strategies
+    /// or re-scan 100k snapshots.
     fn scale_plan_cached(
         &self,
         dpath: &Path,
@@ -2531,17 +2593,8 @@ impl App {
             }
         }
 
-        let (sim, _, _, _) = self.analysis_shared(dpath);
-        let view = self.tape(dpath);
-        let (strategies, _) = load_strategies_with_errors(&self.strategies_dir);
-        let median_depth = median_observed_book_depth(&view.snaps);
-        let plan = scaling::compute_scale_plan_with_depth(
-            &view.grouped,
-            &strategies,
-            &sim,
-            &sanitized,
-            median_depth,
-        );
+        let ctx = self.scale_ctx_shared(dpath);
+        let plan = scaling::compute_scale_plan_from_context(&ctx, &sanitized);
         let mut val = serde_json::to_value(&plan).unwrap_or_else(|_| serde_json::json!({}));
         val["dataset"] = serde_json::json!(dataset);
         let payload = Arc::new(val.to_string());

@@ -1207,6 +1207,144 @@ pub fn compute_scale_plan_from_observations_with_depth(
     }
 }
 
+/// Pre-extracted tape context shared via `RwLock` across repeated
+/// `POST /api/analytics/scale-plan` calls so slider/seed changes never
+/// re-compile strategies, re-scan 100k snapshots, or re-hash 2,000 windows.
+#[derive(Clone)]
+pub struct ScaleTapeContext {
+    pub windows_settled_total: usize,
+    pub observed_series: Vec<String>,
+    pub observed_median_depth: Option<f64>,
+    pub portfolio_max_dd_pct: f64,
+    pub portfolio_obs: Vec<TimedCalibrationObs>,
+    pub by_strategy_obs: std::collections::HashMap<String, Vec<TimedCalibrationObs>>,
+}
+
+/// Build `ScaleTapeContext` once for a fixed `(tape, strategies)` state.
+pub fn build_scale_tape_context(
+    windows: &BTreeMap<String, Vec<Snapshot>>,
+    strategies: &[Strategy],
+    sim: &SlotSimulation,
+    observed_median_depth: Option<f64>,
+) -> ScaleTapeContext {
+    let mut windows_settled_total = 0usize;
+    let mut observed_series: Vec<String> = Vec::new();
+    let mut portfolio_obs: Vec<TimedCalibrationObs> = Vec::new();
+    let mut by_strategy_obs: std::collections::HashMap<String, Vec<TimedCalibrationObs>> =
+        std::collections::HashMap::with_capacity(strategies.len());
+
+    for (ticker, snaps) in windows {
+        let facts_fp = facts_fingerprint(snaps);
+        let (result, close_epoch) = match window_facts_keyed(snaps, facts_fp) {
+            WindowFacts::Settled { result, close_epoch } => (result, close_epoch),
+            WindowFacts::Conflict | WindowFacts::Unsettled => continue,
+        };
+        windows_settled_total += 1;
+        let series = snaps.first().map(|s| s.series.clone()).unwrap_or_default();
+        if !series.is_empty() && !observed_series.contains(&series) {
+            observed_series.push(series.clone());
+        }
+
+        if !strategies.is_empty() {
+            let win_fp = window_fingerprint(snaps);
+            for strat in strategies {
+                if let Some(price) = window_entry_keyed(strat, Some(ticker.as_str()), snaps, win_fp)
+                {
+                    if is_valid_whole_cent(price) {
+                        let ob = TimedCalibrationObs {
+                            close_epoch,
+                            ticker: ticker.clone(),
+                            series: series.clone(),
+                            side: strat.side.clone(),
+                            raw_prob: price,
+                            entry_price: price,
+                            outcome: result == strat.side,
+                        };
+                        portfolio_obs.push(ob.clone());
+                        by_strategy_obs
+                            .entry(strat.name.clone())
+                            .or_default()
+                            .push(ob);
+                    }
+                }
+            }
+        }
+    }
+
+    let port_trades = portfolio_trades_from_sim(sim);
+    let (m, _, _) = compute_performance_metrics(&port_trades, sim.paper_pot_start);
+
+    ScaleTapeContext {
+        windows_settled_total,
+        observed_series,
+        observed_median_depth,
+        portfolio_max_dd_pct: m.max_drawdown_pct,
+        portfolio_obs,
+        by_strategy_obs,
+    }
+}
+
+/// Fast scale-plan evaluation over a cached `ScaleTapeContext` (zero strategy
+/// compilation or snapshot scanning on parameter/seed changes).
+pub fn compute_scale_plan_from_context(
+    ctx: &ScaleTapeContext,
+    raw_req: &ScalePlanRequest,
+) -> ScalePlanResponse {
+    let req = raw_req.sanitized();
+    let scope = req.strategy.as_deref().unwrap_or("portfolio");
+    let empty: Vec<TimedCalibrationObs> = Vec::new();
+    let (obs, max_dd_pct): (&[TimedCalibrationObs], f64) = match &req.strategy {
+        None => (&ctx.portfolio_obs, ctx.portfolio_max_dd_pct),
+        Some(name) => {
+            let slice = ctx
+                .by_strategy_obs
+                .get(name)
+                .map(Vec::as_slice)
+                .unwrap_or(&empty);
+            let risk_f = (req.max_slot_risk_pct / 100.0).clamp(0.01, 0.50);
+            let mut eq = req.starting_bankroll;
+            let mut peak = eq;
+            let mut max_dd = 0.0f64;
+            let mut ordered = slice.to_vec();
+            ordered.sort_by_key(|o| o.close_epoch);
+            for o in &ordered {
+                if eq <= 0.0 {
+                    break;
+                }
+                let contracts = (eq * risk_f / o.entry_price).floor() as i64;
+                if contracts <= 0 {
+                    continue;
+                }
+                let payoff = if o.outcome { contracts as f64 } else { 0.0 };
+                let pnl = payoff
+                    - contracts as f64 * o.entry_price
+                    - contracts as f64 * fee(o.entry_price);
+                eq += pnl;
+                if eq > peak {
+                    peak = eq;
+                }
+                if peak > 1e-9 {
+                    let dd = (((peak - eq).max(0.0) / peak) * 100.0).clamp(0.0, 100.0);
+                    if dd > max_dd {
+                        max_dd = dd;
+                    }
+                }
+            }
+            (slice, max_dd)
+        }
+    };
+
+    compute_scale_plan_from_observations_with_depth(
+        obs,
+        max_dd_pct,
+        ctx.windows_settled_total,
+        &ctx.observed_series,
+        scope,
+        &req,
+        ctx.observed_median_depth,
+    )
+}
+
 /// Top-level desk entrypoint for `POST /api/analytics/scale-plan`.
 /// Collects chronological settled strategy entries directly from the collected
 /// tape windows, computes empirical drawdown from the slot simulation (or
@@ -1228,105 +1366,8 @@ pub fn compute_scale_plan_with_depth(
     raw_req: &ScalePlanRequest,
     observed_median_depth: Option<f64>,
 ) -> ScalePlanResponse {
-    let req = raw_req.sanitized();
-
-    let selected: Vec<&Strategy> = match &req.strategy {
-        Some(name) => strategies.iter().filter(|s| s.name == *name).collect(),
-        None => strategies.iter().collect(),
-    };
-    let scope = req
-        .strategy
-        .as_deref()
-        .unwrap_or("portfolio");
-
-    let mut windows_settled_total = 0usize;
-    let mut observed_series: Vec<String> = Vec::new();
-    let mut obs: Vec<TimedCalibrationObs> = Vec::new();
-
-    for (ticker, snaps) in windows {
-        let facts_fp = facts_fingerprint(snaps);
-        let (result, close_epoch) = match window_facts_keyed(snaps, facts_fp) {
-            WindowFacts::Settled { result, close_epoch } => (result, close_epoch),
-            WindowFacts::Conflict | WindowFacts::Unsettled => continue,
-        };
-        windows_settled_total += 1;
-        let series = snaps.first().map(|s| s.series.clone()).unwrap_or_default();
-        if !series.is_empty() && !observed_series.contains(&series) {
-            observed_series.push(series.clone());
-        }
-
-        if !selected.is_empty() {
-            let win_fp = window_fingerprint(snaps);
-            for strat in &selected {
-                if let Some(price) = window_entry_keyed(strat, Some(ticker.as_str()), snaps, win_fp)
-                {
-                    if is_valid_whole_cent(price) {
-                        obs.push(TimedCalibrationObs {
-                            close_epoch,
-                            ticker: ticker.clone(),
-                            series: series.clone(),
-                            side: strat.side.clone(),
-                            raw_prob: price,
-                            entry_price: price,
-                            outcome: result == strat.side,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // Measure empirical max drawdown honestly from the slot simulation (portfolio)
-    // or standalone fractional simulation (single strategy).
-    let max_dd_pct = if req.strategy.is_none() {
-        let port_trades = portfolio_trades_from_sim(sim);
-        let (m, _, _) = compute_performance_metrics(&port_trades, sim.paper_pot_start);
-        m.max_drawdown_pct
-    } else if let Some(strat) = selected.first() {
-        let risk_f = (req.max_slot_risk_pct / 100.0).clamp(0.01, 0.50);
-        let mut eq = req.starting_bankroll;
-        let mut peak = eq;
-        let mut max_dd = 0.0f64;
-        let mut ordered = obs.clone();
-        ordered.sort_by_key(|o| o.close_epoch);
-        for o in &ordered {
-            if eq <= 0.0 {
-                break;
-            }
-            let contracts = (eq * risk_f / o.entry_price).floor() as i64;
-            if contracts <= 0 {
-                continue;
-            }
-            let payoff = if o.outcome { contracts as f64 } else { 0.0 };
-            let pnl = payoff
-                - contracts as f64 * o.entry_price
-                - contracts as f64 * fee(o.entry_price);
-            eq += pnl;
-            if eq > peak {
-                peak = eq;
-            }
-            if peak > 1e-9 {
-                let dd = (((peak - eq).max(0.0) / peak) * 100.0).clamp(0.0, 100.0);
-                if dd > max_dd {
-                    max_dd = dd;
-                }
-            }
-        }
-        let _ = strat;
-        max_dd
-    } else {
-        0.0
-    };
-
-    compute_scale_plan_from_observations_with_depth(
-        &obs,
-        max_dd_pct,
-        windows_settled_total,
-        &observed_series,
-        scope,
-        &req,
-        observed_median_depth,
-    )
+    let ctx = build_scale_tape_context(windows, strategies, sim, observed_median_depth);
+    compute_scale_plan_from_context(&ctx, raw_req)
 }
 
 // ---------------------------------------------------------------------------
