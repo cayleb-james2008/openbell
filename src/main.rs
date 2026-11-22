@@ -117,10 +117,51 @@ struct Snapshot {
     no_bid: Option<f64>,
     no_ask: Option<f64>,
     last_price: Option<f64>,
+    #[serde(default)]
+    yes_bid_size: f64,
+    #[serde(default)]
+    no_bid_size: f64,
 }
 
 fn dollars(v: &serde_json::Value, key: &str) -> Option<f64> {
     v.get(key).and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok())
+}
+
+/// Parse top-of-book contract depth from Kalshi public market JSON (string `*_fp`
+/// or numeric fields), returning finite non-negative depth or `0.0` when absent.
+fn depth_size(v: &serde_json::Value, keys: &[&str]) -> f64 {
+    for &key in keys {
+        let parsed = v.get(key).and_then(|x| {
+            x.as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| x.as_f64())
+        });
+        if let Some(n) = parsed {
+            if n.is_finite() && n >= 0.0 {
+                return n;
+            }
+        }
+    }
+    0.0
+}
+
+#[allow(dead_code)]
+fn median_observed_book_depth(snaps: &[Snapshot]) -> Option<f64> {
+    let mut depths: Vec<f64> = snaps
+        .iter()
+        .flat_map(|s| [s.yes_bid_size, s.no_bid_size])
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .collect();
+    if depths.is_empty() {
+        return None;
+    }
+    depths.sort_unstable_by(|a, b| a.total_cmp(b));
+    let mid = depths.len() / 2;
+    if depths.len() % 2 == 1 {
+        Some(depths[mid])
+    } else {
+        Some((depths[mid - 1] + depths[mid]) * 0.5)
+    }
 }
 
 fn active_series() -> Vec<String> {
@@ -213,6 +254,8 @@ fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize, bo
                 no_bid: dollars(m, "no_bid_dollars"),
                 no_ask: dollars(m, "no_ask_dollars"),
                 last_price: dollars(m, "last_price_dollars"),
+                yes_bid_size: depth_size(m, &["yes_bid_size_fp", "yes_bid_size"]),
+                no_bid_size: depth_size(m, &["no_bid_size_fp", "no_bid_size", "yes_ask_size_fp"]),
             });
         }
         return Ok((snaps, skipped, hit_rate_limit));
@@ -1953,7 +1996,19 @@ struct AnalyticsCacheEntry {
     paper_pot_start: f64,
 }
 
+#[allow(dead_code)]
+struct RecalibrationCacheEntry {
+    path: PathBuf,
+    len: u64,
+    mtime: u64,
+    key: u64,
+    dataset: String,
+    json: Arc<String>,
+}
+
 const BACKTEST_CACHE_CAP: usize = 16;
+#[allow(dead_code)]
+const SCALE_PLAN_CACHE_CAP: usize = 32;
 
 struct App {
     data_dir: PathBuf,
@@ -1979,6 +2034,14 @@ struct App {
     /// chronological returns for instant Quant Lab & Monte Carlo reads.
     analytics_cache: std::sync::RwLock<Option<AnalyticsCacheEntry>>,
     analytics_compute_lock: std::sync::Mutex<()>,
+    /// Cached PAV isotonic recalibration JSON payload under RwLock + singleflight.
+    #[allow(dead_code)]
+    recalibration_cache: std::sync::RwLock<Option<RecalibrationCacheEntry>>,
+    #[allow(dead_code)]
+    recalibration_compute_lock: std::sync::Mutex<()>,
+    /// Bounded cache for repeated `$500/day` capital scale-plan requests.
+    #[allow(dead_code)]
+    scale_plan_cache: std::sync::RwLock<Vec<(u64, Arc<String>)>>,
     /// Small bounded cache for repeated in-memory sandbox backtests over
     /// an unchanged tape + identical source/config hash.
     backtest_cache: std::sync::RwLock<Vec<(u64, Arc<String>)>>,
@@ -1996,6 +2059,9 @@ impl App {
             analysis_compute_lock: std::sync::Mutex::new(()),
             analytics_cache: std::sync::RwLock::new(None),
             analytics_compute_lock: std::sync::Mutex::new(()),
+            recalibration_cache: std::sync::RwLock::new(None),
+            recalibration_compute_lock: std::sync::Mutex::new(()),
+            scale_plan_cache: std::sync::RwLock::new(Vec::new()),
             backtest_cache: std::sync::RwLock::new(Vec::new()),
         }
     }
@@ -3787,6 +3853,8 @@ mod tests {
             no_bid: na.map(|v| v - 0.02),
             no_ask: na,
             last_price: None,
+            yes_bid_size: 0.0,
+            no_bid_size: 0.0,
         }
     }
 
@@ -3818,6 +3886,8 @@ mod tests {
             no_bid: None,
             no_ask: Some(0.5),
             last_price: None,
+            yes_bid_size: 0.0,
+            no_bid_size: 0.0,
         };
         // Conflicting settlements: not scored, ever.
         let conflict = vec![
@@ -4554,6 +4624,8 @@ mod tests {
             no_bid: Some(0.46),
             no_ask: Some(0.49),
             last_price: Some(0.52),
+            yes_bid_size: 120.0,
+            no_bid_size: 95.0,
         };
         let mut s2 = s1.clone();
         s2.fetched_at = 1060;
@@ -4646,5 +4718,34 @@ mod tests {
         assert!(b.contains("OpenBell ") && b.contains(env!("CARGO_PKG_VERSION")));
         assert!(b.contains("http://127.0.0.1:8475") && b.contains("/data/ob"));
         assert!(b.contains("auto (installs") && b.contains("opening it in your browser") && b.contains("no order path"));
+    }
+
+    #[test]
+    fn top_of_book_depth_parses_live_kalshi_fields_with_zero_fallback() {
+        let live_kalshi = json!({
+            "yes_bid_size_fp": "1304.28",
+            "yes_ask_size_fp": "42.50"
+        });
+        assert!((depth_size(&live_kalshi, &["yes_bid_size_fp", "yes_bid_size"]) - 1304.28).abs() < 1e-9);
+        assert!((depth_size(&live_kalshi, &["no_bid_size_fp", "no_bid_size", "yes_ask_size_fp"]) - 42.50).abs() < 1e-9);
+
+        let explicit_no = json!({ "yes_bid_size": 250, "no_bid_size": 180.5 });
+        assert!((depth_size(&explicit_no, &["yes_bid_size_fp", "yes_bid_size"]) - 250.0).abs() < 1e-9);
+        assert!((depth_size(&explicit_no, &["no_bid_size_fp", "no_bid_size", "yes_ask_size_fp"]) - 180.5).abs() < 1e-9);
+
+        let missing_or_bad = json!({ "yes_bid_size_fp": "-10", "no_bid_size_fp": "NaN" });
+        assert_eq!(depth_size(&missing_or_bad, &["yes_bid_size_fp", "yes_bid_size"]), 0.0);
+        assert_eq!(depth_size(&missing_or_bad, &["no_bid_size_fp", "no_bid_size", "yes_ask_size_fp"]), 0.0);
+
+        // Legacy snapshots without depth fields deserialize cleanly with 0.0 fallback.
+        let legacy = r#"{"fetched_at":1000,"ticker":"KXBTC15M-1","event_ticker":"E","series":"KXBTC15M","close_time":"2026-11-22T08:00:00Z","status":"open","result":"","yes_bid":0.5,"yes_ask":0.52,"no_bid":0.48,"no_ask":0.5,"last_price":0.51}"#;
+        let parsed: Snapshot = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.yes_bid_size, 0.0);
+        assert_eq!(parsed.no_bid_size, 0.0);
+
+        let mut s1 = parsed.clone();
+        s1.yes_bid_size = 100.0;
+        s1.no_bid_size = 300.0;
+        assert_eq!(median_observed_book_depth(&[parsed, s1]), Some(200.0));
     }
 }
