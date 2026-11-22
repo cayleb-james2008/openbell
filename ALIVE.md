@@ -1,4 +1,4 @@
-# Aliveness Inventory — OpenBell v0.6.0
+# Aliveness Inventory — OpenBell v0.7.0
 
 Every motion timing and spring value comes from `rune/used/motion.ts` (`frontend/src/motionProps.ts`) and the `--dur-*` / `--ease-house` CSS tokens in `frontend/src/tokens.css`. Nothing in the first fold plays a decorative entrance animation on load; continuous loops (`BorderTrail`, `TextShimmer`) run strictly while `POST /api/collect` is in flight and stop immediately when the pass finishes; `prefers-reduced-motion: reduce` cuts Vaul drawer/CSS transitions to `0.01ms` and disables `pathLength` drawing and `SlidingNumber` springs (`MotionConfig reducedMotion="user"`).
 
