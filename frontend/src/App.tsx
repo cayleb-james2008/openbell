@@ -33,7 +33,7 @@ import { HeroStrip } from "@/HeroStrip";
 import { TapeTab } from "@/TapeTab";
 import { StrategiesTab } from "@/StrategiesTab";
 import { SlotsTab } from "@/SlotsTab";
-import { QuantLabTab } from "@/QuantLabTab";
+import { QuantLabTab, type QuantSectionId } from "@/QuantLabTab";
 import { CommandPalette, type DeskTabId } from "@/CommandPalette";
 import { SettingsSheet } from "@/SettingsSheet";
 import { UpdateStrip, useUpdates } from "@/Update";
@@ -89,7 +89,7 @@ function Shell() {
   const [jumpTicker, setJumpTicker] = useState<string | null>(null);
   const [jumpStrategy, setJumpStrategy] = useState<string | null>(null);
   const [sandboxSignal, setSandboxSignal] = useState(0);
-  const [quantFocus, setQuantFocus] = useState<"calibration" | "montecarlo" | "walkforward" | null>(null);
+  const [quantFocus, setQuantFocus] = useState<QuantSectionId | null>(null);
   const [reseedSignal, setReseedSignal] = useState(0);
   const searchRef = useRef<HTMLInputElement>(null);
 
@@ -105,7 +105,7 @@ function Shell() {
   const allFailed = !!reads && Object.values(reads).every((r) => !r.ok);
   const failMsg = reads && !reads.home.ok ? reads.home.msg : "";
   const isFixture = dataset === "fixture";
-  const versionText = home?.version || upd.version?.version || "0.5.0";
+  const versionText = home?.version || upd.version?.version || "0.6.0";
 
   const validMarkets = useMemo(
     () => (markets ? markets.filter((m): m is Market => !!m && typeof m === "object") : []),

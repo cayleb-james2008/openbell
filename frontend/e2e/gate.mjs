@@ -390,8 +390,42 @@ for (const m of measures) {
     `low=${slotsM.lowContrast} svg=${slotsM.svgBad} small=${slotsM.smallTargets}`)
   await p.screenshot({ path: `${OUT}/slots-1440-light.png` })
 
-  // Quant Lab (4th tab): Calibration Reliability SVG + Wilson error bars + Brier/ECE, Monte Carlo 1,000-path Fan + Reseed, Walk-Forward IS vs OOS
-  await p.locator('#tab-quant').click(); await p.waitForTimeout(500)
+  // Quant Lab (4th tab): $500/Day Scale Planner, 5-Gate Readiness Scorecard, PAV Isotonic Recalibration, Calibration Reliability, Monte Carlo Fan, Walk-Forward IS vs OOS
+  await p.locator('#tab-quant').click(); await p.waitForTimeout(550)
+  const scaleReady =
+    (await p.locator('#quant-scale-planner').isVisible()) &&
+    (await p.locator('[data-scale-trajectory-chart] svg[role=img]').count()) === 1 &&
+    (await p.locator('[data-scale-trajectory-chart] [data-target-ref-line]').count()) === 1
+  ok('Quant Lab renders $500/Day Scale Planner controls, 180-day trajectory SVG & target reference line', scaleReady)
+  await p.locator('#scale-sizing-mode').selectOption('quarter_kelly')
+  await p.locator('#scale-assumed-edge').fill('4')
+  await p.locator('#scale-plan-run-btn').click(); await p.waitForTimeout(300)
+  const sensLabel = (await p.locator('#scale-mode-pill').innerText()).trim()
+  await p.locator('#scale-assumed-edge').fill('')
+  await p.locator('#scale-plan-run-btn').click(); await p.waitForTimeout(300)
+  const empLabel = (await p.locator('#scale-mode-pill').innerText()).trim()
+  ok('Scale Planner sensitivity override toggles Empirical Tape <-> Sensitivity (Assumed Edge)',
+    sensLabel.includes('Sensitivity') && empLabel.includes('Empirical Tape'),
+    `${sensLabel} -> ${empLabel}`)
+  const gateCount = await p.locator('[data-readiness-scorecard] [data-readiness-gate]').count()
+  const verdictTxt = (await p.locator('#readiness-verdict-pill').innerText()).trim()
+  ok('5-Gate Readiness Scorecard renders 5 mechanical gates with honest Paper Research Only verdict',
+    gateCount === 5 && verdictTxt.includes('Paper Research Only'),
+    `gates=${gateCount} verdict=${verdictTxt}`)
+  await p.locator('#quant-scale-planner').scrollIntoViewIfNeeded(); await p.waitForTimeout(150)
+  await p.screenshot({ path: `${OUT}/scale-planner-1440-light.png` })
+
+  const recalChartOk =
+    (await p.locator('[data-recalibration-chart] svg[role=img]').count()) === 1 &&
+    (await p.locator('#recal-brier').innerText()).includes('->') &&
+    (await p.locator('#ev-gate-impact tbody tr').count()) === 3
+  ok('Quant Lab renders PAV Isotonic Recalibration Before vs After SVG & EV-After-Fees Gate impact', recalChartOk)
+  await p.locator('#quant-recalibration').scrollIntoViewIfNeeded(); await p.waitForTimeout(150)
+  await p.screenshot({ path: `${OUT}/recalibration-1440-light.png` })
+
+  const quantRuneLeak = await p.evaluate(() => /\brune\b/i.test(document.body.innerText))
+  ok('zero user-facing Rune jargon across Quant Lab (v0.6.0)', !quantRuneLeak)
+
   const brierTxt = (await p.locator('#quant-brier').innerText()).trim()
   const eceTxt = (await p.locator('#quant-ece').innerText()).trim()
   const wilsonCount = await p.locator('[data-calibration-chart] [data-wilson-bar]').count()
@@ -466,16 +500,130 @@ for (const m of measures) {
   await ctx.close()
 }
 
-// 5. v0.5.0 API Wire-Contract E2E (proves live SSE, Calibration, Monte Carlo, Walk-Forward, Validate, Backtest & Export wiring)
+// 5. v0.6.0 API Wire-Contract E2E (proves live SSE, Recalibration, Scale Plan, Calibration, Monte Carlo, Walk-Forward, Validate, Backtest & Export wiring)
 {
   const { ctx, p } = await open(1440, 900)
   const hits = new Set()
   await p.route('**/api/home', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.5.0'
-    j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export']
+    j.version = '0.6.0'
+    j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan']
     return r.fulfill({ response: res, body: JSON.stringify(j) })
+  })
+  await p.route('**/api/analytics/recalibration*', r => {
+    hits.add('recalibration')
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        windows_settled: 240,
+        windows_conflicted: 0,
+        slippage_cents: 1.0,
+        portfolio: {
+          population: 'portfolio',
+          is_count: 144,
+          oos_count: 96,
+          total_count: 240,
+          is_fraction: 0.6,
+          oos_fraction: 0.4,
+          oos_before: { sample_size: 96, brier_score: 0.194, log_loss: 0.562, ece: 0.068, mce: 0.11 },
+          oos_after: { sample_size: 96, brier_score: 0.171, log_loss: 0.514, ece: 0.031, mce: 0.05 },
+          oos_improved: true,
+          min_detectable_edge: 0.098,
+          honesty_note: 'Monotone PAV fitted strictly on IS (60%) and evaluated on OOS (40%).',
+          oos_buckets: [
+            { bucket_index: 0, label: '0-5%', lower_bound: 0.0, upper_bound: 0.05, midpoint: 0.025, n: 0, wins: 0, realised_rate: null, wilson_lower_95: null, wilson_upper_95: null, mean_pred_p: null, gap: null, calibrated_p: 0.05, brier_contrib: 0, log_loss_contrib: 0 },
+            { bucket_index: 13, label: '65-70%', lower_bound: 0.65, upper_bound: 0.70, midpoint: 0.675, n: 40, wins: 27, mean_pred_p: 0.675, realised_rate: 0.675, wilson_lower_95: 0.52, wilson_upper_95: 0.80, gap: 0.0, calibrated_p: 0.68, brier_contrib: 0.08, log_loss_contrib: 0.25 },
+            { bucket_index: 15, label: '75-80%', lower_bound: 0.75, upper_bound: 0.80, midpoint: 0.775, n: 56, wins: 45, mean_pred_p: 0.775, realised_rate: 0.804, wilson_lower_95: 0.68, wilson_upper_95: 0.89, gap: 0.029, calibrated_p: 0.79, brier_contrib: 0.09, log_loss_contrib: 0.26 },
+          ],
+          entry_gate: {
+            slippage_margin_cents: 1.0,
+            total_evaluated: 96,
+            accepted_count: 56,
+            refused_count: 40,
+            acceptance_rate: 0.583,
+            baseline_win_rate: 0.75,
+            accepted_win_rate: 0.804,
+            refused_win_rate: 0.675,
+            baseline_total_pnl_dollars_1ct: 14.2,
+            accepted_total_pnl_dollars_1ct: 22.8,
+            refused_total_pnl_dollars_1ct: -8.6,
+            pnl_delta_dollars_1ct: 8.6,
+            cells: [],
+          },
+        },
+        market: { population: 'market', is_count: 0, oos_count: 0, total_count: 0, oos_buckets: [] },
+        by_strategy: [],
+      }),
+    })
+  })
+  await p.route('**/api/analytics/scale-plan*', r => {
+    hits.add('scale-plan')
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        mode_notice: 'Paper research only.',
+        sizing_mode_resolved: 'equal_slots',
+        strategy_scope: 'portfolio',
+        target_daily_dollars: 500,
+        current_empirical_daily_dollars: -4.2,
+        required_bankroll_equal_slots: null,
+        required_bankroll_quarter_kelly: null,
+        required_bankroll_half_kelly: null,
+        required_bankroll_reason: 'OOS expectancy after fees and slippage is <= 0; refusing to fabricate positive bankroll scaling.',
+        empirical_summary: {
+          windows_settled_total: 240,
+          windows_settled_oos: 96,
+          total_trades: 240,
+          oos_trades: 96,
+          oos_net_expectancy_cents: -0.65,
+          oos_ece: 0.031,
+          max_drawdown_pct: 9.4,
+        },
+        liquidity_ceiling: {
+          windows_per_day_per_series: 96,
+          max_contracts_per_window: 250,
+          active_series_count: 4,
+          single_series_max_daily_dollars: 0,
+          multi_series_max_daily_dollars: 0,
+          fill_ratio_at_target: 0,
+          note: 'No positive edge.',
+        },
+        compounding_projection: {
+          mode_label: 'Empirical Tape',
+          is_empirical: true,
+          seed: 42,
+          paths: 1000,
+          horizon_days: 180,
+          starting_bankroll: 1000,
+          target_daily_dollars: 500,
+          prob_reach_target: 0,
+          median_days_to_target: null,
+          prob_dd_gte_25_pct: 0.31,
+          curve: [
+            { day: 0, equity_p10: 1000, equity_p50: 1000, equity_p90: 1000, daily_run_rate_p10: 0, daily_run_rate_p50: 0, daily_run_rate_p90: 0 },
+            { day: 90, equity_p10: 920, equity_p50: 960, equity_p90: 1020, daily_run_rate_p10: -6, daily_run_rate_p50: -4, daily_run_rate_p90: 2 },
+            { day: 180, equity_p10: 840, equity_p50: 925, equity_p90: 1040, daily_run_rate_p10: -8, daily_run_rate_p50: -4, daily_run_rate_p90: 3 },
+          ],
+        },
+        sensitivity_projection: null,
+        readiness_gates: {
+          verdict: 'PAPER_RESEARCH_ONLY',
+          passed_count: 3,
+          total_gates: 5,
+          gates: [
+            { id: 'sample_depth', label: 'Sample depth >= 200 settled trades', passed: true, observed: 240, threshold: 200, unit: 'trades', detail: '240 settled paper trades recorded.' },
+            { id: 'oos_net_expectancy', label: 'OOS net expectancy > 0 after fees & slippage', passed: false, observed: -0.65, threshold: 0.0, unit: 'cents/contract', detail: 'OOS net expectancy is -0.65c/contract.' },
+            { id: 'oos_ece', label: 'OOS calibration ECE < 0.05', passed: true, observed: 0.031, threshold: 0.05, unit: 'ECE', detail: 'OOS ECE is 0.0310.' },
+            { id: 'max_drawdown_pct', label: 'Max paper drawdown < 20%', passed: true, observed: 9.4, threshold: 20.0, unit: '%', detail: 'Max drawdown is 9.4%.' },
+            { id: 'liquidity_fill_ratio', label: 'Liquidity fill ratio >= 75% at target', passed: false, observed: 0.0, threshold: 0.75, unit: 'ratio', detail: 'Book capacity covers 0.0% of target.' },
+          ],
+          blocking_reasons: ['OOS net expectancy > 0 after fees & slippage: OOS net expectancy is -0.65c/contract.'],
+        },
+      }),
+    })
   })
   await p.route('**/api/tape/stream', r => {
     hits.add('sse')
@@ -567,10 +715,20 @@ for (const m of measures) {
   await p.locator('#sandbox-backtest-btn').click(); await p.waitForTimeout(200)
   await p.locator('#tab-slots').click(); await p.waitForTimeout(200)
   await Promise.all([p.waitForEvent('download'), p.locator('#export-report-md').click()])
-  await p.locator('#tab-quant').click(); await p.waitForTimeout(350)
-  const serverEngineShown = (await p.locator('#quant-calibration').innerText()).includes('Server Quant Engine')
-  ok('v0.5.0 live API contract integrates SSE, validate, backtest, export, calibration, walkforward & montecarlo',
-    ['sse', 'calibration', 'walkforward', 'montecarlo', 'validate', 'backtest', 'export'].every(k => hits.has(k)) && serverEngineShown,
+  await p.locator('#tab-quant').click(); await p.waitForTimeout(450)
+  const scorecardText = await p.locator('#readiness-scorecard').innerText()
+  const evGateText = await p.locator('#ev-gate-impact').innerText()
+  const serverEngineShown =
+    (await p.locator('#quant-calibration').innerText()).includes('Server Quant Engine') &&
+    (await p.locator('#quant-scale-planner').innerText()).includes('Server Scale Engine') &&
+    (await p.locator('#quant-recalibration').innerText()).includes('Server PAV Engine') &&
+    (await p.locator('#scale-req-equal').innerText()).trim() === 'N/A' &&
+    scorecardText.includes('240 trades') &&
+    scorecardText.includes('-0.65c/ct') &&
+    scorecardText.includes('3.10%') &&
+    evGateText.includes('+$8.60')
+  ok('v0.6.0 live API contract integrates SSE, recalibration, scale-plan, validate, backtest, export, calibration, walkforward & montecarlo',
+    ['sse', 'recalibration', 'scale-plan', 'calibration', 'walkforward', 'montecarlo', 'validate', 'backtest', 'export'].every(k => hits.has(k)) && serverEngineShown,
     `hits=${[...hits].sort().join(',')} serverEngine=${serverEngineShown}`)
   await ctx.close()
 }

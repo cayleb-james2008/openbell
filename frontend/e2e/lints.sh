@@ -14,7 +14,7 @@ export CHROME_PATH=${E2E_CHROME:-$HOME/.cache/ms-playwright/chromium-1234/chrome
 have() { [ -e "$1" ] || { echo "SKIP $2: $1 not found"; return 1; }; }
 cd "$G" # sloplint writes .hallmark/ next to its input and in the working directory: keep both in the out dir
 cp "$ROOT/assets/index.html" "$G/index.html"
-have "$TASTE_DIR/scripts/lint.mjs" lint && timeout 120 node "$TASTE_DIR/scripts/lint.mjs" "$ROOT/frontend/src/HeroStrip.tsx" "$ROOT/frontend/src/TapeTab.tsx" "$ROOT/frontend/src/StrategiesTab.tsx" "$ROOT/frontend/src/RuneSandbox.tsx" "$ROOT/frontend/src/SlotsTab.tsx" "$ROOT/frontend/src/QuantLabTab.tsx" "$ROOT/frontend/src/CommandPalette.tsx" "$ROOT/frontend/src/Charts.tsx" --json > "$G/lint.json" 2>&1
+have "$TASTE_DIR/scripts/lint.mjs" lint && timeout 120 node "$TASTE_DIR/scripts/lint.mjs" "$ROOT/frontend/src/HeroStrip.tsx" "$ROOT/frontend/src/TapeTab.tsx" "$ROOT/frontend/src/StrategiesTab.tsx" "$ROOT/frontend/src/RuneSandbox.tsx" "$ROOT/frontend/src/SlotsTab.tsx" "$ROOT/frontend/src/QuantLabTab.tsx" "$ROOT/frontend/src/ScalePlannerPanel.tsx" "$ROOT/frontend/src/RecalibrationPanel.tsx" "$ROOT/frontend/src/CommandPalette.tsx" "$ROOT/frontend/src/Charts.tsx" --json > "$G/lint.json" 2>&1
 have "$IMPECCABLE" detect && timeout 120 "$IMPECCABLE" detect --json "$U" > "$G/detect.json" 2>/dev/null
 have "$TASTE_DIR/scripts/inspect.mjs" inspect && timeout 300 node "$TASTE_DIR/scripts/inspect.mjs" "$U" --out "$G/inspect" --json > "$G/inspect.json" 2>/dev/null
 have "$HALLMARK" sloplint && timeout 300 node "$HALLMARK" "$G/index.html" --url "$U" --scope app --json > "$G/slop.json" 2>/dev/null
