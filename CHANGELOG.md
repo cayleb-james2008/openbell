@@ -4,6 +4,16 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.7.0 - 2026-11-22
+
+- **Paper Strategy Tournament, 12×12 Correlation Matrix, Optimal Uncorrelated 4-Slot Lineup & 2D Regime Heatmap (`src/tournament.rs`, `GET /api/analytics/tournament[?dataset=fixture&slippage_cents=0..5]`):**
+  - Ranks all 12 paper strategies strictly on held-out Out-of-Sample (last 40%) net expectancy after Kalshi fees and configurable slippage (`0¢..5¢`), with Sharpe, Sortino, Max Drawdown %, sample count, Wilson 95% confidence intervals, and per-series breakdown (`BTC`/`ETH`/`SOL`/`XRP`/`DOGE`).
+  - Computes an exact symmetric `12×12` pairwise Pearson return correlation matrix across shared settled windows and runs exact combinatorial search for the highest-OOS-expectancy 4-slot portfolio subject to `|r| <= 0.65`, with explicit honest fallback disclosure whenever fewer than 4 strategies achieve positive OOS expectancy (never padding with negative-EV strategies).
+  - Builds a 2D Entry Price Bucket (`10-30c`..`90-99c`) × Seconds-to-Close (`>600s`..`<120s`) Edge-by-Regime Heatmap reporting `n`, realized win rate, average fee, net paper expectancy (`¢/ct`), and Wilson sample-depth warnings (`n < 20`), backed by singleflight `RwLock` `TournamentTapeContext` caching.
+- **Toggleable Background Public Tape Collector & 200-Window Readiness Gate (`--auto-collect`, `GET /api/collector/status`, `POST /api/collector/schedule`):**
+  - Adds a safe toggleable background public tape collector (`--auto-collect` / `OPENBELL_AUTO_COLLECT=1` / runtime `POST /api/collector/schedule` `{ enabled, interval_secs: 30..=900 }`, parked idle by default with zero unsolicited venue calls) featuring adaptive HTTP 429 exponential backoff, live SSE `event: tape` broadcasts (`type: "schedule" | "collect"`), and `settled_windows / 200` Readiness Gate progress telemetry — strictly read-only public Kalshi GET endpoints only (`fence.sh` `FENCE OK`).
+- **Quant Lab Tournament & Auto-Collector UI (`frontend/` -> single-file `assets/index.html`):** adds the Paper Strategy Tournament & Optimal 4-Slot Lineup panel, interactive `12×12` Correlation Matrix SVG, interactive `5×4` Edge-by-Regime Heatmap SVG, and synchronized `Off / 60s / 180s` Auto-Collector Control Strip + 200-Window Readiness progress bar inside `Live 15m Tape` and Desk Settings while preserving 4 clean tabs, opaque sticky header, Settings-only Light/Dark theme, zero new Cargo dependencies, and `.loop/checks/fence.sh` `FENCE OK` / `.loop/checks/equity.sh` `EQUITY OK`.
+
 ## 0.6.0 - 2026-11-22
 
 - **Monotone PAV Isotonic Probability Recalibration & EV-After-Fees Gate (`src/recalibration.rs`, `GET /api/analytics/recalibration[?dataset=fixture&slippage_cents=0..5]`):**

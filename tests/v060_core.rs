@@ -119,7 +119,10 @@ esac
 
     let port = free_port();
     let _srv = spawn_server(&dir, port, Some(&bin));
-    std::thread::sleep(Duration::from_millis(400));
+
+    // Trigger one public collector pass via fake Kalshi shim to capture top-of-book depth.
+    let (st_col, body_col) = http_req(port, "POST", "/api/collect", "{}");
+    assert_eq!(st_col, 200, "collect failed: {body_col}");
 
     // Capabilities expose v0.6.0 routes.
     let (st_home, body_home) = http_req(port, "GET", "/api/home", "");
