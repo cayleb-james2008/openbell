@@ -4,6 +4,17 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.6.0 - 2026-11-22
+
+- **Monotone PAV Isotonic Probability Recalibration & EV-After-Fees Gate (`src/recalibration.rs`, `GET /api/analytics/recalibration[?dataset=fixture&slippage_cents=0..5]`):**
+  - Fits weighted Pool-Adjacent-Violators (PAV) isotonic regression strictly on chronological In-Sample (first 60%) settled windows and evaluates strictly on held-out Out-of-Sample (last 40%) windows with zero lookahead leakage.
+  - Emits 20 five-point probability buckets (`0-5%`..`95-100%`) with exact 95% Wilson score confidence intervals, before-vs-after OOS Brier score, log loss, ECE, 80%-power binomial Minimum Detectable Edge, and a retrospective EV-After-Fees entry gate (`p_cal > entry_price + fee + slippage_margin`) showing accepted vs refused count, win rate, and paper P&L impact.
+- **`$500/Day` Paper Capital Scaling & Liquidity Capacity Engine (`src/scaling.rs`, `POST /api/analytics/scale-plan[?dataset=fixture]`):**
+  - Computes empirical daily paper run-rate vs target (`$500/day` default) strictly from OOS fee- and slippage-adjusted expectancy, returning `required_bankroll_equal_slots`, `required_bankroll_quarter_kelly`, and `required_bankroll_half_kelly` — explicitly `null` with an honest explanation whenever OOS net expectancy is `<= 0`.
+  - Computes single-series (`96` 15m windows/day × `max_contracts_per_window`) and multi-series liquidity ceilings, exact `fill_ratio_at_target`, and incorporates live observed top-of-book depth from the public Kalshi collector (`yes_bid_size`/`no_bid_size`, `#[serde(default)]` `0.0` fallback).
+  - Runs a deterministic 180-trading-day 1,000-path Xoshiro256++ Monte Carlo compounding trajectory (`P10`/`P50`/`P90` equity & daily run-rate, `prob_reach_target`, `median_days_to_target`, `prob_dd_gte_25_pct`) clearly separating `"Empirical Tape"` from optional `"Sensitivity (Assumed Edge)"`, plus a 5-gate mechanical readiness scorecard (`sample_depth >= 200`, `oos_net_expectancy > 0`, `oos_ece < 0.05`, `max_drawdown_pct < 20.0`, `liquidity_fill_ratio >= 0.75`) -> `READY_FOR_OWNER_REVIEW` vs `PAPER_RESEARCH_ONLY`.
+- **Quant Lab `$500/Day` Scale Planner & Recalibration Panels (`frontend/` -> single-file `assets/index.html`):** adds interactive Scale Planner controls, Liquidity Capacity bar, 180-day Compounding Trajectory SVG with `$500/day` target reference line & hover crosshair, 5-Gate Readiness Scorecard, Before-vs-After PAV Isotonic Recalibration SVG with 95% Wilson whiskers, EV-After-Fees Gate impact table, and `Cmd+K` jump actions inside Quant Lab while preserving 4 clean tabs, opaque sticky header, Settings-only Light/Dark theme, zero new Cargo dependencies, and `.loop/checks/fence.sh` `FENCE OK` / `.loop/checks/equity.sh` `EQUITY OK`.
+
 ## 0.5.0 - 2026-11-22
 
 - **12-Strategy Paper Library (`strategies/*.rn`):** expanded the seeded built-in library from 5 to 12 distinct paper strategies (`bid_ask_imbalance`, `favourite_floor`, `favourite_late`, `late_convergence_cap`, `longshot_late`, `mean_reversion_fade`, `mid_window_momentum`, `no_favourite`, `opening_range_break`, `spread_compression`, `time_decay_harvest`, `volatility_squeeze`) with whole-cent `0.01..=0.99` quote discipline and strict paper-only isolation.
