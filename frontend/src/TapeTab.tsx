@@ -9,8 +9,10 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
 import { MarketHistoryChart, ProbBar, ProvenanceTag } from "@/Charts";
+import { AutoCollectorStrip } from "@/AutoCollectorStrip";
 import { useWide } from "@/lib/media";
 import {
+  type CollectorScheduleStatus,
   type Dataset,
   type Home,
   type Market,
@@ -237,6 +239,10 @@ export function TapeTab({
   dataset,
   search,
   stream,
+  collectorStatus,
+  updatingSchedule,
+  onSelectSchedule,
+  onOpenScorecard,
   onRetry,
   onCollect,
   collectingNow,
@@ -248,6 +254,10 @@ export function TapeTab({
   dataset: Dataset;
   search: string;
   stream: TapeStreamState;
+  collectorStatus: CollectorScheduleStatus | null;
+  updatingSchedule: boolean;
+  onSelectSchedule: (enabled: boolean, intervalSecs: number) => void;
+  onOpenScorecard: () => void;
   onRetry: () => void;
   onCollect: () => void;
   collectingNow: boolean;
@@ -430,6 +440,15 @@ export function TapeTab({
           </Pill>
         </div>
       </div>
+
+      {/* Background Auto-Collector Control Strip + 200-Window Readiness Gate Progress Bar */}
+      <AutoCollectorStrip
+        status={collectorStatus}
+        updating={updatingSchedule}
+        onSelectSchedule={onSelectSchedule}
+        onOpenScorecard={onOpenScorecard}
+        variant="banner"
+      />
 
       {/* Inline interactive SVG Price + Spread History card for leading/pinned 15m market */}
       {featuredMarket && (

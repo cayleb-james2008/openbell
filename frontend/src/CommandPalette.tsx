@@ -9,6 +9,7 @@ import {
   Dices,
   Download,
   FlaskConical,
+  Grid3X3,
   Layers,
   RefreshCw,
   Search,
@@ -16,6 +17,7 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   TrendingUp,
+  Trophy,
   X,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -193,6 +195,39 @@ export function CommandPalette({
                     <span>Quant Lab: 5-Gate Readiness Scorecard</span>
                   </span>
                   <span className="mono text-xs text-ink-3">5 gates</span>
+                </Command.Item>
+                <Command.Item
+                  value="Quant Lab Strategy Tournament Optimal 4-Slot Lineup OOS Expectancy"
+                  onSelect={() => closeAnd(() => onJumpQuantSection("tournament"))}
+                  className="flex min-h-11 cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-2 text-sm text-ink outline-none data-[selected=true]:bg-blue-soft sm:min-h-9"
+                >
+                  <span className="flex items-center gap-2">
+                    <Trophy className="size-4 text-info-foreground" aria-hidden />
+                    <span>Quant Lab: Strategy Tournament &amp; 4-Slot Lineup</span>
+                  </span>
+                  <span className="mono text-xs text-ink-3">12 strategies</span>
+                </Command.Item>
+                <Command.Item
+                  value="Quant Lab 12x12 Return Correlation Matrix Pearson Heatmap"
+                  onSelect={() => closeAnd(() => onJumpQuantSection("correlation"))}
+                  className="flex min-h-11 cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-2 text-sm text-ink outline-none data-[selected=true]:bg-blue-soft sm:min-h-9"
+                >
+                  <span className="flex items-center gap-2">
+                    <Grid3X3 className="size-4 text-ink-2" aria-hidden />
+                    <span>Quant Lab: 12&times;12 Correlation Matrix</span>
+                  </span>
+                  <span className="mono text-xs text-ink-3">|r| &le; 0.65</span>
+                </Command.Item>
+                <Command.Item
+                  value="Quant Lab Edge by Regime Heatmap Entry Price Seconds to Close"
+                  onSelect={() => closeAnd(() => onJumpQuantSection("regime"))}
+                  className="flex min-h-11 cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-2 text-sm text-ink outline-none data-[selected=true]:bg-blue-soft sm:min-h-9"
+                >
+                  <span className="flex items-center gap-2">
+                    <Grid3X3 className="size-4 text-success-foreground" aria-hidden />
+                    <span>Quant Lab: Edge-by-Regime Heatmap</span>
+                  </span>
+                  <span className="mono text-xs text-ink-3">5&times;4 grid</span>
                 </Command.Item>
                 <Command.Item
                   value="Quant Lab Isotonic Recalibration PAV EV After Fees Gate"

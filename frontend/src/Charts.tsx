@@ -20,6 +20,7 @@ import {
 } from "@/lib/desk";
 import type { CalibrationBucket, MonteCarloData } from "@/lib/quant";
 import type { RecalBucket, ScalePlanData } from "@/lib/scaling";
+import type { CorrelationMatrixData, RegimeCell } from "@/lib/tournament";
 import { drawOnce } from "@/motionProps";
 
 export type Point = [number, number];
@@ -1524,5 +1525,462 @@ export function ProvenanceTag({ kind }: { kind: "venue" | "tape" | "paper" }) {
     <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-ink-2">
       tape
     </Pill>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 12x12 Strategy Return Correlation Heatmap SVG (Pearson r across OOS windows)
+// ---------------------------------------------------------------------------
+
+function shortStrategyTag(name: string, maxLen = 13): string {
+  if (name.length <= maxLen) return name;
+  return name.slice(0, maxLen - 1) + "…";
+}
+
+function shortColumnTag(name: string, idx: number): string {
+  const parts = name.split(/[-_]/).filter(Boolean);
+  if (parts.length >= 2) {
+    return `${parts[0].slice(0, 2)}${parts[1].slice(0, 1)}`.toUpperCase();
+  }
+  return `S${idx + 1}`;
+}
+
+export function CorrelationMatrixChart({
+  data,
+  lineupSet,
+}: {
+  data: CorrelationMatrixData;
+  lineupSet?: Set<string>;
+}) {
+  const [hover, setHover] = useState<[number, number] | null>(null);
+  const strategies = data.strategies.slice(0, 12);
+  const n = strategies.length;
+
+  if (n === 0) {
+    return (
+      <div className="rounded-lg border border-hairline bg-board p-4 text-xs text-ink-2">
+        Need strategies with settled out-of-sample windows to compute pairwise return correlations.
+      </div>
+    );
+  }
+
+  const left = 120;
+  const top = 34;
+  const cellW = 38;
+  const cellH = 28;
+  const right = 10;
+  const bottom = 10;
+  const W = left + n * cellW + right;
+  const H = top + n * cellH + bottom;
+
+  const active = hover ?? (n > 1 ? [0, 1] : [0, 0]);
+  const [ai, aj] = active;
+  const activeR = data.matrix[ai]?.[aj] ?? null;
+  const activeN = data.sharedWindows[ai]?.[aj] ?? 0;
+  const exceedsCap = ai !== aj && activeR !== null && Math.abs(activeR) > data.threshold;
+
+  return (
+    <div className="w-full space-y-2">
+      {/* Live cell readout strip */}
+      <div
+        id="corr-hover-readout"
+        className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-hairline bg-board px-3 py-1.5 font-mono text-xs tabular-nums"
+      >
+        <span className="truncate font-semibold text-ink">
+          {strategies[ai]} × {strategies[aj]}
+        </span>
+        <div className="flex flex-wrap items-center gap-3">
+          <span
+            className={
+              activeR === null
+                ? "text-ink-3"
+                : exceedsCap
+                  ? "font-semibold text-warning-foreground"
+                  : activeR >= 0
+                    ? "text-info-foreground"
+                    : "text-destructive-foreground"
+            }
+          >
+            r = {activeR !== null ? `${activeR >= 0 ? "+" : ""}${activeR.toFixed(2)}` : "n/a"}
+          </span>
+          <span className="text-ink-2">n={activeN}</span>
+          {ai !== aj && activeR !== null && (
+            <span className={exceedsCap ? "text-warning-foreground" : "text-success-foreground"}>
+              {exceedsCap ? `|r| > ${data.threshold.toFixed(2)}` : `|r| <= ${data.threshold.toFixed(2)}`}
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="w-full overflow-x-auto pb-1">
+        <svg
+          id="correlation-matrix-svg"
+          role="img"
+          aria-label={`${n} by ${n} strategy return Pearson correlation matrix with ${data.threshold} decorrelation threshold`}
+          viewBox={`0 0 ${W} ${H}`}
+          width={W}
+          height={H}
+          style={{ width: W, height: H }}
+          className="block select-none"
+        >
+          {/* Column headers */}
+          {strategies.map((s, j) => {
+            const cx = left + j * cellW + cellW / 2;
+            const hi = aj === j;
+            return (
+              <text
+                key={`ch-${s}`}
+                x={cx}
+                y={top - 10}
+                textAnchor="middle"
+                fontSize={12}
+                className="font-mono"
+                style={{ fill: hi ? "var(--ink)" : "var(--ink-3)", fontWeight: hi ? 700 : 500 }}
+              >
+                {shortColumnTag(s, j)}
+              </text>
+            );
+          })}
+
+          {/* Rows */}
+          {strategies.map((rowName, i) => {
+            const ry = top + i * cellH;
+            const rowHi = ai === i;
+            const inLineup = lineupSet?.has(rowName) ?? false;
+            return (
+              <g key={`row-${rowName}`}>
+                <text
+                  x={left - 8}
+                  y={ry + cellH / 2 + 4}
+                  textAnchor="end"
+                  fontSize={12}
+                  className="font-mono"
+                  style={{
+                    fill: rowHi ? "var(--ink)" : inLineup ? "var(--blue)" : "var(--ink-2)",
+                    fontWeight: rowHi || inLineup ? 600 : 400,
+                  }}
+                >
+                  {shortStrategyTag(rowName, 13)}
+                </text>
+
+                {strategies.map((colName, j) => {
+                  const rx = left + j * cellW;
+                  const r = data.matrix[i]?.[j] ?? null;
+                  const isDiag = i === j;
+                  const isActive = ai === i && aj === j;
+                  const highCorr = !isDiag && r !== null && Math.abs(r) > data.threshold;
+                  const mag = r !== null ? Math.min(1, Math.abs(r)) : 0;
+                  const overlayFill =
+                    r === null
+                      ? "transparent"
+                      : isDiag
+                        ? "var(--track)"
+                        : r >= 0
+                          ? "var(--dot-blue)"
+                          : "var(--dot-red)";
+                  const overlayOpacity = r === null ? 0 : isDiag ? 0.55 : 0.08 + mag * 0.34;
+                  const cellText = r === null ? "·" : isDiag ? "1.0" : r.toFixed(1).replace("-0.0", "0.0");
+
+                  return (
+                    <g
+                      key={`cell-${rowName}-${colName}`}
+                      data-corr-cell={`${i}-${j}`}
+                      className="cursor-pointer"
+                      onMouseEnter={() => setHover([i, j])}
+                      onClick={() => setHover([i, j])}
+                    >
+                      <rect
+                        x={rx + 1}
+                        y={ry + 1}
+                        width={cellW - 2}
+                        height={cellH - 2}
+                        rx={3}
+                        style={{ fill: "var(--board)" }}
+                      />
+                      {overlayOpacity > 0 && (
+                        <rect
+                          x={rx + 1}
+                          y={ry + 1}
+                          width={cellW - 2}
+                          height={cellH - 2}
+                          rx={3}
+                          style={{ fill: overlayFill, opacity: overlayOpacity }}
+                        />
+                      )}
+                      <rect
+                        x={rx + 1}
+                        y={ry + 1}
+                        width={cellW - 2}
+                        height={cellH - 2}
+                        rx={3}
+                        fill="none"
+                        style={{
+                          stroke: isActive
+                            ? "var(--ink)"
+                            : highCorr
+                              ? "var(--dot-amber)"
+                              : "var(--hairline)",
+                          strokeWidth: isActive ? 1.75 : highCorr ? 1.25 : 0.75,
+                        }}
+                      />
+                      <text
+                        x={rx + cellW / 2}
+                        y={ry + cellH / 2 + 4}
+                        textAnchor="middle"
+                        fontSize={12}
+                        className="font-mono tabular-nums"
+                        style={{
+                          fill: r === null ? "var(--ink-3)" : "var(--ink)",
+                          fontWeight: isActive || highCorr ? 700 : 500,
+                        }}
+                      >
+                        {cellText}
+                      </text>
+                    </g>
+                  );
+                })}
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 5x4 Edge-by-Regime Heatmap SVG (Entry Price Bucket x Seconds-to-Close)
+// ---------------------------------------------------------------------------
+
+export function RegimeHeatmapChart({
+  priceBuckets,
+  timeBuckets,
+  cells,
+}: {
+  priceBuckets: string[];
+  timeBuckets: string[];
+  cells: RegimeCell[];
+}) {
+  const cellMap = new Map<string, RegimeCell>();
+  for (const c of cells) cellMap.set(`${c.priceBucket}|${c.timeBucket}`, c);
+
+  const firstPopulated = cells.find((c) => c.n > 0) ?? cells[0] ?? null;
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const activeCell =
+    (selectedKey ? cellMap.get(selectedKey) : null) ?? firstPopulated;
+
+  const left = 74;
+  const top = 32;
+  const cellW = 114;
+  const cellH = 54;
+  const right = 10;
+  const bottom = 10;
+  const W = left + timeBuckets.length * cellW + right;
+  const H = top + priceBuckets.length * cellH + bottom;
+
+  const maxAbsExp = Math.max(
+    4,
+    ...cells.map((c) => (c.netExpectancyCents !== null ? Math.abs(c.netExpectancyCents) : 0)),
+  );
+
+  return (
+    <div className="w-full space-y-2">
+      {/* Hover / active regime cell readout */}
+      <div
+        id="regime-hover-readout"
+        className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-hairline bg-board px-3 py-1.5 font-mono text-xs tabular-nums"
+      >
+        {activeCell && activeCell.n > 0 ? (
+          <>
+            <span className="font-semibold text-ink">
+              {activeCell.priceBucket} · {activeCell.timeBucket} (n={activeCell.n})
+            </span>
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-ink-2">
+                Win {activeCell.winRatePct !== null ? `${activeCell.winRatePct.toFixed(1)}%` : "-"}
+                {activeCell.wilsonLowPct !== null && activeCell.wilsonHighPct !== null
+                  ? ` [${Math.round(activeCell.wilsonLowPct)}–${Math.round(activeCell.wilsonHighPct)}%]`
+                  : ""}
+              </span>
+              <span className="text-ink-3">
+                Fee {activeCell.avgFeeCents !== null ? `${activeCell.avgFeeCents.toFixed(1)}c` : "-"}
+              </span>
+              <span
+                className={
+                  activeCell.netExpectancyCents !== null && activeCell.netExpectancyCents > 0
+                    ? "font-semibold text-success-foreground"
+                    : "font-semibold text-destructive-foreground"
+                }
+              >
+                {activeCell.netExpectancyCents !== null
+                  ? `${activeCell.netExpectancyCents >= 0 ? "+" : ""}${activeCell.netExpectancyCents.toFixed(2)}c/ct`
+                  : "-"}
+              </span>
+              {activeCell.lowSample && (
+                <span className="text-warning-foreground">Low n (&lt;20)</span>
+              )}
+            </div>
+          </>
+        ) : (
+          <span className="text-ink-2">Hover any populated entry-price × time-to-close cell to inspect edge &amp; Wilson CI.</span>
+        )}
+      </div>
+
+      <div className="w-full overflow-x-auto pb-1">
+        <svg
+          id="regime-heatmap-svg"
+          role="img"
+          aria-label="Edge by regime heatmap of entry price bucket versus seconds to close"
+          viewBox={`0 0 ${W} ${H}`}
+          width={W}
+          height={H}
+          style={{ width: W, height: H }}
+          className="block select-none"
+        >
+          {/* Time-to-close column headers */}
+          {timeBuckets.map((tb, j) => {
+            const cx = left + j * cellW + cellW / 2;
+            return (
+              <text
+                key={`tb-${tb}`}
+                x={cx}
+                y={top - 10}
+                textAnchor="middle"
+                fontSize={12}
+                className="font-mono"
+                style={{ fill: "var(--ink-2)", fontWeight: 600 }}
+              >
+                {tb}
+              </text>
+            );
+          })}
+
+          {/* Price bucket rows */}
+          {priceBuckets.map((pb, i) => {
+            const ry = top + i * cellH;
+            return (
+              <g key={`pb-${pb}`}>
+                <text
+                  x={left - 8}
+                  y={ry + cellH / 2 + 4}
+                  textAnchor="end"
+                  fontSize={12}
+                  className="font-mono"
+                  style={{ fill: "var(--ink-2)", fontWeight: 600 }}
+                >
+                  {pb}
+                </text>
+
+                {timeBuckets.map((tb, j) => {
+                  const key = `${pb}|${tb}`;
+                  const cell = cellMap.get(key) ?? {
+                    priceBucket: pb,
+                    timeBucket: tb,
+                    n: 0,
+                    wins: 0,
+                    winRatePct: null,
+                    avgFeeCents: null,
+                    netExpectancyCents: null,
+                    wilsonLowPct: null,
+                    wilsonHighPct: null,
+                    lowSample: true,
+                  };
+                  const rx = left + j * cellW;
+                  const isActive =
+                    activeCell?.priceBucket === pb && activeCell?.timeBucket === tb;
+                  const exp = cell.netExpectancyCents;
+                  const intensity = exp !== null && cell.n > 0 ? Math.min(1, Math.abs(exp) / maxAbsExp) : 0;
+                  const fillTone =
+                    cell.n === 0 || exp === null
+                      ? "transparent"
+                      : exp > 0
+                        ? "var(--dot-green)"
+                        : "var(--dot-red)";
+                  const fillOpacity = cell.n === 0 || exp === null ? 0 : 0.1 + intensity * 0.28;
+
+                  return (
+                    <g
+                      key={key}
+                      data-regime-cell={key}
+                      className="cursor-pointer"
+                      onMouseEnter={() => setSelectedKey(key)}
+                      onClick={() => setSelectedKey(key)}
+                    >
+                      <rect
+                        x={rx + 2}
+                        y={ry + 2}
+                        width={cellW - 4}
+                        height={cellH - 4}
+                        rx={6}
+                        style={{ fill: "var(--board)" }}
+                      />
+                      {fillOpacity > 0 && (
+                        <rect
+                          x={rx + 2}
+                          y={ry + 2}
+                          width={cellW - 4}
+                          height={cellH - 4}
+                          rx={6}
+                          style={{ fill: fillTone, opacity: fillOpacity }}
+                        />
+                      )}
+                      <rect
+                        x={rx + 2}
+                        y={ry + 2}
+                        width={cellW - 4}
+                        height={cellH - 4}
+                        rx={6}
+                        fill="none"
+                        style={{
+                          stroke: isActive ? "var(--ink)" : "var(--hairline)",
+                          strokeWidth: isActive ? 1.75 : 1,
+                        }}
+                      />
+
+                      {cell.n > 0 && cell.lowSample && (
+                        <circle
+                          cx={rx + cellW - 11}
+                          cy={ry + 11}
+                          r={3}
+                          style={{ fill: "var(--dot-amber)" }}
+                        />
+                      )}
+
+                      <text
+                        x={rx + cellW / 2}
+                        y={ry + 22}
+                        textAnchor="middle"
+                        fontSize={12}
+                        className="font-mono tabular-nums"
+                        style={{
+                          fill: cell.n > 0 ? "var(--ink)" : "var(--ink-3)",
+                          fontWeight: cell.n > 0 ? 700 : 400,
+                        }}
+                      >
+                        {cell.n > 0 && exp !== null
+                          ? `${exp >= 0 ? "+" : ""}${exp.toFixed(1)}c`
+                          : "—"}
+                      </text>
+                      <text
+                        x={rx + cellW / 2}
+                        y={ry + 41}
+                        textAnchor="middle"
+                        fontSize={12}
+                        className="font-mono tabular-nums"
+                        style={{ fill: "var(--ink-2)" }}
+                      >
+                        {cell.n > 0
+                          ? `n=${cell.n}${cell.winRatePct !== null ? ` · ${Math.round(cell.winRatePct)}%` : ""}`
+                          : "no trades"}
+                      </text>
+                    </g>
+                  );
+                })}
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+    </div>
   );
 }
