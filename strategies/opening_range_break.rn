@@ -1,0 +1,40 @@
+// Paper research shape: opening range break.
+// Buy YES in the opening third of the 15-minute window (10 to 14 minutes
+// remaining) when price breaks cleanly above 60c without already being
+// pinned above 78c, with an orderly book spread (<= 4c).
+// Scored strictly on paper by the shadow scorer — this file places nothing.
+
+pub fn name() {
+    "opening-range-break"
+}
+
+pub fn side() {
+    "yes"
+}
+
+pub fn describe() {
+    "Capture opening-range YES breakouts (60c-78c, spread <=4c) with 10m-14m remaining."
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    if secs_to_close > 840 || secs_to_close < 600 {
+        return false;
+    }
+    if yes_ask < 0.60 || yes_ask > 0.78 || no_ask < 0.01 || no_ask > 0.99 {
+        return false;
+    }
+    let spread = yes_ask + no_ask - 1.0;
+    if spread < -0.001 || spread > 0.045 {
+        return false;
+    }
+    let cents = yes_ask * 100.0;
+    (cents - cents.round()).abs() < 0.000001
+}
+
+pub fn entry_quote(yes_ask, no_ask, secs_to_close) {
+    if allow_entry(yes_ask, no_ask, secs_to_close) {
+        Some((yes_ask * 100.0).round() / 100.0)
+    } else {
+        None
+    }
+}
