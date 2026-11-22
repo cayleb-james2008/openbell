@@ -189,12 +189,11 @@ Environment (all optional):
 
 ## Checks
 
-`cargo test` runs the unit tests and the `--version` integration test. `bash .loop/verify` builds the binary, runs
-the Rust tests, and runs the
-check kit (including `first_run.sh`: the port fallback, the opener's skip rules and the built-in library): the order-path fence, slot rotation and reconciliation against
+`cargo test` runs the unit tests and the `--version` integration test, and `cargo clippy --all-targets -- -D warnings` enforces zero warnings. `bash .loop/verify` builds the binary, runs
+the Rust tests, and runs the 15-check hermetic and venue-proof kit (including `first_run.sh`: the port fallback, the opener's skip rules and the built-in library): the order-path fence, slot rotation and reconciliation against
 independent recomputation, collector health counted both ways, the equity
 curve reconciled against the slot report, the daily report's honesty
-assertions, the strategy-library mutation isolation, and both themes. The
+assertions, the strategy-library mutation isolation, and both themes. In `frontend/`, `npm run check:ui` runs the headless Playwright gate (71 checks across 1440/768/390/320 px in light and dark) and worst-case data replay suite (18 checks). The
 kit is the bar: it is expected to pass end to end, and it is re-run after
 every change.
 
@@ -202,9 +201,9 @@ every change.
 
 - `src/main.rs` — the whole server: collector, shadow scorer, slot system,
   report, and the HTTP API.
+- `src/open.rs` — display-aware local browser opener on startup.
 - `src/update.rs` — the release check and self-update.
 - `strategies/*.rn` — the strategy library (Rune).
-- `assets/index.html` — the desk's single page: a purpose line and a "How to
-  read this" line, account, collector health, the paper equity chart, the
-  strategies, and the daily report. Each panel shows its own error. Light and
-  dark themes, dark by default, the switch in the settings footer.
+- `frontend/` & `rune/used/` — React 19 + Tailwind 4 House Frontend source, self-hosted Geist & Geist Mono `.woff2` fonts, copied House Frontend parts, and Playwright E2E checks (`frontend/e2e/`), compiled into one self-contained HTML file at `assets/index.html` and embedded into the binary.
+- `JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md` — product job questions, eight-library House Frontend coverage, and interaction/motion inventory.
+- `assets/index.html` — the compiled single-file desk: daily report and forward-evidence standing, six instrument readings, paper slots, keyboard-navigable strategy ledger with detail drawer (`/` search, `j`/`k`/`Enter`), virtualised market tape, venue account, and line-by-line audit trail. Light by default with a full dark theme (`Appearance` in the header).
