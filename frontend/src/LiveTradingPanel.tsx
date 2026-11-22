@@ -485,8 +485,8 @@ export function LiveDeskWorkspace({
   const parsedCount = Number(countInput);
   const parsedPrice = Number(priceInput);
   const railEval = useMemo(
-    () => evaluateOrderRails(status, ticker, parsedCount, parsedPrice),
-    [status, ticker, parsedCount, parsedPrice],
+    () => evaluateOrderRails(status, ticker, parsedCount, parsedPrice, action),
+    [status, ticker, parsedCount, parsedPrice, action],
   );
 
   const tickerSuggestions = useMemo(() => {

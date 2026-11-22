@@ -99,9 +99,9 @@ as **unavailable** — never zero, never fabricated.
 
 ## The collector
 
-A background pass collects Kalshi's **public** market data — the only
-venue call in the program is an unauthenticated GET of public markets (the release check in "Versions and updates" is the only other outbound call) —
-for five 15-minute series (BTC, ETH, SOL, XRP, DOGE) and appends each pass to
+A background pass collects Kalshi's **public** market data via unauthenticated
+GET requests (separate from the authenticated Kalshi Trade API v2 trading client
+and the GitHub release check in "Versions and updates") for five 15-minute series (BTC, ETH, SOL, XRP, DOGE) and appends each pass to
 a local tape in a single write, so a reader never sees a torn half-pass. The
 home screen shows the collector's health next to everything else: tape
 lines on disk, distinct markets seen, distinct settled windows, tape lines
@@ -220,7 +220,7 @@ Environment (all optional):
 ## Checks
 
 `cargo test` runs the unit tests (including `src/analytics.rs` exact Wilson/Brier/ECE, Walk-Forward, Monte Carlo, and 12-strategy sandbox proofs), the `--version` integration test (`tests/cli.rs`), and the `v0.5.0` scale/SSE/export/Quant HTTP suite (`tests/v050_core.rs`: 100,000 ticks / 2,000 settled windows / 30 concurrent clients at `<300ms` p95), while `cargo clippy --all-targets -- -D warnings` enforces zero warnings. `bash .loop/verify` builds the binary, runs
-the Rust tests, and runs the 16-check hermetic and venue-proof kit (including `first_run.sh`: the port fallback, the opener's skip rules and the 12-strategy built-in library): the order-path fence, slot rotation and reconciliation against
+the Rust tests, and runs the 16-check hermetic and venue-proof kit (including `first_run.sh`: the port fallback, the opener's skip rules and the 12-strategy built-in library): the hard risk rails check (`.loop/checks/rails.sh`), slot rotation and reconciliation against
 independent recomputation, collector health counted both ways, the equity
 curve reconciled against the slot report, the daily report's honesty
 assertions, the strategy-library mutation isolation, and both themes. In `frontend/`, `npm run check:ui` runs the headless Playwright gate (responsive layout, WCAG AA contrast, tap targets, Settings-only Light/Dark theme, SVG label geometry, Tape/Strategies/Slots/Quant Lab 4-tab workbench, Strategy Sandbox, Cmd+K palette, Market & Strategy inspectors, and Update strip across 1440/768/390/320 px in light and dark) and worst-case data replay suite. The
@@ -241,4 +241,4 @@ every change.
 - `strategies/*.rn` — the 12-strategy paper library.
 - `frontend/` — React 19 + Tailwind 4 House Frontend source (8/8 libraries), self-hosted Geist & Geist Mono `.woff2` fonts, and Playwright E2E checks (`frontend/e2e/`), compiled into one self-contained HTML file at `assets/index.html` and embedded into the binary.
 - `JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md` — product job questions, eight-library House Frontend coverage, and interaction/motion inventory.
-- `assets/index.html` — the compiled single-file Kalshi 15m Institutional Paper Quant Desk: top command bar with `/` global filter, `Cmd+K` Command Palette, and live `Collect now`; Hero Telemetry & Compounding Strip (`SlidingNumber` KPI tiles, interactive paper equity curve, Tremor `Tracker` & `CategoryBar`); four-tab Quant Workbench (`Live 15m Tape` with SSE stream pill, inline YES/spread chart & Market Inspector; `Strategies` with 12-strategy leaderboard, Strategy Inspector & interactive Strategy Sandbox editor + "Backtest on Tape"; `Slot Desk` with synchronized Equity + Drawdown underwater subplot, stint attribution, 3-strike tracker, `.md`/`.csv` Report Exports, verbatim Daily Report & read-only Venue Account; `Quant Lab` with Calibration Wilson CIs, 1,000-path Monte Carlo fan & IS/OOS Walk-Forward table); and Desk Settings `Vaul` sheet (Light default + full Dark `Appearance` toggle, collector cadence, self-updates, and provenance legend).
+- `assets/index.html` — the compiled single-file Live Kalshi Connected Trading & Quant Desk: top command bar with `/` global filter, `Cmd+K` Command Palette, `Paper | Arm Live` pill, crimson Emergency Kill Switch, and live `Collect now`; Live Kalshi Account Strip + Order Ticket with real-time 7-check Hard Risk Rails & working orders/positions/fills; Hero Telemetry & Compounding Strip (`SlidingNumber` KPI tiles, interactive paper equity curve, Tremor `Tracker` & `CategoryBar`); five-tab Quant & Live Trading Workbench (`Live 15m Tape`, `Live Trading`, `Strategies`, `Slot Desk`, `Quant Lab`); and Desk Settings `Vaul` sheet (Kalshi Trade API v2 Demo/Prod credentials & Risk Rail caps, Light default + full Dark `Appearance` toggle, auto-collector cadence, self-updates, and provenance legend).
