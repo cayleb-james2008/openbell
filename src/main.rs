@@ -3286,6 +3286,37 @@ fn refuse_request(
     None
 }
 
+/// Hard transport boundary for `/api/live/*`:
+/// - Strictly loopback-only (`localhost` / `127.0.0.1` / `[::1]`), even if
+///   `OPENBELL_ALLOWED_HOSTS` grants LAN read access.
+/// - Every live mutation (`POST`/`DELETE`/etc.) requires explicit `X-OpenBell-CSRF` header.
+fn refuse_live_request(
+    method: &str,
+    host: &str,
+    headers: &[(String, String)],
+) -> Option<(u16, &'static str)> {
+    if !is_loopback_host(host) {
+        return Some((
+            403,
+            "live Kalshi trading endpoints are restricted to localhost (loopback) only",
+        ));
+    }
+    if !matches!(method, "GET" | "HEAD") {
+        let csrf = headers
+            .iter()
+            .find(|(n, _)| n == "x-openbell-csrf")
+            .map(|(_, v)| v.trim())
+            .unwrap_or("");
+        if csrf.is_empty() {
+            return Some((
+                403,
+                "live Kalshi mutations require the X-OpenBell-CSRF header",
+            ));
+        }
+    }
+    None
+}
+
 type RawRequest = (String, String, String, Vec<(String, String)>);
 fn read_request(stream: &mut std::net::TcpStream) -> Option<RawRequest> {
     // One deadline for the whole request: a per-read timeout alone
@@ -4509,6 +4540,13 @@ fn main() {
                             return;
                         }
                         let route = path.split_once('?').map(|(r, _)| r).unwrap_or(&path);
+                        if route == "/api/live" || route.starts_with("/api/live/") {
+                            if let Some((status, message)) = refuse_live_request(&method, host, &headers) {
+                                let response = json_response(status, &serde_json::json!({ "error": message }).to_string());
+                                let _ = stream.write_all(response.as_bytes());
+                                return;
+                            }
+                        }
                         if method == "GET" && route == "/api/tape/stream" {
                             serve_sse_stream(&mut stream, &app);
                             return;
@@ -5749,5 +5787,25 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn live_endpoints_enforce_loopback_and_csrf_header() {
+        let no_hdrs: Vec<(String, String)> = vec![];
+        let with_csrf = vec![("x-openbell-csrf".to_string(), "1".to_string())];
+
+        // Non-loopback host refused for BOTH GET and POST even with CSRF header.
+        assert_eq!(refuse_live_request("GET", "desk.lan:8472", &no_hdrs).map(|x| x.0), Some(403));
+        assert_eq!(refuse_live_request("POST", "192.168.1.10:8472", &with_csrf).map(|x| x.0), Some(403));
+
+        // Loopback GET allowed without CSRF.
+        assert!(refuse_live_request("GET", "127.0.0.1:8472", &no_hdrs).is_none());
+        assert!(refuse_live_request("GET", "localhost:8472", &no_hdrs).is_none());
+
+        // Loopback mutations refused without CSRF, allowed with CSRF.
+        assert_eq!(refuse_live_request("POST", "127.0.0.1:8472", &no_hdrs).map(|x| x.0), Some(403));
+        assert_eq!(refuse_live_request("DELETE", "localhost:8472", &no_hdrs).map(|x| x.0), Some(403));
+        assert!(refuse_live_request("POST", "127.0.0.1:8472", &with_csrf).is_none());
+        assert!(refuse_live_request("DELETE", "127.0.0.1:8472", &with_csrf).is_none());
     }
 }
