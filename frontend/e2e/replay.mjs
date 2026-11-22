@@ -41,6 +41,9 @@ for (const w of [1440, 390]) {
     ok(`openbell ${w}: differing standards say waiting for evidence and claim no window count`, /waiting for evidence/.test(t) && !/below/.test(t), t.replace(/\s+/g, ' ')); await ctx.close() }
   { const { ctx, p } = await page(w, BASE + '?dataset=fixture', [['**/api/strategies*', r => json(r, { not: 'a list' })]])
     ok(`openbell ${w}: a strategies body of the wrong shape says the state is unavailable`, (await p.locator('#standing-label').innerText().catch(() => '')) === 'Strategy state unavailable', p.errs.join('|')); await ctx.close() }
+  { const { ctx, p } = await page(w, BASE + '?dataset=fixture', [['**/api/strategies*', patch(j => [null, ...j.map((s, i) => i === 0 ? { ...s, verdict: null } : i === 1 ? { ...s, verdict: 42 } : s)])]])
+    const bodyTxt = await p.locator('body').innerText().catch(() => '')
+    ok(`openbell ${w}: null list entry and non-string verdict render without crashing or NaN`, !p.errs.length && await p.locator('#strategies table tbody tr').count() === 5 && !/\bNaN\b|\bundefined\b/.test(bodyTxt), p.errs.join('|')); await ctx.close() }
   { const { ctx, p } = await page(w, BASE + '?dataset=fixture', [['**/api/collect', r => json(r, { snapshots_written: 8, errors: ['KXETH15M/open: venue response had no markets array'] })]])
     await p.locator('#collect-btn').click(); await p.waitForTimeout(800)
     ok(`openbell ${w}: a partial collect names the failed read`, /Collected one pass, but 1 market read failed/.test(await p.locator('#collect-status').innerText().catch(() => ''))); await ctx.close() }

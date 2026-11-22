@@ -29,7 +29,7 @@ cp strategies/*.rn "$WORK/strats/"
 PORT=8496
 OPENBELL_DATA="$WORK/data" OPENBELL_STRATEGIES="$WORK/strats" \
 OPENBELL_COLLECT_SECS=3600 PORT=$PORT \
-  ./target/debug/openbell-rs > "$WORK/server.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s "http://127.0.0.1:$PORT/api/home" >/dev/null 2>&1 && break; sleep 0.5; done
 
@@ -83,7 +83,7 @@ jq -s 'length > 0' "$WORK/data/snapshots.jsonl" >/dev/null \
 # an infinite pot falls back to the default 100.
 OPENBELL_DATA="$WORK/data" OPENBELL_STRATEGIES="$PWD/strategies" \
 OPENBELL_COLLECT_SECS=0 OPENBELL_PAPER_POT=inf PORT=8495 \
-  ./target/debug/openbell-rs > "$WORK/server2.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server2.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s "http://127.0.0.1:8495/api/home" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -s "http://127.0.0.1:8495/api/home" | jq -e '.collector.collect_interval_secs == 5' >/dev/null \
@@ -103,11 +103,11 @@ SHIM
 chmod +x "$WORK/shim-env/curl" "$WORK/shim-garbage/curl"
 PATH="$WORK/shim-env:$PATH" OPENBELL_DATA="$WORK/data-env" OPENBELL_STRATEGIES="$PWD/strategies" \
 OPENBELL_COLLECT_SECS=3600 PORT=8494 \
-  ./target/debug/openbell-rs > "$WORK/server-env.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server-env.log" 2>&1 &
 PIDS="$PIDS $!"
 PATH="$WORK/shim-garbage:$PATH" OPENBELL_DATA="$WORK/data-garbage" OPENBELL_STRATEGIES="$PWD/strategies" \
 OPENBELL_COLLECT_SECS=3600 PORT=8493 \
-  ./target/debug/openbell-rs > "$WORK/server-garbage.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server-garbage.log" 2>&1 &
 PIDS="$PIDS $!"
 for p in 8494 8493; do for i in $(seq 1 20); do curl -s "http://127.0.0.1:$p/api/home" >/dev/null 2>&1 && break; sleep 0.5; done; done
 code=$(curl -s -o "$WORK/env-resp.json" -w '%{http_code}' -X POST "http://127.0.0.1:8494/api/collect")
@@ -122,7 +122,7 @@ curl -s "http://127.0.0.1:8493/api/home" | jq -e '.collector.markets_seen == 0 a
 # A half-present credential gets its true reason (D-R4).
 OPENBELL_DATA="$WORK/data" OPENBELL_STRATEGIES="$PWD/strategies" \
 OPENBELL_COLLECT_SECS=3600 PORT=8492 KALSHI_API_KEY_ID=dummy-id \
-  ./target/debug/openbell-rs > "$WORK/server-half.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server-half.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s "http://127.0.0.1:8492/api/report" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -s "http://127.0.0.1:8492/api/report" | jq -r '.report' | head -1 | grep -q 'no private key path is set' \
@@ -164,7 +164,7 @@ pub fn describe() { "a well-formed strategy" }
 RN
 OPENBELL_DATA="$WORK/data2" OPENBELL_STRATEGIES="$WORK/strats2" \
 OPENBELL_COLLECT_SECS=3600 PORT=8491 \
-  ./target/debug/openbell-rs > "$WORK/server2.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server2.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s "http://127.0.0.1:8491/api/home" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -s "http://127.0.0.1:8491/api/home" > "$WORK/home2.json"
@@ -203,7 +203,7 @@ pub fn describe() { "enters every window on the yes side" }
 RN
 OPENBELL_DATA="$WORK/data3" OPENBELL_STRATEGIES="$WORK/strats3" \
 OPENBELL_COLLECT_SECS=3600 PORT=8490 \
-  ./target/debug/openbell-rs > "$WORK/server3.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server3.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s "http://127.0.0.1:8490/api/home" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -s "http://127.0.0.1:8490/api/home" | jq -e '.collector.conflicting_settlements == 1' >/dev/null \
@@ -233,7 +233,7 @@ open(path, "w").write("\n".join([
 PY
 OPENBELL_DATA="$WORK/data4" OPENBELL_STRATEGIES="$WORK/strats3" \
 OPENBELL_COLLECT_SECS=60 PORT=8489 \
-  ./target/debug/openbell-rs > "$WORK/server4.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server4.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s "http://127.0.0.1:8489/api/home" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -s "http://127.0.0.1:8489/api/home" > "$WORK/home4.json"
@@ -255,11 +255,11 @@ cp strategies/*.rn "$WORK/strats5l/"
 cp "$WORK/strats/looper.rn" "$WORK/strats5l/"
 OPENBELL_DATA="$WORK/data5" OPENBELL_STRATEGIES="$WORK/strats5" \
 OPENBELL_COLLECT_SECS=3600 PORT=8488 \
-  ./target/debug/openbell-rs > "$WORK/server5.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server5.log" 2>&1 &
 PIDS="$PIDS $!"
 OPENBELL_DATA="$WORK/data5" OPENBELL_STRATEGIES="$WORK/strats5l" \
 OPENBELL_COLLECT_SECS=3600 PORT=8487 \
-  ./target/debug/openbell-rs > "$WORK/server5l.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server5l.log" 2>&1 &
 PIDS="$PIDS $!"
 for p in 8488 8487; do for i in $(seq 1 20); do curl -s "http://127.0.0.1:$p/api/home" >/dev/null 2>&1 && break; sleep 0.5; done; done
 curl -s "http://127.0.0.1:8488/api/slots" | jq '[.strategy_totals[] | {strategy, windows_traded}] | sort_by(.strategy)' > "$WORK/totals-clean.json"

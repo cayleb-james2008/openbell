@@ -78,6 +78,16 @@ for (const m of measures) ok(`measure ${m.data} ${m.size} ${m.theme}`, m.docOver
   ok('search empty state', await p.locator('#strategies [role=status]').innerText().then(t => /No strategy matches/.test(t)))
   await p.getByRole('button', { name: 'Show all strategies' }).click(); await p.waitForTimeout(150)
   ok('show all restores', await rowsShown(p) === 5)
+  // '/' shortcut focuses search and Kbd hint is present
+  await p.locator('body').click({ position: { x: 5, y: 300 } })
+  ok('search kbd hint shown when empty', (await p.locator('#strategies kbd').innerText().catch(() => '')).trim() === '/')
+  await p.keyboard.press('/'); await p.waitForTimeout(100)
+  ok('slash key focuses strategies search', await p.evaluate(() => document.activeElement?.id === 'strategies-search'))
+  await p.keyboard.press('Escape'); await p.waitForTimeout(80)
+  ok('Escape blurs empty search', await p.evaluate(() => document.activeElement?.id !== 'strategies-search'))
+  // self-hosted Geist & Geist Mono fonts loaded
+  const fontsOk = await p.evaluate(async () => { await document.fonts.ready; return document.fonts.check('14px "Geist"') && [...document.fonts].some(f => f.family.includes('Geist Mono') && f.status === 'loaded') })
+  ok('self-hosted Geist and Geist Mono woff2 loaded', fontsOk)
   // standing line: the tally the page opens with must agree with the table filters above, and never count the example tape as forward-proven
   const tally = (await p.locator('#standing-detail li').evaluateAll(ls => ls.map(l => l.innerText.replace(/\s+/g, ' ').trim())))
   ok('standing line: fixture pass is not forward-proven, tally matches the Proven / Not proven / Waiting filters (2 / 1 / 2)',
@@ -121,7 +131,7 @@ for (const m of measures) ok(`measure ${m.data} ${m.size} ${m.theme}`, m.docOver
   ok('live tape switch', !p.url().includes('dataset=fixture') && await p.locator('text=Example tape.').count() === 0)
   ok('standing line on the live tape: 0 of 5, all below 100 traded windows', (await p.locator('#standing').innerText()).replace(/\s+/g, ' ').includes('Strategies proven on forward evidence 0 of 5 5 below 100 traded windows'))
   // theme
-  await p.getByRole('button', { name: 'Dark appearance' }).click()
+  await p.getByRole('button', { name: 'Dark', exact: true }).click()
   ok('theme toggles', (await p.evaluate(() => document.documentElement.dataset.theme)) === 'dark')
   // how to read
   await p.getByRole('button', { name: 'How to read this' }).click(); await p.waitForTimeout(400)
@@ -200,7 +210,50 @@ for (const m of measures) ok(`measure ${m.data} ${m.size} ${m.theme}`, m.docOver
   ok('phone how-to-read dialog', await p.locator('[role=dialog]').isVisible())
   await ctx.close()
 }
-// 5. reduced motion
+// 5. update strip: loopback apply/dismiss/focus/plain-error/staged, and non-loopback shared address
+{
+  const { ctx, p } = await open(1440, 900)
+  p.__allow = /409|500/
+  let snap = { mode: 'notify', current: '0.3.0', latest: '0.4.0', available: true, can_apply: true, dev_build: false, notes: 'Faster tape scan.', release_url: 'https://github.com/cayleb-james2008/openbell/releases/tag/v0.4.0', checked_at: Math.floor(Date.now() / 1000) }
+  let failApply = true
+  await p.route('**/api/update', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(snap) }))
+  await p.route('**/api/update/apply', r => {
+    if (failApply) return r.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: 'the download does not match its checksum, so it was discarded' }) })
+    snap = { ...snap, available: false, staged: '0.4.0', can_apply: false }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(snap) })
+  })
+  await p.goto(FX); await ready(p); await p.waitForSelector('#update-banner', { timeout: 5000 })
+  ok('update banner shows Update now and explainer on loopback', (await p.locator('#update-banner').innerText()).includes('Update now downloads it, checks it, and replaces this app.') && await p.getByRole('button', { name: 'Update now', exact: true }).count() === 1)
+  await p.getByRole('button', { name: 'Dismiss', exact: true }).click(); await p.waitForTimeout(200)
+  ok('Dismiss hides banner and focuses Show update', await p.locator('#update-banner').count() === 0 && await p.evaluate(() => document.activeElement?.textContent?.trim() === 'Show update'))
+  await p.getByRole('button', { name: 'Show update', exact: true }).click(); await p.waitForTimeout(200)
+  ok('Show update restores banner and focuses status', await p.locator('#update-banner').count() === 1 && await p.evaluate(() => document.activeElement?.closest('#update-banner') !== null))
+  await p.getByRole('button', { name: 'Update now', exact: true }).click(); await p.waitForTimeout(300)
+  const errTxt = await p.locator('#update-banner').innerText()
+  ok('failed apply shows plainUpdateError, Try again, and hides raw text in Details', errTxt.includes('The download did not pass its safety check') && !errTxt.includes('discarded') && await p.getByRole('button', { name: 'Try again', exact: true }).count() === 1)
+  failApply = false
+  await p.getByRole('button', { name: 'Try again', exact: true }).click(); await p.waitForTimeout(300)
+  const verRowCount = await p.locator('#version-row [role=status]').count()
+  ok('staged install focuses Restart now and says installed once in version row', await p.evaluate(() => document.activeElement?.textContent?.trim() === 'Restart now') && verRowCount === 1 && (await p.locator('#check-result').innerText()).trim() === '0.4.0 installed. Restart to use it.')
+  await ctx.close()
+}
+{
+  const { ctx, p } = await open(1440, 900)
+  const sharedOrigin = 'http://openbell.shared:18890'
+  const snap = { mode: 'notify', current: '0.3.0', latest: '0.4.0', available: true, can_apply: true, dev_build: false, notes: 'Notes.', release_url: 'https://github.com/cayleb-james2008/openbell/releases/tag/v0.4.0', checked_at: Math.floor(Date.now() / 1000) }
+  await p.route(sharedOrigin + '/**', async r => {
+    const u = new URL(r.request().url())
+    if (u.pathname === '/api/update') return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(snap) })
+    const upstream = await fetch(new URL(u.pathname + u.search, BASE).href, { method: r.request().method(), headers: { Host: new URL(BASE).host } })
+    const buf = Buffer.from(await upstream.arrayBuffer())
+    return r.fulfill({ status: upstream.status, headers: Object.fromEntries(upstream.headers.entries()), body: buf })
+  })
+  await p.goto(sharedOrigin + '/?dataset=fixture'); await ready(p); await p.waitForSelector('#update-banner', { timeout: 5000 })
+  const bannerTxt = await p.locator('#update-banner').innerText()
+  ok('non-loopback hides Update now and Check for updates, shows plain machine line', await p.getByRole('button', { name: 'Update now' }).count() === 0 && await p.locator('#check-updates').count() === 0 && bannerTxt.includes('To update, open OpenBell on the computer it runs on.') && !bannerTxt.includes('Update now downloads it'))
+  await ctx.close()
+}
+// 6. reduced motion
 {
   const { ctx, p } = await open(1440, 900, 'light', { reducedMotion: 'reduce' })
   await p.goto(FX); await ready(p); await p.waitForTimeout(1500)

@@ -17,7 +17,7 @@ python3 gen_fixture.py "$WORK/data/fixture-snapshots.jsonl"
 
 OPENBELL_DATA="$WORK/data" OPENBELL_STRATEGIES="$PWD/strategies" \
 OPENBELL_COLLECT_SECS=3600 PORT=$PORT \
-  ./target/debug/openbell-rs > "$WORK/server.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 1
 

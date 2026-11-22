@@ -134,7 +134,7 @@ export function AuditTrail({ lines }: { lines: string[] }) {
             {({ isExpanded }: { isExpanded: boolean }) => (
               <>
                 <ExpandableTrigger aria-expanded={isExpanded}
-                  className="flex min-h-11 w-full cursor-pointer flex-wrap items-center justify-between gap-x-3 gap-y-0.5 rounded-md py-1 pr-1 text-left outline-none transition-[background-color] duration-(--dur-press) ease-(--ease-house) hover:bg-board focus-visible:ring-2 focus-visible:ring-ring">
+                  className="flex min-h-11 w-full cursor-pointer flex-wrap items-center justify-between gap-x-3 gap-y-0.5 rounded-md py-1 pr-1 text-left outline-none transition-[background-color] duration-(--dur-press) ease-(--ease-house) hover:bg-board active:bg-track focus-visible:ring-2 focus-visible:ring-ring">
                   <span className="min-w-0 font-medium break-words text-ink">{it.title}</span>
                   <span className="basis-full text-sm break-words text-ink-2 md:basis-auto md:min-w-0 md:truncate">{it.summary}</span>
                 </ExpandableTrigger>

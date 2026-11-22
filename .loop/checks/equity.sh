@@ -19,7 +19,7 @@ python3 gen_slot_fixture.py "$WORK/data/slot-snapshots.jsonl" >/dev/null
 
 OPENBELL_DATA="$WORK/data" OPENBELL_STRATEGIES="$PWD/strategies" \
 OPENBELL_COLLECT_SECS=3600 PORT=$PORT \
-  ./target/debug/openbell-rs > "$WORK/server.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/openbell-rs" > "$WORK/server.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s "http://127.0.0.1:$PORT/api/home" >/dev/null 2>&1 && break; sleep 0.5; done
 

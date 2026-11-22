@@ -1,3 +1,4 @@
-/* Self-hosted theme fonts (SIL OFL / Fontshare free licence), inlined into the single page by the build. */
-@font-face { font-family: "Host Grotesk"; font-weight: 300 800; font-style: normal; font-display: swap; src: url("./fonts/HostGrotesk.woff2") format("woff2"); }
-@font-face { font-family: "Atkinson Hyperlegible Mono"; font-weight: 400 700; font-style: normal; font-display: swap; src: url("./fonts/AtkinsonHyperlegibleMono.woff2") format("woff2"); }
+/* Self-hosted Geist & Geist Mono (SIL OFL), inlined into the single page by the build. */
+@font-face { font-family: "Geist"; font-weight: 400; font-style: normal; font-display: swap; src: url("./fonts/Geist-Regular.woff2") format("woff2"); }
+@font-face { font-family: "Geist"; font-weight: 500; font-style: normal; font-display: swap; src: url("./fonts/Geist-Medium.woff2") format("woff2"); }
+@font-face { font-family: "Geist Mono"; font-weight: 400 500; font-style: normal; font-display: swap; src: url("./fonts/GeistMono-Regular.woff2") format("woff2"); }
