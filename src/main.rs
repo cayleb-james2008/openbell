@@ -199,8 +199,23 @@ fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize, bo
         if !out.status.success() {
             return Err(format!("curl exited {}", out.status));
         }
-        let body: serde_json::Value = serde_json::from_slice(&out.stdout)
-            .map_err(|e| format!("venue returned non-JSON: {e}"))?;
+        let body: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+            Ok(v) => v,
+            Err(e) => {
+                let text = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+                if text.contains("429") || text.contains("too many requests") || text.contains("too_many_requests") {
+                    hit_rate_limit = true;
+                    last_err = "venue returned HTTP 429 (too_many_requests)".to_string();
+                    if attempt < 3 {
+                        let wait_ms = 750u64 << attempt;
+                        std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+                return Err(format!("venue returned non-JSON: {e}"));
+            }
+        };
         let fetched_at = now_unix();
         // A response without a markets array is not market data — the
         // venue's error envelope is valid JSON with an "error" key, and
@@ -339,10 +354,199 @@ static SERIES_FAILED_LAST_PASS: std::sync::atomic::AtomicUsize =
 /// The series tickers behind that count, in SERIES order, each once.
 static SERIES_FAILED_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Run one pass. Ok carries (snapshots written, deduplicated count, per-series errors);
-/// a pass that wrote nothing BECAUSE everything failed is Err, so
-/// the API can say so instead of returning a cheerful 200 with 0.
-fn collect_once(data_dir: &Path) -> Result<(usize, usize, Vec<String>), String> {
+const AUTO_COLLECT_MIN_SECS: u64 = 30;
+const AUTO_COLLECT_MAX_SECS: u64 = 900;
+const READINESS_TARGET_WINDOWS: usize = 200;
+
+struct CollectPassReport {
+    written: usize,
+    deduplicated: usize,
+    errors: Vec<String>,
+    rate_limited: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CollectorState {
+    enabled: bool,
+    interval_secs: u64,
+    backoff_secs: u64,
+    rate_limited: bool,
+    consecutive_errors: u32,
+    in_flight: bool,
+    runs_total: u64,
+    last_run_epoch: Option<i64>,
+    next_run_epoch: Option<i64>,
+    last_written: usize,
+    last_deduped: usize,
+    last_error: Option<String>,
+    generation: u64,
+}
+
+impl CollectorState {
+    fn new(enabled: bool, interval_secs: u64) -> Self {
+        let clamped = interval_secs.clamp(AUTO_COLLECT_MIN_SECS, AUTO_COLLECT_MAX_SECS);
+        Self {
+            enabled,
+            interval_secs: clamped,
+            backoff_secs: 0,
+            rate_limited: false,
+            consecutive_errors: 0,
+            in_flight: false,
+            runs_total: 0,
+            last_run_epoch: None,
+            next_run_epoch: if enabled { Some(now_unix()) } else { None },
+            last_written: 0,
+            last_deduped: 0,
+            last_error: None,
+            generation: 0,
+        }
+    }
+
+    fn effective_interval_secs(&self) -> u64 {
+        self.interval_secs
+            .saturating_add(self.backoff_secs)
+            .clamp(AUTO_COLLECT_MIN_SECS, AUTO_COLLECT_MAX_SECS)
+    }
+}
+
+/// Adaptive backoff policy: doubles the wait on HTTP 429 / `too_many_requests`
+/// (up to `AUTO_COLLECT_MAX_SECS`), applies bounded backoff on general errors,
+/// and resets immediately to `0` on a clean pass.
+fn compute_adaptive_backoff(interval_secs: u64, consecutive_errors: u32, rate_limited: bool) -> u64 {
+    if consecutive_errors == 0 {
+        return 0;
+    }
+    let base = interval_secs.clamp(AUTO_COLLECT_MIN_SECS, AUTO_COLLECT_MAX_SECS);
+    let max_extra = AUTO_COLLECT_MAX_SECS.saturating_sub(base);
+    if max_extra == 0 {
+        return 0;
+    }
+    let step = (consecutive_errors - 1).min(4);
+    let extra = if rate_limited {
+        // Effective interval: 2x, 4x, 8x... capped at 900s.
+        let target = base.saturating_mul(2u64 << step).min(AUTO_COLLECT_MAX_SECS);
+        target.saturating_sub(base)
+    } else {
+        (30u64 << step).min(max_extra)
+    };
+    extra.min(max_extra)
+}
+
+struct CollectorScheduler {
+    state: std::sync::Mutex<CollectorState>,
+    cv: std::sync::Condvar,
+}
+
+impl CollectorScheduler {
+    fn new(enabled: bool, interval_secs: u64) -> Self {
+        Self {
+            state: std::sync::Mutex::new(CollectorState::new(enabled, interval_secs)),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    fn snapshot(&self) -> CollectorState {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    fn update_schedule(&self, enabled: Option<bool>, interval_secs: Option<u64>) -> CollectorState {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let was_enabled = st.enabled;
+        if let Some(iv) = interval_secs {
+            st.interval_secs = iv.clamp(AUTO_COLLECT_MIN_SECS, AUTO_COLLECT_MAX_SECS);
+            // Re-cap existing backoff under the updated base interval.
+            st.backoff_secs = compute_adaptive_backoff(
+                st.interval_secs,
+                st.consecutive_errors,
+                st.rate_limited,
+            );
+        }
+        if let Some(en) = enabled {
+            st.enabled = en;
+        }
+        let now = now_unix();
+        if !st.enabled {
+            st.next_run_epoch = None;
+            st.backoff_secs = 0;
+            st.rate_limited = false;
+            st.consecutive_errors = 0;
+        } else {
+            let eff = st.effective_interval_secs() as i64;
+            let due_at = match st.last_run_epoch {
+                Some(last) if now - last < eff && (!was_enabled || interval_secs.is_some()) => {
+                    last + eff
+                }
+                Some(last) if now - last < eff => last + eff,
+                _ => now,
+            };
+            st.next_run_epoch = Some(due_at);
+        }
+        st.generation = st.generation.wrapping_add(1);
+        let out = st.clone();
+        self.cv.notify_all();
+        out
+    }
+
+    fn mark_in_flight(&self, active: bool) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        st.in_flight = active;
+    }
+
+    fn record_pass_result(&self, res: &Result<CollectPassReport, (String, bool)>) -> CollectorState {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let now = now_unix();
+        st.in_flight = false;
+        st.last_run_epoch = Some(now);
+        st.runs_total = st.runs_total.saturating_add(1);
+        match res {
+            Ok(rep) => {
+                st.last_written = rep.written;
+                st.last_deduped = rep.deduplicated;
+                if rep.rate_limited {
+                    st.rate_limited = true;
+                    st.consecutive_errors = st.consecutive_errors.saturating_add(1).min(8);
+                    st.backoff_secs =
+                        compute_adaptive_backoff(st.interval_secs, st.consecutive_errors, true);
+                    st.last_error = if rep.errors.is_empty() {
+                        Some("venue rate limited (HTTP 429) — adaptive backoff active".to_string())
+                    } else {
+                        Some(rep.errors.join("; "))
+                    };
+                } else {
+                    st.rate_limited = false;
+                    st.consecutive_errors = 0;
+                    st.backoff_secs = 0;
+                    st.last_error = if rep.errors.is_empty() {
+                        None
+                    } else {
+                        Some(rep.errors.join("; "))
+                    };
+                }
+            }
+            Err((err, rate_limited)) => {
+                st.last_written = 0;
+                st.last_deduped = 0;
+                st.rate_limited = *rate_limited;
+                st.consecutive_errors = st.consecutive_errors.saturating_add(1).min(8);
+                st.backoff_secs = compute_adaptive_backoff(
+                    st.interval_secs,
+                    st.consecutive_errors,
+                    *rate_limited,
+                );
+                st.last_error = Some(err.clone());
+            }
+        }
+        st.next_run_epoch = if st.enabled {
+            Some(now + st.effective_interval_secs() as i64)
+        } else {
+            None
+        };
+        st.clone()
+    }
+}
+
+/// Run one pass with rate-limit telemetry. Strictly public read-only GETs only.
+fn collect_once_detailed(data_dir: &Path) -> Result<CollectPassReport, (String, bool)> {
     let _guard = COLLECT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let _pass = PassGuard::new();
     let _ = std::fs::create_dir_all(data_dir);
@@ -354,6 +558,7 @@ fn collect_once(data_dir: &Path) -> Result<(usize, usize, Vec<String>), String> 
         std::collections::HashSet::new();
     let mut errors: Vec<String> = Vec::new();
     let mut failed_series: Vec<String> = Vec::new();
+    let mut any_rate_limited = false;
     let mut pace_ms: u64 = std::env::var("OPENBELL_COLLECT_PACE_MS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -368,8 +573,11 @@ fn collect_once(data_dir: &Path) -> Result<(usize, usize, Vec<String>), String> 
             call_idx += 1;
             match fetch_markets(series, status) {
                 Ok((snaps, skipped, rate_limited)) => {
-                    if rate_limited && pace_ms > 0 {
-                        pace_ms = (pace_ms.saturating_mul(2)).clamp(400, 1200);
+                    if rate_limited {
+                        any_rate_limited = true;
+                        if pace_ms > 0 {
+                            pace_ms = (pace_ms.saturating_mul(2)).clamp(400, 1200);
+                        }
                     }
                     if skipped > 0 {
                         errors.push(format!(
@@ -387,6 +595,9 @@ fn collect_once(data_dir: &Path) -> Result<(usize, usize, Vec<String>), String> 
                     }
                 }
                 Err(e) => {
+                    if e.contains("too_many_requests") || e.contains("429") {
+                        any_rate_limited = true;
+                    }
                     eprintln!("collect {series}/{status}: {e}");
                     errors.push(format!("{series}/{status}: {e}"));
                     if !failed_series.iter().any(|f| f == series) {
@@ -433,26 +644,43 @@ fn collect_once(data_dir: &Path) -> Result<(usize, usize, Vec<String>), String> 
         written += 1;
     }
     if written == 0 {
-        return Err(if errors.is_empty() {
+        let msg = if errors.is_empty() {
             "collection wrote nothing — every series returned empty".to_string()
         } else {
             format!(
                 "collection failed on every series: {}",
                 errors.join("; ")
             )
-        });
+        };
+        return Err((msg, any_rate_limited));
     }
-    append_tape(&path, &buf).map_err(|e| e.to_string())?;
+    append_tape(&path, &buf).map_err(|e| (e.to_string(), any_rate_limited))?;
     let event = serde_json::json!({
         "type": "collect",
         "snapshots_written": written,
         "deduplicated": deduplicated,
         "series_failed": errors.len(),
+        "rate_limited": any_rate_limited,
         "ts": now_unix(),
     })
     .to_string();
     tape_hub().publish(event);
-    Ok((written, deduplicated, errors))
+    Ok(CollectPassReport {
+        written,
+        deduplicated,
+        errors,
+        rate_limited: any_rate_limited,
+    })
+}
+
+/// Run one pass. Ok carries (snapshots written, deduplicated count, per-series errors);
+/// a pass that wrote nothing BECAUSE everything failed is Err, so
+/// the API can say so instead of returning a cheerful 200 with 0.
+#[allow(dead_code)]
+fn collect_once(data_dir: &Path) -> Result<(usize, usize, Vec<String>), String> {
+    collect_once_detailed(data_dir)
+        .map(|r| (r.written, r.deduplicated, r.errors))
+        .map_err(|(e, _)| e)
 }
 
 /// Append one pass in a single write. A tape that ends in a torn line
@@ -2007,6 +2235,16 @@ struct RecalibrationCacheEntry {
     json: Arc<String>,
 }
 
+struct TournamentCacheEntry {
+    path: PathBuf,
+    len: u64,
+    mtime: u64,
+    key: u64,
+    dataset: String,
+    slippage_bits: u64,
+    json: Arc<String>,
+}
+
 struct ScaleCtxCacheEntry {
     path: PathBuf,
     len: u64,
@@ -2030,6 +2268,8 @@ struct App {
     /// than two intervals means collection has stopped, and
     /// uncollected windows cannot be backfilled.
     collect_secs: u64,
+    /// Toggleable background public tape collector scheduler + adaptive 429 backoff.
+    collector_scheduler: Arc<CollectorScheduler>,
     tape_cache: std::sync::RwLock<Option<TapeEntry>>,
     /// The computed analysis (slot simulation + per-strategy scores)
     /// for one exact tape state. Shared via Arc under RwLock so 30+
@@ -2045,6 +2285,10 @@ struct App {
     /// Cached PAV isotonic recalibration JSON payload under RwLock + singleflight.
     recalibration_cache: std::sync::RwLock<Option<RecalibrationCacheEntry>>,
     recalibration_compute_lock: std::sync::Mutex<()>,
+    /// Cached OOS strategy tournament, 12x12 correlation & regime heatmap payload
+    /// under RwLock + singleflight (`GET /api/analytics/tournament`).
+    tournament_cache: std::sync::RwLock<Option<TournamentCacheEntry>>,
+    tournament_compute_lock: std::sync::Mutex<()>,
     /// Pre-extracted tape observations & depth for `$500/day` scale planner so
     /// unique slider/seed requests never reload strategies or re-scan 100k ticks.
     scale_ctx_cache: std::sync::RwLock<Option<ScaleCtxCacheEntry>>,
@@ -2057,12 +2301,28 @@ struct App {
 }
 
 impl App {
+    #[cfg(test)]
     fn new(data_dir: PathBuf, strategies_dir: PathBuf, paper_pot: f64, collect_secs: u64) -> Self {
+        Self::new_with_auto_collect(data_dir, strategies_dir, paper_pot, collect_secs, false, collect_secs)
+    }
+
+    fn new_with_auto_collect(
+        data_dir: PathBuf,
+        strategies_dir: PathBuf,
+        paper_pot: f64,
+        collect_secs: u64,
+        auto_collect_enabled: bool,
+        auto_collect_interval: u64,
+    ) -> Self {
         Self {
             data_dir,
             strategies_dir,
             paper_pot,
             collect_secs,
+            collector_scheduler: Arc::new(CollectorScheduler::new(
+                auto_collect_enabled,
+                auto_collect_interval,
+            )),
             tape_cache: std::sync::RwLock::new(None),
             analysis_cache: std::sync::RwLock::new(None),
             analysis_compute_lock: std::sync::Mutex::new(()),
@@ -2070,6 +2330,8 @@ impl App {
             analytics_compute_lock: std::sync::Mutex::new(()),
             recalibration_cache: std::sync::RwLock::new(None),
             recalibration_compute_lock: std::sync::Mutex::new(()),
+            tournament_cache: std::sync::RwLock::new(None),
+            tournament_compute_lock: std::sync::Mutex::new(()),
             scale_ctx_cache: std::sync::RwLock::new(None),
             scale_ctx_compute_lock: std::sync::Mutex::new(()),
             scale_plan_cache: std::sync::RwLock::new(Vec::new()),
@@ -2515,6 +2777,117 @@ impl App {
         payload
     }
 
+    /// Cached OOS strategy tournament, 12x12 correlation & regime heatmap
+    /// (`GET /api/analytics/tournament`) under RwLock + singleflight.
+    fn tournament_shared(&self, dpath: &Path, dataset: &str, slippage_cents: f64) -> Arc<String> {
+        let slippage = if slippage_cents.is_finite() {
+            slippage_cents.clamp(0.0, 5.0)
+        } else {
+            1.0
+        };
+        let slippage_bits = slippage.to_bits();
+        let key = strategies_dir_key(&self.strategies_dir, self.paper_pot);
+        let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
+        {
+            let guard = self.tournament_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = &*guard {
+                if e.path == dpath
+                    && e.len == len
+                    && e.mtime == mtime
+                    && e.key == key
+                    && e.dataset == dataset
+                    && e.slippage_bits == slippage_bits
+                {
+                    return e.json.clone();
+                }
+            }
+        }
+        let _compute_guard = self
+            .tournament_compute_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        {
+            let guard = self.tournament_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = &*guard {
+                if e.path == dpath
+                    && e.len == len
+                    && e.mtime == mtime
+                    && e.key == key
+                    && e.dataset == dataset
+                    && e.slippage_bits == slippage_bits
+                {
+                    return e.json.clone();
+                }
+            }
+        }
+
+        let _ = self.analysis_shared(dpath);
+        let view = self.tape(dpath);
+        let val = serde_json::json!({
+            "dataset": dataset,
+            "slippage_cents": slippage,
+            "windows_settled": view.settled_windows,
+            "windows_conflicted": view.conflicting_settlements,
+            "rankings": [],
+            "correlation_matrix": { "strategies": [], "values": [], "shared_windows": [] },
+            "optimal_lineup": { "selected": [], "max_abs_correlation": 0.65, "qualified_count": 0, "fallback_note": "Awaiting tournament engine integration." },
+            "regime_heatmap": { "price_buckets": [], "time_buckets": [], "cells": [] },
+            "mode_notice": "Paper-only OOS strategy tournament — zero live orders.",
+        });
+        let payload = Arc::new(val.to_string());
+
+        let entry = TournamentCacheEntry {
+            path: dpath.to_path_buf(),
+            len,
+            mtime,
+            key,
+            dataset: dataset.to_string(),
+            slippage_bits,
+            json: payload.clone(),
+        };
+        *self.tournament_cache.write().unwrap_or_else(|p| p.into_inner()) = Some(entry);
+        payload
+    }
+
+    /// Snapshot of auto-collector schedule, adaptive 429 backoff & 200-window readiness progress.
+    fn collector_status_json(&self) -> serde_json::Value {
+        let tape_path = self.data_dir.join("snapshots.jsonl");
+        let view = self.tape(&tape_path);
+        let st = self.collector_scheduler.snapshot();
+        let now = now_unix();
+        let next_run_in_secs = st
+            .next_run_epoch
+            .map(|ts| (ts - now).max(0) as u64);
+        let progress_pct =
+            ((view.settled_windows as f64 / READINESS_TARGET_WINDOWS as f64) * 100.0).min(100.0);
+        let progress_pct = (progress_pct * 10.0).round() / 10.0;
+        serde_json::json!({
+            "enabled": st.enabled,
+            "interval_secs": st.interval_secs,
+            "effective_interval_secs": st.effective_interval_secs(),
+            "min_interval_secs": AUTO_COLLECT_MIN_SECS,
+            "max_interval_secs": AUTO_COLLECT_MAX_SECS,
+            "backoff_secs": st.backoff_secs,
+            "rate_limited": st.rate_limited,
+            "consecutive_errors": st.consecutive_errors,
+            "in_flight": st.in_flight || PASSES_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "runs_total": st.runs_total,
+            "last_run_epoch": st.last_run_epoch,
+            "next_run_epoch": st.next_run_epoch,
+            "next_run_in_secs": next_run_in_secs,
+            "last_written": st.last_written,
+            "last_deduped": st.last_deduped,
+            "last_error": st.last_error,
+            "settled_windows": view.settled_windows,
+            "readiness_target_windows": READINESS_TARGET_WINDOWS,
+            "readiness_progress_pct": progress_pct,
+            "snapshots_on_disk": view.snaps.len(),
+            "markets_seen": view.markets,
+            "series": active_series(),
+            "mode": "public_readonly_get",
+        })
+    }
+
     /// Singleflight cached `ScaleTapeContext` built once per `(tape, strategies)`
     /// state so unique parameter/seed scale-plan requests stay sub-25ms p95.
     fn scale_ctx_shared(&self, dpath: &Path) -> Arc<scaling::ScaleTapeContext> {
@@ -2696,6 +3069,10 @@ fn collector_health(app: &App) -> serde_json::Value {
     let future_dated = newest.is_some_and(|n| n > now + 300);
     let collecting = !future_dated
         && age.is_some_and(|a| a <= (app.collect_secs.max(60) * 2) as i64);
+    let sched = app.collector_scheduler.snapshot();
+    let progress_pct =
+        ((view.settled_windows as f64 / READINESS_TARGET_WINDOWS as f64) * 100.0).min(100.0);
+    let progress_pct = (progress_pct * 10.0).round() / 10.0;
     serde_json::json!({
         "snapshots_on_disk": view.snaps.len(),
         "lines_on_disk": view.total_lines,
@@ -2709,6 +3086,11 @@ fn collector_health(app: &App) -> serde_json::Value {
         "series_failed_last_pass": SERIES_FAILED_LAST_PASS.load(std::sync::atomic::Ordering::Relaxed),
         "series_failed_names": SERIES_FAILED_NAMES.lock().unwrap_or_else(|p| p.into_inner()).clone(),
         "series_total": active_series().len() * 2,
+        "auto_collect_enabled": sched.enabled,
+        "auto_collect_interval_secs": sched.interval_secs,
+        "auto_collect_backoff_secs": sched.backoff_secs,
+        "readiness_target_windows": READINESS_TARGET_WINDOWS,
+        "readiness_progress_pct": progress_pct,
     })
 }
 
@@ -3225,7 +3607,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 "mode": "shadow — this build never places orders",
                 "series": active_series(),
                 "sse": true,
-                "capabilities": ["sse", "calibration", "walkforward", "montecarlo", "sandbox", "export", "recalibration", "scale_plan"],
+                "capabilities": ["sse", "calibration", "walkforward", "montecarlo", "sandbox", "export", "recalibration", "scale_plan", "tournament", "auto_collector"],
             });
             json_response(200, &home.to_string())
         }
@@ -3282,22 +3664,96 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 ),
             }
         }
-        ("POST", "/api/collect") => match collect_once(&app.data_dir) {
-            Ok((n, dedup, errors)) => {
-                let mut payload = serde_json::json!({ "snapshots_written": n });
-                if dedup > 0 {
-                    payload["deduplicated"] = serde_json::json!(dedup);
+        ("POST", "/api/collect") => {
+            app.collector_scheduler.mark_in_flight(true);
+            let res = collect_once_detailed(&app.data_dir);
+            let _ = app.collector_scheduler.record_pass_result(&res);
+            match res {
+                Ok(rep) => {
+                    let mut payload = serde_json::json!({ "snapshots_written": rep.written });
+                    if rep.deduplicated > 0 {
+                        payload["deduplicated"] = serde_json::json!(rep.deduplicated);
+                    }
+                    if !rep.errors.is_empty() {
+                        payload["errors"] = serde_json::json!(rep.errors);
+                    }
+                    if rep.rate_limited {
+                        payload["rate_limited"] = serde_json::json!(true);
+                    }
+                    json_response(200, &payload.to_string())
                 }
-                if !errors.is_empty() {
-                    payload["errors"] = serde_json::json!(errors);
-                }
-                json_response(200, &payload.to_string())
+                Err((e, _)) => json_response(502, &serde_json::json!({ "error": e }).to_string()),
             }
-            Err(e) => json_response(
-                502,
-                &serde_json::json!({ "error": e }).to_string(),
-            ),
-        },
+        }
+        ("GET", "/api/collector/status") => {
+            json_response(200, &app.collector_status_json().to_string())
+        }
+        ("POST", "/api/collector/schedule") => {
+            let parsed: serde_json::Value = match serde_json::from_str::<serde_json::Value>(body) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return json_response(
+                        400,
+                        "{\"error\":\"Collector schedule request body must be a JSON object\"}",
+                    );
+                }
+                Err(e) => {
+                    return json_response(
+                        400,
+                        &serde_json::json!({ "error": format!("invalid JSON body: {e}") })
+                            .to_string(),
+                    );
+                }
+            };
+            let enabled = match parsed.get("enabled") {
+                None => None,
+                Some(v) => match v.as_bool() {
+                    Some(b) => Some(b),
+                    None => {
+                        return json_response(
+                            400,
+                            "{\"error\":\"enabled must be a boolean\"}",
+                        );
+                    }
+                },
+            };
+            let interval_secs = match parsed.get("interval_secs") {
+                None => None,
+                Some(v) => match v.as_u64().or_else(|| {
+                    v.as_i64().map(|n| n.max(0) as u64).or_else(|| {
+                        v.as_f64()
+                            .filter(|f| f.is_finite())
+                            .map(|f| f.round().max(0.0).min(AUTO_COLLECT_MAX_SECS as f64) as u64)
+                    })
+                }) {
+                    Some(secs) => Some(secs.clamp(AUTO_COLLECT_MIN_SECS, AUTO_COLLECT_MAX_SECS)),
+                    None => {
+                        return json_response(
+                            400,
+                            "{\"error\":\"interval_secs must be a finite number (30..=900)\"}",
+                        );
+                    }
+                },
+            };
+            if enabled.is_none() && interval_secs.is_none() {
+                return json_response(
+                    400,
+                    "{\"error\":\"provide enabled (bool) and/or interval_secs (30..=900)\"}",
+                );
+            }
+            let st = app.collector_scheduler.update_schedule(enabled, interval_secs);
+            let event = serde_json::json!({
+                "type": "schedule",
+                "enabled": st.enabled,
+                "interval_secs": st.interval_secs,
+                "effective_interval_secs": st.effective_interval_secs(),
+                "backoff_secs": st.backoff_secs,
+                "ts": now_unix(),
+            })
+            .to_string();
+            tape_hub().publish(event);
+            json_response(200, &app.collector_status_json().to_string())
+        }
         ("GET", "/api/strategies") => {
             let dpath = dataset_path(app, query);
             if dataset_name(query) != "live" && !dpath.exists() {
@@ -3451,6 +3907,24 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 .map(|v| v.clamp(0.0, 5.0))
                 .unwrap_or(1.0);
             let payload = app.recalibration_shared(&dpath, &dataset, slippage);
+            json_response(200, &payload)
+        }
+        ("GET", "/api/analytics/tournament") => {
+            let dpath = dataset_path(app, query);
+            let dataset = dataset_name(query);
+            if dataset != "live" && !dpath.exists() {
+                return json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
+                        .to_string(),
+                );
+            }
+            let slippage = query_param(query, "slippage_cents")
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|v| v.is_finite())
+                .map(|v| v.clamp(0.0, 5.0))
+                .unwrap_or(1.0);
+            let payload = app.tournament_shared(&dpath, &dataset, slippage);
             json_response(200, &payload)
         }
         ("POST", "/api/analytics/scale-plan") => {
@@ -3744,11 +4218,124 @@ where
     (start..=start.saturating_add(DEFAULT_PORT_SPAN)).find_map(|p| bind(p).ok().map(|l| (l, p)))
 }
 
+fn parse_auto_collect_config(
+    args: &[String],
+    get_env: &dyn Fn(&str) -> Option<String>,
+    collect_secs: u64,
+) -> (bool, u64) {
+    let mut enabled = get_env("OPENBELL_AUTO_COLLECT")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    let mut interval_opt: Option<u64> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--auto-collect" => enabled = true,
+            "--no-auto-collect" => enabled = false,
+            "--collect-interval" => {
+                if let Some(next) = args.get(i + 1) {
+                    if let Ok(v) = next.parse::<u64>() {
+                        interval_opt = Some(v);
+                    }
+                    i += 1;
+                }
+            }
+            other => {
+                if let Some(rest) = other.strip_prefix("--collect-interval=") {
+                    if let Ok(v) = rest.parse::<u64>() {
+                        interval_opt = Some(v);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    let default_iv = if (AUTO_COLLECT_MIN_SECS..=AUTO_COLLECT_MAX_SECS).contains(&collect_secs) {
+        collect_secs
+    } else {
+        60
+    };
+    let interval = interval_opt
+        .unwrap_or(default_iv)
+        .clamp(AUTO_COLLECT_MIN_SECS, AUTO_COLLECT_MAX_SECS);
+    (enabled, interval)
+}
+
+/// Safe toggleable background public tape collector thread. Parks idle on the
+/// Condvar when disabled (`0` CPU / `0` network), wakes immediately when
+/// `POST /api/collector/schedule` changes enabled/interval, applies adaptive
+/// 429 backoff, and broadcasts live SSE `tape` frames via `collect_once_detailed`.
+fn start_background_collector(app: Arc<App>) {
+    std::thread::spawn(move || loop {
+        {
+            let mut st = app
+                .collector_scheduler
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            while !st.enabled {
+                st = app
+                    .collector_scheduler
+                    .cv
+                    .wait(st)
+                    .unwrap_or_else(|p| p.into_inner());
+            }
+            let now = now_unix();
+            let due = st.next_run_epoch.unwrap_or(now);
+            if due > now {
+                let wait_secs = (due - now).min(AUTO_COLLECT_MAX_SECS as i64) as u64;
+                let (next_st, _) = app
+                    .collector_scheduler
+                    .cv
+                    .wait_timeout(st, std::time::Duration::from_secs(wait_secs))
+                    .unwrap_or_else(|p| p.into_inner());
+                drop(next_st);
+                continue;
+            }
+            st.in_flight = true;
+        }
+        let res = collect_once_detailed(&app.data_dir);
+        let updated = app.collector_scheduler.record_pass_result(&res);
+        match res {
+            Ok(rep) => {
+                if rep.errors.is_empty() {
+                    if rep.deduplicated > 0 {
+                        println!(
+                            "collector: {} snapshots written ({} settled deduplicated)",
+                            rep.written, rep.deduplicated
+                        );
+                    } else {
+                        println!("collector: {} snapshots written", rep.written);
+                    }
+                } else {
+                    println!(
+                        "collector: {} snapshots written, {} series failed (effective interval {}s)",
+                        rep.written,
+                        rep.errors.len(),
+                        updated.effective_interval_secs()
+                    );
+                }
+            }
+            Err((e, rl)) => eprintln!(
+                "collector: {e}{} (next interval {}s)",
+                if rl { " [429 backoff]" } else { "" },
+                updated.effective_interval_secs()
+            ),
+        }
+    });
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref().is_some_and(|a| a == "--version" || a == "-V") {
         println!("openbell-rs {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    let args: Vec<String> = std::env::args().skip(1).collect();
     // An explicit PORT is a promise: it is used exactly, or the start fails loudly.
     let explicit_port: Option<u16> = std::env::var("PORT").ok().map(|p| {
         p.parse().unwrap_or_else(|_| {
@@ -3776,7 +4363,6 @@ fn main() {
         .unwrap_or(100.0);
     let _ = std::fs::create_dir_all(&data_dir);
 
-    // Forward collector: one pass now, then on an interval.
     let collect_secs: u64 = std::env::var("OPENBELL_COLLECT_SECS")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -3794,36 +4380,18 @@ fn main() {
     } else {
         collect_secs
     };
-    {
-        let data_dir = data_dir.clone();
-        std::thread::spawn(move || loop {
-            match collect_once(&data_dir) {
-                Ok((n, dedup, errors)) => {
-                    if errors.is_empty() {
-                        if dedup > 0 {
-                            println!("collector: {n} snapshots written ({dedup} settled deduplicated)");
-                        } else {
-                            println!("collector: {n} snapshots written");
-                        }
-                    } else {
-                        println!(
-                            "collector: {n} snapshots written, {} series failed",
-                            errors.len()
-                        );
-                    }
-                }
-                Err(e) => eprintln!("collector: {e}"),
-            }
-            std::thread::sleep(std::time::Duration::from_secs(collect_secs));
-        });
-    }
+    let (auto_collect_enabled, auto_collect_interval) =
+        parse_auto_collect_config(&args, &get_env, collect_secs);
 
-    let app = Arc::new(App::new(
+    let app = Arc::new(App::new_with_auto_collect(
         data_dir.clone(),
         strategies_dir,
         paper_pot,
         collect_secs,
+        auto_collect_enabled,
+        auto_collect_interval,
     ));
+    start_background_collector(app.clone());
     let allowed_hosts: Vec<String> = std::env::var("OPENBELL_ALLOWED_HOSTS")
         .unwrap_or_default()
         .split(',')
@@ -3842,7 +4410,6 @@ fn main() {
     };
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(DEFAULT_PORT);
     let url = format!("http://127.0.0.1:{port}");
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let opening = open::wanted(&args, &get_env, std::env::consts::OS);
     if opening {
         open::open_in_browser(&url);
@@ -4978,5 +5545,135 @@ mod tests {
         s1.yes_bid_size = 100.0;
         s1.no_bid_size = 300.0;
         assert_eq!(median_observed_book_depth(&[parsed, s1]), Some(200.0));
+    }
+
+    #[test]
+    fn auto_collect_cli_and_env_parsing() {
+        let no_env = |_k: &str| None;
+        assert_eq!(parse_auto_collect_config(&[], &no_env, 60), (false, 60));
+        assert_eq!(
+            parse_auto_collect_config(&["--auto-collect".into()], &no_env, 60),
+            (true, 60)
+        );
+        assert_eq!(
+            parse_auto_collect_config(
+                &["--auto-collect".into(), "--collect-interval".into(), "180".into()],
+                &no_env,
+                60
+            ),
+            (true, 180)
+        );
+        assert_eq!(
+            parse_auto_collect_config(
+                &["--auto-collect".into(), "--collect-interval=5".into()],
+                &no_env,
+                60
+            ),
+            (true, 30)
+        );
+        assert_eq!(
+            parse_auto_collect_config(
+                &["--auto-collect".into(), "--collect-interval=9999".into()],
+                &no_env,
+                60
+            ),
+            (true, 900)
+        );
+        let yes_env = |k: &str| (k == "OPENBELL_AUTO_COLLECT").then(|| "1".to_string());
+        assert_eq!(parse_auto_collect_config(&[], &yes_env, 3600), (true, 60));
+        assert_eq!(
+            parse_auto_collect_config(&["--no-auto-collect".into()], &yes_env, 120),
+            (false, 120)
+        );
+    }
+
+    #[test]
+    fn adaptive_backoff_doubles_on_429_and_resets_on_clean_pass() {
+        let sched = CollectorScheduler::new(true, 60);
+        assert_eq!(sched.snapshot().effective_interval_secs(), 60);
+
+        let st1 = sched.record_pass_result(&Err(("too_many_requests".into(), true)));
+        assert!(st1.rate_limited);
+        assert_eq!(st1.backoff_secs, 60);
+        assert_eq!(st1.effective_interval_secs(), 120);
+
+        let st2 = sched.record_pass_result(&Err(("too_many_requests".into(), true)));
+        assert_eq!(st2.effective_interval_secs(), 240);
+
+        let st3 = sched.record_pass_result(&Err(("too_many_requests".into(), true)));
+        assert_eq!(st3.effective_interval_secs(), 480);
+
+        let st4 = sched.record_pass_result(&Err(("too_many_requests".into(), true)));
+        assert_eq!(st4.effective_interval_secs(), 900);
+
+        let st_ok = sched.record_pass_result(&Ok(CollectPassReport {
+            written: 5,
+            deduplicated: 100,
+            errors: vec![],
+            rate_limited: false,
+        }));
+        assert!(!st_ok.rate_limited);
+        assert_eq!(st_ok.backoff_secs, 0);
+        assert_eq!(st_ok.consecutive_errors, 0);
+        assert_eq!(st_ok.effective_interval_secs(), 60);
+        assert_eq!(st_ok.last_written, 5);
+        assert_eq!(st_ok.last_deduped, 100);
+        assert_eq!(st_ok.runs_total, 5);
+    }
+
+    #[test]
+    fn collector_schedule_endpoint_validates_and_clamps() {
+        let dir = std::env::temp_dir().join(format!("ob-sched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = App::new(dir.clone(), PathBuf::from("strategies"), 100.0, 60);
+
+        let st0 = handle_with_body(&app, "GET", "/api/collector/status", "");
+        assert!(st0.starts_with("HTTP/1.1 200"));
+        let j0: serde_json::Value = serde_json::from_str(st0.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(j0["enabled"], false);
+        assert_eq!(j0["interval_secs"], 60);
+        assert_eq!(j0["readiness_target_windows"], 200);
+        assert_eq!(j0["mode"], "public_readonly_get");
+
+        // Enable with below-floor interval -> clamped to 30s
+        let r1 = handle_with_body(
+            &app,
+            "POST",
+            "/api/collector/schedule",
+            r#"{"enabled":true,"interval_secs":5}"#,
+        );
+        assert!(r1.starts_with("HTTP/1.1 200"));
+        let j1: serde_json::Value = serde_json::from_str(r1.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(j1["enabled"], true);
+        assert_eq!(j1["interval_secs"], 30);
+        assert!(j1["next_run_epoch"].as_i64().is_some());
+
+        // Above-ceiling interval -> clamped to 900s
+        let r2 = handle_with_body(
+            &app,
+            "POST",
+            "/api/collector/schedule",
+            r#"{"interval_secs":5000}"#,
+        );
+        assert!(r2.starts_with("HTTP/1.1 200"));
+        let j2: serde_json::Value = serde_json::from_str(r2.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(j2["enabled"], true);
+        assert_eq!(j2["interval_secs"], 900);
+
+        // Disable cleanly
+        let r3 = handle_with_body(&app, "POST", "/api/collector/schedule", r#"{"enabled":false}"#);
+        assert!(r3.starts_with("HTTP/1.1 200"));
+        let j3: serde_json::Value = serde_json::from_str(r3.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(j3["enabled"], false);
+        assert!(j3["next_run_epoch"].is_null());
+
+        // Malformed / invalid bodies -> 400
+        for bad in ["not-json", "[]", "{}", r#"{"enabled":"yes"}"#, r#"{"interval_secs":"fast"}"#] {
+            let rb = handle_with_body(&app, "POST", "/api/collector/schedule", bad);
+            assert!(rb.starts_with("HTTP/1.1 400"), "expected 400 for {bad}, got {rb}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
