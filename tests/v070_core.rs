@@ -127,7 +127,7 @@ esac
     let (st_home, body_home) = http_req(port, "GET", "/api/home", "");
     assert_eq!(st_home, 200);
     let home: serde_json::Value = serde_json::from_str(&body_home).unwrap();
-    assert_eq!(home["version"], "0.7.0");
+    assert_eq!(home["version"], env!("CARGO_PKG_VERSION"));
     let caps = home["capabilities"].as_array().unwrap();
     assert!(caps.iter().any(|c| c == "tournament"));
     assert!(caps.iter().any(|c| c == "auto_collector"));

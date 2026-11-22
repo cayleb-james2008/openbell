@@ -4,6 +4,20 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.8.0 - 2026-11-22
+
+- **Live Connected Kalshi Trade API v2 Client & RSA-PSS SHA-256 Signer (`src/kalshi_live.rs`):**
+  - Genuine Kalshi v2 REST integration for both Demo (`https://demo-api.kalshi.co/trade-api/v2`) and Production (`https://api.elections.kalshi.com/trade-api/v2`) with RSA-PSS SHA-256 request signing (`KALSHI-ACCESS-KEY`, `KALSHI-ACCESS-TIMESTAMP`, `KALSHI-ACCESS-SIGNATURE`), supporting `GET /portfolio/{balance,positions,orders,fills}`, `POST /portfolio/orders`, `DELETE /portfolio/orders/{id}`, and `cancel_all_orders()`.
+  - Dual-target offline-verified cryptography (`ring` on Unix/macOS, pure-Rust RFC 8017 RSA-PSS on Windows `x86_64-pc-windows-msvc`), strict `0600` credential storage under `OPENBELL_DATA`, and redacted `Debug` output that never logs or echoes private key PEM bytes.
+- **Fail-Closed Hard Risk Rails, Loopback+CSRF Guard & Emergency Kill Switch (`src/risk_rails.rs`, `/api/live/*`, `.loop/checks/rails.sh`):**
+  - Always boots disarmed (`live_armed: false`), requiring configured credentials AND explicit `confirm_arm: true` via `POST /api/live/arm` before any live order can route.
+  - Enforces hard caps on every order (`max_order_contracts`, `max_order_dollars`, `max_daily_loss_dollars`, `max_open_exposure_dollars`, `allowed_ticker_prefix`, whole-cent `1..=99` price check) with fail-closed HTTP `403` rejections, strict loopback-only + `X-OpenBell-CSRF: 1` protection across all `/api/live/*` routes, and an instant **Emergency Kill Switch** (`POST /api/live/kill-switch`) that disarms first and cancels all resting orders.
+  - Replaced legacy `.loop/checks/fence.sh` with `.loop/checks/rails.sh` mechanically proving zero hardcoded secrets, disarmed-by-default boot, `403` fail-closed orders & CSRF enforcement, and RSA-PSS + risk-rail unit suites while preserving `.loop/checks/equity.sh` intact.
+- **Live Kalshi Connected Trading & Quant Desk UI (`frontend/src/LiveTradingPanel.tsx`, `frontend/src/lib/live.ts` -> single-file `assets/index.html` `1733 kB`):**
+  - Updated all desk copy from shadow/paper-only wording to truthful **Live Kalshi Connected Trading & Quant Desk** copy; added Live Account & Positions Strip (`Cash`, `Portfolio`, `Positions`, `Orders`, `Fills`), `Paper / Arm Live` switcher with explicit confirmation modal, Live Order Ticket with 7-point real-time Hard Risk Rails pre-check, 1-click `Trade` prefill from `Live 15m Tape`, per-order `Cancel`, crimson **Emergency Kill Switch**, and `#settings` Kalshi API & Risk Rails panel.
+  - Preserved all `$500/Day` Capital Scale Planner, PAV Isotonic Recalibration, Strategy Tournament, `12×12` Correlation & `5×4` Regime Heatmaps, Auto-Collector, `#67` Settings-only Light/Dark theme, and `#155` plain wording.
+- **Linux & Windows Standalone Desktop App Window (`src/open.rs`):** upgraded startup opener to launch a chromeless desktop app window (`chromium`/`google-chrome`/`brave` `--app=<url>` on Linux, `msedge.exe`/`chrome.exe --app=<url>` on Windows, honoring `--no-open` / `--service` / `OPENBELL_NO_OPEN=1`).
+
 ## 0.7.0 - 2026-11-22
 
 - **Paper Strategy Tournament, 12×12 Correlation Matrix, Optimal Uncorrelated 4-Slot Lineup & 2D Regime Heatmap (`src/tournament.rs`, `GET /api/analytics/tournament[?dataset=fixture&slippage_cents=0..5]`):**

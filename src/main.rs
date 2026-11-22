@@ -1,12 +1,11 @@
-//! openbell-rs — Cayleb's Kalshi compounding desk, rebuilt lean.
+//! openbell-rs — Cayleb's Kalshi Connected Trading & Quant Desk, rebuilt lean in Rust.
 //!
 //! Venue truth on every number: every figure the app shows comes from
-//! Kalshi's own record or is shown as "unavailable". This build is a
-//! measuring machine — a forward collector plus a shadow scorer. It has NO
-//! order-placement code path at all: nothing here can place, arm, or
-//! simulate placing a live order. Strategies are Rune scripts, scored on
-//! paper against collected forward data, and a strategy is only "proven"
-//! when it passes the desk's promotion standard on forward evidence.
+//! Kalshi's own record or is shown as "unavailable". Combines a live Kalshi
+//! Trade API v2 RSA-PSS client gated by fail-closed Hard Risk Rails and an
+//! Emergency Kill Switch (always disarmed on boot) with a forward 15-minute
+//! collector, paper slot simulator, PAV isotonic recalibration, `$500/day`
+//! capital scaling engine, and out-of-sample strategy tournament.
 
 mod analytics;
 mod kalshi_live;
@@ -2268,6 +2267,12 @@ const BACKTEST_CACHE_CAP: usize = 16;
 const SCALE_PLAN_CACHE_CAP: usize = 32;
 const SLIPPAGE_CACHE_CAP: usize = 16;
 
+struct LiveDeskManager {
+    config: kalshi_live::PersistedLiveConfig,
+    rails: risk_rails::RiskRailsState,
+    connected: bool,
+}
+
 struct App {
     data_dir: PathBuf,
     strategies_dir: PathBuf,
@@ -2282,6 +2287,8 @@ struct App {
     collect_secs: u64,
     /// Toggleable background public tape collector scheduler + adaptive 429 backoff.
     collector_scheduler: Arc<CollectorScheduler>,
+    /// Live Kalshi Trade API v2 connection config & fail-closed risk rails (always boots disarmed).
+    live_desk: std::sync::Mutex<LiveDeskManager>,
     tape_cache: std::sync::RwLock<Option<TapeEntry>>,
     /// The computed analysis (slot simulation + per-strategy scores)
     /// for one exact tape state. Shared via Arc under RwLock so 30+
@@ -2330,6 +2337,8 @@ impl App {
         auto_collect_enabled: bool,
         auto_collect_interval: u64,
     ) -> Self {
+        let live_cfg = kalshi_live::load_live_config(&data_dir);
+        let live_rails = risk_rails::RiskRailsState::load(&data_dir);
         Self {
             data_dir,
             strategies_dir,
@@ -2339,6 +2348,11 @@ impl App {
                 auto_collect_enabled,
                 auto_collect_interval,
             )),
+            live_desk: std::sync::Mutex::new(LiveDeskManager {
+                config: live_cfg,
+                rails: live_rails,
+                connected: false,
+            }),
             tape_cache: std::sync::RwLock::new(None),
             analysis_cache: std::sync::RwLock::new(None),
             analysis_compute_lock: std::sync::Mutex::new(()),
@@ -3702,19 +3716,31 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
         ("GET", "/") => html_response(include_str!("../assets/index.html")),
         ("GET", "/api/home") => {
             let (sim, _, lib_errors, _) = app.analysis_shared(&app.data_dir.join("snapshots.jsonl"));
+            let live_snap = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                st.rails.status_snapshot(&st.config, st.connected)
+            };
+            let mode_str = if live_snap.live_armed && live_snap.configured {
+                "live — Kalshi v2 armed under hard risk rails"
+            } else if live_snap.configured {
+                "live_disarmed — Kalshi v2 configured (disarmed; arm explicitly to route orders)"
+            } else {
+                "paper — Kalshi v2 ready (configure credentials in Settings to connect live)"
+            };
             let home = serde_json::json!({
                 "account": account_state(),
                 "collector": collector_health(app),
+                "live": live_snap,
                 "stage_target": stage_progress(&sim),
                 "library_errors": lib_errors
                     .iter()
                     .map(|(file, error)| serde_json::json!({ "file": file, "error": error }))
                     .collect::<Vec<_>>(),
                 "version": env!("CARGO_PKG_VERSION"),
-                "mode": "shadow — this build never places orders",
+                "mode": mode_str,
                 "series": active_series(),
                 "sse": true,
-                "capabilities": ["sse", "calibration", "walkforward", "montecarlo", "sandbox", "export", "recalibration", "scale_plan", "tournament", "auto_collector"],
+                "capabilities": ["sse", "calibration", "walkforward", "montecarlo", "sandbox", "export", "recalibration", "scale_plan", "tournament", "auto_collector", "live_kalshi", "risk_rails"],
             });
             json_response(200, &home.to_string())
         }
@@ -4235,6 +4261,743 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let payload = app.sandbox_backtest_cached(&dpath, &dataset, source, cfg);
             json_response(200, &payload)
         }
+        ("GET", "/api/live/status") => {
+            let snap = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                st.rails.status_snapshot(&st.config, st.connected)
+            };
+            json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
+        }
+        ("GET", "/api/live/account") => {
+            let cfg = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                st.config.clone()
+            };
+            if !cfg.is_configured() {
+                return json_response(
+                    200,
+                    &serde_json::json!({
+                        "configured": false,
+                        "connected": false,
+                        "balance_cents": null,
+                        "balance_dollars": null,
+                        "portfolio_value_cents": null,
+                        "portfolio_value_dollars": null,
+                        "daily_pnl_dollars": null,
+                        "note": "Configure Kalshi v2 API credentials in Desk Settings to connect your account.",
+                    })
+                    .to_string(),
+                );
+            }
+            let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                    st.connected = false;
+                    st.rails.last_error = Some(e.clone());
+                    return json_response(
+                        502,
+                        &serde_json::json!({ "configured": true, "connected": false, "error": e })
+                            .to_string(),
+                    );
+                }
+            };
+            match client.get_balance() {
+                Ok(bal) => {
+                    {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.connected = true;
+                        st.rails.last_error = None;
+                    }
+                    json_response(
+                        200,
+                        &serde_json::json!({
+                            "configured": true,
+                            "connected": true,
+                            "balance_cents": bal.balance_cents,
+                            "balance_dollars": bal.balance_dollars,
+                            "portfolio_value_cents": bal.portfolio_value_cents,
+                            "portfolio_value_dollars": bal.portfolio_value_dollars,
+                            "payout_cents": bal.payout_cents,
+                            "note": "Connected to Kalshi v2 REST portfolio.",
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(e) => {
+                    {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.connected = false;
+                        st.rails.last_error = Some(e.clone());
+                    }
+                    json_response(
+                        502,
+                        &serde_json::json!({ "configured": true, "connected": false, "error": e })
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        ("GET", "/api/live/positions") => {
+            let cfg = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                st.config.clone()
+            };
+            if !cfg.is_configured() {
+                return json_response(
+                    200,
+                    &serde_json::json!({
+                        "configured": false,
+                        "connected": false,
+                        "positions": [],
+                        "total_exposure_dollars": 0.0,
+                        "note": "Configure Kalshi v2 API credentials in Desk Settings to load positions.",
+                    })
+                    .to_string(),
+                );
+            }
+            let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    return json_response(
+                        502,
+                        &serde_json::json!({ "configured": true, "connected": false, "positions": [], "error": e })
+                            .to_string(),
+                    );
+                }
+            };
+            match client.get_positions() {
+                Ok(positions) => {
+                    let total_exposure: f64 = positions
+                        .iter()
+                        .map(|p| p.market_exposure_dollars.abs())
+                        .sum();
+                    let realized_loss: f64 = positions
+                        .iter()
+                        .filter(|p| p.realized_pnl_dollars < 0.0)
+                        .map(|p| -p.realized_pnl_dollars)
+                        .sum();
+                    {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.connected = true;
+                        st.rails.last_error = None;
+                        st.rails.sync_venue_metrics(total_exposure, realized_loss);
+                    }
+                    json_response(
+                        200,
+                        &serde_json::json!({
+                            "configured": true,
+                            "connected": true,
+                            "positions": positions,
+                            "total_exposure_dollars": total_exposure,
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(e) => {
+                    {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.connected = false;
+                        st.rails.last_error = Some(e.clone());
+                    }
+                    json_response(
+                        502,
+                        &serde_json::json!({ "configured": true, "connected": false, "positions": [], "error": e })
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        ("GET", "/api/live/orders") => {
+            let cfg = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                st.config.clone()
+            };
+            if !cfg.is_configured() {
+                return json_response(
+                    200,
+                    &serde_json::json!({
+                        "configured": false,
+                        "connected": false,
+                        "orders": [],
+                        "note": "Configure Kalshi v2 API credentials in Desk Settings to load orders.",
+                    })
+                    .to_string(),
+                );
+            }
+            let status_filter = query_param(query, "status");
+            let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    return json_response(
+                        502,
+                        &serde_json::json!({ "configured": true, "connected": false, "orders": [], "error": e })
+                            .to_string(),
+                    );
+                }
+            };
+            match client.get_orders(status_filter.as_deref()) {
+                Ok(orders) => {
+                    {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.connected = true;
+                        st.rails.last_error = None;
+                    }
+                    json_response(
+                        200,
+                        &serde_json::json!({
+                            "configured": true,
+                            "connected": true,
+                            "orders": orders,
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(e) => {
+                    {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.connected = false;
+                        st.rails.last_error = Some(e.clone());
+                    }
+                    json_response(
+                        502,
+                        &serde_json::json!({ "configured": true, "connected": false, "orders": [], "error": e })
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        ("GET", "/api/live/fills") => {
+            let cfg = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                st.config.clone()
+            };
+            if !cfg.is_configured() {
+                return json_response(
+                    200,
+                    &serde_json::json!({
+                        "configured": false,
+                        "connected": false,
+                        "fills": [],
+                        "note": "Configure Kalshi v2 API credentials in Desk Settings to load fills.",
+                    })
+                    .to_string(),
+                );
+            }
+            let limit = query_param(query, "limit")
+                .and_then(|s| s.parse::<usize>().ok())
+                .map(|n| n.clamp(1, 200))
+                .unwrap_or(50);
+            let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    return json_response(
+                        502,
+                        &serde_json::json!({ "configured": true, "connected": false, "fills": [], "error": e })
+                            .to_string(),
+                    );
+                }
+            };
+            match client.get_fills(Some(limit)) {
+                Ok(fills) => {
+                    {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.connected = true;
+                        st.rails.last_error = None;
+                    }
+                    json_response(
+                        200,
+                        &serde_json::json!({
+                            "configured": true,
+                            "connected": true,
+                            "fills": fills,
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(e) => {
+                    {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.connected = false;
+                        st.rails.last_error = Some(e.clone());
+                    }
+                    json_response(
+                        502,
+                        &serde_json::json!({ "configured": true, "connected": false, "fills": [], "error": e })
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        ("POST", "/api/live/config") => {
+            let parsed: serde_json::Value = match serde_json::from_str::<serde_json::Value>(body) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return json_response(
+                        400,
+                        "{\"error\":\"Live config request body must be a JSON object\"}",
+                    );
+                }
+                Err(e) => {
+                    return json_response(
+                        400,
+                        &serde_json::json!({ "error": format!("invalid JSON body: {e}") })
+                            .to_string(),
+                    );
+                }
+            };
+            let (mut next_cfg, mut next_rails) = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                (st.config.clone(), st.rails.rails.clone())
+            };
+            let mut creds_changed = false;
+            if let Some(v) = parsed.get("api_key_id") {
+                let Some(s) = v.as_str() else {
+                    return json_response(400, "{\"error\":\"api_key_id must be a string\"}");
+                };
+                next_cfg.api_key_id = s.trim().to_string();
+                creds_changed = true;
+            }
+            if let Some(v) = parsed.get("private_key_path") {
+                let Some(s) = v.as_str() else {
+                    return json_response(400, "{\"error\":\"private_key_path must be a string\"}");
+                };
+                next_cfg.private_key_path = s.trim().to_string();
+                creds_changed = true;
+            }
+            let private_key_pem: Option<String> = match parsed.get("private_key_pem") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => match v.as_str() {
+                    Some(s) if !s.trim().is_empty() => {
+                        creds_changed = true;
+                        Some(s.to_string())
+                    }
+                    Some(_) => None,
+                    None => {
+                        return json_response(400, "{\"error\":\"private_key_pem must be a string\"}");
+                    }
+                },
+            };
+            if let Some(v) = parsed.get("environment") {
+                let Some(s) = v.as_str().and_then(kalshi_live::KalshiEnv::parse_loose) else {
+                    return json_response(
+                        400,
+                        "{\"error\":\"environment must be \\\"demo\\\" or \\\"prod\\\"\"}",
+                    );
+                };
+                if next_cfg.environment != s {
+                    next_cfg.environment = s;
+                    creds_changed = true;
+                }
+            }
+            if let Some(v) = parsed.get("api_base_url") {
+                if v.is_null() {
+                    next_cfg.api_base_url = None;
+                    creds_changed = true;
+                } else if let Some(s) = v.as_str() {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        next_cfg.api_base_url = None;
+                    } else {
+                        match kalshi_live::validate_api_base_url(trimmed) {
+                            Ok(valid) => next_cfg.api_base_url = Some(valid),
+                            Err(e) => {
+                                return json_response(
+                                    400,
+                                    &serde_json::json!({ "error": e }).to_string(),
+                                );
+                            }
+                        }
+                    }
+                    creds_changed = true;
+                } else {
+                    return json_response(400, "{\"error\":\"api_base_url must be a string or null\"}");
+                }
+            }
+            if let Some(rv) = parsed.get("rails") {
+                let Some(ro) = rv.as_object() else {
+                    return json_response(400, "{\"error\":\"rails must be a JSON object\"}");
+                };
+                if let Some(v) = ro.get("max_order_contracts") {
+                    let Some(n) = v.as_u64().and_then(|u| u32::try_from(u).ok()) else {
+                        return json_response(400, "{\"error\":\"max_order_contracts must be a positive integer\"}");
+                    };
+                    next_rails.max_order_contracts = n;
+                }
+                if let Some(v) = ro.get("max_order_dollars") {
+                    let Some(f) = v.as_f64() else {
+                        return json_response(400, "{\"error\":\"max_order_dollars must be a number\"}");
+                    };
+                    next_rails.max_order_dollars = f;
+                }
+                if let Some(v) = ro.get("max_daily_loss_dollars") {
+                    let Some(f) = v.as_f64() else {
+                        return json_response(400, "{\"error\":\"max_daily_loss_dollars must be a number\"}");
+                    };
+                    next_rails.max_daily_loss_dollars = f;
+                }
+                if let Some(v) = ro.get("max_open_exposure_dollars") {
+                    let Some(f) = v.as_f64() else {
+                        return json_response(400, "{\"error\":\"max_open_exposure_dollars must be a number\"}");
+                    };
+                    next_rails.max_open_exposure_dollars = f;
+                }
+                if let Some(v) = ro.get("allowed_ticker_prefix") {
+                    let Some(s) = v.as_str() else {
+                        return json_response(400, "{\"error\":\"allowed_ticker_prefix must be a string\"}");
+                    };
+                    next_rails.allowed_ticker_prefix = s.to_string();
+                }
+            }
+
+            let validated_rails = match next_rails.validate() {
+                Ok(r) => r,
+                Err(errs) => {
+                    return json_response(
+                        400,
+                        &serde_json::json!({ "error": errs.join("; "), "rail_violations": errs })
+                            .to_string(),
+                    );
+                }
+            };
+            let saved_cfg = match kalshi_live::save_live_config(
+                &app.data_dir,
+                next_cfg,
+                private_key_pem.as_deref(),
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    return json_response(400, &serde_json::json!({ "error": e }).to_string());
+                }
+            };
+            if let Err(e) = risk_rails::save_rails_config(&app.data_dir, &validated_rails) {
+                return json_response(500, &serde_json::json!({ "error": e }).to_string());
+            }
+            let snap = {
+                let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                st.config = saved_cfg;
+                let _ = st.rails.update_rails(&validated_rails);
+                if creds_changed {
+                    st.connected = false;
+                    if !st.config.is_configured() {
+                        st.rails.disarm();
+                    }
+                }
+                st.rails.last_error = None;
+                st.rails.status_snapshot(&st.config, st.connected)
+            };
+            let ev = serde_json::json!({
+                "type": "live_status",
+                "configured": snap.configured,
+                "live_armed": snap.live_armed,
+                "environment": snap.environment,
+                "ts": now_unix(),
+            })
+            .to_string();
+            tape_hub().publish(ev);
+            json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
+        }
+        ("POST", "/api/live/arm") => {
+            let parsed: serde_json::Value = match serde_json::from_str::<serde_json::Value>(body) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return json_response(
+                        400,
+                        "{\"error\":\"Arm request body must be a JSON object\"}",
+                    );
+                }
+                Err(e) => {
+                    return json_response(
+                        400,
+                        &serde_json::json!({ "error": format!("invalid JSON body: {e}") })
+                            .to_string(),
+                    );
+                }
+            };
+            let confirm_arm = match parsed.get("confirm_arm") {
+                None => false,
+                Some(v) => match v.as_bool() {
+                    Some(b) => b,
+                    None => {
+                        return json_response(400, "{\"error\":\"confirm_arm must be a boolean\"}");
+                    }
+                },
+            };
+            let (res, configured, snap) = {
+                let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                let configured = st.config.is_configured();
+                let res = st.rails.arm(confirm_arm, configured);
+                let snap = st.rails.status_snapshot(&st.config, st.connected);
+                (res, configured, snap)
+            };
+            match res {
+                Ok(()) => {
+                    let ev = serde_json::json!({
+                        "type": "live_status",
+                        "live_armed": true,
+                        "environment": snap.environment,
+                        "ts": now_unix(),
+                    })
+                    .to_string();
+                    tape_hub().publish(ev);
+                    json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
+                }
+                Err(e) => {
+                    let code = if !configured { 412 } else { 400 };
+                    json_response(
+                        code,
+                        &serde_json::json!({ "error": e, "status": snap }).to_string(),
+                    )
+                }
+            }
+        }
+        ("POST", "/api/live/disarm") => {
+            let snap = {
+                let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                st.rails.disarm();
+                st.rails.status_snapshot(&st.config, st.connected)
+            };
+            let ev = serde_json::json!({
+                "type": "live_status",
+                "live_armed": false,
+                "ts": now_unix(),
+            })
+            .to_string();
+            tape_hub().publish(ev);
+            json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
+        }
+        ("POST", "/api/live/order") => {
+            let parsed: serde_json::Value = match serde_json::from_str::<serde_json::Value>(body) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return json_response(
+                        400,
+                        "{\"error\":\"Order request body must be a JSON object\"}",
+                    );
+                }
+                Err(e) => {
+                    return json_response(
+                        400,
+                        &serde_json::json!({ "error": format!("invalid JSON body: {e}") })
+                            .to_string(),
+                    );
+                }
+            };
+            let intent: risk_rails::LiveOrderIntent = match serde_json::from_value(parsed) {
+                Ok(i) => i,
+                Err(e) => {
+                    return json_response(
+                        400,
+                        &serde_json::json!({ "ok": false, "error": format!("invalid order intent: {e}") })
+                            .to_string(),
+                    );
+                }
+            };
+            let (auth_res, cfg) = {
+                let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                (st.rails.authorize_order(&intent), st.config.clone())
+            };
+            let (kalshi_req, check) = match auth_res {
+                Ok(ok) => ok,
+                Err(check) => {
+                    return json_response(
+                        403,
+                        &serde_json::json!({
+                            "ok": false,
+                            "error": check.rail_violations.join("; "),
+                            "rail_violations": check.rail_violations,
+                            "order_notional_dollars": check.order_notional_dollars,
+                            "projected_exposure_dollars": check.projected_exposure_dollars,
+                        })
+                        .to_string(),
+                    );
+                }
+            };
+            if intent.dry_run {
+                return json_response(
+                    200,
+                    &serde_json::json!({
+                        "ok": true,
+                        "dry_run": true,
+                        "order_request": kalshi_req,
+                        "risk_check": check,
+                    })
+                    .to_string(),
+                );
+            }
+            let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    return json_response(
+                        412,
+                        &serde_json::json!({ "ok": false, "error": e }).to_string(),
+                    );
+                }
+            };
+            match client.place_order(&kalshi_req) {
+                Ok(order) => {
+                    let snap = {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.connected = true;
+                        st.rails.last_error = None;
+                        st.rails
+                            .record_submitted_order(&intent.action, check.order_notional_dollars);
+                        st.rails.status_snapshot(&st.config, st.connected)
+                    };
+                    let ev = serde_json::json!({
+                        "type": "live_order",
+                        "action": "placed",
+                        "order_id": order.order_id,
+                        "ticker": order.ticker,
+                        "ts": now_unix(),
+                    })
+                    .to_string();
+                    tape_hub().publish(ev);
+                    json_response(
+                        200,
+                        &serde_json::json!({
+                            "ok": true,
+                            "order": order,
+                            "risk_check": check,
+                            "status": snap,
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(e) => {
+                    {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.rails.last_error = Some(e.clone());
+                    }
+                    json_response(
+                        502,
+                        &serde_json::json!({ "ok": false, "error": e }).to_string(),
+                    )
+                }
+            }
+        }
+        ("DELETE", r) if r.starts_with("/api/live/orders/") => {
+            let order_id = &r["/api/live/orders/".len()..];
+            if let Err(e) = kalshi_live::validate_order_id(order_id) {
+                return json_response(
+                    400,
+                    &serde_json::json!({ "ok": false, "error": e }).to_string(),
+                );
+            }
+            let cfg = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                st.config.clone()
+            };
+            let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    return json_response(
+                        412,
+                        &serde_json::json!({ "ok": false, "error": e }).to_string(),
+                    );
+                }
+            };
+            match client.cancel_order(order_id) {
+                Ok(venue_resp) => {
+                    let ev = serde_json::json!({
+                        "type": "live_order",
+                        "action": "cancelled",
+                        "order_id": order_id,
+                        "ts": now_unix(),
+                    })
+                    .to_string();
+                    tape_hub().publish(ev);
+                    json_response(
+                        200,
+                        &serde_json::json!({
+                            "ok": true,
+                            "order_id": order_id,
+                            "cancelled": true,
+                            "venue_response": venue_resp,
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(e) => {
+                    {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.rails.last_error = Some(e.clone());
+                    }
+                    json_response(
+                        502,
+                        &serde_json::json!({ "ok": false, "error": e }).to_string(),
+                    )
+                }
+            }
+        }
+        ("POST", "/api/live/kill-switch") => {
+            let reason: Option<String> = if body.trim().is_empty() {
+                None
+            } else {
+                serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
+            };
+            // Fail-closed FIRST under lock: disarm & latch killed BEFORE network calls!
+            let (why, client_opt) = {
+                let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                let why = reason
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("operator emergency kill switch")
+                    .to_string();
+                st.rails.live_armed = false;
+                st.rails.killed = true;
+                st.rails.kill_reason = Some(why.clone());
+                let client_opt = if st.config.is_configured() {
+                    kalshi_live::KalshiLiveClient::from_config(&st.config).ok()
+                } else {
+                    None
+                };
+                (why, client_opt)
+            };
+            let report = match client_opt {
+                Some(c) => c.cancel_all_orders(),
+                None => kalshi_live::CancelAllReport {
+                    attempted: 0,
+                    cancelled_count: 0,
+                    cancelled_ids: Vec::new(),
+                    errors: Vec::new(),
+                },
+            };
+            let snap = {
+                let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                if !report.errors.is_empty() {
+                    st.rails.last_error = Some(report.errors.join("; "));
+                }
+                st.rails.status_snapshot(&st.config, st.connected)
+            };
+            let ev = serde_json::json!({
+                "type": "kill_switch",
+                "disarmed": true,
+                "killed": true,
+                "cancelled_count": report.cancelled_count,
+                "ts": now_unix(),
+            })
+            .to_string();
+            tape_hub().publish(ev);
+            json_response(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "disarmed": true,
+                    "killed": true,
+                    "kill_reason": why,
+                    "attempted": report.attempted,
+                    "cancelled_count": report.cancelled_count,
+                    "cancelled_ids": report.cancelled_ids,
+                    "errors": report.errors,
+                    "status": snap,
+                })
+                .to_string(),
+            )
+        }
         _ => json_response(404, "{\"error\":\"not found\"}"),
     }
 }
@@ -4311,7 +5074,7 @@ fn start_banner(url: &str, data_dir: &Path, updates: update::Mode, opened: bool)
     };
     let browser = if opened { "opening it in your browser" } else { "open that address in a browser" };
     format!(
-        "\n  OpenBell {}\n  Your desk:  {url}  ({browser})\n  Tape:       {}\n  Updates:    {updates}\n  Shadow mode: no order path exists in this build.\n",
+        "\n  OpenBell {}\n  Your desk:  {url}  ({browser})\n  Tape:       {}\n  Updates:    {updates}\n  Live mode:  Kalshi v2 ready (disarmed by default under hard risk rails).\n",
         env!("CARGO_PKG_VERSION"),
         data_dir.display()
     )
@@ -5470,8 +6233,8 @@ mod tests {
     fn version_endpoint_names_the_running_build() {
         let (status, v) = body_json(&update_response("GET", "/api/version", "127.0.0.1:8472").unwrap());
         assert_eq!(status, 200);
-        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.7.0")));
-        assert_eq!(v["release_url"], json!("https://github.com/cayleb-james2008/openbell/releases/tag/v0.7.0"));
+        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.8.0")));
+        assert_eq!(v["release_url"], json!("https://github.com/cayleb-james2008/openbell/releases/tag/v0.8.0"));
     }
 
     #[test]
@@ -5481,7 +6244,7 @@ mod tests {
         for key in ["name", "current", "mode", "repo", "platform", "checked_at", "available", "latest", "notes", "release_url", "error", "staged", "can_apply", "dev_build"] {
             assert!(u.get(key).is_some(), "missing {key}: {u}");
         }
-        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!("0.7.0"), json!(false)));
+        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!("0.8.0"), json!(false)));
         assert!(u["checked_at"].is_null(), "nothing is fetched until a check is asked for");
         assert_eq!(u["staged"], Value::Null);
     }
@@ -5514,7 +6277,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let app = App::new(dir.clone(), dir.clone(), 100.0, 60);
         let (_, home) = body_json(&handle(&app, "GET", "/api/home"));
-        assert_eq!(home["version"], json!("0.7.0"));
+        assert_eq!(home["version"], json!("0.8.0"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5629,7 +6392,7 @@ mod tests {
         let b = start_banner("http://127.0.0.1:8475", Path::new("/data/ob"), update::Mode::Auto, true);
         assert!(b.contains("OpenBell ") && b.contains(env!("CARGO_PKG_VERSION")));
         assert!(b.contains("http://127.0.0.1:8475") && b.contains("/data/ob"));
-        assert!(b.contains("auto (installs") && b.contains("opening it in your browser") && b.contains("no order path"));
+        assert!(b.contains("auto (installs") && b.contains("opening it in your browser") && b.contains("hard risk rails"));
     }
 
     #[test]

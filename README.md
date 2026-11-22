@@ -3,15 +3,23 @@
 [![latest release](https://img.shields.io/github/v/release/cayleb-james2008/openbell)](https://github.com/cayleb-james2008/openbell/releases)
 
 
-A compounding desk for Kalshi's 15-minute markets, rebuilt in Rust. OpenBell
-collects the venue's public market data around the clock, scores a library of
-strategies against that tape on paper, and writes a daily report whose first
-line is the venue's own word on the day — or an honest "unavailable".
+A Live Kalshi Connected Trading & Quant Desk for Kalshi's 15-minute markets,
+rebuilt lean in Rust. OpenBell connects directly to Kalshi Trade API v2 (Demo &
+Production) with RSA-PSS SHA-256 signing under fail-closed Hard Risk Rails and
+an Emergency Kill Switch, alongside a 15-minute public tape collector, 12-strategy
+paper slot simulator, PAV isotonic recalibration, `$500/day` capital scaling
+planner, and out-of-sample strategy tournament.
 
-It places no orders. There is no order-placement code path in this build, in
-any form, and nothing in it can arm or trade live. That is a design rule, not
-a missing feature: a mechanical scan of the source and the compiled binary
-runs in the check kit on every change.
+Live trading is **disarmed by default (`live_armed: false`)** on every launch
+and restart. Routing a live order requires configured Kalshi v2 API credentials
+(stored `0600` under `OPENBELL_DATA` and never echoed), explicit `confirm_arm: true`
+arming over localhost with `X-OpenBell-CSRF: 1`, and passing every configured
+Hard Risk Rail (`max_order_contracts`, `max_order_dollars`,
+`max_daily_loss_dollars`, `max_open_exposure_dollars`, `allowed_ticker_prefix`,
+and whole-cent `1..=99` price check). The Emergency Kill Switch disarms
+immediately and cancels all resting orders. A mechanical check kit
+(`.loop/checks/rails.sh` and `.loop/checks/equity.sh`) verifies every invariant
+on every build.
 
 ## The slot system
 
@@ -66,13 +74,28 @@ reads stay open to same-host clients.
 
 ## Venue truth, or "unavailable"
 
-Every number on the home screen and in the daily report is one of three
-kinds, and it is labelled as such: **venue** (read from Kalshi), **tape**
-(counted from the collected snapshots), or **paper** (the slot simulation).
-Anything the desk has not actually obtained is shown as **unavailable** —
-never as zero, never estimated. Signed venue reads are not enabled in this
-build, so the account figures read "unavailable" and the report's first line
-says why.
+Every number on the home screen and in the daily report is labelled by
+provenance: **venue** (live Kalshi Trade API v2 portfolio/market reads), **tape**
+(counted from the collected 15-minute snapshots), or **paper** (the simulated
+slot desk and research analytics). Anything the desk has not obtained is shown
+as **unavailable** — never zero, never fabricated.
+
+## Live Kalshi v2 & Hard Risk Rails
+
+- **Authentication (`src/kalshi_live.rs`):** RSA-PSS SHA-256 request signing
+  (`KALSHI-ACCESS-KEY`, `KALSHI-ACCESS-TIMESTAMP`, `KALSHI-ACCESS-SIGNATURE`)
+  against Demo (`https://demo-api.kalshi.co/trade-api/v2`) or Production
+  (`https://api.elections.kalshi.com/trade-api/v2`). Credentials are validated
+  cryptographically and written `0600` inside `OPENBELL_DATA`; private key bytes
+  are never echoed or logged.
+- **Endpoints (loopback-only; mutations require `X-OpenBell-CSRF: 1`):**
+  `GET /api/live/{status,account,positions,orders,fills}`,
+  `POST /api/live/{config,arm,disarm,order,kill-switch}`, and
+  `DELETE /api/live/orders/:id`.
+- **Fail-closed rails (`src/risk_rails.rs`):** Always boots `live_armed: false`.
+  Every order must pass contract cap, per-order notional cap, daily realized loss
+  cap, projected open exposure cap, allowed ticker prefix, and whole-cent
+  `1..=99` validation or fails closed with HTTP `403`.
 
 ## The collector
 
@@ -206,12 +229,14 @@ every change.
 
 ## Layout
 
-- `src/main.rs` — the HTTP/SSE server, toggleable rate-limit-resilient deduplicating public collector (`--auto-collect`, `GET /api/collector/status`, `POST /api/collector/schedule`, adaptive 429 backoff, capturing top-of-book public depth `yes_bid_size`/`no_bid_size`), shadow scorer, slot system, daily report + `.md`/`.csv` exports (`GET /api/export/report`), live SSE tape stream (`GET /api/tape/stream`), and Quant/Sandbox/Scaling/Tournament routes (`GET /api/analytics/calibration`, `GET /api/analytics/walkforward`, `GET /api/analytics/recalibration`, `GET /api/analytics/tournament`, `POST /api/analytics/montecarlo`, `POST /api/analytics/scale-plan`, `POST /api/strategy/validate`, `POST /api/backtest`, `GET /api/markets/history`, `GET /api/strategy/source`) backed by `RwLock` singleflight caches.
-- `src/analytics.rs` — pure-Rust paper Quant Diagnostics Engine: 10-decile calibration with exact 95% Wilson CIs, Brier/ECE/MCE; chronological 60%/40% Walk-Forward IS vs OOS attribution with Sharpe/Sortino/Profit Factor/Max DD/Calmar/Fee Drag/Streaks; deterministic Xoshiro256++ Monte Carlo bootstrap; and in-memory paper-only strategy validator & backtester.
+- `src/main.rs` — the HTTP/SSE server, loopback+CSRF-guarded Live Kalshi v2 routes (`/api/live/*`), toggleable rate-limit-resilient deduplicating public collector (`--auto-collect`, `GET /api/collector/status`, `POST /api/collector/schedule`, adaptive 429 backoff, capturing top-of-book public depth `yes_bid_size`/`no_bid_size`), shadow scorer, slot system, daily report + `.md`/`.csv` exports (`GET /api/export/report`), live SSE tape stream (`GET /api/tape/stream`), and Quant/Sandbox/Scaling/Tournament routes backed by `RwLock` singleflight caches.
+- `src/kalshi_live.rs` — genuine Kalshi Trade API v2 REST client (Demo & Production) with RSA-PSS SHA-256 request signing (`ring` on Unix/macOS, pure-Rust RFC 8017 on Windows), `0600` credential persistence, and redacted key handling.
+- `src/risk_rails.rs` — fail-closed Hard Risk Rails (`live_armed: false` on boot, explicit `confirm_arm`, contract/notional/daily-loss/exposure/ticker-prefix/whole-cent caps) and Emergency Kill Switch (`cancel_all_orders()` + immediate disarm).
+- `src/analytics.rs` — pure-Rust paper Quant Diagnostics Engine: 10-decile calibration with exact 95% Wilson CIs, Brier/ECE/MCE; chronological 60%/40% Walk-Forward IS vs OOS attribution with Sharpe/Sortino/Profit Factor/Max DD/Calmar/Fee Drag/Streaks; deterministic Xoshiro256++ Monte Carlo bootstrap; and in-memory strategy validator & backtester.
 - `src/recalibration.rs` — monotone Pool-Adjacent-Violators (PAV) isotonic probability recalibration fitted strictly on chronological IS (60%) and evaluated strictly on held-out OOS (40%) windows, emitting 5-point probability buckets with 95% Wilson CIs, OOS Brier/Log-Loss/ECE deltas, Minimum Detectable Edge, and retrospective EV-After-Fees entry gate impact.
 - `src/scaling.rs` — `$500/day` paper capital scaling & liquidity capacity planner computing honest OOS required bankrolls (Equal-Slots / Quarter-Kelly / Half-Kelly, `null` when OOS expectancy `<= 0`), per-series and multi-series 15m liquidity ceilings using observed top-of-book depth, 180-day 1,000-path compounding trajectories (`Empirical Tape` vs optional `Sensitivity`), and a 5-gate mechanical readiness scorecard (`READY_FOR_OWNER_REVIEW` vs `PAPER_RESEARCH_ONLY`).
 - `src/tournament.rs` — Out-of-Sample (40%) 12-strategy paper tournament leaderboard with per-series attribution (`BTC`/`ETH`/`SOL`/`XRP`/`DOGE`), symmetric `12×12` pairwise Pearson correlation matrix across shared settled windows, exact combinatorial Optimal Uncorrelated 4-Slot Lineup (`|r| <= 0.65`, with honest fallback disclosure when `< 4` pass positive OOS), and 2D Entry Price × Seconds-to-Close Edge-by-Regime Heatmap with Wilson sample-depth warnings.
-- `src/open.rs` — display-aware local browser opener on startup.
+- `src/open.rs` — cross-platform chromeless desktop app window launcher (`chromium`/`chrome`/`brave --app=` on Linux, `msedge.exe`/`chrome.exe --app=` on Windows, honoring `--no-open` / `--service` / `OPENBELL_NO_OPEN=1`).
 - `src/update.rs` — the release check and self-update.
 - `strategies/*.rn` — the 12-strategy paper library.
 - `frontend/` — React 19 + Tailwind 4 House Frontend source (8/8 libraries), self-hosted Geist & Geist Mono `.woff2` fonts, and Playwright E2E checks (`frontend/e2e/`), compiled into one self-contained HTML file at `assets/index.html` and embedded into the binary.
