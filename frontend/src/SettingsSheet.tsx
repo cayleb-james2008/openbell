@@ -5,7 +5,8 @@ import { Button } from "@/components/ui/button";
 import { SegmentedControl, SegmentedControlItem } from "@/components/ui/segmented-control";
 import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
 import { useWide } from "@/lib/media";
-import { type Home, ageWords, isNum } from "@/lib/desk";
+import { type CollectorScheduleStatus, type Home, ageWords, isNum } from "@/lib/desk";
+import { AutoCollectorStrip } from "@/AutoCollectorStrip";
 import { VersionRow, type UpdatesHandle } from "@/Update";
 
 export function SettingsSheet({
@@ -14,6 +15,9 @@ export function SettingsSheet({
   theme,
   onThemeChange,
   home,
+  collectorStatus,
+  updatingSchedule,
+  onSelectSchedule,
   collectingNow,
   onCollect,
   upd,
@@ -23,6 +27,9 @@ export function SettingsSheet({
   theme: "light" | "dark";
   onThemeChange: (next: "light" | "dark") => void;
   home: Home | null;
+  collectorStatus: CollectorScheduleStatus | null;
+  updatingSchedule: boolean;
+  onSelectSchedule: (enabled: boolean, intervalSecs: number) => void;
   collectingNow: boolean;
   onCollect: () => void;
   upd: UpdatesHandle;
@@ -114,6 +121,12 @@ export function SettingsSheet({
                   {collectingNow ? "Collecting…" : "Collect now"}
                 </Button>
               </div>
+              <AutoCollectorStrip
+                status={collectorStatus}
+                updating={updatingSchedule}
+                onSelectSchedule={onSelectSchedule}
+                variant="compact"
+              />
               <dl className="grid grid-cols-2 gap-2.5 rounded-[10px] border border-hairline bg-board p-3 text-xs">
                 <div>
                   <dt className="text-ink-3">Status</dt>
