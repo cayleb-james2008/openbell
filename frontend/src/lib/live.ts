@@ -354,6 +354,7 @@ export function evaluateOrderRails(
   ticker: string,
   count: number,
   priceCents: number,
+  action: "buy" | "sell" = "buy",
 ): RailEvaluation {
   const cleanTicker = ticker.trim().toUpperCase();
   const c = Number.isFinite(count) ? Math.floor(count) : 0;
@@ -363,13 +364,24 @@ export function evaluateOrderRails(
   const estFeeDollars = c > 0 && p >= 1 && p <= 99 ? Number(kalshiFeeDollars(c, p / 100).toFixed(2)) : 0;
 
   const r = status.rails;
-  const prefix = r.allowedTickerPrefix.trim().toUpperCase();
-  const prefixOk = cleanTicker.length > 0 && (!prefix || cleanTicker.startsWith(prefix));
+  const prefixes = r.allowedTickerPrefix
+    .split(",")
+    .map((s) => s.trim().toUpperCase())
+    .filter((s) => s.length > 0);
+  const matchedPrefix = prefixes.find((pref) => cleanTicker.startsWith(pref));
+  const tickerCharsOk = cleanTicker.length > 0 && /^[A-Z0-9_-]+$/.test(cleanTicker);
+  const prefixOk = tickerCharsOk && (prefixes.length === 0 || Boolean(matchedPrefix));
   const contractsOk = c >= 1 && c <= r.maxOrderContracts;
   const orderDollarsOk = orderNotionalDollars > 0 && orderNotionalDollars <= r.maxOrderDollars + 1e-9;
-  const exposureAfter = Number((status.openExposureDollars + orderNotionalDollars).toFixed(2));
-  const exposureOk = exposureAfter <= r.maxOpenExposureDollars + 1e-9;
-  const dailyLossOk = status.dailyRealizedLossDollars < r.maxDailyLossDollars;
+  const isSell = action === "sell";
+  const exposureAfter = Number(
+    (isSell
+      ? Math.max(0, status.openExposureDollars - orderNotionalDollars)
+      : status.openExposureDollars + orderNotionalDollars
+    ).toFixed(2),
+  );
+  const exposureOk = isSell || exposureAfter <= r.maxOpenExposureDollars + 1e-9;
+  const dailyLossOk = status.dailyRealizedLossDollars < r.maxDailyLossDollars - 1e-9;
   const armedOk = status.configured && status.liveArmed && !status.killed;
 
   const checks: RailCheckItem[] = [
@@ -391,9 +403,11 @@ export function evaluateOrderRails(
       passed: prefixOk,
       detail: !cleanTicker
         ? "Select or enter a ticker"
-        : prefixOk
-          ? `Matches ${prefix || "*"}`
-          : `Must start with ${prefix}`,
+        : !tickerCharsOk
+          ? "Ticker contains invalid characters"
+          : prefixOk
+            ? `Matches ${matchedPrefix ?? "*"}`
+            : `Must start with ${prefixes.join(", ")}`,
     },
     {
       id: "price",
@@ -417,7 +431,9 @@ export function evaluateOrderRails(
       id: "open_exposure",
       label: "Open Exposure",
       passed: exposureOk,
-      detail: `$${exposureAfter.toFixed(2)} / $${r.maxOpenExposureDollars.toFixed(2)}`,
+      detail: isSell
+        ? `$${exposureAfter.toFixed(2)} / $${r.maxOpenExposureDollars.toFixed(2)} (reduces)`
+        : `$${exposureAfter.toFixed(2)} / $${r.maxOpenExposureDollars.toFixed(2)}`,
     },
     {
       id: "daily_loss",
