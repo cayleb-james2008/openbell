@@ -13,10 +13,14 @@ import {
   RefreshCw,
   Search,
   Settings,
+  ShieldCheck,
+  SlidersHorizontal,
+  TrendingUp,
   X,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Kbd } from "@/components/ui/kbd";
+import type { QuantSectionId } from "@/QuantLabTab";
 import {
   type Market,
   type Slot,
@@ -59,7 +63,7 @@ export function CommandPalette({
   onJumpStrategy: (name: string) => void;
   onOpenSandbox: () => void;
   onJumpSlot: (slotNumber: number, strategyName: string) => void;
-  onJumpQuantSection: (section: "calibration" | "montecarlo" | "walkforward") => void;
+  onJumpQuantSection: (section: QuantSectionId) => void;
   onCollect: () => void;
   onExportReport: (format: "md" | "csv") => void;
   onReseedMonteCarlo: () => void;
@@ -167,6 +171,39 @@ export function CommandPalette({
                     <span>Quant Lab</span>
                   </span>
                   <Kbd>4</Kbd>
+                </Command.Item>
+                <Command.Item
+                  value="Quant Lab 500 Day Scale Planner Bankroll Kelly Liquidity"
+                  onSelect={() => closeAnd(() => onJumpQuantSection("scale"))}
+                  className="flex min-h-11 cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-2 text-sm text-ink outline-none data-[selected=true]:bg-blue-soft sm:min-h-9"
+                >
+                  <span className="flex items-center gap-2">
+                    <TrendingUp className="size-4 text-info-foreground" aria-hidden />
+                    <span>Quant Lab: $500/Day Scale Planner</span>
+                  </span>
+                  <span className="mono text-xs text-ink-3">180d</span>
+                </Command.Item>
+                <Command.Item
+                  value="Quant Lab 5-Gate Readiness Scorecard Paper Research"
+                  onSelect={() => closeAnd(() => onJumpQuantSection("scorecard"))}
+                  className="flex min-h-11 cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-2 text-sm text-ink outline-none data-[selected=true]:bg-blue-soft sm:min-h-9"
+                >
+                  <span className="flex items-center gap-2">
+                    <ShieldCheck className="size-4 text-ink-2" aria-hidden />
+                    <span>Quant Lab: 5-Gate Readiness Scorecard</span>
+                  </span>
+                  <span className="mono text-xs text-ink-3">5 gates</span>
+                </Command.Item>
+                <Command.Item
+                  value="Quant Lab Isotonic Recalibration PAV EV After Fees Gate"
+                  onSelect={() => closeAnd(() => onJumpQuantSection("recalibration"))}
+                  className="flex min-h-11 cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-2 text-sm text-ink outline-none data-[selected=true]:bg-blue-soft sm:min-h-9"
+                >
+                  <span className="flex items-center gap-2">
+                    <SlidersHorizontal className="size-4 text-ink-2" aria-hidden />
+                    <span>Quant Lab: Isotonic Recalibration (PAV)</span>
+                  </span>
+                  <span className="mono text-xs text-ink-3">IS/OOS</span>
                 </Command.Item>
                 <Command.Item
                   value="Quant Lab Calibration Reliability Chart Wilson Brier ECE"

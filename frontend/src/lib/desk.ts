@@ -185,13 +185,25 @@ export function semverAtLeast(version: string | undefined, target: [number, numb
   return pat >= target[2];
 }
 
+function hasCapability(caps: string[] | undefined, capability: string): boolean {
+  if (!Array.isArray(caps)) return false;
+  if (caps.includes(capability)) return true;
+  const underscore = capability.replace(/-/g, "_");
+  const hyphen = capability.replace(/_/g, "-");
+  return caps.includes(underscore) || caps.includes(hyphen);
+}
+
 export function supportsV050(home: Home | null, capability?: string): boolean {
   if (!home) return false;
-  if (capability && Array.isArray(home.capabilities)) {
-    if (home.capabilities.includes(capability)) return true;
-  }
+  if (capability && hasCapability(home.capabilities, capability)) return true;
   if (capability === "sse" && home.sse === true) return true;
   return semverAtLeast(home.version, [0, 5, 0]);
+}
+
+export function supportsV060(home: Home | null, capability?: string): boolean {
+  if (!home) return false;
+  if (capability && hasCapability(home.capabilities, capability)) return true;
+  return semverAtLeast(home.version, [0, 6, 0]);
 }
 
 export async function getJson(url: string, init?: RequestInit): Promise<unknown> {
