@@ -1,4 +1,18 @@
-# OpenBell front end: DESIGN (round 1, first draft)
+# OpenBell front end: DESIGN (v0.4.0 Kalshi 15m Quant Research & Paper Compounding Desk)
+
+## v0.4.0 Architecture Summary
+- **Complete frontend restart**: Replaced the two-column report-card layout with a focused Kalshi 15-minute Quant Research & Paper Compounding Desk built on Cayleb's House Frontend system (`8/8` libraries active in `ROLE-COVERAGE.md`, self-hosted Geist 400/500/600 & Geist Mono `.woff2`, calm Square UI nested hairline surfaces).
+- **Settings-only Appearance**: Light is the crisp default surface; Dark is the full second theme toggled exclusively inside the Desk Settings `Vaul` sheet (`#settings` / `#themeBtn`), never on the top command bar.
+- **Live-first operation**: Zero fixture badge or fixture switcher in live mode. `?dataset=fixture` remains available strictly for automated tests and CI verification.
+- **Hero Telemetry & Compounding Strip (`#readings`)**: 4 tabular `Geist Mono` `SlidingNumber` KPI tiles (Paper Compounding Pot + Stage 1 Tremor `ProgressCircle`, Proven Strategies standing tally, Active 15m Markets, Live Tape Snapshots), hover-inspectable Paper Compounding Curve SVG (`role="img"`, ≥12px SVG labels, `motion.path` `pathLength`), Tremor `Tracker` of recent settled outcomes, and 5-series crypto coverage `CategoryBar`. Motion Primitives `BorderTrail` and `TextShimmer` run strictly while `POST /api/collect` is in flight.
+- **Three-tab Workbench (`COSS UI Tabs` + `AnimatedBackground` glide + `/` global filter + `1`/`2`/`3` hotkeys)**:
+  - `Live 15m Tape`: Open 15m contracts sorted first with live countdowns, YES/NO implied probability bars, bid/ask/spread, and clickable Vaul Market Inspector backed by `GET /api/markets/history`.
+  - `Rune Strategies`: Ranked leaderboard with Tremor `SparkAreaChart` + evidence `Tracker`, null/malformed guards, `j`/`k`/`Enter` navigation, and Vaul Strategy Inspector showing live `.rn` script source (`GET /api/strategy/source`) inside a Cult UI `Expandable`.
+  - `Slot Desk`: Compound-sized slot allocation, 3-strike Tremor `Tracker`, verbatim Daily Report inside a Cult UI `Expandable`, and Read-only Venue Account.
+
+---
+
+# Historical Notes (round 1-3)
 
 ## Job
 An honest paper-trading desk for Kalshi's 15-minute crypto markets: it collects the venue's public data, scores Rune strategies on paper, and writes a daily report.

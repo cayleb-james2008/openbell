@@ -1,88 +1,126 @@
-/* Colour scheme for openbell: the shared Anthropic/owner palette (_fe/palette-claude.css), applied by hand here. Light is the default
-   ivory theme; dark is the full second theme (warm near-black). Blue is the instrument colour (readings, traces), clay the one
-   primary key, sage and red only for gain/loss state. Fonts, radii and the shadow recipe stay as Console. */
+/* Calm Square UI quant desk theme for OpenBell v0.4.0.
+ * Light is the default crisp hairline surface stack; dark is the full second theme
+ * (toggled exclusively inside the Settings Vaul sheet). Cobalt (--blue) is the single
+ * interactive accent; emerald and crimson mark paper gain/loss and status only.
+ */
 :root[data-theme="light"] {
   color-scheme: light;
-  --canvas: #f5f4ee;
-  --board: #eeede5;
-  --surface: #fdfcfa;
-  --hairline: #e3e1d6;
-  --input: #8c8a80;
-  --track: #ebe9df;
-  --raised: #fefefc;
-  --ink: #141413;
-  --ink-2: #4d4c47;
-  --ink-3: #66655e;
-  --icon: #7d7c75;
-  --disabled: #b0aea5;
-  --blue: #d97757; --blue-fg: #141413; --blue-hover: #cc6a49; --blue-soft: #f6e3d9; --focus: #b35634;
-  --ink-button: #141413; --ink-button-fg: #faf9f5;
-  --dot-green: #788c5d; --dot-blue: #6a9bcc; --dot-red: #c4483a; --dot-clay: #d97757; --dot-amber: #c99a3e; --dot-online: #788c5d; --unread: #c4483a;
-  --tag-plan-bg: oklch(94% 0.05 40); --tag-plan-fg: oklch(36% 0.11 40);
-  --tag-ops-bg: oklch(94% 0.05 250); --tag-ops-fg: oklch(36% 0.11 250);
-  --tag-design-bg: oklch(94% 0.04 10); --tag-design-fg: oklch(36% 0.11 10);
-  --tag-research-bg: oklch(94% 0.035 300); --tag-research-fg: oklch(36% 0.11 300);
-  --tag-mint-bg: oklch(94% 0.045 130); --tag-mint-fg: oklch(36% 0.11 130);
-  --tag-dev-bg: oklch(94% 0.04 85); --tag-dev-fg: oklch(36% 0.11 85);
-  --tag-neutral-bg: oklch(94% 0.01 90); --tag-neutral-fg: oklch(36% 0.11 90);
-  --tag-sky-bg: oklch(94% 0.05 250); --tag-sky-fg: oklch(36% 0.11 250);
-  --pill-active-bg: oklch(94% 0.06 130); --pill-active-fg: oklch(36% 0.11 130);
-  --pill-pro-bg: oklch(94% 0.06 40); --pill-pro-fg: oklch(36% 0.11 40);
-  --pill-warn-bg: oklch(94% 0.06 85); --pill-warn-fg: oklch(36% 0.11 85);
-  --pill-inactive-bg: #ebe9df; --pill-inactive-fg: #4d4c47;
-  --av-rose-bg: oklch(94% 0.05 10); --av-rose-fg: oklch(36% 0.11 10);
-  --av-violet-bg: oklch(94% 0.05 300); --av-violet-fg: oklch(36% 0.11 300);
-  --av-sky-bg: oklch(94% 0.05 250); --av-sky-fg: oklch(36% 0.11 250);
-  --av-grey-bg: oklch(94% 0.05 90); --av-grey-fg: oklch(36% 0.11 90);
-  --elev-shell: 0 40px 100px rgba(20, 20, 19, 0.10); --elev-card: 0 1px 2px rgba(20, 20, 19, 0.05); --elev-raised: 0 1px 2px rgba(20, 20, 19, 0.08); --elev-lift: 0 10px 28px rgba(20, 20, 19, 0.12); --elev-primary: none;
-  --destructive-foreground: #9a2f24; --info-foreground: #2f5f94; --success-foreground: #4f6038; --warning-foreground: #7a5a14;
+  --canvas: #f0f2f5;
+  --board: #f5f7fa;
+  --surface: #ffffff;
+  --hairline: #dfe4ec;
+  --input: #8c95a6;
+  --track: #e9edf4;
+  --raised: #ffffff;
+  --ink: #13151a;
+  --ink-2: #4c5568;
+  --ink-3: #5e677a;
+  --icon: #646e82;
+  --disabled: #b8c0ce;
+  --blue: #1562fc;
+  --blue-fg: #ffffff;
+  --blue-hover: #0f52d6;
+  --blue-soft: #e8f0ff;
+  --focus: #1562fc;
+  --ink-button: #14161b;
+  --ink-button-fg: #ffffff;
+  --dot-green: #109468;
+  --dot-blue: #1562fc;
+  --dot-red: #c93746;
+  --dot-clay: #c58e76;
+  --dot-amber: #d48906;
+  --dot-online: #109468;
+  --unread: #c93746;
+  --destructive-foreground: #b4232f;
+  --info-foreground: #144ec4;
+  --success-foreground: #066e4c;
+  --warning-foreground: #855600;
+  --pill-active-bg: #dcf7e9;
+  --pill-active-fg: #066e4c;
+  --pill-warn-bg: #fdf0d3;
+  --pill-warn-fg: #855600;
+  --pill-inactive-bg: #e9edf4;
+  --pill-inactive-fg: #444c5e;
+  --elev-shell: 0 24px 64px rgba(16, 24, 40, 0.08);
+  --elev-card: 0 1px 2px rgba(16, 24, 40, 0.04);
+  --elev-raised: 0 1px 2px rgba(16, 24, 40, 0.08);
+  --elev-lift: 0 10px 28px rgba(16, 24, 40, 0.12);
+  --elev-primary: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 1px 2px rgba(21, 98, 252, 0.28);
 }
+
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --canvas: #141413;
-  --board: #1c1c1a;
-  --surface: #1f1e1c;
-  --hairline: #33322f;
-  --input: #6e6d65;
-  --track: #292825;
-  --raised: #363531;
-  --ink: #faf9f5;
-  --ink-2: #c8c7bd;
-  --ink-3: #9d9c92;
-  --icon: #8c8b82;
-  --disabled: #5b5a55;
-  --blue: #d97757; --blue-fg: #141413; --blue-hover: #e08a6d; --blue-soft: #3a2a22; --focus: #e08a6d;
-  --ink-button: #faf9f5; --ink-button-fg: #141413;
-  --dot-green: #8fa86d; --dot-blue: #6a9bcc; --dot-red: #e0675a; --dot-clay: #d97757; --dot-amber: #d9a84a; --dot-online: #8fa86d; --unread: #e0675a;
-  --tag-plan-bg: oklch(28% 0.05 40); --tag-plan-fg: oklch(84% 0.11 40);
-  --tag-ops-bg: oklch(28% 0.05 250); --tag-ops-fg: oklch(84% 0.11 250);
-  --tag-design-bg: oklch(28% 0.04 10); --tag-design-fg: oklch(84% 0.11 10);
-  --tag-research-bg: oklch(28% 0.035 300); --tag-research-fg: oklch(84% 0.11 300);
-  --tag-mint-bg: oklch(28% 0.045 130); --tag-mint-fg: oklch(84% 0.11 130);
-  --tag-dev-bg: oklch(28% 0.04 85); --tag-dev-fg: oklch(84% 0.11 85);
-  --tag-neutral-bg: oklch(28% 0.01 90); --tag-neutral-fg: oklch(84% 0.11 90);
-  --tag-sky-bg: oklch(28% 0.05 250); --tag-sky-fg: oklch(84% 0.11 250);
-  --pill-active-bg: oklch(28% 0.06 130); --pill-active-fg: oklch(84% 0.11 130);
-  --pill-pro-bg: oklch(28% 0.06 40); --pill-pro-fg: oklch(84% 0.11 40);
-  --pill-warn-bg: oklch(28% 0.06 85); --pill-warn-fg: oklch(84% 0.11 85);
-  --pill-inactive-bg: #262523; --pill-inactive-fg: #c8c7bd;
-  --av-rose-bg: oklch(28% 0.05 10); --av-rose-fg: oklch(84% 0.11 10);
-  --av-violet-bg: oklch(28% 0.05 300); --av-violet-fg: oklch(84% 0.11 300);
-  --av-sky-bg: oklch(28% 0.05 250); --av-sky-fg: oklch(84% 0.11 250);
-  --av-grey-bg: oklch(28% 0.05 90); --av-grey-fg: oklch(84% 0.11 90);
-  --elev-shell: 0 40px 100px rgba(10, 10, 9, 0.5); --elev-card: 0 1px 2px rgba(10, 10, 9, 0.4); --elev-raised: 0 1px 2px rgba(10, 10, 9, 0.5); --elev-lift: 0 12px 28px rgba(10, 10, 9, 0.55); --elev-primary: none;
-  --destructive-foreground: #f0988e; --info-foreground: #9dc0e4; --success-foreground: #a9c188; --warning-foreground: #e7c277;
+  --canvas: #0e1013;
+  --board: #13161c;
+  --surface: #181c23;
+  --hairline: #282e39;
+  --input: #626c80;
+  --track: #20252f;
+  --raised: #2d3442;
+  --ink: #eef0f5;
+  --ink-2: #a5adbe;
+  --ink-3: #8992a5;
+  --icon: #8a93a6;
+  --disabled: #4c5363;
+  --blue: #4a86ff;
+  --blue-fg: #081020;
+  --blue-hover: #699cff;
+  --blue-soft: rgba(74, 134, 255, 0.16);
+  --focus: #699cff;
+  --ink-button: #eef0f5;
+  --ink-button-fg: #12151a;
+  --dot-green: #40c997;
+  --dot-blue: #4a86ff;
+  --dot-red: #f26d7a;
+  --dot-clay: #c58e76;
+  --dot-amber: #f5b338;
+  --dot-online: #40c997;
+  --unread: #f26d7a;
+  --destructive-foreground: #f7929c;
+  --info-foreground: #8fb4ff;
+  --success-foreground: #5ee0b0;
+  --warning-foreground: #f6c462;
+  --pill-active-bg: rgba(49, 184, 138, 0.16);
+  --pill-active-fg: #5ee0b0;
+  --pill-warn-bg: rgba(245, 165, 36, 0.16);
+  --pill-warn-fg: #f6c462;
+  --pill-inactive-bg: rgba(255, 255, 255, 0.08);
+  --pill-inactive-fg: #c2c8d6;
+  --elev-shell: 0 32px 80px rgba(0, 0, 0, 0.48);
+  --elev-card: 0 0 #0000;
+  --elev-raised: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --elev-lift: 0 12px 28px rgba(0, 0, 0, 0.55);
+  --elev-primary: inset 0 1px 0 rgba(255, 255, 255, 0.22);
 }
+
 :root {
-  /* House typography (Geist + Geist Mono), radii and heading recipe */
   --font-sans: "Geist", ui-sans-serif, sans-serif;
   --font-heading: "Geist", ui-sans-serif, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, monospace;
-  --radius-shell: 12px; --radius-panel: 10px; --radius-dialog: 10px; --radius-card: 10px;
-  --radius-segment: 6px; --radius-chip: 4px; --radius-menu: 10px; --radius: 6px;
-  --display-weight: 500; --tracking-display: -0.025em;
+  --radius-shell: 12px;
+  --radius-panel: 10px;
+  --radius-dialog: 10px;
+  --radius-card: 10px;
+  --radius-segment: 6px;
+  --radius-chip: 4px;
+  --radius-menu: 10px;
+  --radius: 6px;
+  --display-weight: 600;
+  --tracking-display: -0.02em;
   font-synthesis: none;
 }
-h1, h2, h3, .font-heading { font-family: var(--font-heading); font-weight: var(--display-weight); letter-spacing: var(--tracking-display); }
-.num, .mono, [data-measured] { font-family: var(--font-mono); font-variant-numeric: tabular-nums slashed-zero; }
-::selection { background: color-mix(in oklab, var(--blue) 28%, transparent); }
+
+h1, h2, h3, .font-heading {
+  font-family: var(--font-heading);
+  font-weight: var(--display-weight);
+  letter-spacing: var(--tracking-display);
+}
+
+.num, .mono, [data-measured] {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--blue) 26%, transparent);
+}

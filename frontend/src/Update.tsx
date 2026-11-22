@@ -212,7 +212,8 @@ export function useUpdates() {
   };
 }
 
-type U = ReturnType<typeof useUpdates>;
+export type UpdatesHandle = ReturnType<typeof useUpdates>;
+type U = UpdatesHandle;
 
 function ErrorDetails({ raw }: { raw: string }) {
   return (
@@ -282,6 +283,14 @@ export function UpdateStrip({ u }: { u: U }) {
           {u.raw && <ErrorDetails raw={u.raw} />}
         </section>
       )}
+      {u.hiddenByDismiss && !u.showBanner && (
+        <div className="flex items-center justify-between gap-3 rounded-[10px] border border-hairline bg-surface px-4 py-2 text-xs text-ink-2">
+          <span>Update {snap.latest} dismissed.</span>
+          <Button ref={u.refs.showRef} variant="outline" className="min-h-11 text-xs" onClick={u.showAgain}>
+            Show update
+          </Button>
+        </div>
+      )}
     </>
   );
 }
@@ -297,7 +306,7 @@ export function VersionRow({ u }: { u: U }) {
       {relUrl
         ? <a id="version-link" href={relUrl} target="_blank" rel="noopener" className="inline-flex min-h-11 items-center rounded-md text-ink underline-offset-4 outline-none hover:underline active:bg-track focus-visible:ring-2 focus-visible:ring-ring">OpenBell {version.version}</a>
         : <span className="text-ink">OpenBell {version.version}</span>}
-      {u.hiddenByDismiss && <Button ref={u.refs.showRef} variant="outline" className="min-h-11" onClick={u.showAgain}>Show update</Button>}
+      {u.hiddenByDismiss && <Button variant="outline" className="min-h-11" onClick={u.showAgain}>Show update</Button>}
       {local && (!snap || snap.mode !== "off") && (
         <Button id="check-updates" variant="outline" className="min-h-11" disabled={busy} onClick={u.check}>
           {u.busy === "check" ? "Checking..." : u.checkErr ? "Try again" : "Check for updates"}

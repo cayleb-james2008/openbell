@@ -124,28 +124,43 @@ fn dollars(v: &serde_json::Value, key: &str) -> Option<f64> {
 
 fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize), String> {
     let url = format!("{API_BASE}/markets?series_ticker={series}&status={status}&limit=100");
-    let out = Command::new("curl")
-        // -q first: never read the user's ~/.curlrc.
-        .arg("-q")
-        .args(["-s", "-m", "25", &url])
-        .output()
-        .map_err(|e| format!("curl failed: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("curl exited {}", out.status));
-    }
-    let body: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("venue returned non-JSON: {e}"))?;
-    let fetched_at = now_unix();
-    let mut snaps: Vec<Snapshot> = Vec::new();
-    let mut skipped = 0usize;
-    // A response without a markets array is not market data — the
-    // venue's error envelope is valid JSON with an "error" key, and
-    // treating it as an empty list would report a dead venue as a
-    // successful, empty collection.
-    let Some(markets) = body.get("markets").and_then(|m| m.as_array()) else {
-        return Err("venue response had no markets array".to_string());
-    };
-    {
+    let mut last_err = "venue response had no markets array".to_string();
+    for attempt in 0..4u32 {
+        let out = Command::new("curl")
+            // -q first: never read the user's ~/.curlrc.
+            .arg("-q")
+            .args(["-s", "-m", "25", &url])
+            .output()
+            .map_err(|e| format!("curl failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("curl exited {}", out.status));
+        }
+        let body: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .map_err(|e| format!("venue returned non-JSON: {e}"))?;
+        let fetched_at = now_unix();
+        // A response without a markets array is not market data — the
+        // venue's error envelope is valid JSON with an "error" key, and
+        // treating it as an empty list would report a dead venue as a
+        // successful, empty collection. Rate-limit envelopes retry with
+        // bounded backoff so shared outbound IPs still complete a full pass.
+        let Some(markets) = body.get("markets").and_then(|m| m.as_array()) else {
+            let code = body
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            if code == "too_many_requests" {
+                last_err = "venue response had no markets array (too_many_requests)".to_string();
+                if attempt < 3 {
+                    let wait_ms = 750u64 << attempt;
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                    continue;
+                }
+            }
+            return Err(last_err);
+        };
+        let mut snaps: Vec<Snapshot> = Vec::new();
+        let mut skipped = 0usize;
         for m in markets {
             let get = |k: &str| m.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
             // A record that cannot be a snapshot is not written to
@@ -177,8 +192,9 @@ fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize), S
                 last_price: dollars(m, "last_price_dollars"),
             });
         }
+        return Ok((snaps, skipped));
     }
-    Ok((snaps, skipped))
+    Err(last_err)
 }
 
 /// One collector pass over every series the desk trades: open markets (the
@@ -212,8 +228,18 @@ fn collect_once(data_dir: &Path) -> Result<(usize, Vec<String>), String> {
     let mut written = 0;
     let mut errors: Vec<String> = Vec::new();
     let mut failed_series: Vec<String> = Vec::new();
+    let pace_ms: u64 = std::env::var("OPENBELL_COLLECT_PACE_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(250)
+        .min(5000);
+    let mut call_idx = 0usize;
     for series in SERIES {
         for status in ["open", "settled"] {
+            if call_idx > 0 && pace_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(pace_ms));
+            }
+            call_idx += 1;
             match fetch_markets(series, status) {
                 Ok((snaps, skipped)) => {
                     if skipped > 0 {
@@ -2223,8 +2249,41 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<RawRequest> {
     Some((method, path, String::from_utf8_lossy(&body).to_string(), headers))
 }
 
-fn latest_markets(app: &App) -> Vec<Snapshot> {
-    let snapshots = app.snapshots_cached(&app.data_dir.join("snapshots.jsonl"));
+fn query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                let mut out = String::with_capacity(v.len());
+                let bytes = v.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'%' && i + 2 < bytes.len() {
+                        if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                                out.push(byte as char);
+                                i += 3;
+                                continue;
+                            }
+                        }
+                    } else if bytes[i] == b'+' {
+                        out.push(' ');
+                        i += 1;
+                        continue;
+                    }
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+                if !out.is_empty() {
+                    return Some(out);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn latest_markets_from(app: &App, path: &Path) -> Vec<Snapshot> {
+    let snapshots = app.snapshots_cached(path);
     let mut latest: BTreeMap<String, Snapshot> = BTreeMap::new();
     for snap in snapshots.iter() {
         latest
@@ -2239,6 +2298,43 @@ fn latest_markets(app: &App) -> Vec<Snapshot> {
     let mut out: Vec<Snapshot> = latest.into_values().collect();
     out.sort_by(|a, b| a.close_time.cmp(&b.close_time));
     out
+}
+
+fn market_history_from(app: &App, path: &Path, ticker: &str) -> Vec<Snapshot> {
+    let snapshots = app.snapshots_cached(path);
+    let mut pts: Vec<Snapshot> = snapshots
+        .iter()
+        .filter(|s| s.ticker == ticker)
+        .cloned()
+        .collect();
+    pts.sort_by_key(|s| s.fetched_at);
+    let total = pts.len();
+    if total > 240 {
+        pts.drain(0..total - 240);
+    }
+    pts
+}
+
+fn strategy_source_for(dir: &Path, name: &str) -> Option<(String, String, String)> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map(|x| x == "rn").unwrap_or(false))
+        .collect();
+    paths.sort();
+    for path in paths {
+        if let Ok(s) = Strategy::load(&path) {
+            if s.name == name {
+                let file = path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let source = std::fs::read_to_string(&path).unwrap_or_default();
+                return Some((file, s.side, source));
+            }
+        }
+    }
+    None
 }
 
 fn handle(app: &App, method: &str, path: &str) -> String {
@@ -2266,7 +2362,56 @@ fn handle(app: &App, method: &str, path: &str) -> String {
             json_response(200, &home.to_string())
         }
         ("GET", "/api/markets") => {
-            json_response(200, &serde_json::to_string(&latest_markets(app)).unwrap())
+            let dpath = dataset_path(app, query);
+            if dataset_name(query) != "live" && !dpath.exists() {
+                return json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {}", dataset_name(query)) })
+                        .to_string(),
+                );
+            }
+            json_response(200, &serde_json::to_string(&latest_markets_from(app, &dpath)).unwrap())
+        }
+        ("GET", "/api/markets/history") => {
+            let dpath = dataset_path(app, query);
+            if dataset_name(query) != "live" && !dpath.exists() {
+                return json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {}", dataset_name(query)) })
+                        .to_string(),
+                );
+            }
+            let Some(ticker) = query_param(query, "ticker") else {
+                return json_response(400, "{\"error\":\"missing ticker parameter\"}");
+            };
+            let points = market_history_from(app, &dpath, &ticker);
+            let body = serde_json::json!({
+                "ticker": ticker,
+                "dataset": dataset_name(query),
+                "points": points,
+            });
+            json_response(200, &body.to_string())
+        }
+        ("GET", "/api/strategy/source") => {
+            let Some(name) = query_param(query, "name") else {
+                return json_response(400, "{\"error\":\"missing name parameter\"}");
+            };
+            match strategy_source_for(&app.strategies_dir, &name) {
+                Some((file, side, source)) => json_response(
+                    200,
+                    &serde_json::json!({
+                        "strategy": name,
+                        "file": file,
+                        "side": side,
+                        "source": source,
+                    })
+                    .to_string(),
+                ),
+                None => json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such strategy: {name}") }).to_string(),
+                ),
+            }
         }
         ("POST", "/api/collect") => match collect_once(&app.data_dir) {
             Ok((n, errors)) => {
@@ -3537,8 +3682,8 @@ mod tests {
     fn version_endpoint_names_the_running_build() {
         let (status, v) = body_json(&update_response("GET", "/api/version", "127.0.0.1:8472").unwrap());
         assert_eq!(status, 200);
-        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.3.0")));
-        assert_eq!(v["release_url"], json!("https://github.com/cayleb-james2008/openbell/releases/tag/v0.3.0"));
+        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.4.0")));
+        assert_eq!(v["release_url"], json!("https://github.com/cayleb-james2008/openbell/releases/tag/v0.4.0"));
     }
 
     #[test]
@@ -3548,7 +3693,7 @@ mod tests {
         for key in ["name", "current", "mode", "repo", "platform", "checked_at", "available", "latest", "notes", "release_url", "error", "staged", "can_apply", "dev_build"] {
             assert!(u.get(key).is_some(), "missing {key}: {u}");
         }
-        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!("0.3.0"), json!(false)));
+        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!("0.4.0"), json!(false)));
         assert!(u["checked_at"].is_null(), "nothing is fetched until a check is asked for");
         assert_eq!(u["staged"], Value::Null);
     }
@@ -3588,7 +3733,65 @@ mod tests {
             analysis_cache: std::sync::Mutex::new(None),
         };
         let (_, home) = body_json(&handle(&app, "GET", "/api/home"));
-        assert_eq!(home["version"], json!("0.3.0"));
+        assert_eq!(home["version"], json!("0.4.0"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn market_history_and_strategy_source_endpoints_return_read_only_data() {
+        let dir = std::env::temp_dir().join(format!("ob-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s1 = Snapshot {
+            fetched_at: 1000,
+            ticker: "KXBTC15M-TEST".to_string(),
+            event_ticker: "KXBTC15M".to_string(),
+            series: "KXBTC15M".to_string(),
+            close_time: "2026-11-21T23:00:00Z".to_string(),
+            status: "open".to_string(),
+            result: String::new(),
+            yes_bid: Some(0.51),
+            yes_ask: Some(0.54),
+            no_bid: Some(0.46),
+            no_ask: Some(0.49),
+            last_price: Some(0.52),
+        };
+        let mut s2 = s1.clone();
+        s2.fetched_at = 1060;
+        s2.yes_ask = Some(0.58);
+        std::fs::write(
+            dir.join("snapshots.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&s2).unwrap(),
+                serde_json::to_string(&s1).unwrap()
+            ),
+        )
+        .unwrap();
+        let strat_dir = dir.join("strategies");
+        seed_strategy_library(&strat_dir).unwrap();
+        let app = App {
+            data_dir: dir.clone(),
+            strategies_dir: strat_dir,
+            paper_pot: 100.0,
+            collect_secs: 60,
+            tape_cache: std::sync::Mutex::new(None),
+            analysis_cache: std::sync::Mutex::new(None),
+        };
+        let (st, body) = body_json(&handle(&app, "GET", "/api/markets/history?ticker=KXBTC15M-TEST"));
+        assert_eq!(st, 200);
+        let pts = body["points"].as_array().unwrap();
+        assert_eq!(pts.len(), 2);
+        assert_eq!(pts[0]["fetched_at"], json!(1000));
+        assert_eq!(pts[1]["fetched_at"], json!(1060));
+
+        let (st2, src) = body_json(&handle(&app, "GET", "/api/strategy/source?name=favourite-late"));
+        assert_eq!(st2, 200);
+        assert_eq!(src["file"], json!("favourite_late.rn"));
+        assert!(src["source"].as_str().unwrap().contains("allow_entry"));
+
+        let (st3, _) = body_json(&handle(&app, "GET", "/api/strategy/source?name=../etc/passwd"));
+        assert_eq!(st3, 404);
         std::fs::remove_dir_all(&dir).ok();
     }
 

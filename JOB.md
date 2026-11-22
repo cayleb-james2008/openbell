@@ -1,10 +1,11 @@
 # OpenBell — Job
 
-OpenBell is an honest paper-trading desk for Kalshi's 15-minute crypto markets: it collects public venue snapshots, scores Rune strategies in compound-sized slots on paper, and writes a plain-English daily report — with zero order-placement capability anywhere in the binary.
-A trader opens this screen to read the daily verdict first, scan the six instrument readings and slot stints, and inspect strategy promotion evidence; a generic dashboard without venue/tape/paper provenance tags, 3-strike slot rotation, and the 100-window promotion bar would fail this job.
+OpenBell is a local Kalshi 15-minute quant research and paper compounding desk built in Rust + Rune: it collects live public Kalshi 15m market tape (BTC, ETH, SOL, XRP, DOGE), scores Rune strategies on compound-sized paper slots, and publishes an honest daily audit trail — with zero order-placement capability anywhere in the binary.
 
-1. How did paper trading and the venue do today (the daily report)?
-2. What is the paper pot, its equity curve, and its progress toward the $1,000 stage target?
-3. Is the forward collector healthy, and how fresh is the collected tape?
-4. Are any strategies proven on forward evidence, and how is each active or retired slot performing?
-5. What does the venue account report, or why are venue figures unavailable?
+A quant operator opens this screen to monitor the live 15-minute tape, track the paper compounding pot and Stage 1 ($1,000) trajectory, inspect Rune strategy promotion evidence and `.rn` entry rules, and verify slot allocations and 3-strike rotations. A generic dashboard without live Kalshi 15m implied probability bars, `venue`/`tape`/`paper` provenance tags, 3-strike slot rotation, Rune script inspection, and the 100-window forward promotion bar would fail this job.
+
+1. What is the paper compounding pot, its curve, and its progress toward the $1,000 Stage 1 target?
+2. Is the live Kalshi 15m collector healthy and fresh, and what are the open 15-minute quotes right now?
+3. How is each Rune strategy performing on paper, what are its entry rules, and is any strategy proven on forward evidence?
+4. How is paper capital allocated across compound-sized slots, what is each slot's 3-strike standing, and what does the daily audit report say?
+5. What does the read-only venue account report, or why are venue figures unavailable?
