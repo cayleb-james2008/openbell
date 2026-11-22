@@ -1043,7 +1043,7 @@ function normalizeCalibration(raw: unknown): CalibrationData | null {
     const mc = root.market_calibration as Record<string, unknown> | undefined;
     const pc = root.portfolio_calibration as Record<string, unknown> | undefined;
     if (mc && typeof mc === "object" && Array.isArray(mc.buckets)) {
-      const mCount = pickNum(mc, ["total_windows", "total_observations", "n", "count"]) ?? 0;
+      const mCount = pickNum(mc, ["sample_size", "total_windows", "total_observations", "n", "count"]) ?? 0;
       if (mCount > 0 || !pc) return mc;
     }
     if (pc && typeof pc === "object" && Array.isArray(pc.buckets)) return pc;
@@ -1055,8 +1055,8 @@ function normalizeCalibration(raw: unknown): CalibrationData | null {
 
   const buckets: CalibrationBucket[] = rawBuckets.map((b, idx) => {
     const bo = (b && typeof b === "object" ? b : {}) as Record<string, unknown>;
-    const low = pickNum(bo, ["low", "lower", "bin_low", "min_prob"]) ?? idx / 10;
-    const high = pickNum(bo, ["high", "upper", "bin_high", "max_prob"]) ?? (idx + 1) / 10;
+    const low = pickNum(bo, ["lower_bound", "low", "lower", "bin_low", "min_prob"]) ?? idx / 10;
+    const high = pickNum(bo, ["upper_bound", "high", "upper", "bin_high", "max_prob"]) ?? (idx + 1) / 10;
     const count = pickNum(bo, ["count", "total", "n", "samples"]) ?? 0;
     const meanPredicted =
       pickNum(bo, ["mean_predicted", "predicted_mean", "predicted", "avg_predicted"]) ?? (low + high) / 2;
@@ -1066,7 +1066,7 @@ function normalizeCalibration(raw: unknown): CalibrationData | null {
     const wilsonHigh =
       pickNum(bo, ["wilson_upper_95", "wilson_high", "ci_high", "upper_95"]) ?? Math.min(1, realizedRate);
     return {
-      binIndex: pickNum(bo, ["bin_index", "index", "bucket"]) ?? idx,
+      binIndex: pickNum(bo, ["bucket_index", "bin_index", "index", "bucket"]) ?? idx,
       low,
       high,
       meanPredicted,
@@ -1078,7 +1078,7 @@ function normalizeCalibration(raw: unknown): CalibrationData | null {
   });
 
   const totalWindows =
-    pickNum(o, ["total_windows", "total_observations", "sample_count", "n", "count"]) ??
+    pickNum(o, ["sample_size", "total_windows", "total_observations", "sample_count", "n", "count"]) ??
     buckets.reduce((a, b) => a + b.count, 0);
 
   return {
@@ -1142,7 +1142,7 @@ function normalizeMonteCarlo(raw: unknown, fallbackSeed: number, fallbackStart: 
   return {
     paths: pickNum(o, ["paths", "num_paths"]) ?? 1000,
     seed: pickNum(o, ["seed"]) ?? fallbackSeed,
-    startEquity: pickNum(o, ["start_equity", "paper_pot_start"]) ?? fallbackStart,
+    startEquity: pickNum(o, ["start_equity_dollars", "start_equity", "paper_pot_start"]) ?? fallbackStart,
     steps: Math.max(0, p50.length - 1),
     percentiles: { p5, p25, p50, p75, p95 },
     terminal: {
@@ -1169,7 +1169,7 @@ function normalizeSplit(raw: unknown): SplitMetrics {
   const o = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const st = (o.streaks && typeof o.streaks === "object" ? o.streaks : {}) as Record<string, unknown>;
   return {
-    windows: pickNum(o, ["windows", "windows_traded", "trades", "trade_count", "n"]) ?? 0,
+    windows: pickNum(o, ["trades_count", "windows", "windows_traded", "trades", "trade_count", "n"]) ?? 0,
     netPnlDollars: pickNum(o, ["net_pnl_dollars", "paper_pnl_dollars", "net_pnl"]) ?? 0,
     sharpe: pickNum(o, ["sharpe", "sharpe_ratio", "sharpe_annualized"]),
     sortino: pickNum(o, ["sortino", "sortino_ratio"]),
@@ -1324,6 +1324,15 @@ export async function validateRuneStrategy(
           if (Array.isArray(raw.errors)) {
             for (const e of raw.errors) diags.push({ level: "error", message: String(e) });
           }
+          if (Array.isArray(raw.warnings)) {
+            for (const w of raw.warnings) diags.push({ level: "warn", message: String(w) });
+          }
+          if (typeof raw.diagnostics === "string" && raw.diagnostics.trim()) {
+            const msg = raw.diagnostics.trim();
+            if (!diags.some((d) => d.message === msg)) {
+              diags.push({ level: raw.valid === false ? "error" : "warn", message: msg });
+            }
+          }
           if (typeof raw.error === "string" && raw.error) {
             diags.push({ level: "error", message: raw.error });
           }
@@ -1331,13 +1340,20 @@ export async function validateRuneStrategy(
           const sideStr = String(raw.side || "").toLowerCase();
           return {
             valid,
-            name: typeof raw.name === "string" && raw.name ? raw.name : typeof raw.strategy === "string" ? raw.strategy : "custom-strategy",
+            name:
+              typeof raw.strategy_name === "string" && raw.strategy_name
+                ? raw.strategy_name
+                : typeof raw.name === "string" && raw.name
+                  ? raw.name
+                  : typeof raw.strategy === "string"
+                    ? raw.strategy
+                    : "custom-strategy",
             side: sideStr === "yes" || sideStr === "no" ? sideStr : "unknown",
             diagnostics:
               diags.length > 0
                 ? diags
                 : [{ level: "info", message: "Compiled cleanly in Rune sandbox VM." }],
-            elapsedMs: pickNum(raw, ["elapsed_ms"]) ?? 1,
+            elapsedMs: Number((pickNum(raw, ["elapsed_ms"]) ?? 1).toFixed(1)),
             source: "server",
           };
         }
@@ -1392,6 +1408,18 @@ export async function runRuneBacktest(
               });
             }
           }
+          if (Array.isArray(valObj.errors)) {
+            for (const e of valObj.errors) diags.push({ level: "error", message: String(e) });
+          }
+          if (Array.isArray(valObj.warnings)) {
+            for (const w of valObj.warnings) diags.push({ level: "warn", message: String(w) });
+          }
+          if (typeof valObj.diagnostics === "string" && valObj.diagnostics.trim()) {
+            const msg = valObj.diagnostics.trim();
+            if (!diags.some((d) => d.message === msg)) {
+              diags.push({ level: valObj.valid === false ? "error" : "warn", message: msg });
+            }
+          }
           if (typeof raw.error === "string" && raw.error) diags.push({ level: "error", message: raw.error });
           const rawCurve = Array.isArray(raw.equity_curve)
             ? raw.equity_curve
@@ -1404,7 +1432,7 @@ export async function runRuneBacktest(
             else if (pt && typeof pt === "object") {
               const po = pt as Record<string, unknown>;
               const t = pickNum(po, ["epoch", "close_epoch", "t"]);
-              const v = pickNum(po, ["equity", "pnl", "value"]);
+              const v = pickNum(po, ["cumulative_pnl_dollars", "equity_dollars", "equity", "pnl", "value"]);
               if (t !== null && v !== null) equityCurve.push([t, v]);
             }
           }
@@ -1418,15 +1446,23 @@ export async function runRuneBacktest(
               price: pickNum(t, ["price", "entry_price"]) ?? 0.5,
               contracts: pickNum(t, ["contracts", "qty"]) ?? 1,
               pnlDollars: pickNum(t, ["pnl_dollars", "pnl"]) ?? 0,
-              result: String(t.result || "").toUpperCase(),
+              result: String(t.result || t.outcome || "").toUpperCase(),
             }));
           const valid = Boolean(valObj.valid ?? valObj.ok ?? raw.valid ?? raw.ok ?? (r.ok && diags.every((d) => d.level !== "error")));
           const sideStr = String(valObj.side || scoreObj?.side || raw.side || "").toLowerCase();
           const winsCount = trades.filter((t) => t.pnlDollars > 0).length;
           const computedWinPct = trades.length > 0 ? Number(((winsCount / trades.length) * 100).toFixed(1)) : 0;
+          const rawWinRatePct = pickNum(sum, ["win_rate_pct"]);
+          const rawWinRateFrac = pickNum(sum, ["win_rate"]);
+          const winRatePct =
+            rawWinRatePct !== null
+              ? Number(rawWinRatePct.toFixed(1))
+              : rawWinRateFrac !== null
+                ? Number((rawWinRateFrac <= 1 ? rawWinRateFrac * 100 : rawWinRateFrac).toFixed(1))
+                : computedWinPct;
           return {
             valid,
-            strategy: String(scoreObj?.strategy || valObj.name || raw.strategy || raw.name || "custom-strategy"),
+            strategy: String(scoreObj?.strategy || valObj.strategy_name || valObj.name || raw.strategy || raw.name || "custom-strategy"),
             side: sideStr === "yes" || sideStr === "no" ? sideStr : "unknown",
             diagnostics:
               diags.length > 0
@@ -1439,7 +1475,7 @@ export async function runRuneBacktest(
               maxDrawdownPct: pickNum(sum, ["max_drawdown_pct", "max_dd_pct"]) ?? 0,
               brierScore: (calObj ? pickNum(calObj, ["brier_score", "brier"]) : null) ?? pickNum(sum, ["brier_score", "brier"]),
               ece: (calObj ? pickNum(calObj, ["ece"]) : null) ?? pickNum(sum, ["ece"]),
-              winRatePct: pickNum(sum, ["win_rate_pct", "win_rate"]) ?? computedWinPct,
+              winRatePct,
               windowsTraded:
                 (scoreObj ? pickNum(scoreObj, ["windows_traded"]) : null) ??
                 pickNum(sum, ["windows_traded", "trades_count", "windows"]) ??
@@ -1452,7 +1488,7 @@ export async function runRuneBacktest(
             },
             equityCurve,
             trades,
-            elapsedMs: pickNum(raw, ["elapsed_ms"]) ?? 1,
+            elapsedMs: Number((pickNum(raw, ["elapsed_ms"]) ?? 1).toFixed(1)),
             source: "server",
           };
         }

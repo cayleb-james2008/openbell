@@ -2717,19 +2717,20 @@ fn csv_escape(s: &str) -> String {
 
 /// Markdown export of the daily report. Line 1 is strictly the venue's own
 /// Day P&L line verbatim (never invented, never pushed below a heading).
-fn export_report_md(app: &App) -> String {
+fn export_report_md(app: &App, dpath: &Path, dataset: &str) -> String {
     let raw = daily_report(app);
     let line1 = raw
         .lines()
         .next()
         .unwrap_or("Day P&L (venue): unavailable");
     let health = collector_health(app);
-    let (sim, scores, _, _) = app.analysis_shared(&app.data_dir.join("snapshots.jsonl"));
+    let (sim, scores, _, _) = app.analysis_shared(dpath);
     let mut out = String::new();
     out.push_str(line1);
     out.push_str("\n\n## OpenBell Daily Paper Report\n\n");
     out.push_str(&format!(
         "- **Mode:** Shadow paper-only desk (zero order-placement paths)\n\
+         - **Dataset:** {dataset}\n\
          - **Paper pot:** {} (started {})\n\
          - **Collector:** {} ({} snapshots on disk, {} markets, {} settled windows)\n\n",
         fmt_money(sim.paper_equity_dollars),
@@ -2764,9 +2765,10 @@ fn export_report_md(app: &App) -> String {
             .mean_cents_per_contract
             .map(|m| format!("{m:+.2}c"))
             .unwrap_or_else(|| "n/a".to_string());
+        let verdict = dataset_verdict(&r.verdict, dataset);
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
-            r.strategy, r.side, r.windows_traded, mean, r.verdict
+            r.strategy, r.side, r.windows_traded, mean, verdict
         ));
     }
     out.push_str("\n## Verbatim Report\n\n```text\n");
@@ -2777,14 +2779,14 @@ fn export_report_md(app: &App) -> String {
 
 /// CSV export of the daily report. Line 1 preserves the exact venue Day P&L
 /// line verbatim before the RFC-4180 CSV header and structured rows.
-fn export_report_csv(app: &App) -> String {
+fn export_report_csv(app: &App, dpath: &Path, dataset: &str) -> String {
     let raw = daily_report(app);
     let line1 = raw
         .lines()
         .next()
         .unwrap_or("Day P&L (venue): unavailable");
     let health = collector_health(app);
-    let (sim, scores, _, _) = app.analysis_shared(&app.data_dir.join("snapshots.jsonl"));
+    let (sim, scores, _, _) = app.analysis_shared(dpath);
     let mut out = String::new();
     out.push_str("# ");
     out.push_str(line1);
@@ -2837,13 +2839,14 @@ fn export_report_csv(app: &App) -> String {
             .mean_cents_per_contract
             .map(|m| format!("{m:.4}"))
             .unwrap_or_default();
+        let verdict = dataset_verdict(&st.verdict, dataset);
         out.push_str(&format!(
             "strategy,{},{},{},{},,,,{}\n",
             csv_escape(&st.strategy),
             csv_escape(&st.side),
             st.windows_traded,
             mean,
-            csv_escape(&st.verdict),
+            csv_escape(&verdict),
         ));
     }
     out
@@ -2985,6 +2988,8 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 "version": env!("CARGO_PKG_VERSION"),
                 "mode": "shadow — this build never places orders",
                 "series": active_series(),
+                "sse": true,
+                "capabilities": ["sse", "calibration", "walkforward", "montecarlo", "sandbox", "export"],
             });
             json_response(200, &home.to_string())
         }
@@ -3140,17 +3145,26 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             json_response(200, &serde_json::json!({ "report": report }).to_string())
         }
         ("GET", "/api/export/report") => {
+            let dpath = dataset_path(app, query);
+            let dataset = dataset_name(query);
+            if dataset != "live" && !dpath.exists() {
+                return json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
+                        .to_string(),
+                );
+            }
             let fmt = query_param(query, "format").unwrap_or_else(|| "md".to_string());
             match fmt.to_ascii_lowercase().as_str() {
                 "md" | "markdown" => text_download_response(
                     "text/markdown; charset=utf-8",
                     "openbell-daily-report.md",
-                    &export_report_md(app),
+                    &export_report_md(app, &dpath, &dataset),
                 ),
                 "csv" => text_download_response(
                     "text/csv; charset=utf-8",
                     "openbell-daily-report.csv",
-                    &export_report_csv(app),
+                    &export_report_csv(app, &dpath, &dataset),
                 ),
                 other => json_response(
                     400,
@@ -4474,8 +4488,8 @@ mod tests {
     fn version_endpoint_names_the_running_build() {
         let (status, v) = body_json(&update_response("GET", "/api/version", "127.0.0.1:8472").unwrap());
         assert_eq!(status, 200);
-        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.4.0")));
-        assert_eq!(v["release_url"], json!("https://github.com/cayleb-james2008/openbell/releases/tag/v0.4.0"));
+        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.5.0")));
+        assert_eq!(v["release_url"], json!("https://github.com/cayleb-james2008/openbell/releases/tag/v0.5.0"));
     }
 
     #[test]
@@ -4485,7 +4499,7 @@ mod tests {
         for key in ["name", "current", "mode", "repo", "platform", "checked_at", "available", "latest", "notes", "release_url", "error", "staged", "can_apply", "dev_build"] {
             assert!(u.get(key).is_some(), "missing {key}: {u}");
         }
-        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!("0.4.0"), json!(false)));
+        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!("0.5.0"), json!(false)));
         assert!(u["checked_at"].is_null(), "nothing is fetched until a check is asked for");
         assert_eq!(u["staged"], Value::Null);
     }
@@ -4518,7 +4532,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let app = App::new(dir.clone(), dir.clone(), 100.0, 60);
         let (_, home) = body_json(&handle(&app, "GET", "/api/home"));
-        assert_eq!(home["version"], json!("0.4.0"));
+        assert_eq!(home["version"], json!("0.5.0"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
