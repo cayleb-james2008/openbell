@@ -147,7 +147,6 @@ fn depth_size(v: &serde_json::Value, keys: &[&str]) -> f64 {
     0.0
 }
 
-#[allow(dead_code)]
 fn median_observed_book_depth(snaps: &[Snapshot]) -> Option<f64> {
     let mut depths: Vec<f64> = snaps
         .iter()
@@ -1998,18 +1997,17 @@ struct AnalyticsCacheEntry {
     paper_pot_start: f64,
 }
 
-#[allow(dead_code)]
 struct RecalibrationCacheEntry {
     path: PathBuf,
     len: u64,
     mtime: u64,
     key: u64,
     dataset: String,
+    slippage_bits: u64,
     json: Arc<String>,
 }
 
 const BACKTEST_CACHE_CAP: usize = 16;
-#[allow(dead_code)]
 const SCALE_PLAN_CACHE_CAP: usize = 32;
 
 struct App {
@@ -2037,12 +2035,9 @@ struct App {
     analytics_cache: std::sync::RwLock<Option<AnalyticsCacheEntry>>,
     analytics_compute_lock: std::sync::Mutex<()>,
     /// Cached PAV isotonic recalibration JSON payload under RwLock + singleflight.
-    #[allow(dead_code)]
     recalibration_cache: std::sync::RwLock<Option<RecalibrationCacheEntry>>,
-    #[allow(dead_code)]
     recalibration_compute_lock: std::sync::Mutex<()>,
     /// Bounded cache for repeated `$500/day` capital scale-plan requests.
-    #[allow(dead_code)]
     scale_plan_cache: std::sync::RwLock<Vec<(u64, Arc<String>)>>,
     /// Small bounded cache for repeated in-memory sandbox backtests over
     /// an unchanged tape + identical source/config hash.
@@ -2437,6 +2432,126 @@ impl App {
                 }
                 guard.push((cache_key, payload.clone()));
             }
+        }
+        payload
+    }
+
+    /// Cached PAV isotonic recalibration study (`GET /api/analytics/recalibration`)
+    /// under RwLock + singleflight guard so 30 concurrent clients stay sub-5ms p95.
+    fn recalibration_shared(&self, dpath: &Path, dataset: &str, slippage_cents: f64) -> Arc<String> {
+        let slippage = if slippage_cents.is_finite() {
+            slippage_cents.clamp(0.0, 5.0)
+        } else {
+            1.0
+        };
+        let slippage_bits = slippage.to_bits();
+        let key = strategies_dir_key(&self.strategies_dir, self.paper_pot);
+        let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
+        {
+            let guard = self.recalibration_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = &*guard {
+                if e.path == dpath
+                    && e.len == len
+                    && e.mtime == mtime
+                    && e.key == key
+                    && e.dataset == dataset
+                    && e.slippage_bits == slippage_bits
+                {
+                    return e.json.clone();
+                }
+            }
+        }
+        let _compute_guard = self
+            .recalibration_compute_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        {
+            let guard = self.recalibration_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = &*guard {
+                if e.path == dpath
+                    && e.len == len
+                    && e.mtime == mtime
+                    && e.key == key
+                    && e.dataset == dataset
+                    && e.slippage_bits == slippage_bits
+                {
+                    return e.json.clone();
+                }
+            }
+        }
+
+        let _ = self.analysis_shared(dpath);
+        let view = self.tape(dpath);
+        let (strategies, _) = load_strategies_with_errors(&self.strategies_dir);
+        let rep = recalibration::recalibration_from_windows(&view.grouped, &strategies, slippage);
+        let mut val = serde_json::to_value(&rep).unwrap_or_else(|_| serde_json::json!({}));
+        val["dataset"] = serde_json::json!(dataset);
+        let payload = Arc::new(val.to_string());
+
+        let entry = RecalibrationCacheEntry {
+            path: dpath.to_path_buf(),
+            len,
+            mtime,
+            key,
+            dataset: dataset.to_string(),
+            slippage_bits,
+            json: payload.clone(),
+        };
+        *self.recalibration_cache.write().unwrap_or_else(|p| p.into_inner()) = Some(entry);
+        payload
+    }
+
+    /// Cached `$500/day` paper capital scaling & liquidity capacity planner
+    /// (`POST /api/analytics/scale-plan`), passing observed top-of-book depth
+    /// from the collected tape.
+    fn scale_plan_cached(
+        &self,
+        dpath: &Path,
+        dataset: &str,
+        req: &scaling::ScalePlanRequest,
+    ) -> Arc<String> {
+        use std::hash::{Hash, Hasher};
+        let sanitized = req.sanitized();
+        let key = strategies_dir_key(&self.strategies_dir, self.paper_pot);
+        let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
+        let req_json = serde_json::to_string(&sanitized).unwrap_or_default();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        dpath.hash(&mut h);
+        len.hash(&mut h);
+        mtime.hash(&mut h);
+        key.hash(&mut h);
+        dataset.hash(&mut h);
+        req_json.hash(&mut h);
+        let cache_key = h.finish();
+
+        {
+            let guard = self.scale_plan_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some((_, cached)) = guard.iter().find(|(k, _)| *k == cache_key) {
+                return cached.clone();
+            }
+        }
+
+        let (sim, _, _, _) = self.analysis_shared(dpath);
+        let view = self.tape(dpath);
+        let (strategies, _) = load_strategies_with_errors(&self.strategies_dir);
+        let median_depth = median_observed_book_depth(&view.snaps);
+        let plan = scaling::compute_scale_plan_with_depth(
+            &view.grouped,
+            &strategies,
+            &sim,
+            &sanitized,
+            median_depth,
+        );
+        let mut val = serde_json::to_value(&plan).unwrap_or_else(|_| serde_json::json!({}));
+        val["dataset"] = serde_json::json!(dataset);
+        let payload = Arc::new(val.to_string());
+
+        let mut guard = self.scale_plan_cache.write().unwrap_or_else(|p| p.into_inner());
+        if !guard.iter().any(|(k, _)| *k == cache_key) {
+            if guard.len() >= SCALE_PLAN_CACHE_CAP {
+                guard.remove(0);
+            }
+            guard.push((cache_key, payload.clone()));
         }
         payload
     }
@@ -3057,7 +3172,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 "mode": "shadow — this build never places orders",
                 "series": active_series(),
                 "sse": true,
-                "capabilities": ["sse", "calibration", "walkforward", "montecarlo", "sandbox", "export"],
+                "capabilities": ["sse", "calibration", "walkforward", "montecarlo", "sandbox", "export", "recalibration", "scale_plan"],
             });
             json_response(200, &home.to_string())
         }
@@ -3266,6 +3381,67 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             }
             let (_, wf_json, _, _, _) = app.analytics_shared(&dpath, &dataset);
             json_response(200, &wf_json)
+        }
+        ("GET", "/api/analytics/recalibration") => {
+            let dpath = dataset_path(app, query);
+            let dataset = dataset_name(query);
+            if dataset != "live" && !dpath.exists() {
+                return json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
+                        .to_string(),
+                );
+            }
+            let slippage = query_param(query, "slippage_cents")
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|v| v.is_finite())
+                .map(|v| v.clamp(0.0, 5.0))
+                .unwrap_or(1.0);
+            let payload = app.recalibration_shared(&dpath, &dataset, slippage);
+            json_response(200, &payload)
+        }
+        ("POST", "/api/analytics/scale-plan") => {
+            let parsed: serde_json::Value = if body.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                match serde_json::from_str::<serde_json::Value>(body) {
+                    Ok(v) if v.is_object() => v,
+                    Ok(_) => {
+                        return json_response(
+                            400,
+                            "{\"error\":\"Scale plan request body must be a JSON object\"}",
+                        );
+                    }
+                    Err(e) => {
+                        return json_response(
+                            400,
+                            &serde_json::json!({ "error": format!("invalid JSON body: {e}") })
+                                .to_string(),
+                        );
+                    }
+                }
+            };
+            let (dataset, dpath) =
+                resolve_dataset(app, query, parsed.get("dataset").and_then(|v| v.as_str()));
+            if dataset != "live" && !dpath.exists() {
+                return json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
+                        .to_string(),
+                );
+            }
+            let req: scaling::ScalePlanRequest = match serde_json::from_value(parsed) {
+                Ok(r) => r,
+                Err(e) => {
+                    return json_response(
+                        400,
+                        &serde_json::json!({ "error": format!("invalid scale-plan parameters: {e}") })
+                            .to_string(),
+                    );
+                }
+            };
+            let payload = app.scale_plan_cached(&dpath, &dataset, &req);
+            json_response(200, &payload)
         }
         ("POST", "/api/analytics/montecarlo") => {
             let parsed: serde_json::Value = if body.trim().is_empty() {
