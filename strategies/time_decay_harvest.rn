@@ -1,0 +1,40 @@
+// Paper research shape: time decay harvest.
+// Buy NO late in the window (1 to 4 minutes remaining) when YES has failed to
+// gain traction and NO trades cleanly in the 68c-88c theta-harvest zone with
+// tight spread (<= 3c) and low fee drag.
+// Scored strictly on paper by the shadow scorer — this file places nothing.
+
+pub fn name() {
+    "time-decay-harvest"
+}
+
+pub fn side() {
+    "no"
+}
+
+pub fn describe() {
+    "Harvest late NO theta (68c-88c, spread <=3c) with 1m-4m left before expiry."
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    if secs_to_close > 240 || secs_to_close < 61 {
+        return false;
+    }
+    if no_ask < 0.68 || no_ask > 0.88 || yes_ask < 0.01 || yes_ask > 0.99 {
+        return false;
+    }
+    let spread = yes_ask + no_ask - 1.0;
+    if spread < -0.001 || spread > 0.035 {
+        return false;
+    }
+    let cents = no_ask * 100.0;
+    (cents - cents.round()).abs() < 0.000001
+}
+
+pub fn entry_quote(yes_ask, no_ask, secs_to_close) {
+    if allow_entry(yes_ask, no_ask, secs_to_close) {
+        Some((no_ask * 100.0).round() / 100.0)
+    } else {
+        None
+    }
+}

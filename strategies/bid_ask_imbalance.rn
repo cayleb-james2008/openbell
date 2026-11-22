@@ -1,0 +1,43 @@
+// Paper research shape: bid-ask imbalance.
+// Buy YES when synthetic book skew strongly favours YES (yes_ask - no_ask >= 0.42)
+// while entry remains below 88c and overround stays <= 3c inside 90s to 8m
+// remaining — targeting one-sided pressure without paying extreme tail prices.
+// Scored strictly on paper by the shadow scorer — this file places nothing.
+
+pub fn name() {
+    "bid-ask-imbalance"
+}
+
+pub fn side() {
+    "yes"
+}
+
+pub fn describe() {
+    "Follow strong YES book skew (yes_ask - no_ask >= 42c, <=88c, spread <=3c) with 90s-8m left."
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    if secs_to_close > 480 || secs_to_close < 90 {
+        return false;
+    }
+    if yes_ask < 0.72 || yes_ask > 0.88 || no_ask < 0.01 || no_ask > 0.32 {
+        return false;
+    }
+    if (yes_ask - no_ask) < 0.419 {
+        return false;
+    }
+    let spread = yes_ask + no_ask - 1.0;
+    if spread < -0.001 || spread > 0.035 {
+        return false;
+    }
+    let cents = yes_ask * 100.0;
+    (cents - cents.round()).abs() < 0.000001
+}
+
+pub fn entry_quote(yes_ask, no_ask, secs_to_close) {
+    if allow_entry(yes_ask, no_ask, secs_to_close) {
+        Some((yes_ask * 100.0).round() / 100.0)
+    } else {
+        None
+    }
+}

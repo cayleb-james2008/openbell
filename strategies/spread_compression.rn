@@ -1,0 +1,40 @@
+// Paper research shape: spread compression.
+// Buy YES when market makers compress the binary overround (yes_ask + no_ask - 1.0)
+// to two cents or tighter on a clear YES lean (0.58 to 0.82) during the core
+// mid-to-late liquidity window (2 to 9 minutes before close).
+// Scored strictly on paper by the shadow scorer — this file places nothing.
+
+pub fn name() {
+    "spread-compression"
+}
+
+pub fn side() {
+    "yes"
+}
+
+pub fn describe() {
+    "Buy YES at 58c-82c when synthetic book spread compresses to <=2c with 2m-9m left."
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    if secs_to_close > 540 || secs_to_close < 120 {
+        return false;
+    }
+    if yes_ask < 0.58 || yes_ask > 0.82 || no_ask < 0.01 || no_ask > 0.99 {
+        return false;
+    }
+    let spread = yes_ask + no_ask - 1.0;
+    if spread < -0.001 || spread > 0.025 {
+        return false;
+    }
+    let cents = yes_ask * 100.0;
+    (cents - cents.round()).abs() < 0.000001
+}
+
+pub fn entry_quote(yes_ask, no_ask, secs_to_close) {
+    if allow_entry(yes_ask, no_ask, secs_to_close) {
+        Some((yes_ask * 100.0).round() / 100.0)
+    } else {
+        None
+    }
+}

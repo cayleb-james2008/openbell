@@ -1,0 +1,40 @@
+// Paper research shape: mean reversion fade.
+// Buy NO when YES spikes aggressively (0.74 to 0.88) while 5 to 12 minutes
+// remain in the 15-minute window and the book spread stays orderly (<= 4c),
+// fading early overextension before late-window convergence sets in.
+// Scored strictly on paper by the shadow scorer — this file places nothing.
+
+pub fn name() {
+    "mean-reversion-fade"
+}
+
+pub fn side() {
+    "no"
+}
+
+pub fn describe() {
+    "Fade mid-window YES spikes (74c-88c) by buying NO at 14c-30c with 5m-12m left."
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    if secs_to_close > 720 || secs_to_close < 300 {
+        return false;
+    }
+    if yes_ask < 0.74 || yes_ask > 0.88 || no_ask < 0.14 || no_ask > 0.30 {
+        return false;
+    }
+    let spread = yes_ask + no_ask - 1.0;
+    if spread < -0.001 || spread > 0.045 {
+        return false;
+    }
+    let cents = no_ask * 100.0;
+    (cents - cents.round()).abs() < 0.000001
+}
+
+pub fn entry_quote(yes_ask, no_ask, secs_to_close) {
+    if allow_entry(yes_ask, no_ask, secs_to_close) {
+        Some((no_ask * 100.0).round() / 100.0)
+    } else {
+        None
+    }
+}

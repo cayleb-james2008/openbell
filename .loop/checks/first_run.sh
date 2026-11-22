@@ -65,7 +65,8 @@ if wait_banner "$D1.log" "$pid"; then
     echo "ok: default port busy -> desk at $url"
   fi
   n=$(ls "$D1/strategies"/*.rn 2>/dev/null | wc -l)
-  [ "$n" = "5" ] || { echo "FAIL: built-in library seeded $n strategy files, expected 5"; fail=1; }
+  expected=$(ls strategies/*.rn 2>/dev/null | wc -l)
+  [ "$n" = "$expected" ] && [ "$n" -ge 12 ] || { echo "FAIL: built-in library seeded $n strategy files, expected $expected (>= 12)"; fail=1; }
   [ "$(opened_count)" = "0" ] || { echo "FAIL: a browser was opened with no display"; fail=1; }
 else
   echo "FAIL: the desk did not start with the default port busy"; tail -5 "$D1.log"; fail=1
