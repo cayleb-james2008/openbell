@@ -187,16 +187,16 @@ function Shell() {
 
   const searchPlaceholder =
     tab === "tape"
-      ? "Filter 15m tickers or series…"
+      ? "Filter 15m tickers…"
       : tab === "strategies"
-        ? "Filter Rune strategies or verdicts…"
-        : "Filter slots or assigned strategies…";
+        ? "Filter strategies…"
+        : "Filter slots…";
 
   return (
     <TooltipProvider>
       <div className="flex min-h-dvh flex-col bg-canvas text-ink">
         {/* Top Command & Live Collector Bar — NO Light/Dark switcher on bar (#67), NO fixture pill in live mode (#61/#68) */}
-        <header className="sticky top-0 z-30 border-b border-hairline bg-surface/95 backdrop-blur-xs">
+        <header className="sticky top-0 z-30 border-b border-hairline bg-surface">
           <div className="mx-auto flex max-w-[1360px] flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5 sm:px-6">
             {/* Brand + Paper-only provenance */}
             <div className="mr-auto flex items-center gap-2.5">
