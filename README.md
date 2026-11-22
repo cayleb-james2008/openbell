@@ -41,8 +41,11 @@ each scored against the same tape:
   silently resolved in anyone's favour.
 
 Strategies are small [Rune](https://rune-rs.github.io/) scripts in
-`strategies/` — the library ships five shapes (favourite late, favourite
-floor, longshot late, mid-window momentum, no-favourite). Editing one file
+`strategies/` — the library ships twelve paper shapes (`bid_ask_imbalance`,
+`favourite_floor`, `favourite_late`, `late_convergence_cap`, `longshot_late`,
+`mean_reversion_fade`, `mid_window_momentum`, `no_favourite`,
+`opening_range_break`, `spread_compression`, `time_decay_harvest`,
+`volatility_squeeze`). Editing one file
 changes only that strategy's results; the check kit proves it. The contract
 is enforced, not assumed: a strategy whose `side()` returns anything but
 "yes" or "no", a duplicate strategy name, or a file past the size cap is
@@ -165,7 +168,7 @@ It serves `http://127.0.0.1:8472`. If that port is busy the desk takes the next
 free one (up to 8492) and prints its address. Without any variable set, the tape
 lives in the platform's data folder: `$XDG_DATA_HOME/openbell` or
 `~/.local/share/openbell` on Linux, `~/Library/Application Support/openbell` on
-macOS, `%APPDATA%\openbell` on Windows. The five built-in strategies are written to
+macOS, `%APPDATA%\openbell` on Windows. The twelve built-in strategies are written to
 `strategies/` inside that folder, once. A checkout keeps working: an
 `openbell-data` or `strategies` folder in the current directory is used when it
 is there.
@@ -182,7 +185,9 @@ Environment (all optional):
 | `OPENBELL_DATA` | the platform data folder above |
 | `OPENBELL_STRATEGIES` | `strategies/` in the data folder (`./strategies` when it exists) |
 | `OPENBELL_COLLECT_SECS` | `60` (the collector's interval, 5 to 3600 seconds) |
-| `OPENBELL_COLLECT_PACE_MS` | `250` (inter-request pace in milliseconds across the 10 public Kalshi reads, 0 to 5000; rate-limit `too_many_requests` responses retry with bounded exponential backoff) |
+| `OPENBELL_COLLECT_PACE_MS` | `250` (inter-request pace in milliseconds across the 10 public Kalshi reads, 0 to 5000; rate-limit `too_many_requests` responses double pace and retry with bounded exponential backoff) |
+| `OPENBELL_SERIES` | `KXBTC15M,KXETH15M,KXSOL15M,KXXRP15M,KXDOGE15M` (optional comma-separated override of public 15m series to collect) |
+| `OPENBELL_DEDUP_SETTLED` | `1` (deduplicates already-recorded immutable settled snapshots across passes; set `0` to append every settled read) |
 | `OPENBELL_PAPER_POT` | `100` (paper pot for the slot simulation, always labelled a simulation parameter, never venue money) |
 | `OPENBELL_ALLOWED_HOSTS` | none (extra host names allowed past the same-site guard, see above) |
 | `PORT` | `8472`, then the next free port up to 8492; an explicit `PORT` is used exactly, and the start fails if it is busy |
@@ -190,21 +195,21 @@ Environment (all optional):
 
 ## Checks
 
-`cargo test` runs the unit tests and the `--version` integration test, and `cargo clippy --all-targets -- -D warnings` enforces zero warnings. `bash .loop/verify` builds the binary, runs
-the Rust tests, and runs the 15-check hermetic and venue-proof kit (including `first_run.sh`: the port fallback, the opener's skip rules and the built-in library): the order-path fence, slot rotation and reconciliation against
+`cargo test` runs the unit tests (including `src/analytics.rs` exact Wilson/Brier/ECE, Walk-Forward, Monte Carlo, and 12-strategy Rune sandbox proofs), the `--version` integration test (`tests/cli.rs`), and the `v0.5.0` scale/SSE/export/Quant HTTP suite (`tests/v050_core.rs`: 100,000 ticks / 2,000 settled windows / 30 concurrent clients at `<300ms` p95), while `cargo clippy --all-targets -- -D warnings` enforces zero warnings. `bash .loop/verify` builds the binary, runs
+the Rust tests, and runs the 16-check hermetic and venue-proof kit (including `first_run.sh`: the port fallback, the opener's skip rules and the 12-strategy built-in library): the order-path fence, slot rotation and reconciliation against
 independent recomputation, collector health counted both ways, the equity
 curve reconciled against the slot report, the daily report's honesty
-assertions, the strategy-library mutation isolation, and both themes. In `frontend/`, `npm run check:ui` runs the headless Playwright gate (responsive layout, WCAG AA contrast, tap targets, Settings-only Light/Dark theme, SVG label geometry, Tape/Strategies/Slots tabs, Market & Strategy inspectors, and Update strip across 1440/768/390/320 px in light and dark) and worst-case data replay suite. The
+assertions, the strategy-library mutation isolation, and both themes. In `frontend/`, `npm run check:ui` runs the headless Playwright gate (responsive layout, WCAG AA contrast, tap targets, Settings-only Light/Dark theme, SVG label geometry, Tape/Strategies/Slots/Quant Lab 4-tab workbench, Rune Sandbox, Cmd+K palette, Market & Strategy inspectors, and Update strip across 1440/768/390/320 px in light and dark) and worst-case data replay suite. The
 kit is the bar: it is expected to pass end to end, and it is re-run after
 every change.
 
 ## Layout
 
-- `src/main.rs` — the whole server: rate-limit-resilient collector, shadow scorer, slot system,
-  report, and the HTTP API (including read-only `GET /api/markets/history` and `GET /api/strategy/source`).
+- `src/main.rs` — the HTTP/SSE server, rate-limit-resilient deduplicating collector, shadow scorer, slot system, daily report + `.md`/`.csv` exports (`GET /api/export/report`), live SSE tape stream (`GET /api/tape/stream`), and Quant/Sandbox routes (`GET /api/analytics/calibration`, `GET /api/analytics/walkforward`, `POST /api/analytics/montecarlo`, `POST /api/strategy/validate`, `POST /api/backtest`, `GET /api/markets/history`, `GET /api/strategy/source`) backed by `RwLock` singleflight caches.
+- `src/analytics.rs` — pure-Rust paper Quant Diagnostics Engine: 10-decile calibration with exact 95% Wilson CIs, Brier/ECE/MCE; chronological 60%/40% Walk-Forward IS vs OOS attribution with Sharpe/Sortino/Profit Factor/Max DD/Calmar/Fee Drag/Streaks; deterministic Xoshiro256++ Monte Carlo bootstrap; and in-memory paper-only Rune validator & backtester.
 - `src/open.rs` — display-aware local browser opener on startup.
 - `src/update.rs` — the release check and self-update.
-- `strategies/*.rn` — the strategy library (Rune).
+- `strategies/*.rn` — the 12-strategy paper library (Rune).
 - `frontend/` & `rune/used/` — React 19 + Tailwind 4 House Frontend source (8/8 libraries), self-hosted Geist & Geist Mono `.woff2` fonts, copied House Frontend parts, and Playwright E2E checks (`frontend/e2e/`), compiled into one self-contained HTML file at `assets/index.html` and embedded into the binary.
 - `JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md` — product job questions, eight-library House Frontend coverage, and interaction/motion inventory.
-- `assets/index.html` — the compiled single-file Kalshi 15m quant research & paper compounding desk: top command bar with `/` global filter and live `Collect now`, Hero Telemetry & Compounding Strip (`SlidingNumber` KPI tiles, interactive paper equity curve, Tremor `Tracker` & `CategoryBar`), three-tab Trader Workbench (`Live 15m Tape` with Market Inspector, `Rune Strategies` with `j`/`k`/`Enter` Strategy Inspector & live `.rn` source disclosure, `Slot Desk` with 3-strike tracker, verbatim Daily Report, and read-only Venue Account), and Desk Settings `Vaul` sheet (Light default + full Dark `Appearance` toggle, collector cadence, self-updates, and provenance legend).
+- `assets/index.html` — the compiled single-file Kalshi 15m Institutional Paper Quant Desk: top command bar with `/` global filter, `Cmd+K` Command Palette, and live `Collect now`; Hero Telemetry & Compounding Strip (`SlidingNumber` KPI tiles, interactive paper equity curve, Tremor `Tracker` & `CategoryBar`); four-tab Quant Workbench (`Live 15m Tape` with SSE stream pill, inline YES/spread chart & Market Inspector; `Rune Strategies` with 12-strategy leaderboard, Strategy Inspector & interactive Rune Sandbox editor + "Backtest on Tape"; `Slot Desk` with synchronized Equity + Drawdown underwater subplot, stint attribution, 3-strike tracker, `.md`/`.csv` Report Exports, verbatim Daily Report & read-only Venue Account; `Quant Lab` with Calibration Wilson CIs, 1,000-path Monte Carlo fan & IS/OOS Walk-Forward table); and Desk Settings `Vaul` sheet (Light default + full Dark `Appearance` toggle, collector cadence, self-updates, and provenance legend).
