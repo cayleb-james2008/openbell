@@ -119,8 +119,9 @@ esac
 
     let port = free_port();
     let _srv = spawn_server(&dir, port, Some(&bin));
-    // Let the initial startup collect pass finish.
-    std::thread::sleep(Duration::from_millis(400));
+    // Trigger pass #1 explicitly so the settled row is on disk before pass #2 tests dedup.
+    let (st_seed, _, body_seed) = http_req(port, "POST", "/api/collect", "{}");
+    assert_eq!(st_seed, 200, "initial collect pass failed: {body_seed}");
 
     // 1. Verify Daily Report exports preserve exact Line 1 venue word.
     let (st_rep, _, body_rep) = http_req(port, "GET", "/api/report", "");

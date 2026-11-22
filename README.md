@@ -184,7 +184,8 @@ Environment (all optional):
 | --- | --- |
 | `OPENBELL_DATA` | the platform data folder above |
 | `OPENBELL_STRATEGIES` | `strategies/` in the data folder (`./strategies` when it exists) |
-| `OPENBELL_COLLECT_SECS` | `60` (the collector's interval, 5 to 3600 seconds) |
+| `OPENBELL_COLLECT_SECS` | `60` (the collector freshness interval, 5 to 3600 seconds) |
+| `OPENBELL_AUTO_COLLECT` | `0` (`1` or `--auto-collect` starts the background public tape collector enabled; `--collect-interval <30..900>` overrides cadence; also toggleable live via `POST /api/collector/schedule`) |
 | `OPENBELL_COLLECT_PACE_MS` | `250` (inter-request pace in milliseconds across the 10 public Kalshi reads, 0 to 5000; rate-limit `too_many_requests` responses double pace and retry with bounded exponential backoff) |
 | `OPENBELL_SERIES` | `KXBTC15M,KXETH15M,KXSOL15M,KXXRP15M,KXDOGE15M` (optional comma-separated override of public 15m series to collect) |
 | `OPENBELL_DEDUP_SETTLED` | `1` (deduplicates already-recorded immutable settled snapshots across passes; set `0` to append every settled read) |
@@ -205,10 +206,11 @@ every change.
 
 ## Layout
 
-- `src/main.rs` — the HTTP/SSE server, rate-limit-resilient deduplicating collector (capturing top-of-book public depth `yes_bid_size`/`no_bid_size`), shadow scorer, slot system, daily report + `.md`/`.csv` exports (`GET /api/export/report`), live SSE tape stream (`GET /api/tape/stream`), and Quant/Sandbox/Scaling routes (`GET /api/analytics/calibration`, `GET /api/analytics/walkforward`, `GET /api/analytics/recalibration`, `POST /api/analytics/montecarlo`, `POST /api/analytics/scale-plan`, `POST /api/strategy/validate`, `POST /api/backtest`, `GET /api/markets/history`, `GET /api/strategy/source`) backed by `RwLock` singleflight caches.
+- `src/main.rs` — the HTTP/SSE server, toggleable rate-limit-resilient deduplicating public collector (`--auto-collect`, `GET /api/collector/status`, `POST /api/collector/schedule`, adaptive 429 backoff, capturing top-of-book public depth `yes_bid_size`/`no_bid_size`), shadow scorer, slot system, daily report + `.md`/`.csv` exports (`GET /api/export/report`), live SSE tape stream (`GET /api/tape/stream`), and Quant/Sandbox/Scaling/Tournament routes (`GET /api/analytics/calibration`, `GET /api/analytics/walkforward`, `GET /api/analytics/recalibration`, `GET /api/analytics/tournament`, `POST /api/analytics/montecarlo`, `POST /api/analytics/scale-plan`, `POST /api/strategy/validate`, `POST /api/backtest`, `GET /api/markets/history`, `GET /api/strategy/source`) backed by `RwLock` singleflight caches.
 - `src/analytics.rs` — pure-Rust paper Quant Diagnostics Engine: 10-decile calibration with exact 95% Wilson CIs, Brier/ECE/MCE; chronological 60%/40% Walk-Forward IS vs OOS attribution with Sharpe/Sortino/Profit Factor/Max DD/Calmar/Fee Drag/Streaks; deterministic Xoshiro256++ Monte Carlo bootstrap; and in-memory paper-only strategy validator & backtester.
 - `src/recalibration.rs` — monotone Pool-Adjacent-Violators (PAV) isotonic probability recalibration fitted strictly on chronological IS (60%) and evaluated strictly on held-out OOS (40%) windows, emitting 5-point probability buckets with 95% Wilson CIs, OOS Brier/Log-Loss/ECE deltas, Minimum Detectable Edge, and retrospective EV-After-Fees entry gate impact.
 - `src/scaling.rs` — `$500/day` paper capital scaling & liquidity capacity planner computing honest OOS required bankrolls (Equal-Slots / Quarter-Kelly / Half-Kelly, `null` when OOS expectancy `<= 0`), per-series and multi-series 15m liquidity ceilings using observed top-of-book depth, 180-day 1,000-path compounding trajectories (`Empirical Tape` vs optional `Sensitivity`), and a 5-gate mechanical readiness scorecard (`READY_FOR_OWNER_REVIEW` vs `PAPER_RESEARCH_ONLY`).
+- `src/tournament.rs` — Out-of-Sample (40%) 12-strategy paper tournament leaderboard with per-series attribution (`BTC`/`ETH`/`SOL`/`XRP`/`DOGE`), symmetric `12×12` pairwise Pearson correlation matrix across shared settled windows, exact combinatorial Optimal Uncorrelated 4-Slot Lineup (`|r| <= 0.65`, with honest fallback disclosure when `< 4` pass positive OOS), and 2D Entry Price × Seconds-to-Close Edge-by-Regime Heatmap with Wilson sample-depth warnings.
 - `src/open.rs` — display-aware local browser opener on startup.
 - `src/update.rs` — the release check and self-update.
 - `strategies/*.rn` — the 12-strategy paper library.

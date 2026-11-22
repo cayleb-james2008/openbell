@@ -582,11 +582,16 @@ function normalizeTournament(raw: unknown, fallbackSlippage: number): Tournament
       const seriesBreakdown: SeriesBreakdown[] = rawSeries
         .filter((s): s is Record<string, unknown> => !!s && typeof s === "object")
         .map((s) => ({
-          series: seriesShort(cleanStr(s.series ?? s.symbol, "BTC")),
-          windows: pickNum(s, ["windows", "oos_windows", "trades", "n"]) ?? 0,
-          winRatePct: normPct(pickNum(s, ["win_rate_pct", "win_rate"])),
-          netExpectancyCents: pickNum(s, ["net_expectancy_cents", "expectancy_cents", "mean_cents"]),
-          netPnlDollars: pickNum(s, ["net_pnl_dollars", "pnl_dollars"]) ?? 0,
+          series: seriesShort(cleanStr(s.asset ?? s.series ?? s.symbol, "BTC")),
+          windows: pickNum(s, ["oos_trades", "windows", "oos_windows", "trades", "n"]) ?? 0,
+          winRatePct: normPct(pickNum(s, ["oos_win_rate", "win_rate_pct", "win_rate"])),
+          netExpectancyCents: pickNum(s, [
+            "oos_net_expectancy_cents",
+            "net_expectancy_cents",
+            "expectancy_cents",
+            "mean_cents",
+          ]),
+          netPnlDollars: pickNum(s, ["oos_net_pnl_dollars_1ct", "net_pnl_dollars", "pnl_dollars"]) ?? 0,
         }));
 
       const oosPositive =
@@ -600,11 +605,18 @@ function normalizeTournament(raw: unknown, fallbackSlippage: number): Tournament
         rank: pickNum(r, ["rank"]) ?? idx + 1,
         strategy: name,
         side: cleanStr(r.side, "yes").toLowerCase(),
-        oosWindows: pickNum(r, ["oos_windows", "oos_trades", "sample_count", "oos_count"]) ?? 0,
-        isWindows: pickNum(r, ["is_windows", "is_trades", "is_count"]) ?? 0,
+        oosWindows: pickNum(r, ["oos_trades", "oos_windows", "sample_count", "oos_count"]) ?? 0,
+        isWindows: pickNum(r, ["is_trades", "is_windows", "is_count"]) ?? 0,
         oosWinRatePct: oosWinRate,
         oosNetExpectancyCents: oosExp,
-        oosNetPnlDollars: pickNum(r, ["oos_net_pnl_dollars", "oos_pnl_dollars", "net_pnl_dollars"]) ?? 0,
+        oosNetPnlDollars:
+          pickNum(r, [
+            "oos_compounded_pnl_dollars",
+            "oos_net_pnl_dollars_1ct",
+            "oos_net_pnl_dollars",
+            "oos_pnl_dollars",
+            "net_pnl_dollars",
+          ]) ?? 0,
         oosSharpe: pickNum(r, ["oos_sharpe", "sharpe"]),
         oosMaxDrawdownPct: pickNum(r, ["oos_max_drawdown_pct", "max_drawdown_pct", "oos_max_dd_pct"]) ?? 0,
         oosPositive,
@@ -666,9 +678,13 @@ function normalizeTournament(raw: unknown, fallbackSlippage: number): Tournament
   const regObj = (
     o.regime_heatmap && typeof o.regime_heatmap === "object"
       ? o.regime_heatmap
-      : o.heatmap && typeof o.heatmap === "object"
-        ? o.heatmap
-        : {}
+      : o.regime_heatmap_oos && typeof o.regime_heatmap_oos === "object"
+        ? o.regime_heatmap_oos
+        : o.regime_heatmap_full && typeof o.regime_heatmap_full === "object"
+          ? o.regime_heatmap_full
+          : o.heatmap && typeof o.heatmap === "object"
+            ? o.heatmap
+            : {}
   ) as Record<string, unknown>;
 
   const rawPriceBuckets = Array.isArray(regObj.price_buckets)
@@ -711,44 +727,67 @@ function normalizeTournament(raw: unknown, fallbackSlippage: number): Tournament
       netExpectancyCents: pickNum(c, ["net_expectancy_cents", "expectancy_cents", "net_paper_expectancy_cents"]),
       wilsonLowPct: wLo,
       wilsonHighPct: wHi,
-      lowSample: typeof c.low_sample === "boolean" ? c.low_sample : typeof c.sample_warning === "boolean" ? c.sample_warning : n < 20,
+      lowSample:
+        typeof c.low_sample === "boolean"
+          ? c.low_sample
+          : typeof c.sample_warning === "boolean"
+            ? c.sample_warning
+            : c.sample_depth_status === "insufficient" || c.sample_depth_status === "empty" || n < 20,
     };
   });
 
-  const corrLimit = pickNum(lineupObj, ["max_correlation_limit", "max_abs_corr_limit", "correlation_cap"]) ?? pickNum(corrObj, ["threshold", "max_abs_corr"]) ?? 0.65;
+  const corrLimit =
+    pickNum(lineupObj, ["max_correlation_limit", "max_abs_corr_limit", "correlation_cap"]) ??
+    pickNum(o, ["correlation_cap"]) ??
+    pickNum(corrObj, ["threshold", "max_abs_corr"]) ??
+    0.65;
   const posCount =
-    pickNum(lineupObj, ["positive_candidate_count", "positive_oos_count"]) ??
+    pickNum(lineupObj, ["positive_oos_candidates", "positive_candidate_count", "positive_oos_count"]) ??
     rankings.filter((r) => r.oosPositive).length;
   const isFallback =
-    typeof lineupObj.is_fallback === "boolean"
-      ? lineupObj.is_fallback
-      : typeof lineupObj.fallback === "boolean"
-        ? lineupObj.fallback
-        : lineupStrategies.length < 4 || posCount < 4;
+    typeof lineupObj.fallback_used === "boolean"
+      ? lineupObj.fallback_used
+      : typeof lineupObj.is_fallback === "boolean"
+        ? lineupObj.is_fallback
+        : typeof lineupObj.fallback === "boolean"
+          ? lineupObj.fallback
+          : lineupStrategies.length < 4 || posCount < 4;
 
   const lineupHonestyNote =
-    typeof lineupObj.honesty_note === "string" && lineupObj.honesty_note
-      ? lineupObj.honesty_note
-      : typeof lineupObj.fallback_reason === "string" && lineupObj.fallback_reason
-        ? lineupObj.fallback_reason
-        : typeof lineupObj.note === "string" && lineupObj.note
-          ? lineupObj.note
-          : isFallback
-            ? `Only ${posCount} of ${rankings.length} strategies pass positive OOS expectancy after fees + ${slip}c slippage.`
-            : `Selected ${lineupStrategies.length} uncorrelated positive-OOS strategies (|r| <= ${corrLimit.toFixed(2)}).`;
+    typeof lineupObj.fallback_disclosure === "string" && lineupObj.fallback_disclosure
+      ? lineupObj.fallback_disclosure
+      : typeof lineupObj.honesty_note === "string" && lineupObj.honesty_note
+        ? lineupObj.honesty_note
+        : typeof lineupObj.fallback_reason === "string" && lineupObj.fallback_reason
+          ? lineupObj.fallback_reason
+          : typeof lineupObj.note === "string" && lineupObj.note
+            ? lineupObj.note
+            : isFallback
+              ? `Only ${posCount} of ${rankings.length} strategies pass positive OOS expectancy after fees + ${slip}c slippage.`
+              : `Selected ${lineupStrategies.length} uncorrelated positive-OOS strategies (|r| <= ${corrLimit.toFixed(2)}).`;
 
   return {
     slippageCents: slip,
     isFraction: pickNum(o, ["is_fraction"]) ?? 0.6,
     oosFraction: pickNum(o, ["oos_fraction"]) ?? 0.4,
-    oosWindowsTotal: pickNum(o, ["oos_windows_total", "oos_windows", "windows_oos"]) ?? 0,
+    oosWindowsTotal:
+      pickNum(o, ["windows_settled_oos", "oos_windows_total", "oos_windows", "windows_oos"]) ?? 0,
     rankings,
     optimalLineup: {
       strategies: lineupStrategies,
       maxCorrelationLimit: corrLimit,
-      maxPairwiseAbsCorr: pickNum(lineupObj, ["max_pairwise_abs_corr", "max_abs_corr", "max_pairwise_corr"]),
+      maxPairwiseAbsCorr: pickNum(lineupObj, [
+        "max_abs_correlation",
+        "max_pairwise_abs_corr",
+        "max_abs_corr",
+        "max_pairwise_corr",
+      ]),
       positiveCandidateCount: posCount,
-      combinedOosExpectancyCents: pickNum(lineupObj, ["combined_oos_expectancy_cents", "mean_oos_expectancy_cents", "portfolio_oos_expectancy_cents"]),
+      combinedOosExpectancyCents: pickNum(lineupObj, [
+        "combined_oos_expectancy_cents",
+        "mean_oos_expectancy_cents",
+        "portfolio_oos_expectancy_cents",
+      ]),
       isFallback,
       honestyNote: lineupHonestyNote,
     },
@@ -764,7 +803,9 @@ function normalizeTournament(raw: unknown, fallbackSlippage: number): Tournament
     honestyNote:
       typeof o.honesty_note === "string" && o.honesty_note
         ? o.honesty_note
-        : `Ranked strictly on OOS (40%) tape after fees + ${slip}c slippage. Paper research only.`,
+        : typeof o.mode_notice === "string" && o.mode_notice
+          ? o.mode_notice
+          : `Ranked strictly on OOS (40%) tape after fees + ${slip}c slippage. Paper research only.`,
     source: "server",
   };
 }

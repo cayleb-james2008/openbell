@@ -2246,6 +2246,14 @@ struct TournamentCacheEntry {
     json: Arc<String>,
 }
 
+struct TournamentCtxCacheEntry {
+    path: PathBuf,
+    len: u64,
+    mtime: u64,
+    key: u64,
+    ctx: Arc<tournament::TournamentTapeContext>,
+}
+
 struct ScaleCtxCacheEntry {
     path: PathBuf,
     len: u64,
@@ -2256,6 +2264,7 @@ struct ScaleCtxCacheEntry {
 
 const BACKTEST_CACHE_CAP: usize = 16;
 const SCALE_PLAN_CACHE_CAP: usize = 32;
+const SLIPPAGE_CACHE_CAP: usize = 16;
 
 struct App {
     data_dir: PathBuf,
@@ -2283,12 +2292,16 @@ struct App {
     /// chronological returns for instant Quant Lab & Monte Carlo reads.
     analytics_cache: std::sync::RwLock<Option<AnalyticsCacheEntry>>,
     analytics_compute_lock: std::sync::Mutex<()>,
-    /// Cached PAV isotonic recalibration JSON payload under RwLock + singleflight.
-    recalibration_cache: std::sync::RwLock<Option<RecalibrationCacheEntry>>,
+    /// Cached PAV isotonic recalibration JSON payloads (multi-slippage) under RwLock + singleflight.
+    recalibration_cache: std::sync::RwLock<Vec<RecalibrationCacheEntry>>,
     recalibration_compute_lock: std::sync::Mutex<()>,
-    /// Cached OOS strategy tournament, 12x12 correlation & regime heatmap payload
-    /// under RwLock + singleflight (`GET /api/analytics/tournament`).
-    tournament_cache: std::sync::RwLock<Option<TournamentCacheEntry>>,
+    /// Pre-scanned tape observations for OOS strategy tournament, 12x12
+    /// correlation matrix & 2D regime heatmap (`GET /api/analytics/tournament`).
+    tournament_ctx_cache: std::sync::RwLock<Option<TournamentCtxCacheEntry>>,
+    tournament_ctx_compute_lock: std::sync::Mutex<()>,
+    /// Cached OOS strategy tournament, 12x12 correlation & regime heatmap payloads
+    /// (multi-slippage) under RwLock + singleflight (`GET /api/analytics/tournament`).
+    tournament_cache: std::sync::RwLock<Vec<TournamentCacheEntry>>,
     tournament_compute_lock: std::sync::Mutex<()>,
     /// Pre-extracted tape observations & depth for `$500/day` scale planner so
     /// unique slider/seed requests never reload strategies or re-scan 100k ticks.
@@ -2329,9 +2342,11 @@ impl App {
             analysis_compute_lock: std::sync::Mutex::new(()),
             analytics_cache: std::sync::RwLock::new(None),
             analytics_compute_lock: std::sync::Mutex::new(()),
-            recalibration_cache: std::sync::RwLock::new(None),
+            recalibration_cache: std::sync::RwLock::new(Vec::new()),
             recalibration_compute_lock: std::sync::Mutex::new(()),
-            tournament_cache: std::sync::RwLock::new(None),
+            tournament_ctx_cache: std::sync::RwLock::new(None),
+            tournament_ctx_compute_lock: std::sync::Mutex::new(()),
+            tournament_cache: std::sync::RwLock::new(Vec::new()),
             tournament_compute_lock: std::sync::Mutex::new(()),
             scale_ctx_cache: std::sync::RwLock::new(None),
             scale_ctx_compute_lock: std::sync::Mutex::new(()),
@@ -2726,16 +2741,15 @@ impl App {
         let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
         {
             let guard = self.recalibration_cache.read().unwrap_or_else(|p| p.into_inner());
-            if let Some(e) = &*guard {
-                if e.path == dpath
+            if let Some(e) = guard.iter().find(|e| {
+                e.path == dpath
                     && e.len == len
                     && e.mtime == mtime
                     && e.key == key
                     && e.dataset == dataset
                     && e.slippage_bits == slippage_bits
-                {
-                    return e.json.clone();
-                }
+            }) {
+                return e.json.clone();
             }
         }
         let _compute_guard = self
@@ -2744,16 +2758,15 @@ impl App {
             .unwrap_or_else(|p| p.into_inner());
         {
             let guard = self.recalibration_cache.read().unwrap_or_else(|p| p.into_inner());
-            if let Some(e) = &*guard {
-                if e.path == dpath
+            if let Some(e) = guard.iter().find(|e| {
+                e.path == dpath
                     && e.len == len
                     && e.mtime == mtime
                     && e.key == key
                     && e.dataset == dataset
                     && e.slippage_bits == slippage_bits
-                {
-                    return e.json.clone();
-                }
+            }) {
+                return e.json.clone();
             }
         }
 
@@ -2774,8 +2787,64 @@ impl App {
             slippage_bits,
             json: payload.clone(),
         };
-        *self.recalibration_cache.write().unwrap_or_else(|p| p.into_inner()) = Some(entry);
+        let mut guard = self.recalibration_cache.write().unwrap_or_else(|p| p.into_inner());
+        guard.retain(|e| {
+            !(e.path == dpath && (e.len != len || e.mtime != mtime || e.key != key))
+        });
+        if guard.len() >= SLIPPAGE_CACHE_CAP {
+            guard.remove(0);
+        }
+        guard.push(entry);
         payload
+    }
+
+    /// Singleflight cached `TournamentTapeContext` built once per `(tape, strategies)`
+    /// state so switching `slippage_cents` skips re-scanning 100k snapshots.
+    fn tournament_ctx_shared(&self, dpath: &Path) -> Arc<tournament::TournamentTapeContext> {
+        let key = strategies_dir_key(&self.strategies_dir, self.paper_pot);
+        let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
+        {
+            let guard = self
+                .tournament_ctx_cache
+                .read()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = &*guard {
+                if e.path == dpath && e.len == len && e.mtime == mtime && e.key == key {
+                    return e.ctx.clone();
+                }
+            }
+        }
+        let _compute_guard = self
+            .tournament_ctx_compute_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        {
+            let guard = self
+                .tournament_ctx_cache
+                .read()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = &*guard {
+                if e.path == dpath && e.len == len && e.mtime == mtime && e.key == key {
+                    return e.ctx.clone();
+                }
+            }
+        }
+
+        let _ = self.analysis_shared(dpath);
+        let view = self.tape(dpath);
+        let (strategies, _) = load_strategies_with_errors(&self.strategies_dir);
+        let ctx = Arc::new(tournament::build_tournament_context(&view.grouped, &strategies));
+        *self
+            .tournament_ctx_cache
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = Some(TournamentCtxCacheEntry {
+            path: dpath.to_path_buf(),
+            len,
+            mtime,
+            key,
+            ctx: ctx.clone(),
+        });
+        ctx
     }
 
     /// Cached OOS strategy tournament, 12x12 correlation & regime heatmap
@@ -2791,16 +2860,15 @@ impl App {
         let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
         {
             let guard = self.tournament_cache.read().unwrap_or_else(|p| p.into_inner());
-            if let Some(e) = &*guard {
-                if e.path == dpath
+            if let Some(e) = guard.iter().find(|e| {
+                e.path == dpath
                     && e.len == len
                     && e.mtime == mtime
                     && e.key == key
                     && e.dataset == dataset
                     && e.slippage_bits == slippage_bits
-                {
-                    return e.json.clone();
-                }
+            }) {
+                return e.json.clone();
             }
         }
         let _compute_guard = self
@@ -2809,32 +2877,30 @@ impl App {
             .unwrap_or_else(|p| p.into_inner());
         {
             let guard = self.tournament_cache.read().unwrap_or_else(|p| p.into_inner());
-            if let Some(e) = &*guard {
-                if e.path == dpath
+            if let Some(e) = guard.iter().find(|e| {
+                e.path == dpath
                     && e.len == len
                     && e.mtime == mtime
                     && e.key == key
                     && e.dataset == dataset
                     && e.slippage_bits == slippage_bits
-                {
-                    return e.json.clone();
-                }
+            }) {
+                return e.json.clone();
             }
         }
 
-        let _ = self.analysis_shared(dpath);
-        let view = self.tape(dpath);
-        let val = serde_json::json!({
-            "dataset": dataset,
-            "slippage_cents": slippage,
-            "windows_settled": view.settled_windows,
-            "windows_conflicted": view.conflicting_settlements,
-            "rankings": [],
-            "correlation_matrix": { "strategies": [], "values": [], "shared_windows": [] },
-            "optimal_lineup": { "selected": [], "max_abs_correlation": 0.65, "qualified_count": 0, "fallback_note": "Awaiting tournament engine integration." },
-            "regime_heatmap": { "price_buckets": [], "time_buckets": [], "cells": [] },
-            "mode_notice": "Paper-only OOS strategy tournament — zero live orders.",
-        });
+        let ctx = self.tournament_ctx_shared(dpath);
+        let rep = tournament::compute_tournament_from_context(&ctx, slippage);
+        let mut val = serde_json::to_value(&rep).unwrap_or_else(|_| serde_json::json!({}));
+        val["dataset"] = serde_json::json!(dataset);
+        // Provide a canonical `regime_heatmap` alias alongside `regime_heatmap_oos` / `regime_heatmap_full`.
+        let primary_heatmap = if rep.regime_heatmap_oos.total_entries_in_grid > 0 {
+            &rep.regime_heatmap_oos
+        } else {
+            &rep.regime_heatmap_full
+        };
+        val["regime_heatmap"] = serde_json::to_value(primary_heatmap)
+            .unwrap_or_else(|_| serde_json::json!({}));
         let payload = Arc::new(val.to_string());
 
         let entry = TournamentCacheEntry {
@@ -2846,7 +2912,14 @@ impl App {
             slippage_bits,
             json: payload.clone(),
         };
-        *self.tournament_cache.write().unwrap_or_else(|p| p.into_inner()) = Some(entry);
+        let mut guard = self.tournament_cache.write().unwrap_or_else(|p| p.into_inner());
+        guard.retain(|e| {
+            !(e.path == dpath && (e.len != len || e.mtime != mtime || e.key != key))
+        });
+        if guard.len() >= SLIPPAGE_CACHE_CAP {
+            guard.remove(0);
+        }
+        guard.push(entry);
         payload
     }
 
@@ -5357,8 +5430,8 @@ mod tests {
     fn version_endpoint_names_the_running_build() {
         let (status, v) = body_json(&update_response("GET", "/api/version", "127.0.0.1:8472").unwrap());
         assert_eq!(status, 200);
-        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.6.0")));
-        assert_eq!(v["release_url"], json!("https://github.com/cayleb-james2008/openbell/releases/tag/v0.6.0"));
+        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.7.0")));
+        assert_eq!(v["release_url"], json!("https://github.com/cayleb-james2008/openbell/releases/tag/v0.7.0"));
     }
 
     #[test]
@@ -5368,7 +5441,7 @@ mod tests {
         for key in ["name", "current", "mode", "repo", "platform", "checked_at", "available", "latest", "notes", "release_url", "error", "staged", "can_apply", "dev_build"] {
             assert!(u.get(key).is_some(), "missing {key}: {u}");
         }
-        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!("0.6.0"), json!(false)));
+        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!("0.7.0"), json!(false)));
         assert!(u["checked_at"].is_null(), "nothing is fetched until a check is asked for");
         assert_eq!(u["staged"], Value::Null);
     }
@@ -5401,7 +5474,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let app = App::new(dir.clone(), dir.clone(), 100.0, 60);
         let (_, home) = body_json(&handle(&app, "GET", "/api/home"));
-        assert_eq!(home["version"], json!("0.6.0"));
+        assert_eq!(home["version"], json!("0.7.0"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
