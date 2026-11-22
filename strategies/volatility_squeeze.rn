@@ -1,0 +1,44 @@
+// Paper research shape: volatility squeeze.
+// Buy YES when the binary contract sits tightly pinned near 50/50 equilibrium
+// (both asks within 46c-56c, mild positive YES edge yes_ask >= no_ask, spread <= 3c)
+// during minutes 6 to 12 of the window, seeking asymmetric resolution out of a
+// low-dispersion squeeze.
+// Scored strictly on paper by the shadow scorer — this file places nothing.
+
+pub fn name() {
+    "volatility-squeeze"
+}
+
+pub fn side() {
+    "yes"
+}
+
+pub fn describe() {
+    "Enter near-50/50 volatility squeezes (46c-56c, yes_ask >= no_ask, spread <=3c) at 3m-9m left."
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    if secs_to_close > 540 || secs_to_close < 180 {
+        return false;
+    }
+    if yes_ask < 0.46 || yes_ask > 0.56 || no_ask < 0.46 || no_ask > 0.56 {
+        return false;
+    }
+    if yes_ask < no_ask {
+        return false;
+    }
+    let spread = yes_ask + no_ask - 1.0;
+    if spread < -0.001 || spread > 0.035 {
+        return false;
+    }
+    let cents = yes_ask * 100.0;
+    (cents - cents.round()).abs() < 0.000001
+}
+
+pub fn entry_quote(yes_ask, no_ask, secs_to_close) {
+    if allow_entry(yes_ask, no_ask, secs_to_close) {
+        Some((yes_ask * 100.0).round() / 100.0)
+    } else {
+        None
+    }
+}
