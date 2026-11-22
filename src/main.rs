@@ -9,8 +9,10 @@
 //! when it passes the desk's promotion standard on forward evidence.
 
 mod analytics;
+mod kalshi_live;
 mod open;
 mod recalibration;
+mod risk_rails;
 mod scaling;
 mod tournament;
 mod update;
