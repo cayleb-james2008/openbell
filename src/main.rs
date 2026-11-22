@@ -8,6 +8,7 @@
 //! paper against collected forward data, and a strategy is only "proven"
 //! when it passes the desk's promotion standard on forward evidence.
 
+mod analytics;
 mod open;
 mod update;
 
@@ -458,7 +459,7 @@ fn parse_tape_bytes(bytes: &[u8]) -> (Vec<Snapshot>, usize) {
 /// The desk's promotion standard. A strategy is proven only on forward
 /// evidence: enough settled windows, and BOTH chronological halves of the
 /// record positive, at or above the per-contract bar.
-#[derive(Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Standard {
     min_windows: usize,
     min_mean_cents: f64,
@@ -755,7 +756,7 @@ impl Strategy {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScoreReport {
     budget_exhausted: bool,
     call_failures: usize,
@@ -2934,13 +2935,20 @@ fn handle_with_body(app: &App, method: &str, path: &str, _body: &str) -> String 
 const DEFAULT_PORT: u16 = 8472;
 const DEFAULT_PORT_SPAN: u16 = 20;
 
-/// The strategy library built into the binary, so a first run has the five shapes without a checkout.
-const BUILT_IN_STRATEGIES: [(&str, &str); 5] = [
+/// The strategy library built into the binary, so a first run has all twelve paper shapes without a checkout.
+const BUILT_IN_STRATEGIES: [(&str, &str); 12] = [
+    ("bid_ask_imbalance.rn", include_str!("../strategies/bid_ask_imbalance.rn")),
     ("favourite_floor.rn", include_str!("../strategies/favourite_floor.rn")),
     ("favourite_late.rn", include_str!("../strategies/favourite_late.rn")),
+    ("late_convergence_cap.rn", include_str!("../strategies/late_convergence_cap.rn")),
     ("longshot_late.rn", include_str!("../strategies/longshot_late.rn")),
+    ("mean_reversion_fade.rn", include_str!("../strategies/mean_reversion_fade.rn")),
     ("mid_window_momentum.rn", include_str!("../strategies/mid_window_momentum.rn")),
     ("no_favourite.rn", include_str!("../strategies/no_favourite.rn")),
+    ("opening_range_break.rn", include_str!("../strategies/opening_range_break.rn")),
+    ("spread_compression.rn", include_str!("../strategies/spread_compression.rn")),
+    ("time_decay_harvest.rn", include_str!("../strategies/time_decay_harvest.rn")),
+    ("volatility_squeeze.rn", include_str!("../strategies/volatility_squeeze.rn")),
 ];
 
 /// The platform's standard data folder for OpenBell, or None when the home folder is unknown.
@@ -4260,7 +4268,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ob-seed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         seed_strategy_library(&dir).unwrap();
-        assert_eq!(load_strategies(&dir).len(), 5, "all five shapes load from the seeded folder");
+        assert_eq!(load_strategies(&dir).len(), 12, "all twelve shapes load from the seeded folder");
         std::fs::write(dir.join("favourite_late.rn"), "pub fn name() { \"mine\" }\n").unwrap();
         seed_strategy_library(&dir).unwrap();
         assert!(std::fs::read_to_string(dir.join("favourite_late.rn")).unwrap().contains("mine"), "an existing folder is left alone");
