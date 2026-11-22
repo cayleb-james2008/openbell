@@ -317,10 +317,10 @@ for (const m of measures) {
   const k3Ok = await p.locator('#slots-card').isVisible()
   await p.keyboard.press('2'); await p.waitForTimeout(200)
   const k2Ok = await p.locator('#strategies').isVisible()
-  ok('keyboard shortcuts 2/3/4 switch Rune Strategies, Slot Desk & Quant Lab tabs', k4Ok && k3Ok && k2Ok)
+  ok('keyboard shortcuts 2/3/4 switch Strategies, Slot Desk & Quant Lab tabs', k4Ok && k3Ok && k2Ok)
 
-  // Rune Strategies tab + filters + Sandbox Editor + Validate + Backtest + j/k/Enter + Inspector
-  ok('Rune Strategies leaderboard renders full strategy library', (await stratRows(p)) === stratTotal && stratTotal >= 5, String(await stratRows(p)))
+  // Strategies tab + filters + Sandbox Editor + Validate + Backtest + j/k/Enter + Inspector
+  ok('Strategies leaderboard renders full strategy library', (await stratRows(p)) === stratTotal && stratTotal >= 5, String(await stratRows(p)))
   const filterBtns = await p.locator('#strategies [role="group"][aria-label="Filter strategies by verdict"] button').evaluateAll(bs =>
     bs.map(b => ({ label: b.innerText.trim(), n: Number((b.innerText.match(/\((\d+)\)/) || [])[1] || 0) })),
   )
@@ -329,16 +329,18 @@ for (const m of measures) {
     ok(`strategy filter ${label.split(' ')[0]}`, (await stratRows(p)) === n, `${label} -> ${await stratRows(p)}`)
   }
 
-  // Interactive Rune Strategy Sandbox Editor & Backtest on Tape
+  // Interactive Strategy Sandbox Editor & Backtest on Tape
   await p.locator('#open-sandbox-btn').click(); await p.waitForTimeout(250)
-  ok('Rune Strategy Sandbox editor opens inline', await p.locator('#rune-sandbox #rune-editor').isVisible())
+  ok('Strategy Sandbox editor opens inline', await p.locator('#rune-sandbox #rune-editor').isVisible())
   await p.locator('#sandbox-validate-btn').click(); await p.waitForTimeout(250)
-  ok('Validate Rune reports compile diagnostics', (await p.locator('#sandbox-diagnostics').innerText()).includes('Compile passed'))
+  ok('Validate Strategy reports compile diagnostics', (await p.locator('#sandbox-diagnostics').innerText()).includes('Compile passed'))
   await p.locator('#sandbox-backtest-btn').click(); await p.waitForTimeout(350)
   const sbTxt = await p.locator('[data-sandbox-results]').innerText()
   ok('Backtest on Tape renders paper P&L, Sharpe, Max Drawdown & Brier',
     sbTxt.includes('Paper Net P&L') && sbTxt.includes('Sharpe') && sbTxt.includes('Max Drawdown') && sbTxt.includes('Brier Score'),
     sbTxt.slice(0, 120))
+  const sandboxRuneLeak = await p.evaluate(() => /\brune\b/i.test(document.body.innerText))
+  ok('zero user-facing Rune jargon on Strategies + Sandbox view', !sandboxRuneLeak)
   await p.screenshot({ path: `${OUT}/strategies-sandbox-1440.png` })
   await p.locator('#open-sandbox-btn').click(); await p.waitForTimeout(150)
 
@@ -360,8 +362,8 @@ for (const m of measures) {
   await p.keyboard.press('Enter'); await p.waitForTimeout(600)
   ok('Enter opens Strategy Inspector drawer', (await drawerTitle(p)) === secondStrat, await drawerTitle(p))
   ok('Strategy Inspector draws SVG equity curve', (await p.locator('[data-strategy-drawer] svg[role=img]').count()) >= 1)
-  await p.locator('[data-strategy-drawer]').getByText(/Rune script source/).click(); await p.waitForTimeout(350)
-  ok('Cult UI Expandable reveals live Rune .rn source', (await p.locator('[data-strategy-drawer] pre').innerText()).includes('allow_entry'))
+  await p.locator('[data-strategy-drawer]').getByText(/Strategy script source/).click(); await p.waitForTimeout(350)
+  ok('Cult UI Expandable reveals live strategy script source', (await p.locator('[data-strategy-drawer] pre').innerText()).includes('allow_entry'))
   await p.screenshot({ path: `${OUT}/strategy-drawer-1440.png` })
   await p.keyboard.press('j'); await p.waitForTimeout(300)
   ok('j follows inside Strategy Inspector', (await drawerTitle(p)) !== secondStrat, await drawerTitle(p))
@@ -416,10 +418,12 @@ for (const m of measures) {
   // Global Command Palette (Ctrl+K / Cmd+K)
   await p.keyboard.press('Control+k'); await p.waitForTimeout(250)
   ok('Ctrl+K opens global Command Palette', await p.locator('[data-command-palette]').isVisible())
+  const cmdkRuneLeak = await p.evaluate(() => /\brune\b/i.test(document.body.innerText))
+  ok('zero user-facing Rune jargon inside Command Palette', !cmdkRuneLeak)
   await p.screenshot({ path: `${OUT}/cmdk-1440-light.png` })
   await p.locator('[data-command-palette] input').fill('favourite-late'); await p.waitForTimeout(200)
   await p.keyboard.press('Enter'); await p.waitForTimeout(600)
-  ok('Command Palette jumps directly to Rune strategy inspector',
+  ok('Command Palette jumps directly to strategy inspector',
     (await p.locator('[data-command-palette]').count()) === 0 && (await drawerTitle(p)) === 'favourite-late',
     await drawerTitle(p))
   await p.keyboard.press('Escape'); await p.waitForTimeout(400)
@@ -533,7 +537,7 @@ for (const m of measures) {
   })
   await p.route('**/api/strategy/validate', r => {
     hits.add('validate')
-    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ valid: true, name: 'late-favourite-edge', side: 'yes', diagnostics: [{ level: 'info', message: 'Server Rune VM compile OK' }], elapsed_ms: 4 }) })
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ valid: true, name: 'late-favourite-edge', side: 'yes', diagnostics: [{ level: 'info', message: 'Server sandbox compile OK' }], elapsed_ms: 4 }) })
   })
   await p.route('**/api/backtest', r => {
     hits.add('backtest')

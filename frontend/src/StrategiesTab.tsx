@@ -235,13 +235,13 @@ function StrategyInspector({
                   />
                 </div>
 
-                {/* Cult UI Expandable: Rune strategy script source */}
+                {/* Cult UI Expandable: strategy script source */}
                 <div className="rounded-lg border border-hairline bg-board/50 px-3.5 py-2.5">
                   <Expandable expandDirection="vertical" expandBehavior="push" className="w-full">
                     <ExpandableTrigger className="flex min-h-11 w-full cursor-pointer items-center justify-between gap-2 text-left text-xs font-semibold text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring">
                       <span className="inline-flex items-center gap-2">
                         <Code2 className="size-4 text-ink-2" aria-hidden />
-                        <span>Rune script source {source?.file ? `(${source.file})` : ""}</span>
+                        <span>Strategy script source {source?.file ? `(${source.file})` : ""}</span>
                       </span>
                       <ChevronDown className="size-4 text-ink-2" aria-hidden />
                     </ExpandableTrigger>
@@ -251,9 +251,9 @@ function StrategyInspector({
                           {source.source}
                         </pre>
                       ) : sourceErr ? (
-                        <p className="mt-2 text-xs text-ink-2">Rune source unavailable ({sourceErr}).</p>
+                        <p className="mt-2 text-xs text-ink-2">Strategy source unavailable ({sourceErr}).</p>
                       ) : (
-                        <p className="mt-2 text-xs text-ink-3">Loading Rune script…</p>
+                        <p className="mt-2 text-xs text-ink-3">Loading strategy script…</p>
                       )}
                     </ExpandableContent>
                   </Expandable>
@@ -462,7 +462,7 @@ export function StrategiesTab({
   }, [openName, slots]);
 
   return (
-    <section id="strategies" aria-label="Rune strategies leaderboard and sandbox" className="space-y-3">
+    <section id="strategies" aria-label="Strategies leaderboard and sandbox" className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2.5">
         <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Filter strategies by verdict">
           {(
@@ -505,12 +505,12 @@ export function StrategiesTab({
             onClick={() => setSandboxOpen((v) => !v)}
           >
             <Code2 className="size-3.5" aria-hidden />
-            <span>{sandboxOpen ? "Close Rune Sandbox" : "Rune Sandbox"}</span>
+            <span>{sandboxOpen ? "Close Strategy Sandbox" : "Strategy Sandbox"}</span>
           </Button>
         </div>
       </div>
 
-      {/* Interactive Rune Strategy Sandbox Editor & Backtest Panel */}
+      {/* Interactive Strategy Sandbox Editor & Backtest Panel */}
       {sandboxOpen && (
         <RuneSandbox
           strategies={validRows}
@@ -534,7 +534,7 @@ export function StrategiesTab({
       ) : !strategiesRead.ok ? (
         <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-[10px] border border-hairline bg-surface p-5">
           <div>
-            <p className="text-sm font-medium text-destructive-foreground">Could not score the Rune strategy library.</p>
+            <p className="text-sm font-medium text-destructive-foreground">Could not score the strategy library.</p>
             <p className="mt-0.5 text-xs text-ink-2">{strategiesRead.msg}</p>
           </div>
           <Button variant="outline" className="min-h-11" onClick={onRetry}>
@@ -544,7 +544,7 @@ export function StrategiesTab({
       ) : validRows.length === 0 ? (
         <div role="status" className="rounded-[10px] border border-hairline bg-surface p-6">
           <p className="text-sm font-semibold text-ink">No strategies in the library</p>
-          <p className="mt-1 text-xs text-ink-2">Add `.rn` Rune strategy scripts to the strategies folder to score them on paper.</p>
+          <p className="mt-1 text-xs text-ink-2">Add strategy scripts to the strategies folder to score them on paper.</p>
         </div>
       ) : filtered.length === 0 ? (
         <div role="status" className="flex flex-wrap items-center justify-between gap-3 rounded-[10px] border border-hairline bg-surface p-5">
@@ -558,7 +558,7 @@ export function StrategiesTab({
           <Table className="stack">
             <TableHeader>
               <TableRow>
-                <TableHead>Rune Strategy</TableHead>
+                <TableHead>Strategy</TableHead>
                 <TableHead>Side</TableHead>
                 <TableHead className="text-right">Paper Net P&amp;L</TableHead>
                 <TableHead className="text-right">Mean / Contract</TableHead>

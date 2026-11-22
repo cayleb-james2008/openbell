@@ -475,8 +475,8 @@ function Shell() {
                       className="min-h-11 flex-1 px-2 text-xs sm:min-h-9 sm:flex-none sm:px-3.5 sm:text-sm"
                     >
                       <span className="inline-flex items-center gap-1.5 sm:gap-2">
-                        <span className="sm:hidden">Rune</span>
-                        <span className="hidden sm:inline">Rune Strategies</span>
+                        <span className="sm:hidden">Strategies</span>
+                        <span className="hidden sm:inline">Strategies</span>
                         {strategyCount !== null && (
                           <Badge variant="outline" className="mono hidden text-xs sm:inline-flex">
                             {strategyCount}
