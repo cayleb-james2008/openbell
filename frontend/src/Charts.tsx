@@ -19,6 +19,7 @@ import {
   timeUtcLabel,
 } from "@/lib/desk";
 import type { CalibrationBucket, MonteCarloData } from "@/lib/quant";
+import type { RecalBucket, ScalePlanData } from "@/lib/scaling";
 import { drawOnce } from "@/motionProps";
 
 export type Point = [number, number];
@@ -1166,6 +1167,313 @@ export function MonteCarloFanChart({
         <text x={W - PADR} y={H - 8} textAnchor="end" fontSize={12} className="font-mono" style={{ fill: "var(--ink-3)" }}>
           T{len - 1}
         </text>
+      </svg>
+    </div>
+  );
+}
+
+/** 180-Day Compounding Trajectory SVG Chart (P10/P50/P90 daily run-rate or equity + horizontal target line). */
+export function CompoundingTrajectoryChart({
+  plan,
+  metric,
+  height = 248,
+}: {
+  plan: ScalePlanData;
+  metric: "daily" | "equity";
+  height?: number;
+}) {
+  const [ref, W] = useContainerWidth(220, 560);
+  const reduce = useReducedMotion();
+  const [hoverDay, setHoverDay] = useState<number | null>(null);
+
+  const proj = plan.compoundingProjection;
+  const p10 = metric === "daily" ? proj.p10Daily : proj.p10Equity;
+  const p50 = metric === "daily" ? proj.p50Daily : proj.p50Equity;
+  const p90 = metric === "daily" ? proj.p90Daily : proj.p90Equity;
+  const len = p50.length;
+  const H = height;
+  const top = 16;
+  const bottom = H - 30;
+  const padL = 68;
+
+  if (len < 2) {
+    return (
+      <div ref={ref} className="rounded-lg border border-dashed border-hairline bg-board/40 px-4 py-8 text-xs text-ink-2">
+        Run the scale planner with settled tape windows to project 180-day P10/P50/P90 trajectories.
+      </div>
+    );
+  }
+
+  const refLine = metric === "daily" ? plan.targetDailyDollars : plan.startingBankroll;
+  const allVals = [...p10, ...p90, refLine];
+  const lo = Math.min(...allVals);
+  const hi = Math.max(...allVals);
+  const span = Math.max(10, hi - lo);
+  const y0 = lo - span * 0.08;
+  const y1 = hi + span * 0.08;
+
+  const X = (d: number) => padL + (d / Math.max(1, len - 1)) * (W - padL - PADR);
+  const Y = (v: number) => bottom - ((v - y0) / Math.max(1e-9, y1 - y0)) * (bottom - top);
+
+  const bandD =
+    p90.map((v, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(" ") +
+    " " +
+    [...p10]
+      .reverse()
+      .map((v, rev) => `L${X(len - 1 - rev).toFixed(1)},${Y(v).toFixed(1)}`)
+      .join(" ") +
+    " Z";
+  const medianD = p50.map((v, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(" ");
+
+  const activeDay = hoverDay !== null && hoverDay >= 0 && hoverDay < len ? hoverDay : len - 1;
+  const fmtVal = (v: number) => (metric === "daily" ? `${moneyWhole(v)}/d` : moneyWhole(v));
+
+  const onMove = (clientX: number, rect: DOMRect) => {
+    const rel = clientX - rect.left;
+    const ratio = Math.min(1, Math.max(0, (rel - padL) / Math.max(1, W - padL - PADR)));
+    setHoverDay(Math.round(ratio * (len - 1)));
+  };
+
+  return (
+    <div ref={ref} className="min-w-0" data-scale-trajectory-chart>
+      <div
+        data-scale-trajectory-tooltip
+        className="mb-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded-md border border-hairline bg-surface px-2.5 py-1.5 font-mono text-xs tabular-nums"
+      >
+        <span className="font-medium text-ink">Day {activeDay}/{len - 1}</span>
+        <span className="text-success-foreground">P90 {fmtVal(p90[activeDay])}</span>
+        <span className="font-semibold text-info-foreground">P50 {fmtVal(p50[activeDay])}</span>
+        <span className="text-destructive-foreground">P10 {fmtVal(p10[activeDay])}</span>
+        <span className="text-ink-3">
+          {metric === "daily" ? `Target ${moneyWhole(plan.targetDailyDollars)}/d` : `Start ${moneyWhole(plan.startingBankroll)}`}
+        </span>
+      </div>
+
+      <svg
+        role="img"
+        aria-label={`180-day paper compounding trajectory showing P10, P50, and P90 ${metric === "daily" ? "daily run-rate against target" : "paper equity"}`}
+        viewBox={`0 0 ${W} ${H}`}
+        width={W}
+        height={H}
+        className="block h-auto max-w-full select-none"
+        onMouseMove={(e) => onMove(e.clientX, e.currentTarget.getBoundingClientRect())}
+        onMouseLeave={() => setHoverDay(null)}
+      >
+        {[hi, (hi + lo) / 2, lo].map((tick, idx) => (
+          <g key={idx}>
+            <line x1={padL} x2={W - PADR} y1={Y(tick)} y2={Y(tick)} style={{ stroke: "var(--hairline)" }} />
+            <text
+              x={padL - 8}
+              y={Y(tick) + 4}
+              textAnchor="end"
+              fontSize={12}
+              className="font-mono tabular-nums"
+              style={{ fill: "var(--ink-3)" }}
+            >
+              {moneyWhole(tick)}
+            </text>
+          </g>
+        ))}
+
+        {/* Horizontal target ($500/day) or starting bankroll reference line */}
+        <line
+          data-target-ref-line
+          x1={padL}
+          x2={W - PADR}
+          y1={Y(refLine)}
+          y2={Y(refLine)}
+          strokeDasharray="5 4"
+          strokeWidth={1.75}
+          style={{ stroke: metric === "daily" ? "var(--dot-green)" : "var(--ink-3)" }}
+        />
+
+        {/* P10-P90 confidence band */}
+        <path d={bandD} style={{ fill: "var(--dot-blue)", opacity: 0.16 }} />
+
+        {/* P50 median curve */}
+        <motion.path
+          key={`${plan.seed}-${metric}-${medianD.length}`}
+          d={medianD}
+          fill="none"
+          strokeWidth={2.25}
+          strokeLinejoin="round"
+          style={{ stroke: "var(--dot-blue)" }}
+          initial={reduce ? false : { pathLength: 0 }}
+          animate={{ pathLength: 1 }}
+          {...drawOnce}
+        />
+
+        {hoverDay !== null && (
+          <line
+            x1={X(activeDay)}
+            x2={X(activeDay)}
+            y1={top}
+            y2={bottom}
+            strokeDasharray="2 2"
+            style={{ stroke: "var(--ink-3)" }}
+          />
+        )}
+        <circle
+          cx={X(activeDay)}
+          cy={Y(p50[activeDay])}
+          r={4}
+          style={{ fill: "var(--dot-blue)", stroke: "var(--surface)", strokeWidth: 2 }}
+        />
+
+        <text x={padL} y={H - 8} fontSize={12} className="font-mono" style={{ fill: "var(--ink-3)" }}>
+          D0
+        </text>
+        <text x={(padL + W - PADR) / 2} y={H - 8} textAnchor="middle" fontSize={12} className="font-mono" style={{ fill: "var(--ink-3)" }}>
+          D{Math.floor((len - 1) / 2)}
+        </text>
+        <text x={W - PADR} y={H - 8} textAnchor="end" fontSize={12} className="font-mono" style={{ fill: "var(--ink-3)" }}>
+          D{len - 1}
+        </text>
+      </svg>
+    </div>
+  );
+}
+
+/** Before vs After PAV Isotonic Recalibration SVG Chart (Raw implied + 95% Wilson CI vs Calibrated OOS curve). */
+export function IsotonicRecalibrationChart({
+  buckets,
+  height = 248,
+}: {
+  buckets: RecalBucket[];
+  height?: number;
+}) {
+  const [ref, W] = useContainerWidth(220, 480);
+  const reduce = useReducedMotion();
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+
+  const populated = buckets.filter((b) => b.n > 0);
+  const H = height;
+  const left = 52;
+  const right = 18;
+  const top = 16;
+  const bottom = H - 30;
+
+  const X = (p: number) => left + Math.min(1, Math.max(0, p)) * (W - left - right);
+  const Y = (p: number) => bottom - Math.min(1, Math.max(0, p)) * (bottom - top);
+
+  const active =
+    hoverIdx !== null && hoverIdx >= 0 && hoverIdx < populated.length
+      ? populated[hoverIdx]
+      : populated[populated.length - 1] || null;
+
+  const rawD = populated
+    .map((b, i) => `${i ? "L" : "M"}${X(b.meanPredP).toFixed(1)},${Y(b.realisedRate).toFixed(1)}`)
+    .join(" ");
+  const calD = populated
+    .map((b, i) => `${i ? "L" : "M"}${X(b.meanPredP).toFixed(1)},${Y(b.calibratedP).toFixed(1)}`)
+    .join(" ");
+
+  const xTicks = W < 300 ? [0, 0.5, 1] : [0, 0.25, 0.5, 0.75, 1];
+
+  return (
+    <div ref={ref} className="min-w-0" data-recalibration-chart>
+      <div
+        data-recalibration-tooltip
+        className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-hairline bg-surface px-2.5 py-1.5 font-mono text-xs tabular-nums"
+      >
+        {active ? (
+          <>
+            <span className="font-medium text-ink">
+              {Math.round(active.low * 100)}–{Math.round(active.high * 100)}% (n={active.n})
+            </span>
+            <span className="text-ink-2">Raw {(active.meanPredP * 100).toFixed(1)}%</span>
+            <span className="text-success-foreground">Real {(active.realisedRate * 100).toFixed(1)}%</span>
+            <span className="font-semibold text-info-foreground">PAV {(active.calibratedP * 100).toFixed(1)}%</span>
+            <span className="text-ink-3">
+              95% CI [{(active.wilsonLow * 100).toFixed(0)}%, {(active.wilsonHigh * 100).toFixed(0)}%]
+            </span>
+          </>
+        ) : (
+          <span className="text-ink-2">Need settled out-of-sample windows to plot Before vs After PAV recalibration.</span>
+        )}
+      </div>
+
+      <svg
+        role="img"
+        aria-label={`Before vs after PAV isotonic probability recalibration across ${populated.length} out-of-sample buckets`}
+        viewBox={`0 0 ${W} ${H}`}
+        width={W}
+        height={H}
+        className="block h-auto max-w-full select-none"
+      >
+        {[0, 0.5, 1].map((tick) => (
+          <g key={`ry-${tick}`}>
+            <line x1={left} x2={W - right} y1={Y(tick)} y2={Y(tick)} style={{ stroke: "var(--hairline)" }} />
+            <text x={left - 8} y={Y(tick) + 4} textAnchor="end" fontSize={12} className="font-mono tabular-nums" style={{ fill: "var(--ink-3)" }}>
+              {Math.round(tick * 100)}%
+            </text>
+          </g>
+        ))}
+
+        {xTicks.map((tick) => (
+          <g key={`rx-${tick}`}>
+            <line x1={X(tick)} x2={X(tick)} y1={top} y2={bottom} style={{ stroke: "var(--hairline)", opacity: 0.6 }} />
+            <text
+              x={X(tick)}
+              y={H - 8}
+              textAnchor={tick === 0 ? "start" : tick === 1 ? "end" : "middle"}
+              fontSize={12}
+              className="font-mono tabular-nums"
+              style={{ fill: "var(--ink-3)" }}
+            >
+              {Math.round(tick * 100)}%
+            </text>
+          </g>
+        ))}
+
+        {/* Perfect calibration diagonal */}
+        <line x1={X(0)} y1={Y(0)} x2={X(1)} y2={Y(1)} strokeDasharray="5 4" strokeWidth={1.25} style={{ stroke: "var(--ink-3)" }} />
+
+        {/* Before: Raw OOS realized curve (dashed amber/muted) */}
+        {populated.length >= 2 && (
+          <path d={rawD} fill="none" strokeDasharray="3 3" strokeWidth={1.75} style={{ stroke: "var(--dot-amber)" }} />
+        )}
+
+        {/* After: Monotone PAV recalibrated curve (solid cobalt) */}
+        {populated.length >= 2 && (
+          <motion.path
+            key={calD.length}
+            d={calD}
+            fill="none"
+            strokeWidth={2.25}
+            strokeLinejoin="round"
+            style={{ stroke: "var(--dot-blue)" }}
+            initial={reduce ? false : { pathLength: 0 }}
+            animate={{ pathLength: 1 }}
+            {...drawOnce}
+          />
+        )}
+
+        {/* Interactive Wilson CI whiskers & Before/After markers */}
+        {populated.map((b, idx) => {
+          const cx = X(b.meanPredP);
+          const cyReal = Y(b.realisedRate);
+          const cyCal = Y(b.calibratedP);
+          const yLo = Y(b.wilsonLow);
+          const yHi = Y(b.wilsonHigh);
+          const isSel = active === b;
+          return (
+            <g
+              key={idx}
+              data-recal-point
+              className="cursor-pointer"
+              onMouseEnter={() => setHoverIdx(idx)}
+              onClick={() => setHoverIdx(idx)}
+            >
+              <circle cx={cx} cy={cyReal} r={14} fill="transparent" />
+              <line x1={cx} x2={cx} y1={yHi} y2={yLo} strokeWidth={1.5} style={{ stroke: "var(--ink-3)" }} />
+              <line x1={cx - 3.5} x2={cx + 3.5} y1={yHi} y2={yHi} strokeWidth={1.5} style={{ stroke: "var(--ink-3)" }} />
+              <line x1={cx - 3.5} x2={cx + 3.5} y1={yLo} y2={yLo} strokeWidth={1.5} style={{ stroke: "var(--ink-3)" }} />
+              <circle cx={cx} cy={cyReal} r={isSel ? 4.5 : 3.5} style={{ fill: "var(--dot-amber)", stroke: "var(--surface)", strokeWidth: 1.5 }} />
+              <circle cx={cx} cy={cyCal} r={isSel ? 5 : 4} style={{ fill: "var(--dot-blue)", stroke: "var(--surface)", strokeWidth: 1.75 }} />
+            </g>
+          );
+        })}
       </svg>
     </div>
   );

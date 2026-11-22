@@ -8,6 +8,8 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
 import { CalibrationReliabilityChart, MonteCarloFanChart, ProvenanceTag } from "@/Charts";
+import { ScalePlannerPanel } from "@/ScalePlannerPanel";
+import { RecalibrationPanel } from "@/RecalibrationPanel";
 import {
   type Dataset,
   type Home,
@@ -30,6 +32,14 @@ function fmtRatio(v: number | null): string {
   return v === null || !Number.isFinite(v) ? "-" : v.toFixed(2);
 }
 
+export type QuantSectionId =
+  | "scale"
+  | "scorecard"
+  | "recalibration"
+  | "calibration"
+  | "montecarlo"
+  | "walkforward";
+
 export function QuantLabTab({
   dataset,
   home,
@@ -45,7 +55,7 @@ export function QuantLabTab({
   marketsRead?: Read<Market[]>;
   slotsRead?: Read<Slots>;
   search: string;
-  focusSection?: "calibration" | "montecarlo" | "walkforward" | null;
+  focusSection?: QuantSectionId | null;
   reseedSignal?: number;
   onClearFocus?: () => void;
 }) {
@@ -57,6 +67,9 @@ export function QuantLabTab({
   const [runningMc, setRunningMc] = useState(false);
   const [wfScope, setWfScope] = useState<"all" | "portfolio" | "strategies">("all");
 
+  const scaleRef = useRef<HTMLDivElement>(null);
+  const scorecardRef = useRef<HTMLDivElement>(null);
+  const recalRef = useRef<HTMLDivElement>(null);
   const calRef = useRef<HTMLDivElement>(null);
   const mcRef = useRef<HTMLDivElement>(null);
   const wfRef = useRef<HTMLDivElement>(null);
@@ -104,18 +117,28 @@ export function QuantLabTab({
     void executeMc(seed, false);
   }, [dataset, home, slots]);
 
+  const scrollToSection = useCallback((sec: QuantSectionId) => {
+    const node =
+      sec === "scale"
+        ? scaleRef.current
+        : sec === "scorecard"
+          ? scorecardRef.current
+          : sec === "recalibration"
+            ? recalRef.current
+            : sec === "calibration"
+              ? calRef.current
+              : sec === "montecarlo"
+                ? mcRef.current
+                : wfRef.current;
+    node?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+
   // Respond to Cmd+K jump requests
   useEffect(() => {
     if (!focusSection) return;
-    const node =
-      focusSection === "calibration"
-        ? calRef.current
-        : focusSection === "montecarlo"
-          ? mcRef.current
-          : wfRef.current;
-    node?.scrollIntoView({ behavior: "smooth", block: "start" });
+    scrollToSection(focusSection);
     onClearFocus?.();
-  }, [focusSection, onClearFocus]);
+  }, [focusSection, scrollToSection, onClearFocus]);
 
   useEffect(() => {
     if (reseedSignal && reseedSignal > 0) {
@@ -146,6 +169,48 @@ export function QuantLabTab({
 
   return (
     <section id="quant-lab" aria-label="Quant Lab statistical diagnostics" className="space-y-4">
+      {/* Compact in-tab section jump pills (keeps 4 clean top tabs) */}
+      <div className="flex flex-wrap items-center gap-1.5" role="navigation" aria-label="Quant Lab sections">
+        {(
+          [
+            ["scale", "$500/Day Scale Planner"],
+            ["scorecard", "5-Gate Scorecard"],
+            ["recalibration", "Isotonic PAV"],
+            ["calibration", "Calibration"],
+            ["montecarlo", "Monte Carlo"],
+            ["walkforward", "Walk-Forward"],
+          ] as const
+        ).map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => scrollToSection(id)}
+            className="min-h-11 cursor-pointer rounded-md border border-hairline bg-surface px-3 text-xs font-medium text-ink-2 outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) hover:bg-board hover:text-ink focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* $500/Day Paper Capital Scale Planner, 180-Day Trajectory & 5-Gate Readiness Scorecard */}
+      <ScalePlannerPanel
+        dataset={dataset}
+        home={home}
+        markets={markets}
+        slots={slots}
+        panelRef={scaleRef}
+        scorecardRef={scorecardRef}
+      />
+
+      {/* PAV Isotonic Probability Recalibration & EV-After-Fees Entry Gate */}
+      <RecalibrationPanel
+        dataset={dataset}
+        home={home}
+        markets={markets}
+        slots={slots}
+        panelRef={recalRef}
+      />
+
       {/* Row 1: Calibration Reliability SVG Chart + Monte Carlo 1,000-Path Fan Chart */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
         {/* Calibration Reliability Card */}
