@@ -3,7 +3,7 @@
 // slim left desk rail (15m Tape, Strategies, Paper Slots, Quant Lab & Tournament, Live & Rails),
 // 1-click Full Quant Edge Audit trigger, and collapsible Order Ticket & Strategy Rule Editor drawers.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { MotionConfig, motion } from "motion/react";
+import { LazyMotion, MotionConfig, domAnimation } from "motion/react";
 import { Drawer } from "vaul";
 import { Toaster, toast } from "sonner";
 import {
@@ -24,7 +24,6 @@ import {
   X,
 } from "lucide-react";
 import { Badge, Button, Kbd, StatusPill } from "@/components/ui";
-import { glide } from "@/motion";
 import { CommandPalette, type DeskTabId } from "@/CommandPalette";
 import {
   ArmLiveModal,
@@ -492,6 +491,7 @@ export function App() {
 
   return (
     <MotionConfig reducedMotion="user">
+    <LazyMotion features={domAnimation}>
     <div className="min-h-screen bg-canvas text-ink">
       {/* Persistent Quiet Risk / Kill-Switch Header Bar (48px desktop) */}
       <header className="sticky top-0 z-30 border-b border-hairline bg-surface">
@@ -690,14 +690,12 @@ export function App() {
                       }
                     >
                       {active && (
-                        <motion.span
-                          layoutId="desk-nav-pill"
-                          transition={glide}
+                        <span
                           aria-hidden
-                          className="pointer-events-none absolute inset-0 rounded-md border border-hairline bg-board shadow-(--elev-card)"
+                          className="pointer-events-none absolute inset-0 rounded-md border border-hairline bg-board shadow-(--elev-card) transition-opacity duration-(--dur-press)"
                         >
                           <span className="absolute top-1.5 bottom-1.5 left-0 hidden w-0.5 rounded-full bg-blue lg:block" />
-                        </motion.span>
+                        </span>
                       )}
                       <span className="relative z-10 flex items-center gap-2">
                         <Icon
@@ -1157,6 +1155,7 @@ export function App() {
         }}
       />
     </div>
+    </LazyMotion>
     </MotionConfig>
   );
 }

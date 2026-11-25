@@ -2,10 +2,8 @@
 // ticking countdown-to-settlement badges, interactive SVG price + spread chart with hover crosshair,
 // and Vaul Market Inspector drawer.
 import { useEffect, useMemo, useState } from "react";
-import { motion } from "motion/react";
 import { Drawer } from "vaul";
 import { Activity, Clock, RefreshCw, X } from "lucide-react";
-import { glide } from "@/motion";
 import {
   Badge,
   Button,
@@ -408,11 +406,9 @@ export function TapeTab({
                 }
               >
                 {active && (
-                  <motion.span
-                    layoutId="tape-status-pill"
-                    transition={glide}
+                  <span
                     aria-hidden
-                    className="pointer-events-none absolute inset-0 rounded-[5px] border border-hairline bg-raised shadow-(--elev-raised)"
+                    className="pointer-events-none absolute inset-0 rounded-[5px] border border-hairline bg-raised shadow-(--elev-raised) transition-opacity duration-(--dur-press)"
                   />
                 )}
                 <span className="relative z-10">{label}</span>

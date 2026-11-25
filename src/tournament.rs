@@ -329,11 +329,11 @@ fn scan_window_with_vm(
         if !is_valid_whole_cent(price) {
             continue;
         }
-        let close_epoch = if last_close_str == Some(snap.close_time.as_str()) {
+        let close_epoch = if last_close_str == Some(snap.close_time.as_ref()) {
             last_close_epoch
         } else {
             let parsed = parse_iso_z(&snap.close_time);
-            last_close_str = Some(snap.close_time.as_str());
+            last_close_str = Some(snap.close_time.as_ref());
             last_close_epoch = parsed;
             parsed
         };
@@ -418,7 +418,7 @@ pub fn build_tournament_context(
         };
         let series = snaps
             .first()
-            .map(|s| s.series.clone())
+            .map(|s| s.series.to_string())
             .unwrap_or_default();
         if !series.is_empty() {
             series_set.insert(series.clone());
@@ -1738,10 +1738,10 @@ mod tests {
                 let na = (102 - base_c) as f64 / 100.0;
                 let mut s = active_tpl.clone();
                 s.fetched_at = close_epoch - secs;
-                s.ticker = ticker.clone();
-                s.event_ticker = ticker.clone();
-                s.series = series.to_string();
-                s.close_time = close_iso.clone();
+                s.ticker = ticker.as_str().into();
+                s.event_ticker = ticker.as_str().into();
+                s.series = series.into();
+                s.close_time = close_iso.as_str().into();
                 s.yes_bid = Some((100 - (102 - base_c)) as f64 / 100.0);
                 s.yes_ask = Some(ya);
                 s.no_bid = Some((100 - base_c) as f64 / 100.0);
@@ -1751,11 +1751,11 @@ mod tests {
             }
             let mut st = settled_tpl.clone();
             st.fetched_at = close_epoch + 60;
-            st.ticker = ticker.clone();
-            st.event_ticker = ticker.clone();
-            st.series = series.to_string();
-            st.close_time = close_iso;
-            st.result = res.to_string();
+            st.ticker = ticker.as_str().into();
+            st.event_ticker = ticker.as_str().into();
+            st.series = series.into();
+            st.close_time = close_iso.into();
+            st.result = res.into();
             snaps.push(st);
             windows.insert(ticker, snaps);
         }

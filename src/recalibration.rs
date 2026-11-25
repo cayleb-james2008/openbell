@@ -881,7 +881,7 @@ pub fn recalibration_from_windows(
             WindowFacts::Unsettled => continue,
         };
         settled += 1;
-        let series = snaps.first().map(|s| s.series.clone()).unwrap_or_default();
+        let series = snaps.first().map(|s| s.series.to_string()).unwrap_or_default();
 
         if let Some((mid, ask)) = representative_window_market_quote(snaps, close_epoch) {
             market_obs.push(TimedCalibrationObs {

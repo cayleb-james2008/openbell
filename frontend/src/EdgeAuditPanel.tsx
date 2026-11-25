@@ -2,7 +2,7 @@
 // Evaluates 12 strategies -> OOS Tournament -> 4-Slot Uncorrelated Lineup (|r| <= 0.65)
 // -> PAV Isotonic Recalibration -> Kalshi Fee & Slippage Net EV -> Monte Carlo DD & 5-Gate Readiness.
 import { type RefObject, useCallback, useEffect, useState } from "react";
-import { motion, useReducedMotion } from "motion/react";
+import { m, useReducedMotion } from "motion/react";
 import { CheckCircle2, RefreshCw, ShieldAlert, ShieldCheck, XCircle } from "lucide-react";
 import { toast } from "sonner";
 import { Badge, Button, StatusPill } from "@/components/ui";
@@ -199,7 +199,7 @@ export function EdgeAuditPanel({
             </div>
             <div className="grid grid-cols-1 divide-y divide-hairline lg:grid-cols-5 lg:divide-x lg:divide-y-0">
               {audit.funnel.map((stage, idx) => (
-                <motion.div
+                <m.div
                   key={stage.id}
                   data-edge-audit-stage={stage.id}
                   initial={reduce ? false : { opacity: 0, y: 4 }}
@@ -241,7 +241,7 @@ export function EdgeAuditPanel({
                     <p className="mono text-sm font-semibold text-info-foreground">{cleanJoin(stage.metric)}</p>
                     <p className="text-xs text-ink-2">{cleanJoin(stage.detail)}</p>
                   </div>
-                </motion.div>
+                </m.div>
               ))}
             </div>
           </div>

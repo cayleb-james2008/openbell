@@ -16,6 +16,16 @@ export type AutoAllocatorRequest = {
   slippage_cents: number;
   starting_bankroll: number;
   require_stress_resilience: boolean;
+  enable_regime_throttle: boolean;
+};
+
+export type RegimeEdgeBucket = {
+  regime: string;
+  trades: number;
+  win_rate: number;
+  gross_expectancy_cents: number;
+  fee_drag_cents: number;
+  net_expectancy_cents: number;
 };
 
 export type StressProfile = {
@@ -38,8 +48,11 @@ export type AllocatedWinner = {
   oos_avg_entry_price: number;
   taker_fee_cents: number;
   maker_fee_cents: number;
+  gross_expectancy_cents: number;
+  fee_drag_cents: number;
   oos_net_expectancy_cents: number;
   full_kelly_pct: number;
+  regime_throttle_mult: number;
   allocated_pct: number;
   allocated_dollars: number;
   rail_clamped_contracts: number;
@@ -108,6 +121,10 @@ export type AutoAllocatorReport = {
   max_total_heat_pct: number;
   starting_bankroll: number;
   require_stress_resilience: boolean;
+  enable_regime_throttle: boolean;
+  regime_throttle_mult: number;
+  current_oos_drawdown_pct: number;
+  throttle_reason: string;
   windows_settled_total: number;
   windows_settled_oos: number;
   live_armed: boolean;
@@ -115,6 +132,7 @@ export type AutoAllocatorReport = {
   cash_reserve_pct: number;
   active_winners: AllocatedWinner[];
   quarantined: QuarantinedStrategy[];
+  regime_attribution: RegimeEdgeBucket[];
   comparison: AllocatorComparison;
   planned_intents: PlannedAllocatorIntent[];
   daily_target: DailyTargetVerdict;
@@ -132,6 +150,7 @@ export const DEFAULT_ALLOCATOR_REQUEST: AutoAllocatorRequest = {
   slippage_cents: 0.5,
   starting_bankroll: 100,
   require_stress_resilience: true,
+  enable_regime_throttle: true,
 };
 
 const MUTATION_HEADERS: HeadersInit = {
@@ -160,6 +179,7 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
   const o = raw as Record<string, unknown>;
   const winnersRaw = Array.isArray(o.active_winners) ? o.active_winners : [];
   const quarantinedRaw = Array.isArray(o.quarantined) ? o.quarantined : [];
+  const regRaw = Array.isArray(o.regime_attribution) ? o.regime_attribution : [];
   const intentsRaw = Array.isArray(o.planned_intents) ? o.planned_intents : [];
   const notesRaw = Array.isArray(o.honesty_notes) ? o.honesty_notes : [];
   const compRaw = (o.comparison && typeof o.comparison === "object" ? o.comparison : {}) as Record<string, unknown>;
@@ -177,6 +197,10 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
     max_total_heat_pct: finiteOr(o.max_total_heat_pct, 40),
     starting_bankroll: startEq,
     require_stress_resilience: typeof o.require_stress_resilience === "boolean" ? o.require_stress_resilience : true,
+    enable_regime_throttle: typeof o.enable_regime_throttle === "boolean" ? o.enable_regime_throttle : true,
+    regime_throttle_mult: finiteOr(o.regime_throttle_mult, 1.0),
+    current_oos_drawdown_pct: finiteOr(o.current_oos_drawdown_pct, 0),
+    throttle_reason: strOr(o.throttle_reason, "1.00x Normal"),
     windows_settled_total: Math.max(0, Math.round(finiteOr(o.windows_settled_total, 0))),
     windows_settled_oos: Math.max(0, Math.round(finiteOr(o.windows_settled_oos, 0))),
     live_armed: Boolean(o.live_armed),
@@ -186,19 +210,26 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
       .filter((w): w is Record<string, unknown> => !!w && typeof w === "object")
       .map((w) => {
         const exp = finiteOr(w.oos_net_expectancy_cents, 0);
+        const makerFee = finiteOr(w.maker_fee_cents, 0);
+        const takerFee = finiteOr(w.taker_fee_cents, 0);
+        const execM = strOr(w.execution_mode, "maker");
+        const estDrag = execM === "maker" ? makerFee : takerFee;
         const stRaw = (w.stress && typeof w.stress === "object" ? w.stress : {}) as Record<string, unknown>;
         return {
           strategy: strOr(w.strategy, "unnamed"),
           side: strOr(w.side, "yes"),
-          execution_mode: strOr(w.execution_mode, "maker"),
+          execution_mode: execM,
           is_net_expectancy_cents: finiteOpt(w.is_net_expectancy_cents),
           oos_trades: Math.max(0, Math.round(finiteOr(w.oos_trades, 0))),
           oos_win_rate: finiteOr(w.oos_win_rate, 0),
           oos_avg_entry_price: finiteOr(w.oos_avg_entry_price, 0.5),
-          taker_fee_cents: finiteOr(w.taker_fee_cents, 0),
-          maker_fee_cents: finiteOr(w.maker_fee_cents, 0),
+          taker_fee_cents: takerFee,
+          maker_fee_cents: makerFee,
+          gross_expectancy_cents: finiteOr(w.gross_expectancy_cents, exp + estDrag),
+          fee_drag_cents: finiteOr(w.fee_drag_cents, estDrag),
           oos_net_expectancy_cents: exp,
           full_kelly_pct: finiteOr(w.full_kelly_pct, 0),
+          regime_throttle_mult: finiteOr(w.regime_throttle_mult, 1.0),
           allocated_pct: finiteOr(w.allocated_pct, 0),
           allocated_dollars: finiteOr(w.allocated_dollars, 0),
           rail_clamped_contracts: Math.max(0, Math.round(finiteOr(w.rail_clamped_contracts, 0))),
@@ -223,6 +254,16 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
         oos_trades: Math.max(0, Math.round(finiteOr(q.oos_trades, 0))),
         oos_net_expectancy_cents: finiteOpt(q.oos_net_expectancy_cents),
         reason: strOr(q.reason, "negative OOS expectancy"),
+      })),
+    regime_attribution: regRaw
+      .filter((r): r is Record<string, unknown> => !!r && typeof r === "object")
+      .map((r) => ({
+        regime: strOr(r.regime, "Balanced"),
+        trades: Math.max(0, Math.round(finiteOr(r.trades, 0))),
+        win_rate: finiteOr(r.win_rate, 0),
+        gross_expectancy_cents: finiteOr(r.gross_expectancy_cents, 0),
+        fee_drag_cents: finiteOr(r.fee_drag_cents, 0),
+        net_expectancy_cents: finiteOr(r.net_expectancy_cents, 0),
       })),
     comparison: {
       selection_basis: strOr(compRaw.selection_basis, "causal_is_to_oos"),
@@ -290,6 +331,9 @@ export function computeClientFallbackReport(
   if (trades.length === 0) {
     return {
       ...params,
+      regime_throttle_mult: 1.0,
+      current_oos_drawdown_pct: 0,
+      throttle_reason: params.enable_regime_throttle ? "1.00x Normal (OOS DD 0.0%)" : "Disabled (1.00x)",
       windows_settled_total: settledTotal,
       windows_settled_oos: settledOos,
       live_armed: false,
@@ -297,6 +341,7 @@ export function computeClientFallbackReport(
       cash_reserve_pct: 100,
       active_winners: [],
       quarantined: [],
+      regime_attribution: [],
       comparison: {
         selection_basis: "causal_is_to_oos",
         legacy_equal_taker_end_equity: startEq,
@@ -412,6 +457,7 @@ export function computeClientFallbackReport(
     const scale = params.sizing_mode === "half_kelly" ? 0.5 : params.sizing_mode === "quarter_kelly" ? 0.25 : 0;
     const rawPct = scale > 0 ? Math.min(params.max_slot_risk_pct, fullKelly * scale) : params.max_slot_risk_pct;
 
+    const feeDragCents = Number((activeFeeDollars * 100 + slipDollars * 100).toFixed(3));
     rawWinners.push({
       strategy,
       side: s.side,
@@ -422,8 +468,11 @@ export function computeClientFallbackReport(
       oos_avg_entry_price: Number(avgP.toFixed(4)),
       taker_fee_cents: Number(meanTakerCents.toFixed(3)),
       maker_fee_cents: Number(meanMakerCents.toFixed(3)),
+      gross_expectancy_cents: Number((meanNetCents + feeDragCents).toFixed(2)),
+      fee_drag_cents: feeDragCents,
       oos_net_expectancy_cents: Number(meanNetCents.toFixed(2)),
       full_kelly_pct: Number(fullKelly.toFixed(2)),
+      regime_throttle_mult: 1.0,
       allocated_pct: Number(rawPct.toFixed(2)),
       allocated_dollars: 0,
       rail_clamped_contracts: 0,
@@ -515,6 +564,11 @@ export function computeClientFallbackReport(
 
   return {
     ...params,
+    regime_throttle_mult: 1.0,
+    current_oos_drawdown_pct: Number(allocMaxDd.toFixed(2)),
+    throttle_reason: params.enable_regime_throttle
+      ? `1.00x Normal (OOS DD ${allocMaxDd.toFixed(1)}%)`
+      : "Disabled (1.00x)",
     windows_settled_total: settledTotal,
     windows_settled_oos: settledOos,
     live_armed: false,
@@ -522,6 +576,7 @@ export function computeClientFallbackReport(
     cash_reserve_pct: Number(Math.max(0, 100 - totalPct).toFixed(2)),
     active_winners: rawWinners,
     quarantined,
+    regime_attribution: [],
     comparison: {
       selection_basis: isTrades.length > 0 ? "causal_is_to_oos" : "oos_only_no_is_history",
       legacy_equal_taker_end_equity: Number(legacyEq.toFixed(2)),

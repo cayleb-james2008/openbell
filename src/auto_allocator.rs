@@ -107,6 +107,9 @@ fn default_starting_bankroll() -> f64 {
 fn default_require_stress_resilience() -> bool {
     true
 }
+fn default_enable_regime_throttle() -> bool {
+    true
+}
 
 /// Request parameters for `GET /api/allocator` and `POST /api/allocator/plan`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +132,8 @@ pub struct AutoAllocatorRequest {
     pub starting_bankroll: f64,
     #[serde(default = "default_require_stress_resilience")]
     pub require_stress_resilience: bool,
+    #[serde(default = "default_enable_regime_throttle")]
+    pub enable_regime_throttle: bool,
 }
 
 impl Default for AutoAllocatorRequest {
@@ -143,6 +148,7 @@ impl Default for AutoAllocatorRequest {
             slippage_cents: default_slippage_cents(),
             starting_bankroll: default_starting_bankroll(),
             require_stress_resilience: default_require_stress_resilience(),
+            enable_regime_throttle: default_enable_regime_throttle(),
         }
     }
 }
@@ -178,6 +184,7 @@ impl AutoAllocatorRequest {
             starting_bankroll: finite_or(self.starting_bankroll, default_starting_bankroll())
                 .clamp(10.0, 10_000_000.0),
             require_stress_resilience: self.require_stress_resilience,
+            enable_regime_throttle: self.enable_regime_throttle,
         }
     }
 }
@@ -194,6 +201,17 @@ pub struct StressProfile {
     pub stress_resilient: bool,
 }
 
+/// Fee-vs-gross expectancy attribution for one entry-price regime across active winners.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegimeEdgeBucket {
+    pub regime: String,
+    pub trades: usize,
+    pub win_rate: f64,
+    pub gross_expectancy_cents: f64,
+    pub fee_drag_cents: f64,
+    pub net_expectancy_cents: f64,
+}
+
 /// One strategy passing OOS depth, positive-EV, stress, and correlation gates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllocatedWinner {
@@ -206,8 +224,11 @@ pub struct AllocatedWinner {
     pub oos_avg_entry_price: f64,
     pub taker_fee_cents: f64,
     pub maker_fee_cents: f64,
+    pub gross_expectancy_cents: f64,
+    pub fee_drag_cents: f64,
     pub oos_net_expectancy_cents: f64,
     pub full_kelly_pct: f64,
+    pub regime_throttle_mult: f64,
     pub allocated_pct: f64,
     pub allocated_dollars: f64,
     pub rail_clamped_contracts: u32,
@@ -288,6 +309,10 @@ pub struct AutoAllocatorReport {
     pub max_total_heat_pct: f64,
     pub starting_bankroll: f64,
     pub require_stress_resilience: bool,
+    pub enable_regime_throttle: bool,
+    pub regime_throttle_mult: f64,
+    pub current_oos_drawdown_pct: f64,
+    pub throttle_reason: String,
     pub windows_settled_total: usize,
     pub windows_settled_oos: usize,
     pub live_armed: bool,
@@ -295,6 +320,7 @@ pub struct AutoAllocatorReport {
     pub cash_reserve_pct: f64,
     pub active_winners: Vec<AllocatedWinner>,
     pub quarantined: Vec<QuarantinedStrategy>,
+    pub regime_attribution: Vec<RegimeEdgeBucket>,
     pub comparison: AllocatorComparison,
     pub planned_intents: Vec<PlannedAllocatorIntent>,
     pub daily_target: DailyTargetVerdict,
@@ -339,6 +365,8 @@ struct SplitCandidate {
     avg_entry_price: f64,
     taker_fee_cents: f64,
     maker_fee_cents: f64,
+    gross_expectancy_cents: f64,
+    fee_drag_cents: f64,
     net_expectancy_cents: f64,
     full_kelly_pct: f64,
     stress: StressProfile,
@@ -406,6 +434,7 @@ fn evaluate_split_candidates(
         let mut price_sum = 0.0f64;
         let mut taker_fee_sum = 0.0f64;
         let mut maker_fee_sum = 0.0f64;
+        let mut gross_pnl_sum = 0.0f64;
         let mut pnl_1ct_sum = 0.0f64;
         let mut returns_by_win: HashMap<(i64, String), f64> = HashMap::with_capacity(n);
         let mut ordered_pnls: Vec<(i64, &str, f64)> = Vec::with_capacity(n);
@@ -416,7 +445,8 @@ fn evaluate_split_candidates(
             let mf = maker_fee(p);
             let af = if is_maker { mf } else { tf };
             let payoff = if e.won { 1.0 } else { 0.0 };
-            let net_pnl = payoff - p - af - slip_dollars;
+            let gross_pnl = payoff - p;
+            let net_pnl = gross_pnl - af - slip_dollars;
             let cost = (p + af + slip_dollars).min(1.0);
             let ret = if cost > 1e-9 { net_pnl / cost } else { 0.0 };
 
@@ -426,6 +456,7 @@ fn evaluate_split_candidates(
             price_sum += p;
             taker_fee_sum += tf;
             maker_fee_sum += mf;
+            gross_pnl_sum += gross_pnl;
             pnl_1ct_sum += net_pnl;
             returns_by_win.insert((e.close_epoch, e.ticker.clone()), finite_or(ret, 0.0));
             ordered_pnls.push((e.close_epoch, e.ticker.as_str(), net_pnl * 100.0));
@@ -436,7 +467,9 @@ fn evaluate_split_candidates(
         let avg_entry_price = finite_or((price_sum / n_f).clamp(0.01, 0.99), 0.50);
         let taker_fee_cents = finite_or((taker_fee_sum / n_f) * 100.0, 0.0);
         let maker_fee_cents = finite_or((maker_fee_sum / n_f) * 100.0, 0.0);
+        let gross_exp_cents = finite_or((gross_pnl_sum / n_f) * 100.0, 0.0);
         let exp_cents = finite_or((pnl_1ct_sum / n_f) * 100.0, 0.0);
+        let fee_drag_cents = finite_or((gross_exp_cents - exp_cents).max(0.0), 0.0);
         expectancy_by_idx.insert(si, exp_cents);
 
         // Compute rolling chronological walk-forward folds (up to 3 folds) and +0c/+1c/+2c adverse-fill stress.
@@ -544,6 +577,8 @@ fn evaluate_split_candidates(
             avg_entry_price,
             taker_fee_cents,
             maker_fee_cents,
+            gross_expectancy_cents: gross_exp_cents,
+            fee_drag_cents,
             net_expectancy_cents: exp_cents,
             full_kelly_pct,
             stress,
@@ -718,19 +753,51 @@ pub fn compute_auto_allocator_report(
     };
 
     let n_winners = oos_sel.accepted.len();
+
+    // Use strictly causal IS-selected weights for OOS replay whenever IS history exists,
+    // preventing selection lookahead over OOS outcomes.
+    let (replay_weights, selection_basis) = match &is_sel {
+        Some(sel) => {
+            let mut m = HashMap::with_capacity(sel.accepted.len());
+            for (i, c) in sel.accepted.iter().enumerate() {
+                m.insert(c.strategy_idx, finite_or(sel.weights_pct[i], 0.0) / 100.0);
+            }
+            (m, "causal_is_to_oos".to_string())
+        }
+        None => {
+            let mut m = HashMap::with_capacity(n_winners);
+            for (i, c) in oos_sel.accepted.iter().enumerate() {
+                m.insert(c.strategy_idx, finite_or(oos_sel.weights_pct[i], 0.0) / 100.0);
+            }
+            (m, "oos_only_no_is_history".to_string())
+        }
+    };
+
+    let (comparison, regime_throttle_mult, current_oos_drawdown_pct, throttle_reason) =
+        replay_oos_comparison(
+            ctx,
+            &req,
+            &oos_by_epoch,
+            &replay_weights,
+            is_maker,
+            selection_basis,
+        );
+
     let total_allocated_pct = if n_winners == 0 {
         0.0
     } else {
-        finite_or(oos_sel.weights_pct.iter().sum::<f64>().clamp(0.0, 100.0), 0.0)
+        let sum_raw: f64 = oos_sel.weights_pct.iter().sum();
+        finite_or((sum_raw * regime_throttle_mult).clamp(0.0, 100.0), 0.0)
     };
     let cash_reserve_pct = finite_or((100.0 - total_allocated_pct).clamp(0.0, 100.0), 100.0);
 
     let mut active_winners = Vec::with_capacity(n_winners);
     let mut planned_intents = Vec::with_capacity(n_winners);
-    let mut oos_weights_by_idx: HashMap<usize, f64> = HashMap::with_capacity(n_winners);
+    let mut active_idx_set = std::collections::HashSet::with_capacity(n_winners);
 
     for (i, cand) in oos_sel.accepted.iter().enumerate() {
-        let alloc_pct = finite_or(oos_sel.weights_pct[i], 0.0);
+        active_idx_set.insert(cand.strategy_idx);
+        let alloc_pct = finite_or(oos_sel.weights_pct[i] * regime_throttle_mult, 0.0);
         let alloc_dollars = finite_or(req.starting_bankroll * (alloc_pct / 100.0), 0.0);
         let max_limit_cents =
             ((cand.avg_entry_price * 100.0).round() as i64).clamp(1, 99) as u8;
@@ -770,7 +837,6 @@ pub fn compute_auto_allocator_report(
             format!("Ready within Hard Risk Rails (taker limit <= {max_limit_cents}c)")
         };
 
-        oos_weights_by_idx.insert(cand.strategy_idx, alloc_pct / 100.0);
         let is_exp = is_sel
             .as_ref()
             .and_then(|s| s.expectancy_by_idx.get(&cand.strategy_idx).copied())
@@ -786,8 +852,11 @@ pub fn compute_auto_allocator_report(
             oos_avg_entry_price: cand.avg_entry_price,
             taker_fee_cents: cand.taker_fee_cents,
             maker_fee_cents: cand.maker_fee_cents,
+            gross_expectancy_cents: cand.gross_expectancy_cents,
+            fee_drag_cents: cand.fee_drag_cents,
             oos_net_expectancy_cents: cand.net_expectancy_cents,
             full_kelly_pct: cand.full_kelly_pct,
+            regime_throttle_mult,
             allocated_pct: alloc_pct,
             allocated_dollars: alloc_dollars,
             rail_clamped_contracts,
@@ -808,26 +877,11 @@ pub fn compute_auto_allocator_report(
         });
     }
 
-    // Use strictly causal IS-selected weights for OOS replay whenever IS history exists,
-    // preventing selection lookahead over OOS outcomes.
-    let (replay_weights, selection_basis) = match &is_sel {
-        Some(sel) => {
-            let mut m = HashMap::with_capacity(sel.accepted.len());
-            for (i, c) in sel.accepted.iter().enumerate() {
-                m.insert(c.strategy_idx, finite_or(sel.weights_pct[i], 0.0) / 100.0);
-            }
-            (m, "causal_is_to_oos".to_string())
-        }
-        None => (oos_weights_by_idx, "oos_only_no_is_history".to_string()),
-    };
-
-    let comparison = replay_oos_comparison(
-        ctx,
-        &req,
-        &oos_by_epoch,
-        &replay_weights,
+    let regime_attribution = compute_regime_attribution(
+        &oos_by_strat,
+        &active_idx_set,
         is_maker,
-        selection_basis,
+        slip_dollars,
     );
 
     // Compute $500/day net expectancy readiness verdict with concrete blockers.
@@ -889,6 +943,12 @@ pub fn compute_auto_allocator_report(
         );
     }
 
+    if req.enable_regime_throttle {
+        honesty_notes.push(format!(
+            "Causal Regime Throttle active ({throttle_reason}): scales Kelly allocation down during live OOS drawdown or adverse streaks using strictly prior settled epochs."
+        ));
+    }
+
     AutoAllocatorReport {
         execution_mode: req.execution_mode,
         sizing_mode: req.sizing_mode,
@@ -898,6 +958,10 @@ pub fn compute_auto_allocator_report(
         max_total_heat_pct: req.max_total_heat_pct,
         starting_bankroll: req.starting_bankroll,
         require_stress_resilience: req.require_stress_resilience,
+        enable_regime_throttle: req.enable_regime_throttle,
+        regime_throttle_mult,
+        current_oos_drawdown_pct,
+        throttle_reason,
         windows_settled_total: ctx.windows_settled_total,
         windows_settled_oos: ctx.windows_settled_oos,
         live_armed,
@@ -905,6 +969,7 @@ pub fn compute_auto_allocator_report(
         cash_reserve_pct,
         active_winners,
         quarantined: oos_sel.quarantined,
+        regime_attribution,
         comparison,
         planned_intents,
         daily_target,
@@ -1048,6 +1113,112 @@ fn compute_daily_target_verdict(
     }
 }
 
+/// Strictly causal rolling drawdown and adverse-streak Kelly throttle multiplier (`0.35..=1.0`).
+fn compute_causal_throttle(
+    enabled: bool,
+    current_dd_pct: f64,
+    recent_returns: &[f64],
+) -> (f64, String) {
+    if !enabled {
+        return (1.0, "Disabled (1.00x)".to_string());
+    }
+    let dd = current_dd_pct.max(0.0);
+    let dd_mult: f64 = if dd >= 15.0 {
+        0.50
+    } else if dd >= 8.0 {
+        0.70
+    } else if dd >= 4.0 {
+        0.85
+    } else {
+        1.00
+    };
+    let tail_neg = if recent_returns.len() >= 5 {
+        recent_returns[recent_returns.len() - 5..]
+            .iter()
+            .filter(|&&r| r < 0.0)
+            .count()
+    } else {
+        0
+    };
+    let streak_mult = if tail_neg >= 4 { 0.75 } else { 1.0 };
+    let mult = finite_or((dd_mult * streak_mult).clamp(0.35, 1.0), 1.0);
+    let reason = if (mult - 1.0).abs() < 1e-9 {
+        format!("1.00x Normal (OOS DD {dd:.1}%)")
+    } else if streak_mult < 1.0 && dd_mult < 1.0 {
+        format!("{mult:.2}x Throttled (OOS DD {dd:.1}%, {tail_neg}/5 neg)")
+    } else if streak_mult < 1.0 {
+        format!("{mult:.2}x Streak Dampener ({tail_neg}/5 neg epochs)")
+    } else {
+        format!("{mult:.2}x Throttled (OOS DD {dd:.1}%)")
+    };
+    (mult, reason)
+}
+
+fn compute_regime_attribution(
+    oos_by_strat: &[Vec<&TournamentEntry>],
+    active_idxs: &std::collections::HashSet<usize>,
+    is_maker: bool,
+    slip_dollars: f64,
+) -> Vec<RegimeEdgeBucket> {
+    struct Acc {
+        trades: usize,
+        wins: usize,
+        gross_sum: f64,
+        net_sum: f64,
+    }
+    let labels = ["Underdog (<45c)", "Balanced (45-69c)", "Favorite (>=70c)"];
+    let mut accs = [
+        Acc { trades: 0, wins: 0, gross_sum: 0.0, net_sum: 0.0 },
+        Acc { trades: 0, wins: 0, gross_sum: 0.0, net_sum: 0.0 },
+        Acc { trades: 0, wins: 0, gross_sum: 0.0, net_sum: 0.0 },
+    ];
+    for &si in active_idxs {
+        if let Some(entries) = oos_by_strat.get(si) {
+            for e in entries {
+                let p = e.entry_price.clamp(0.01, 0.99);
+                let bucket = if p < 0.45 {
+                    0
+                } else if p < 0.70 {
+                    1
+                } else {
+                    2
+                };
+                let af = if is_maker { maker_fee(p) } else { fee(p) };
+                let payoff = if e.won { 1.0 } else { 0.0 };
+                let gross = (payoff - p) * 100.0;
+                let net = (payoff - p - af - slip_dollars) * 100.0;
+                accs[bucket].trades += 1;
+                if e.won {
+                    accs[bucket].wins += 1;
+                }
+                accs[bucket].gross_sum += gross;
+                accs[bucket].net_sum += net;
+            }
+        }
+    }
+    labels
+        .iter()
+        .enumerate()
+        .filter_map(|(i, label)| {
+            let a = &accs[i];
+            if a.trades == 0 {
+                return None;
+            }
+            let n_f = a.trades as f64;
+            let gross_ev = finite_or(a.gross_sum / n_f, 0.0);
+            let net_ev = finite_or(a.net_sum / n_f, 0.0);
+            Some(RegimeEdgeBucket {
+                regime: (*label).to_string(),
+                trades: a.trades,
+                win_rate: finite_or((a.wins as f64) / n_f, 0.0),
+                gross_expectancy_cents: gross_ev,
+                fee_drag_cents: finite_or((gross_ev - net_ev).max(0.0), 0.0),
+                net_expectancy_cents: net_ev,
+            })
+        })
+        .collect()
+}
+
 fn replay_oos_comparison(
     ctx: &TournamentTapeContext,
     req: &AutoAllocatorRequest,
@@ -1055,7 +1226,7 @@ fn replay_oos_comparison(
     winner_weights_by_idx: &HashMap<usize, f64>,
     is_maker: bool,
     selection_basis: String,
-) -> AllocatorComparison {
+) -> (AllocatorComparison, f64, f64, String) {
     let start_eq = req.starting_bankroll;
     let legacy_slot_frac = 1.0 / (ctx.strategies.len().max(1) as f64);
     let taker_slip = req.slippage_cents / 100.0;
@@ -1068,15 +1239,21 @@ fn replay_oos_comparison(
     let mut alloc_eq = start_eq;
     let mut alloc_peak = start_eq;
     let mut alloc_max_dd_pct = 0.0f64;
+    let mut alloc_current_dd_pct = 0.0f64;
     let mut alloc_fees = 0.0f64;
+    let mut recent_returns: Vec<f64> = Vec::with_capacity(16);
 
     let mut curve: Vec<ComparisonPoint> = Vec::with_capacity(oos_by_epoch.len());
 
     for (&close_epoch, entries) in oos_by_epoch {
         let prev_legacy = legacy_eq;
         let prev_alloc = alloc_eq;
+        // Causal throttle computed strictly from prior epochs (< close_epoch).
+        let (epoch_throttle, _) =
+            compute_causal_throttle(req.enable_regime_throttle, alloc_current_dd_pct, &recent_returns);
         let mut legacy_epoch_pnl = 0.0f64;
         let mut alloc_epoch_pnl = 0.0f64;
+        let mut alloc_traded = false;
 
         for e in entries {
             let p = e.entry_price.clamp(0.01, 0.99);
@@ -1103,8 +1280,10 @@ fn replay_oos_comparison(
                             true
                         };
                         if filled {
-                            let contracts = ((prev_alloc * weight) / p).floor().max(0.0) as u32;
+                            let contracts =
+                                ((prev_alloc * weight * epoch_throttle) / p).floor().max(0.0) as u32;
                             if contracts > 0 {
+                                alloc_traded = true;
                                 let order_fee = kalshi_order_fee_dollars(contracts, p, is_maker);
                                 let slip = if is_maker { 0.0 } else { taker_slip };
                                 let pnl = (contracts as f64) * (payoff - p - slip) - order_fee;
@@ -1133,9 +1312,16 @@ fn replay_oos_comparison(
             alloc_peak = alloc_eq;
         }
         if alloc_peak > 1e-9 {
-            let dd = (((alloc_peak - alloc_eq).max(0.0) / alloc_peak) * 100.0).clamp(0.0, 100.0);
-            if dd > alloc_max_dd_pct {
-                alloc_max_dd_pct = dd;
+            alloc_current_dd_pct =
+                (((alloc_peak - alloc_eq).max(0.0) / alloc_peak) * 100.0).clamp(0.0, 100.0);
+            if alloc_current_dd_pct > alloc_max_dd_pct {
+                alloc_max_dd_pct = alloc_current_dd_pct;
+            }
+        }
+        if alloc_traded && prev_alloc > 1e-9 {
+            recent_returns.push(finite_or(alloc_epoch_pnl / prev_alloc, 0.0));
+            if recent_returns.len() > 8 {
+                recent_returns.remove(0);
             }
         }
 
@@ -1164,21 +1350,28 @@ fn replay_oos_comparison(
     let alloc_end = finite_or(alloc_eq, start_eq);
     let legacy_fees = finite_or(legacy_fees, 0.0);
     let alloc_fees = finite_or(alloc_fees, 0.0);
+    let (end_throttle, end_reason) =
+        compute_causal_throttle(req.enable_regime_throttle, alloc_current_dd_pct, &recent_returns);
 
-    AllocatorComparison {
-        selection_basis,
-        legacy_equal_taker_end_equity: legacy_end,
-        legacy_equal_taker_net_pnl: finite_or(legacy_end - start_eq, 0.0),
-        legacy_equal_taker_max_dd_pct: finite_or(legacy_max_dd_pct, 0.0),
-        legacy_equal_taker_fees_dollars: legacy_fees,
-        auto_allocator_end_equity: alloc_end,
-        auto_allocator_net_pnl: finite_or(alloc_end - start_eq, 0.0),
-        auto_allocator_max_dd_pct: finite_or(alloc_max_dd_pct, 0.0),
-        auto_allocator_fees_dollars: alloc_fees,
-        fee_savings_dollars: finite_or(legacy_fees - alloc_fees, 0.0),
-        equity_delta_dollars: finite_or(alloc_end - legacy_end, 0.0),
-        equity_curve: curve,
-    }
+    (
+        AllocatorComparison {
+            selection_basis,
+            legacy_equal_taker_end_equity: legacy_end,
+            legacy_equal_taker_net_pnl: finite_or(legacy_end - start_eq, 0.0),
+            legacy_equal_taker_max_dd_pct: finite_or(legacy_max_dd_pct, 0.0),
+            legacy_equal_taker_fees_dollars: legacy_fees,
+            auto_allocator_end_equity: alloc_end,
+            auto_allocator_net_pnl: finite_or(alloc_end - start_eq, 0.0),
+            auto_allocator_max_dd_pct: finite_or(alloc_max_dd_pct, 0.0),
+            auto_allocator_fees_dollars: alloc_fees,
+            fee_savings_dollars: finite_or(legacy_fees - alloc_fees, 0.0),
+            equity_delta_dollars: finite_or(alloc_end - legacy_end, 0.0),
+            equity_curve: curve,
+        },
+        end_throttle,
+        finite_or(alloc_current_dd_pct, 0.0),
+        end_reason,
+    )
 }
 
 #[cfg(test)]
@@ -1425,6 +1618,7 @@ mod tests {
             slippage_cents: 0.5,
             starting_bankroll: 1_000.0,
             require_stress_resilience: true,
+            enable_regime_throttle: true,
         };
         let qk = compute_auto_allocator_report(&ctx, &qk_req, &rails, false, false);
         assert_eq!(qk.active_winners.len(), 2, "win-corr must be pruned for |r|>0.65");
@@ -1570,5 +1764,92 @@ mod tests {
             false,
         );
         assert!(relaxed.active_winners.len() >= 2, "disabling stress guard surfaces brittle/thin strategies");
+    }
+
+    #[test]
+    fn regime_throttle_dials_down_on_drawdown_without_lookahead() {
+        let strats = vec![StrategyMeta {
+            name: "regime-edge".into(),
+            side: "yes".into(),
+        }];
+        // 40 windows total: IS = 0..20 (all strong wins so IS selects strategy),
+        // OOS = 20..40 where epochs 20..29 win (building peak) and 30..34 lose consecutively (drawdown),
+        // then 35..39 recover (or flip in future-canary).
+        let build_ctx = |tail_wins: bool| {
+            let mut entries = Vec::new();
+            for w in 0..40i64 {
+                let epoch = 1_000 + w * 900;
+                let won = if w < 20 {
+                    w % 6 != 0
+                } else if w < 30 {
+                    true
+                } else if w < 35 {
+                    false // 5 consecutive losses -> drawdown > 8% & 5/5 neg epochs
+                } else {
+                    tail_wins
+                };
+                entries.push(TournamentEntry {
+                    close_epoch: epoch,
+                    ticker: format!("KXBTC15M-RT{w:02}"),
+                    series: "KXBTC15M".into(),
+                    strategy_idx: 0,
+                    strategy: "regime-edge".into(),
+                    side: "yes".into(),
+                    entry_price: 0.35,
+                    secs_to_close: 240,
+                    won,
+                });
+            }
+            make_ctx(strats.clone(), entries, 40, 20, 1_000 + 20 * 900)
+        };
+
+        let ctx_recover = build_ctx(true);
+        let ctx_bleed = build_ctx(false);
+        let rails = RiskRailsConfig::default();
+
+        let req_throttled = AutoAllocatorRequest {
+            sizing_mode: "half_kelly".into(),
+            max_slot_risk_pct: 25.0,
+            max_total_heat_pct: 25.0,
+            maker_fill_rate: 1.0,
+            require_stress_resilience: false,
+            enable_regime_throttle: true,
+            ..AutoAllocatorRequest::default()
+        };
+        let req_flat = AutoAllocatorRequest {
+            enable_regime_throttle: false,
+            ..req_throttled.clone()
+        };
+
+        let r_throt_rec = compute_auto_allocator_report(&ctx_recover, &req_throttled, &rails, false, false);
+        let r_throt_bleed = compute_auto_allocator_report(&ctx_bleed, &req_throttled, &rails, false, false);
+        let r_flat_bleed = compute_auto_allocator_report(&ctx_bleed, &req_flat, &rails, false, false);
+
+        // 1. Causal check: checkpoint 14 (before w=35) must match identically regardless of w>=35 flip!
+        assert!(
+            (r_throt_rec.comparison.equity_curve[14].allocator_equity
+                - r_throt_bleed.comparison.equity_curve[14].allocator_equity)
+                .abs()
+                < 1e-9,
+            "causal throttle must never look ahead into future epochs"
+        );
+
+        // 2. Throttle dials down allocation and lowers max drawdown vs unthrottled when losing streak hits.
+        assert!(r_throt_bleed.regime_throttle_mult < 1.0);
+        assert!(r_throt_bleed.current_oos_drawdown_pct > 4.0);
+        assert!(r_throt_bleed.total_allocated_pct < r_flat_bleed.total_allocated_pct);
+        assert!(
+            r_throt_bleed.comparison.auto_allocator_max_dd_pct
+                <= r_flat_bleed.comparison.auto_allocator_max_dd_pct + 1e-9
+        );
+
+        // 3. Gross vs fee drag & regime attribution populated consistently.
+        let w0 = &r_throt_rec.active_winners[0];
+        assert!(
+            ((w0.gross_expectancy_cents - w0.fee_drag_cents) - w0.oos_net_expectancy_cents).abs()
+                < 1e-6
+        );
+        assert!(!r_throt_rec.regime_attribution.is_empty());
+        assert_eq!(r_throt_rec.regime_attribution[0].regime, "Underdog (<45c)");
     }
 }

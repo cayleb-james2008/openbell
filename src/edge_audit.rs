@@ -488,16 +488,16 @@ mod tests {
     ) -> Snapshot {
         Snapshot {
             fetched_at,
-            ticker: ticker.to_string(),
-            event_ticker: ticker.to_string(),
-            series: "KXBTC15M".to_string(),
-            close_time: close_iso.to_string(),
+            ticker: ticker.into(),
+            event_ticker: ticker.into(),
+            series: "KXBTC15M".into(),
+            close_time: close_iso.into(),
             status: if result.is_empty() {
-                "active".to_string()
+                "active".into()
             } else {
-                "settled".to_string()
+                "settled".into()
             },
-            result: result.to_string(),
+            result: result.into(),
             yes_bid: ya.map(|p| (p - 0.02).max(0.01)),
             yes_ask: ya,
             no_bid: na.map(|p| (p - 0.02).max(0.01)),
