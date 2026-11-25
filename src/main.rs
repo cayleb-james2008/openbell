@@ -809,6 +809,10 @@ struct Strategy {
 
 impl Strategy {
     fn load(path: &Path) -> Result<Strategy, String> {
+        let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            return Err("refusing symlink or non-regular strategy file".to_string());
+        }
         let script = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let fingerprint = {
             use std::hash::{Hash, Hasher};
@@ -827,16 +831,14 @@ impl Strategy {
         // surface pay it per hit. The Strategy handed out is always
         // fresh (its budget meter and failure counters are per
         // pass); only the immutable compile is shared.
-        let cache_key = std::fs::metadata(path).ok().map(|m| {
-            (
-                script.len() as u64,
-                m.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0),
-            )
-        });
+        let cache_key = Some((
+            script.len() as u64,
+            meta.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        ));
         if let Some((len, mtime)) = cache_key {
             let guard = STRAT_CACHE.lock().unwrap();
             if let Some((_p, _l, _t, unit, runtime, name, side)) =
@@ -1861,6 +1863,7 @@ fn load_strategies_with_errors(dir: &Path) -> (Vec<Strategy>, Vec<(String, Strin
         let mut paths: Vec<PathBuf> = entries
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().map(|x| x == "rn").unwrap_or(false))
+            .filter(|p| is_confined_regular_file(dir, p))
             .collect();
         paths.sort();
         for path in paths {
@@ -2409,17 +2412,35 @@ impl App {
     }
 }
 
+fn is_confined_regular_file(root: &Path, path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return false;
+    }
+    let Ok(canon_root) = root.canonicalize() else {
+        return false;
+    };
+    let Ok(canon_path) = path.canonicalize() else {
+        return false;
+    };
+    canon_path.starts_with(&canon_root)
+}
+
 fn tape_stat(path: &Path) -> Option<(u64, u64)> {
-    std::fs::metadata(path).ok().map(|m| {
-        (
-            m.len(),
-            m.modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0),
-        )
-    })
+    let m = std::fs::symlink_metadata(path).ok()?;
+    if m.file_type().is_symlink() || !m.file_type().is_file() {
+        return None;
+    }
+    Some((
+        m.len(),
+        m.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+    ))
 }
 
 /// Fast fingerprint of `strategies_dir` + `paper_pot` so concurrent HTTP readers
@@ -2432,11 +2453,12 @@ fn strategies_dir_key(dir: &Path, paper_pot: f64) -> u64 {
         let mut paths: Vec<PathBuf> = entries
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().map(|x| x == "rn").unwrap_or(false))
+            .filter(|p| is_confined_regular_file(dir, p))
             .collect();
         paths.sort();
         for p in paths {
             p.file_name().hash(&mut h);
-            if let Ok(m) = std::fs::metadata(&p) {
+            if let Ok(m) = std::fs::symlink_metadata(&p) {
                 m.len().hash(&mut h);
                 let mt = m
                     .modified()
@@ -2471,7 +2493,10 @@ impl App {
                 newest_fetched_at: e.snaps.last().map(|s| s.fetched_at),
             }
         }
-        let Some((len, mtime)) = tape_stat(path) else {
+        let Some((len, mtime)) = is_confined_regular_file(&self.data_dir, path)
+            .then(|| tape_stat(path))
+            .flatten()
+        else {
             return TapeView {
                 snaps: Arc::new(Vec::new()),
                 grouped: Arc::new(BTreeMap::new()),
@@ -3209,6 +3234,10 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
     if !e.ends_newline {
         return None;
     }
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return None;
+    }
     let mut f = std::fs::File::open(path).ok()?;
     let mut seam_buf = Vec::new();
     f.seek(SeekFrom::Start(e.seam_offset)).ok()?;
@@ -3808,6 +3837,7 @@ fn strategy_source_for(dir: &Path, name: &str) -> Option<(String, String, String
     let mut paths: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().map(|x| x == "rn").unwrap_or(false))
+        .filter(|p| is_confined_regular_file(dir, p))
         .collect();
     paths.sort();
     for path in paths {
@@ -3823,6 +3853,40 @@ fn strategy_source_for(dir: &Path, name: &str) -> Option<(String, String, String
         }
     }
     None
+}
+
+fn resolve_dataset_checked(
+    app: &App,
+    query: &str,
+    body_dataset: Option<&str>,
+) -> Result<(String, PathBuf), String> {
+    let (dataset, dpath) = resolve_dataset(app, query, body_dataset);
+    match std::fs::symlink_metadata(&dpath) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink()
+                || !meta.file_type().is_file()
+                || !is_confined_regular_file(&app.data_dir, &dpath)
+            {
+                return Err(json_response(
+                    403,
+                    &serde_json::json!({
+                        "error": format!("dataset path is a symlink or escapes data_dir: {dataset}")
+                    })
+                    .to_string(),
+                ));
+            }
+        }
+        Err(_) => {
+            if dataset != "live" {
+                return Err(json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok((dataset, dpath))
 }
 
 fn resolve_dataset(app: &App, query: &str, body_dataset: Option<&str>) -> (String, PathBuf) {
@@ -3885,33 +3949,25 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             json_response(200, &home.to_string())
         }
         ("GET", "/api/markets") => {
-            let dpath = dataset_path(app, query);
-            if dataset_name(query) != "live" && !dpath.exists() {
-                return json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such dataset: {}", dataset_name(query)) })
-                        .to_string(),
-                );
-            }
+            let (_dataset, dpath) = match resolve_dataset_checked(app, query, None) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             let view = app.tape(&dpath);
             json_response(200, &view.latest_json)
         }
         ("GET", "/api/markets/history") => {
-            let dpath = dataset_path(app, query);
-            if dataset_name(query) != "live" && !dpath.exists() {
-                return json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such dataset: {}", dataset_name(query)) })
-                        .to_string(),
-                );
-            }
+            let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             let Some(ticker) = query_param(query, "ticker") else {
                 return json_response(400, "{\"error\":\"missing ticker parameter\"}");
             };
             let points = market_history_from(app, &dpath, &ticker);
             let body = serde_json::json!({
                 "ticker": ticker,
-                "dataset": dataset_name(query),
+                "dataset": dataset,
                 "points": points,
             });
             json_response(200, &body.to_string())
@@ -4028,16 +4084,11 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             json_response(200, &app.collector_status_json().to_string())
         }
         ("GET", "/api/strategies") => {
-            let dpath = dataset_path(app, query);
-            if dataset_name(query) != "live" && !dpath.exists() {
-                return json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such dataset: {}", dataset_name(query)) })
-                        .to_string(),
-                );
-            }
+            let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             let (_, reports_arc, _, _) = app.analysis_shared(&dpath);
-            let dataset = dataset_name(query);
             let mut reports: Vec<ScoreReport> = (*reports_arc).clone();
             for report in &mut reports {
                 report.verdict = dataset_verdict(&report.verdict, &dataset);
@@ -4045,14 +4096,10 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             json_response(200, &serde_json::to_string(&reports).unwrap())
         }
         ("GET", "/api/slots") => {
-            let dpath = dataset_path(app, query);
-            if dataset_name(query) != "live" && !dpath.exists() {
-                return json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such dataset: {}", dataset_name(query)) })
-                        .to_string(),
-                );
-            }
+            let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             let (sim, _, lib_errors, _) = app.analysis_shared(&dpath);
             let mut body = serde_json::to_value(sim.as_ref()).unwrap();
             body["stage_target"] = serde_json::to_value(stage_progress(&sim)).unwrap();
@@ -4067,18 +4114,14 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     .map(|(file, error)| serde_json::json!({ "file": file, "error": error }))
                     .collect::<Vec<_>>()
             );
-            body["dataset"] = serde_json::json!(dataset_name(query));
+            body["dataset"] = serde_json::json!(dataset);
             json_response(200, &body.to_string())
         }
         ("GET", "/api/equity") => {
-            let dpath = dataset_path(app, query);
-            if dataset_name(query) != "live" && !dpath.exists() {
-                return json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such dataset: {}", dataset_name(query)) })
-                        .to_string(),
-                );
-            }
+            let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             let (sim, _, lib_errors, strategy_names) = app.analysis_shared(&dpath);
             let (pot, per) = equity_curves(&sim);
             let mut series: Vec<serde_json::Value> = strategy_names
@@ -4101,7 +4144,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     .iter()
                     .map(|(file, error)| serde_json::json!({ "file": file, "error": error }))
                     .collect::<Vec<_>>(),
-                "dataset": dataset_name(query),
+                "dataset": dataset,
             });
             json_response(200, &body.to_string())
         }
@@ -4110,15 +4153,10 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             json_response(200, &serde_json::json!({ "report": report }).to_string())
         }
         ("GET", "/api/export/report") => {
-            let dpath = dataset_path(app, query);
-            let dataset = dataset_name(query);
-            if dataset != "live" && !dpath.exists() {
-                return json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
-                        .to_string(),
-                );
-            }
+            let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             let fmt = query_param(query, "format").unwrap_or_else(|| "md".to_string());
             match fmt.to_ascii_lowercase().as_str() {
                 "md" | "markdown" => text_download_response(
@@ -4139,41 +4177,26 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             }
         }
         ("GET", "/api/analytics/calibration") => {
-            let dpath = dataset_path(app, query);
-            let dataset = dataset_name(query);
-            if dataset != "live" && !dpath.exists() {
-                return json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
-                        .to_string(),
-                );
-            }
+            let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             let (cal_json, _, _, _, _) = app.analytics_shared(&dpath, &dataset);
             json_response(200, &cal_json)
         }
         ("GET", "/api/analytics/walkforward") => {
-            let dpath = dataset_path(app, query);
-            let dataset = dataset_name(query);
-            if dataset != "live" && !dpath.exists() {
-                return json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
-                        .to_string(),
-                );
-            }
+            let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             let (_, wf_json, _, _, _) = app.analytics_shared(&dpath, &dataset);
             json_response(200, &wf_json)
         }
         ("GET", "/api/analytics/recalibration") => {
-            let dpath = dataset_path(app, query);
-            let dataset = dataset_name(query);
-            if dataset != "live" && !dpath.exists() {
-                return json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
-                        .to_string(),
-                );
-            }
+            let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             let slippage = query_param(query, "slippage_cents")
                 .and_then(|s| s.parse::<f64>().ok())
                 .filter(|v| v.is_finite())
@@ -4183,15 +4206,10 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             json_response(200, &payload)
         }
         ("GET", "/api/analytics/tournament") => {
-            let dpath = dataset_path(app, query);
-            let dataset = dataset_name(query);
-            if dataset != "live" && !dpath.exists() {
-                return json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
-                        .to_string(),
-                );
-            }
+            let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             let slippage = query_param(query, "slippage_cents")
                 .and_then(|s| s.parse::<f64>().ok())
                 .filter(|v| v.is_finite())
@@ -4201,15 +4219,10 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             json_response(200, &payload)
         }
         ("GET", "/api/analytics/edge-audit") => {
-            let dpath = dataset_path(app, query);
-            let dataset = dataset_name(query);
-            if dataset != "live" && !dpath.exists() {
-                return json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
-                        .to_string(),
-                );
-            }
+            let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             let slippage = query_param(query, "slippage_cents")
                 .and_then(|s| s.parse::<f64>().ok())
                 .filter(|v| v.is_finite())
@@ -4239,15 +4252,14 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     }
                 }
             };
-            let (dataset, dpath) =
-                resolve_dataset(app, query, parsed.get("dataset").and_then(|v| v.as_str()));
-            if dataset != "live" && !dpath.exists() {
-                return json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
-                        .to_string(),
-                );
-            }
+            let (dataset, dpath) = match resolve_dataset_checked(
+                app,
+                query,
+                parsed.get("dataset").and_then(|v| v.as_str()),
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             let req: scaling::ScalePlanRequest = match serde_json::from_value(parsed) {
                 Ok(r) => r,
                 Err(e) => {
@@ -4282,15 +4294,14 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     }
                 }
             };
-            let (dataset, dpath) =
-                resolve_dataset(app, query, parsed.get("dataset").and_then(|v| v.as_str()));
-            if dataset != "live" && !dpath.exists() {
-                return json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
-                        .to_string(),
-                );
-            }
+            let (dataset, dpath) = match resolve_dataset_checked(
+                app,
+                query,
+                parsed.get("dataset").and_then(|v| v.as_str()),
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             let (_, _, portfolio_returns, strategy_returns, default_pot) =
                 app.analytics_shared(&dpath, &dataset);
             let paths = parsed
@@ -4371,15 +4382,14 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     "{\"error\":\"expected JSON body with a string \\\"source\\\" field\"}",
                 );
             };
-            let (dataset, dpath) =
-                resolve_dataset(app, query, parsed.get("dataset").and_then(|v| v.as_str()));
-            if dataset != "live" && !dpath.exists() {
-                return json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
-                        .to_string(),
-                );
-            }
+            let (dataset, dpath) = match resolve_dataset_checked(
+                app,
+                query,
+                parsed.get("dataset").and_then(|v| v.as_str()),
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             let mut cfg = analytics::BacktestConfig {
                 paper_pot_start: app.paper_pot,
                 ..analytics::BacktestConfig::default()
