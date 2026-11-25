@@ -2,8 +2,10 @@
 // ticking countdown-to-settlement badges, interactive SVG price + spread chart with hover crosshair,
 // and Vaul Market Inspector drawer.
 import { useEffect, useMemo, useState } from "react";
+import { motion } from "motion/react";
 import { Drawer } from "vaul";
 import { Activity, Clock, RefreshCw, X } from "lucide-react";
+import { glide } from "@/motion";
 import {
   Badge,
   Button,
@@ -374,38 +376,53 @@ export function TapeTab({
 
   return (
     <section id="markets-card" aria-label="Live 15-minute Kalshi market tape" className="space-y-3">
-      {/* Toolbar: status pills + dynamically derived series pills + SSE status */}
+      {/* Toolbar: segmented status track + dynamically derived series pills + SSE status */}
       <div className="flex flex-wrap items-center justify-between gap-2.5">
-        <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Filter markets by status">
+        <div
+          className="inline-flex flex-wrap items-center gap-0.5 rounded-md border border-hairline bg-track p-0.5"
+          role="group"
+          aria-label="Filter markets by status"
+        >
           {(
             [
               ["all", `All (${validMarkets.length})`],
               ["open", `Open (${openCount})`],
               ["settled", `Settled (${settledCount})`],
             ] as const
-          ).map(([id, label]) => (
-            <button
-              key={id}
-              type="button"
-              aria-pressed={statusFilter === id}
-              onClick={() => {
-                setStatusFilter(id);
-                setShowAll(false);
-              }}
-              className={
-                "min-h-11 cursor-pointer rounded-md border px-3 text-xs font-medium outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9 " +
-                (statusFilter === id
-                  ? "border-ink bg-ink text-canvas"
-                  : "border-hairline bg-surface text-ink-2 hover:bg-board hover:text-ink")
-              }
-            >
-              {label}
-            </button>
-          ))}
+          ).map(([id, label]) => {
+            const active = statusFilter === id;
+            return (
+              <button
+                key={id}
+                type="button"
+                aria-pressed={active}
+                onClick={() => {
+                  setStatusFilter(id);
+                  setShowAll(false);
+                }}
+                className={
+                  "relative min-h-11 cursor-pointer rounded-[5px] px-3 text-xs font-medium outline-none transition-[color,transform] duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring motion-safe:active:scale-[0.98] sm:min-h-8 " +
+                  (active
+                    ? "text-ink"
+                    : "text-ink-2 [@media(hover:hover)_and_(pointer:fine)]:hover:text-ink")
+                }
+              >
+                {active && (
+                  <motion.span
+                    layoutId="tape-status-pill"
+                    transition={glide}
+                    aria-hidden
+                    className="pointer-events-none absolute inset-0 rounded-[5px] border border-hairline bg-raised shadow-(--elev-raised)"
+                  />
+                )}
+                <span className="relative z-10">{label}</span>
+              </button>
+            );
+          })}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Filter markets by crypto series">
+          <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Filter markets by crypto series">
             {seriesChips.map((sym) => (
               <button
                 key={sym}
@@ -417,10 +434,10 @@ export function TapeTab({
                   setShowAll(false);
                 }}
                 className={
-                  "mono min-h-11 min-w-11 cursor-pointer rounded-md border px-2.5 text-xs font-medium outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9 sm:min-w-0 " +
+                  "min-h-11 min-w-11 cursor-pointer rounded-md border px-2.5 text-xs font-medium outline-none transition-[color,background-color,border-color,transform] duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring motion-safe:active:scale-[0.97] sm:min-h-8 sm:min-w-0 " +
                   (seriesFilter === sym
-                    ? "border-blue bg-blue-soft text-info-foreground"
-                    : "border-hairline bg-surface text-ink-2 hover:bg-board hover:text-ink")
+                    ? "border-blue/50 bg-blue-soft text-info-foreground"
+                    : "border-hairline bg-surface text-ink-2 [@media(hover:hover)_and_(pointer:fine)]:hover:bg-board [@media(hover:hover)_and_(pointer:fine)]:hover:text-ink")
                 }
               >
                 {sym}
@@ -439,7 +456,7 @@ export function TapeTab({
             }
           >
             <Activity className="size-3" strokeWidth={1.5} aria-hidden />
-            <span className="mono">{stream.mode === "sse" ? "SSE live" : "30s poll"}</span>
+            <span>{stream.mode === "sse" ? "SSE live" : "30s poll"}</span>
           </StatusPill>
         </div>
       </div>
@@ -448,9 +465,9 @@ export function TapeTab({
       {featuredMarket && (
         <div
           id="tape-inline-chart"
-          className="rounded-[10px] border border-hairline bg-surface p-3.5"
+          className="rounded-[10px] border border-hairline bg-surface p-3"
         >
-          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
             <div className="flex flex-wrap items-center gap-2">
               <Badge variant="outline" className="mono text-xs">
                 {seriesShort(featuredMarket.series, featuredMarket.ticker)} 15m
@@ -488,7 +505,7 @@ export function TapeTab({
           <MarketHistoryChart
             points={inlineHistory && inlineHistory.length > 0 ? inlineHistory : [featuredMarket]}
             ticker={featuredTicker}
-            height={204}
+            height={176}
           />
         </div>
       )}
@@ -542,7 +559,7 @@ export function TapeTab({
       ) : (
         <div className="overflow-hidden rounded-[10px] border border-hairline bg-surface">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-board/50 px-4 py-2 text-xs text-ink-2">
-            <span id="markets-count" className="mono">
+            <span id="markets-count" className="tabular-nums">
               Showing {visible.length} of {filtered.length} markets
             </span>
             <span className="hidden sm:inline">Click any row to inspect snapshot history</span>

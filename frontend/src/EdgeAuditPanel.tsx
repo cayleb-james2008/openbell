@@ -2,11 +2,17 @@
 // Evaluates 12 strategies -> OOS Tournament -> 4-Slot Uncorrelated Lineup (|r| <= 0.65)
 // -> PAV Isotonic Recalibration -> Kalshi Fee & Slippage Net EV -> Monte Carlo DD & 5-Gate Readiness.
 import { type RefObject, useCallback, useEffect, useState } from "react";
+import { motion, useReducedMotion } from "motion/react";
 import { CheckCircle2, RefreshCw, ShieldAlert, ShieldCheck, XCircle } from "lucide-react";
 import { toast } from "sonner";
 import { Badge, Button, StatusPill } from "@/components/ui";
 import { type Dataset, type Home, type Market, type Slots, type Strategy, money, moneySigned } from "@/lib/desk";
 import { type EdgeAuditData, fetchEdgeAudit } from "@/lib/edgeAudit";
+import { reveal } from "@/motion";
+
+function cleanJoin(s: string): string {
+  return s.replace(/\s*·\s*/g, ", ");
+}
 
 function fmtCents(v: number | null): string {
   if (v === null || !Number.isFinite(v)) return "-";
@@ -35,6 +41,7 @@ export function EdgeAuditPanel({
   auditSignal?: number;
   panelRef?: RefObject<HTMLDivElement | null>;
 }) {
+  const reduce = useReducedMotion();
   const [slippage, setSlippage] = useState<number>(1);
   const [audit, setAudit] = useState<EdgeAuditData | null>(null);
   const [running, setRunning] = useState(false);
@@ -182,23 +189,61 @@ export function EdgeAuditPanel({
             </div>
           </dl>
 
-          {/* Row 2: 5-Stage Validation Funnel */}
-          <div className="grid grid-cols-1 divide-y divide-hairline lg:grid-cols-5 lg:divide-x lg:divide-y-0">
-            {audit.funnel.map((stage, idx) => (
-              <div key={stage.id} data-edge-audit-stage={stage.id} className="space-y-1.5 px-4 py-3.5">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="mono text-xs font-medium text-ink-2">Stage {idx + 1}</span>
-                  {stage.passed ? (
-                    <CheckCircle2 className="size-4 shrink-0 text-success-foreground" strokeWidth={1.5} aria-hidden />
-                  ) : (
-                    <XCircle className="size-4 shrink-0 text-destructive-foreground" strokeWidth={1.5} aria-hidden />
-                  )}
-                </div>
-                <p className="text-sm font-semibold text-ink">{stage.title}</p>
-                <p className="mono text-sm font-semibold text-info-foreground">{stage.metric}</p>
-                <p className="text-xs text-ink-2">{stage.detail}</p>
-              </div>
-            ))}
+          {/* Row 2: Architectural Hairline 5-Stage Validation Funnel Strip */}
+          <div className="divide-y divide-hairline">
+            <div className="flex flex-wrap items-center justify-between gap-2 bg-board/40 px-4 py-2 text-xs text-ink-2">
+              <span className="font-medium text-ink">5-Stage Quant Validation Funnel</span>
+              <span className="mono">
+                {audit.funnel.filter((s) => s.passed).length} of {audit.funnel.length} stages cleared
+              </span>
+            </div>
+            <div className="grid grid-cols-1 divide-y divide-hairline lg:grid-cols-5 lg:divide-x lg:divide-y-0">
+              {audit.funnel.map((stage, idx) => (
+                <motion.div
+                  key={stage.id}
+                  data-edge-audit-stage={stage.id}
+                  initial={reduce ? false : { opacity: 0, y: 4 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={reduce ? { duration: 0 } : { ...reveal, delay: idx * 0.03 }}
+                  className="relative flex flex-col justify-between gap-2 px-4 py-3.5"
+                >
+                  <div
+                    aria-hidden
+                    className={
+                      "absolute inset-x-0 top-0 h-[2px] " +
+                      (stage.passed ? "bg-dot-green" : "bg-dot-red")
+                    }
+                  />
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="mono text-xs font-medium text-ink-3">
+                        0{idx + 1}
+                      </span>
+                      <span
+                        className={
+                          "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium " +
+                          (stage.passed
+                            ? "bg-pill-active-bg text-pill-active-fg"
+                            : "border border-dot-red/40 bg-surface text-destructive-foreground")
+                        }
+                      >
+                        {stage.passed ? (
+                          <CheckCircle2 className="size-3 shrink-0" strokeWidth={1.5} aria-hidden />
+                        ) : (
+                          <XCircle className="size-3 shrink-0" strokeWidth={1.5} aria-hidden />
+                        )}
+                        <span>{stage.passed ? "Pass" : "Gate"}</span>
+                      </span>
+                    </div>
+                    <p className="text-sm font-semibold text-ink">{stage.title}</p>
+                  </div>
+                  <div className="space-y-0.5">
+                    <p className="mono text-sm font-semibold text-info-foreground">{cleanJoin(stage.metric)}</p>
+                    <p className="text-xs text-ink-2">{cleanJoin(stage.detail)}</p>
+                  </div>
+                </motion.div>
+              ))}
+            </div>
           </div>
 
           {/* Row 3: 4-Slot Lineup Summary + Blocking Reasons */}

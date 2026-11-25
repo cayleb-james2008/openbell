@@ -651,11 +651,11 @@ export function MarketHistoryChart({
     );
   }
 
-  const H = Math.max(180, height);
-  const priceTop = 14;
-  const priceBot = Math.round(H * 0.60);
-  const spreadTop = priceBot + 18;
-  const spreadBot = H - 24;
+  const H = Math.max(176, height);
+  const priceTop = 12;
+  const priceBot = Math.round(H * 0.56);
+  const spreadTop = priceBot + 24;
+  const spreadBot = H - 22;
 
   const x0 = series[0].t;
   const x1 = series[series.length - 1].t;
@@ -672,6 +672,10 @@ export function MarketHistoryChart({
   const Ys = (sp: number) => spreadBot - (Math.min(maxSpread, Math.max(0, sp)) / maxSpread) * (spreadBot - spreadTop);
 
   const priceD = series.map((p, i) => `${i ? "L" : "M"}${X(p.t, i).toFixed(1)},${Yp(p.prob).toFixed(1)}`).join(" ");
+  const areaD =
+    series.length >= 2
+      ? `${priceD} L${X(series[series.length - 1].t, series.length - 1).toFixed(1)},${priceBot} L${X(series[0].t, 0).toFixed(1)},${priceBot} Z`
+      : "";
   const corridorD =
     series.length >= 2
       ? series.map((p, i) => `${i ? "L" : "M"}${X(p.t, i).toFixed(1)},${Yp(p.yesAsk).toFixed(1)}`).join(" ") +
@@ -716,7 +720,7 @@ export function MarketHistoryChart({
       {/* Interactive crosshair readout tooltip bar */}
       <div
         data-market-crosshair-tooltip
-        className="mb-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded-md border border-hairline bg-surface px-2.5 py-1.5 font-mono text-xs tabular-nums"
+        className="mb-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded-md border border-hairline bg-board/60 px-2.5 py-1 font-mono text-xs tabular-nums"
       >
         <span className="font-medium text-ink">
           {isNum(active.raw.fetched_at) ? timeUtcFullLabel(active.raw.fetched_at) : "Latest"}
@@ -745,6 +749,13 @@ export function MarketHistoryChart({
         onMouseMove={(e) => onMove(e.clientX, e.currentTarget.getBoundingClientRect())}
         onMouseLeave={() => setHoverIdx(null)}
       >
+        <defs>
+          <linearGradient id="ob-prob-area-grad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--dot-blue)" stopOpacity="0.22" />
+            <stop offset="100%" stopColor="var(--dot-blue)" stopOpacity="0.01" />
+          </linearGradient>
+        </defs>
+
         {/* Top price pane grid */}
         {[1, 0.5, 0].map((tick) => (
           <g key={tick}>
@@ -758,7 +769,7 @@ export function MarketHistoryChart({
             />
             <text
               x={PADL - 8}
-              y={Yp(tick) + 4}
+              y={tick === 1 ? Yp(tick) + 7 : tick === 0 ? Yp(tick) - 2 : Yp(tick) + 4}
               textAnchor="end"
               fontSize={12}
               className="font-mono tabular-nums"
@@ -769,8 +780,22 @@ export function MarketHistoryChart({
           </g>
         ))}
 
-        {/* Bid-ask shaded corridor */}
-        {corridorD && <path d={corridorD} style={{ fill: "var(--dot-blue)", opacity: 0.14 }} />}
+        {/* Soft area gradient fade under implied probability */}
+        {areaD && <path d={areaD} fill="url(#ob-prob-area-grad)" />}
+
+        {/* Bid-ask shaded corridor (or baseline guide on single snapshot) */}
+        {corridorD ? (
+          <path d={corridorD} style={{ fill: "var(--dot-blue)", opacity: 0.14 }} />
+        ) : (
+          <line
+            x1={PADL}
+            x2={W - PADR}
+            y1={Yp(series[0].prob)}
+            y2={Yp(series[0].prob)}
+            strokeDasharray="2 3"
+            style={{ stroke: "var(--dot-blue)", opacity: 0.45 }}
+          />
+        )}
 
         {/* Mid implied probability line */}
         {series.length >= 2 && (
@@ -778,7 +803,7 @@ export function MarketHistoryChart({
             key={priceD.length}
             d={priceD}
             fill="none"
-            strokeWidth={2}
+            strokeWidth={1.75}
             strokeLinejoin="round"
             strokeLinecap="round"
             style={{ stroke: "var(--dot-blue)" }}
@@ -791,16 +816,16 @@ export function MarketHistoryChart({
         {/* Bottom spread history subplot */}
         <line x1={PADL} x2={W - PADR} y1={spreadTop} y2={spreadTop} style={{ stroke: "var(--hairline)" }} />
         <line x1={PADL} x2={W - PADR} y1={spreadBot} y2={spreadBot} style={{ stroke: "var(--hairline)" }} />
-        <text x={PADL - 8} y={spreadTop + 4} textAnchor="end" fontSize={12} className="font-mono tabular-nums" style={{ fill: "var(--ink-3)" }}>
+        <text x={PADL - 8} y={spreadTop + 8} textAnchor="end" fontSize={12} className="font-mono tabular-nums" style={{ fill: "var(--ink-3)" }}>
           {maxSpread}c
         </text>
-        <text x={PADL - 8} y={spreadBot + 4} textAnchor="end" fontSize={12} className="font-mono tabular-nums" style={{ fill: "var(--ink-3)" }}>
+        <text x={PADL - 8} y={spreadBot} textAnchor="end" fontSize={12} className="font-mono tabular-nums" style={{ fill: "var(--ink-3)" }}>
           0c
         </text>
         {series.map((p, i) => {
           const cx = X(p.t, i);
           const yTop = Ys(p.spread);
-          const hBar = Math.max(1, spreadBot - yTop);
+          const hBar = Math.max(2, spreadBot - yTop);
           const isActive = i === activeIdx;
           return (
             <rect
