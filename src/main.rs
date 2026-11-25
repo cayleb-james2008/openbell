@@ -186,6 +186,61 @@ mod arc_str {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct OptPrice(u32);
+
+impl OptPrice {
+    const NONE: Self = Self(u32::MAX);
+
+    #[inline]
+    fn from_opt(v: Option<f64>) -> Self {
+        let Some(x) = v else {
+            return Self::NONE;
+        };
+        if !x.is_finite() {
+            return Self::NONE;
+        }
+        if (0.0..=100.0).contains(&x) {
+            let c = (x * 100.0).round();
+            if (c / 100.0).to_bits() == x.to_bits() {
+                return Self(c as u32);
+            }
+        }
+        let bits = (x as f32).to_bits();
+        let encoded = (bits >> 1) | 0x8000_0000;
+        if encoded == u32::MAX {
+            Self(u32::MAX - 1)
+        } else {
+            Self(encoded)
+        }
+    }
+
+    #[inline]
+    fn get(self) -> Option<f64> {
+        if self.0 == u32::MAX {
+            None
+        } else if self.0 <= 10_000 {
+            Some((self.0 as f64) / 100.0)
+        } else {
+            Some(f32::from_bits(self.0 << 1) as f64)
+        }
+    }
+}
+
+impl Serialize for OptPrice {
+    #[inline]
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.get().serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for OptPrice {
+    #[inline]
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Option::<f64>::deserialize(d).map(Self::from_opt)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Snapshot {
     fetched_at: i64,
@@ -201,24 +256,24 @@ struct Snapshot {
     status: Arc<str>,
     #[serde(with = "arc_str")]
     result: Arc<str>,
-    yes_bid: Option<f64>,
-    yes_ask: Option<f64>,
-    no_bid: Option<f64>,
-    no_ask: Option<f64>,
-    last_price: Option<f64>,
+    yes_bid: OptPrice,
+    yes_ask: OptPrice,
+    no_bid: OptPrice,
+    no_ask: OptPrice,
+    last_price: OptPrice,
     #[serde(default)]
-    yes_bid_size: f64,
+    yes_bid_size: f32,
     #[serde(default)]
-    no_bid_size: f64,
+    no_bid_size: f32,
 }
 
-fn dollars(v: &serde_json::Value, key: &str) -> Option<f64> {
-    v.get(key).and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok())
+fn dollars(v: &serde_json::Value, key: &str) -> OptPrice {
+    OptPrice::from_opt(v.get(key).and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()))
 }
 
 /// Parse top-of-book contract depth from Kalshi public market JSON (string `*_fp`
 /// or numeric fields), returning finite non-negative depth or `0.0` when absent.
-fn depth_size(v: &serde_json::Value, keys: &[&str]) -> f64 {
+fn depth_size(v: &serde_json::Value, keys: &[&str]) -> f32 {
     for &key in keys {
         let parsed = v.get(key).and_then(|x| {
             x.as_str()
@@ -227,7 +282,7 @@ fn depth_size(v: &serde_json::Value, keys: &[&str]) -> f64 {
         });
         if let Some(n) = parsed {
             if n.is_finite() && n >= 0.0 {
-                return n;
+                return n as f32;
             }
         }
     }
@@ -244,19 +299,24 @@ fn median_observed_book_depth_grouped(grouped: &BTreeMap<String, Vec<Snapshot>>)
 }
 
 fn median_observed_book_depth_iter<'a, I: Iterator<Item = &'a Snapshot>>(iter: I) -> Option<f64> {
-    let mut depths: Vec<f64> = iter
-        .flat_map(|s| [s.yes_bid_size, s.no_bid_size])
-        .filter(|d| d.is_finite() && *d > 0.0)
-        .collect();
+    let mut depths: Vec<f32> = Vec::new();
+    for s in iter {
+        if s.yes_bid_size.is_finite() && s.yes_bid_size > 0.0 {
+            depths.push(s.yes_bid_size);
+        }
+        if s.no_bid_size.is_finite() && s.no_bid_size > 0.0 {
+            depths.push(s.no_bid_size);
+        }
+    }
     if depths.is_empty() {
         return None;
     }
     depths.sort_unstable_by(|a, b| a.total_cmp(b));
     let mid = depths.len() / 2;
     if depths.len() % 2 == 1 {
-        Some(depths[mid])
+        Some(depths[mid] as f64)
     } else {
-        Some((depths[mid - 1] + depths[mid]) * 0.5)
+        Some(((depths[mid - 1] as f64) + (depths[mid] as f64)) * 0.5)
     }
 }
 
@@ -973,25 +1033,35 @@ impl Strategy {
                 });
             }
         }
-        let context = rune::Context::with_default_modules().map_err(|e| e.to_string())?;
-        let runtime = Arc::new(context.runtime().map_err(|e| e.to_string())?);
-        let mut sources = rune::Sources::new();
-        sources
-            .insert(rune::Source::memory(&script).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        let mut diagnostics = rune::Diagnostics::new();
-        let unit = rune::prepare(&mut sources)
-            .with_context(&context)
-            .with_diagnostics(&mut diagnostics)
-            .build()
-            .map_err(|e| {
-                format!(
-                    "strategy {} failed to build: {}",
-                    path.display(),
-                    e.to_string().replace(" (see diagnostics for details)", "")
-                )
-            })?;
-        let unit = Arc::new(unit);
+        let (unit, runtime) = {
+            static SHARED_RUNE: std::sync::OnceLock<
+                std::sync::Mutex<(rune::Context, Arc<rune::runtime::RuntimeContext>)>,
+            > = std::sync::OnceLock::new();
+            if SHARED_RUNE.get().is_none() {
+                let context = rune::Context::with_default_modules().map_err(|e| e.to_string())?;
+                let runtime = Arc::new(context.runtime().map_err(|e| e.to_string())?);
+                let _ = SHARED_RUNE.set(std::sync::Mutex::new((context, runtime)));
+            }
+            let guard = SHARED_RUNE.get().unwrap().lock().unwrap_or_else(|p| p.into_inner());
+            let (context, runtime) = &*guard;
+            let mut sources = rune::Sources::new();
+            sources
+                .insert(rune::Source::memory(&script).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            let mut diagnostics = rune::Diagnostics::new();
+            let unit = rune::prepare(&mut sources)
+                .with_context(context)
+                .with_diagnostics(&mut diagnostics)
+                .build()
+                .map_err(|e| {
+                    format!(
+                        "strategy {} failed to build: {}",
+                        path.display(),
+                        e.to_string().replace(" (see diagnostics for details)", "")
+                    )
+                })?;
+            (Arc::new(unit), runtime.clone())
+        };
         let mut strat = Strategy {
             name: String::new(),
             side: String::new(),
@@ -1215,8 +1285,8 @@ fn window_fingerprint(snaps: &[Snapshot]) -> u64 {
     snaps.len().hash(&mut h);
     for s in snaps {
         s.fetched_at.hash(&mut h);
-        s.yes_ask.map(f64::to_bits).hash(&mut h);
-        s.no_ask.map(f64::to_bits).hash(&mut h);
+        s.yes_ask.get().map(f64::to_bits).hash(&mut h);
+        s.no_ask.get().map(f64::to_bits).hash(&mut h);
         s.close_time.hash(&mut h);
     }
     h.finish()
@@ -1304,7 +1374,7 @@ fn window_entry_keyed(
 
 fn window_entry_scan(strat: &Strategy, snaps: &[Snapshot]) -> Option<f64> {
     for snap in snaps {
-        let (Some(ya), Some(na)) = (snap.yes_ask, snap.no_ask) else {
+        let (Some(ya), Some(na)) = (snap.yes_ask.get(), snap.no_ask.get()) else {
             continue;
         };
         let Some(close) = parse_iso_z(&snap.close_time) else {
@@ -2760,10 +2830,15 @@ impl App {
             }
         }
         let seam_line = String::from_utf8_lossy(&seam_bytes).into_owned();
-        for snaps in grouped_map.values_mut() {
+        drop(seam_bytes);
+        for (idx, snaps) in grouped_map.values_mut().enumerate() {
             snaps.sort_by_key(|s| s.fetched_at);
             snaps.shrink_to_fit();
+            if idx & 255 == 255 {
+                trim_heap();
+            }
         }
+        trim_heap();
         let grouped = Arc::new(grouped_map);
         let latest_json = build_latest_markets_json(&grouped);
         let entry = TapeEntry {
@@ -2861,7 +2936,10 @@ impl App {
             lib_errors,
             strategy_names,
         };
+        drop(fps);
+        drop(strategies);
         *self.analysis_cache.write().unwrap_or_else(|p| p.into_inner()) = Some(entry);
+        trim_heap();
         out
     }
 
@@ -3085,6 +3163,8 @@ impl App {
             guard.remove(0);
         }
         guard.push(entry);
+        drop(guard);
+        trim_heap();
         payload
     }
 
@@ -3210,6 +3290,8 @@ impl App {
             guard.remove(0);
         }
         guard.push(entry);
+        drop(guard);
+        trim_heap();
         payload
     }
 
@@ -3424,6 +3506,8 @@ impl App {
             guard.remove(0);
         }
         guard.push(entry);
+        drop(guard);
+        trim_heap();
         payload
     }
 
@@ -3458,42 +3542,87 @@ impl App {
             report.verdict = dataset_verdict(&report.verdict, dataset);
         }
         let strategies_json = Arc::new(serde_json::to_string(&reports).unwrap_or_else(|_| "[]".to_string()));
+        drop(reports);
 
-        let mut slots_body = serde_json::to_value(sim.as_ref()).unwrap_or_else(|_| json!({}));
-        slots_body["stage_target"] = serde_json::to_value(stage_progress(&sim)).unwrap_or_else(|_| json!({}));
-        let total = sim.trades.len();
-        let shown: Vec<&Trade> = sim.trades.iter().skip(total.saturating_sub(5000)).collect();
-        slots_body["trades"] = serde_json::to_value(&shown).unwrap_or_else(|_| json!([]));
-        slots_body["trades_truncated"] = json!(total > 5000);
-        let lib_err_val = json!(lib_errors
+        #[derive(Serialize)]
+        struct LibErrItem<'a> {
+            file: &'a str,
+            error: &'a str,
+        }
+        let lib_err_rows: Vec<LibErrItem<'_>> = lib_errors
             .iter()
-            .map(|(file, error)| json!({ "file": file, "error": error }))
-            .collect::<Vec<_>>());
-        slots_body["library_errors"] = lib_err_val.clone();
-        slots_body["dataset"] = json!(dataset);
-        let slots_json = Arc::new(slots_body.to_string());
+            .map(|(file, error)| LibErrItem { file, error })
+            .collect();
 
+        #[derive(Serialize)]
+        struct SlotsJsonBody<'a> {
+            conflicted_windows: usize,
+            paper_pot_start: f64,
+            paper_equity_dollars: f64,
+            slots: &'a [SlotReport],
+            retired: &'a [RetiredReport],
+            strategy_totals: &'a [StrategyTotal],
+            notes: &'a [String],
+            stage_target: StageProgress,
+            trades: &'a [Trade],
+            trades_truncated: bool,
+            library_errors: &'a [LibErrItem<'a>],
+            dataset: &'a str,
+        }
+        let total = sim.trades.len();
+        let shown = &sim.trades[total.saturating_sub(5000)..];
+        let slots_body = SlotsJsonBody {
+            conflicted_windows: sim.conflicted_windows,
+            paper_pot_start: sim.paper_pot_start,
+            paper_equity_dollars: sim.paper_equity_dollars,
+            slots: &sim.slots,
+            retired: &sim.retired,
+            strategy_totals: &sim.strategy_totals,
+            notes: &sim.notes,
+            stage_target: stage_progress(&sim),
+            trades: shown,
+            trades_truncated: total > 5000,
+            library_errors: &lib_err_rows,
+            dataset,
+        };
+        let slots_json = Arc::new(serde_json::to_string(&slots_body).unwrap_or_else(|_| "{}".to_string()));
+
+        #[derive(Serialize)]
+        struct EquitySeriesItem<'a> {
+            strategy: &'a str,
+            points: &'a [(i64, f64)],
+        }
+        #[derive(Serialize)]
+        struct EquityJsonBody<'a> {
+            paper_pot_start: f64,
+            pot: &'a [(i64, f64)],
+            series: Vec<EquitySeriesItem<'a>>,
+            library_errors: &'a [LibErrItem<'a>],
+            dataset: &'a str,
+        }
         let (pot, per) = equity_curves(&sim);
-        let mut series: Vec<serde_json::Value> = strategy_names
+        let mut series: Vec<EquitySeriesItem<'_>> = strategy_names
             .iter()
             .map(|name| {
                 let points = per
                     .iter()
                     .find(|(n, _)| n == name)
-                    .map(|(_, pts)| pts.clone())
-                    .unwrap_or_default();
-                json!({ "strategy": name, "points": points })
+                    .map(|(_, pts)| pts.as_slice())
+                    .unwrap_or(&[]);
+                EquitySeriesItem { strategy: name, points }
             })
             .collect();
-        series.sort_by(|a, b| a["strategy"].as_str().cmp(&b["strategy"].as_str()));
-        let equity_body = json!({
-            "paper_pot_start": sim.paper_pot_start,
-            "pot": pot,
-            "series": series,
-            "library_errors": lib_err_val,
-            "dataset": dataset,
-        });
-        let equity_json = Arc::new(equity_body.to_string());
+        series.sort_by(|a, b| a.strategy.cmp(b.strategy));
+        let equity_body = EquityJsonBody {
+            paper_pot_start: sim.paper_pot_start,
+            pot: &pot,
+            series,
+            library_errors: &lib_err_rows,
+            dataset,
+        };
+        let equity_json = Arc::new(serde_json::to_string(&equity_body).unwrap_or_else(|_| "{}".to_string()));
+        drop(pot);
+        drop(per);
 
         let entry = DeskJsonCacheEntry {
             path: dpath.to_path_buf(),
@@ -3511,6 +3640,8 @@ impl App {
             guard.remove(0);
         }
         guard.push(entry);
+        drop(guard);
+        trim_heap();
         (strategies_json, slots_json, equity_json)
     }
 
@@ -5929,14 +6060,23 @@ fn start_background_collector(app: Arc<App>) {
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 unsafe extern "C" {
     fn mallopt(param: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
+    fn malloc_trim(pad: usize) -> std::ffi::c_int;
+}
+
+#[inline]
+fn trim_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        let _ = malloc_trim(0);
+    }
 }
 
 fn main() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    // SAFETY: M_ARENA_MAX (-8) with value 2 is a process-wide glibc allocator hint before threads spawn,
-    // bounding per-thread heap arenas so 32 HTTP workers reuse freed pages instead of ballooning RSS.
+    // SAFETY: M_ARENA_MAX (-8) and M_TRIM_THRESHOLD (-1) bound per-thread arenas and trim freed heap pages promptly.
     unsafe {
         mallopt(-8, 2);
+        mallopt(-1, 32 * 1024);
     }
     if std::env::args().nth(1).as_deref().is_some_and(|a| a == "--version" || a == "-V") {
         println!("openbell-rs {}", env!("CARGO_PKG_VERSION"));
@@ -6337,11 +6477,11 @@ mod tests {
             close_time: close.into(),
             status: if result.is_empty() { "active".into() } else { "settled".into() },
             result: result.into(),
-            yes_bid: ya.map(|v| v - 0.02),
-            yes_ask: ya,
-            no_bid: na.map(|v| v - 0.02),
-            no_ask: na,
-            last_price: None,
+            yes_bid: OptPrice::from_opt(ya.map(|v| v - 0.02)),
+            yes_ask: OptPrice::from_opt(ya),
+            no_bid: OptPrice::from_opt(na.map(|v| v - 0.02)),
+            no_ask: OptPrice::from_opt(na),
+            last_price: OptPrice::NONE,
             yes_bid_size: 0.0,
             no_bid_size: 0.0,
         }
@@ -6370,11 +6510,11 @@ mod tests {
             close_time: close.into(),
             status: "active".into(),
             result: result.into(),
-            yes_bid: None,
-            yes_ask: Some(0.5),
-            no_bid: None,
-            no_ask: Some(0.5),
-            last_price: None,
+            yes_bid: OptPrice::NONE,
+            yes_ask: OptPrice::from_opt(Some(0.5)),
+            no_bid: OptPrice::NONE,
+            no_ask: OptPrice::from_opt(Some(0.5)),
+            last_price: OptPrice::NONE,
             yes_bid_size: 0.0,
             no_bid_size: 0.0,
         };
@@ -7108,17 +7248,17 @@ mod tests {
             close_time: "2026-11-21T23:00:00Z".into(),
             status: "open".into(),
             result: "".into(),
-            yes_bid: Some(0.51),
-            yes_ask: Some(0.54),
-            no_bid: Some(0.46),
-            no_ask: Some(0.49),
-            last_price: Some(0.52),
+            yes_bid: OptPrice::from_opt(Some(0.51)),
+            yes_ask: OptPrice::from_opt(Some(0.54)),
+            no_bid: OptPrice::from_opt(Some(0.46)),
+            no_ask: OptPrice::from_opt(Some(0.49)),
+            last_price: OptPrice::from_opt(Some(0.52)),
             yes_bid_size: 120.0,
             no_bid_size: 95.0,
         };
         let mut s2 = s1.clone();
         s2.fetched_at = 1060;
-        s2.yes_ask = Some(0.58);
+        s2.yes_ask = OptPrice::from_opt(Some(0.58));
         std::fs::write(
             dir.join("snapshots.jsonl"),
             format!(

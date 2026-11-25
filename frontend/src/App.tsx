@@ -74,10 +74,24 @@ function initialDataset(): Dataset {
   return qs.get("dataset") === "fixture" ? "fixture" : "live";
 }
 
-function collectorText(home: Home | null): { fresh: boolean; label: string; detail: string } {
+function collectorText(
+  home: Home | null,
+  dataset: Dataset,
+  settledMarketsCount: number,
+): { tone: "green" | "amber" | "neutral"; fresh: boolean; label: string; detail: string } {
   const c = home?.collector;
+  if (dataset === "fixture" || home?.mode === "fixture" || home?.mode === "example_only") {
+    const winCount = settledMarketsCount > 0 ? settledMarketsCount : (c?.settled_windows ?? 120);
+    return {
+      tone: "neutral",
+      fresh: false,
+      label: `Fixture tape · ${winCount} windows`,
+      detail: "Bundled offline synthetic fixture tape (paper simulation)",
+    };
+  }
   if (!c) {
     return {
+      tone: "amber",
       fresh: false,
       label: "Collector idle",
       detail: "Collector unavailable on this view",
@@ -88,6 +102,7 @@ function collectorText(home: Home | null): { fresh: boolean; label: string; deta
   const failed = isNum(c.series_failed_last_pass) ? c.series_failed_last_pass : 0;
   const failNote = failed > 0 ? ` (${failed} market read${failed === 1 ? "" : "s"} failed)` : "";
   return {
+    tone: fresh ? "green" : "amber",
     fresh,
     label: fresh ? `Live (${age})` : `Stale (${age})`,
     detail: (fresh ? `Collector active, newest snapshot ${age}` : `Collector stale, newest snapshot ${age}`) + failNote,
@@ -188,7 +203,7 @@ export function App() {
   const openMarketsCount = useMemo(() => markets.filter(marketIsOpen).length, [markets]);
   const settledMarketsCount = Math.max(0, markets.length - openMarketsCount);
   const standing = useMemo(() => computeStanding(reads?.strategies), [reads?.strategies]);
-  const collector = collectorText(home);
+  const collector = collectorText(home, dataset, settledMarketsCount);
   const versionText = home?.version || upd.version?.version || "0.9.0";
 
   const potValue = slots && isNum(slots.paper_equity_dollars) ? slots.paper_equity_dollars : null;
@@ -809,7 +824,13 @@ export function App() {
                 <span
                   id="chip-dot"
                   aria-hidden
-                  className={`size-2 rounded-full ${collector.fresh ? "bg-dot-green" : "bg-dot-amber"}`}
+                  className={`size-2 rounded-full ${
+                    collector.tone === "green"
+                      ? "bg-dot-green"
+                      : collector.tone === "neutral"
+                        ? "bg-ink-3"
+                        : "bg-dot-amber"
+                  }`}
                 />
                 <span id="chip-text" className="mono text-xs font-medium text-ink">
                   {collector.label}

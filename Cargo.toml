@@ -1,6 +1,6 @@
 [package]
 name = "openbell-rs"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 
 [profile.release]
@@ -9,6 +9,15 @@ codegen-units = 1
 strip = "symbols"
 opt-level = 3
 panic = "abort"
+
+[profile.release.package."*"]
+opt-level = "z"
+
+[profile.release.package.serde]
+opt-level = 3
+
+[profile.release.package.serde_json]
+opt-level = 3
 
 [dependencies]
 base64 = "0.22"

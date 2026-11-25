@@ -399,6 +399,29 @@ pub struct DailyTargetVerdict {
     pub blockers: Vec<String>,
 }
 
+/// Zero-config strategy preset ranked across OOS + `+1c` adverse-fill bootstrap trials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyPresetCandidate {
+    pub id: String,
+    pub label: String,
+    pub subtitle: String,
+    pub config: AutoAllocatorRequest,
+    pub active_winners_count: usize,
+    pub net_expectancy_cents: Option<f64>,
+    pub oos_net_pnl_dollars: f64,
+    pub oos_max_dd_pct: f64,
+    pub bootstrap_p50_equity: f64,
+    pub bootstrap_p95_max_dd_pct: f64,
+    pub stress_1c_p50_equity: f64,
+    pub stress_1c_p95_max_dd_pct: f64,
+    pub daily_rail_breach_prob_pct: f64,
+    pub stress_1c_daily_rail_breach_prob_pct: f64,
+    pub risk_adjusted_score: f64,
+    pub safe_gate_passed: bool,
+    pub is_top_safe: bool,
+    pub note: String,
+}
+
 /// Complete response payload for `GET /api/allocator` and `POST /api/allocator/plan`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoAllocatorReport {
@@ -428,6 +451,8 @@ pub struct AutoAllocatorReport {
     pub edge_screener: Vec<EdgeScreenerRow>,
     pub best_basket: BestBasketPlan,
     pub bootstrap_stress: BootstrapStressSummary,
+    pub preset_leaderboard: Vec<StrategyPresetCandidate>,
+    pub top_safe_preset: Option<String>,
     pub comparison: AllocatorComparison,
     pub planned_intents: Vec<PlannedAllocatorIntent>,
     pub daily_target: DailyTargetVerdict,
@@ -1018,6 +1043,15 @@ pub fn compute_auto_allocator_report(
         req.starting_bankroll,
         rails.max_daily_loss_dollars,
     );
+    let (preset_leaderboard, top_safe_preset) = compute_preset_leaderboard(
+        ctx,
+        &req,
+        rails,
+        &is_by_strat,
+        &oos_by_strat,
+        &oos_by_epoch,
+        is_total_entries,
+    );
 
     // Compute $500/day net expectancy readiness verdict with concrete blockers.
     let daily_target = compute_daily_target_verdict(
@@ -1112,6 +1146,8 @@ pub fn compute_auto_allocator_report(
         edge_screener,
         best_basket,
         bootstrap_stress,
+        preset_leaderboard,
+        top_safe_preset,
         comparison,
         planned_intents,
         daily_target,
@@ -1955,7 +1991,21 @@ fn compute_bootstrap_stress_sim(
     starting_bankroll: f64,
     max_daily_loss_dollars: f64,
 ) -> BootstrapStressSummary {
-    const TRIALS: usize = 1_000;
+    compute_bootstrap_stress_sim_trials(
+        oos_window_returns,
+        starting_bankroll,
+        max_daily_loss_dollars,
+        1_000,
+    )
+}
+
+fn compute_bootstrap_stress_sim_trials(
+    oos_window_returns: &[(f64, f64)],
+    starting_bankroll: f64,
+    max_daily_loss_dollars: f64,
+    trials: usize,
+) -> BootstrapStressSummary {
+    let trials = trials.max(100);
     const DAYS: u32 = 30;
     const WINDOWS_PER_DAY: usize = 96;
 
@@ -1970,7 +2020,7 @@ fn compute_bootstrap_stress_sim(
             })
             .collect();
         return BootstrapStressSummary {
-            trials: TRIALS,
+            trials,
             horizon_days: DAYS,
             windows_per_day: WINDOWS_PER_DAY,
             oos_sample_windows: 0,
@@ -1997,7 +2047,7 @@ fn compute_bootstrap_stress_sim(
         &r0,
         starting_bankroll,
         max_daily_loss_dollars,
-        TRIALS,
+        trials,
         DAYS as usize,
         WINDOWS_PER_DAY,
         0x4F50_454E_4245_4C4C,
@@ -2006,7 +2056,7 @@ fn compute_bootstrap_stress_sim(
         &r1,
         starting_bankroll,
         max_daily_loss_dollars,
-        TRIALS,
+        trials,
         DAYS as usize,
         WINDOWS_PER_DAY,
         0x4F50_454E_4245_4C4C,
@@ -2026,18 +2076,22 @@ fn compute_bootstrap_stress_sim(
         .collect();
 
     let last = DAYS as usize;
+    let rail_str = if base.daily_rail_breach_prob_pct > 0.0 && base.daily_rail_breach_prob_pct < 0.05 {
+        "<0.1".to_string()
+    } else {
+        format!("{:.1}", base.daily_rail_breach_prob_pct)
+    };
     let summary = format!(
-        "1,000 causal OOS trials (30d): P50 ${:.2} (${:.2} @ +1c), P95 DD {:.1}% ({:.1}% @ +1c), rail-breach {:.1}%, P(>=$500/d) {:.1}%",
+        "1,000 causal OOS trials (30d): P50 ${:.2} (${:.2} @ +1c), P95 DD {:.1}% ({:.1}% @ +1c), rail-breach {rail_str}%, P(>=$500/d) {:.1}%",
         base.p50[last],
         stress.p50[last],
         base.p95_max_dd_pct,
         stress.p95_max_dd_pct,
-        base.daily_rail_breach_prob_pct,
         base.prob_500_day_pct,
     );
 
     BootstrapStressSummary {
-        trials: TRIALS,
+        trials,
         horizon_days: DAYS,
         windows_per_day: WINDOWS_PER_DAY,
         oos_sample_windows: oos_window_returns.len(),
@@ -2056,6 +2110,277 @@ fn compute_bootstrap_stress_sim(
         trajectory,
         summary,
     }
+}
+
+fn compute_preset_leaderboard(
+    ctx: &TournamentTapeContext,
+    base_req: &AutoAllocatorRequest,
+    rails: &RiskRailsConfig,
+    is_by_strat: &[Vec<&TournamentEntry>],
+    oos_by_strat: &[Vec<&TournamentEntry>],
+    oos_by_epoch: &BTreeMap<i64, Vec<&TournamentEntry>>,
+    is_total_entries: usize,
+) -> (Vec<StrategyPresetCandidate>, Option<String>) {
+    struct PresetSpec {
+        id: &'static str,
+        label: &'static str,
+        subtitle: &'static str,
+        exec_mode: &'static str,
+        sizing_mode: &'static str,
+        fill_rate: f64,
+        min_oos_floor: usize,
+        slot_risk: f64,
+        total_heat: f64,
+        min_fill_pct: f64,
+    }
+
+    const PRESETS: &[PresetSpec] = &[
+        PresetSpec {
+            id: "conservative_maker_qk",
+            label: "Conservative Maker QK",
+            subtitle: "2% slot / 10% heat · 70% maker fill · Quarter-Kelly",
+            exec_mode: "maker",
+            sizing_mode: "quarter_kelly",
+            fill_rate: 0.70,
+            min_oos_floor: 35,
+            slot_risk: 2.0,
+            total_heat: 10.0,
+            min_fill_pct: 60.0,
+        },
+        PresetSpec {
+            id: "balanced_maker_qk",
+            label: "Balanced Maker QK",
+            subtitle: "10% slot / 35% heat · 75% maker fill · Quarter-Kelly",
+            exec_mode: "maker",
+            sizing_mode: "quarter_kelly",
+            fill_rate: 0.75,
+            min_oos_floor: 30,
+            slot_risk: 10.0,
+            total_heat: 35.0,
+            min_fill_pct: 50.0,
+        },
+        PresetSpec {
+            id: "half_kelly_guarded",
+            label: "Half-Kelly Guarded",
+            subtitle: "20% slot / 70% heat · 75% maker fill · Half-Kelly",
+            exec_mode: "maker",
+            sizing_mode: "half_kelly",
+            fill_rate: 0.75,
+            min_oos_floor: 30,
+            slot_risk: 20.0,
+            total_heat: 70.0,
+            min_fill_pct: 50.0,
+        },
+        PresetSpec {
+            id: "equal_winners_guarded",
+            label: "Equal-Winners Guarded",
+            subtitle: "15% slot / 50% heat · 75% maker fill · Equal Weight",
+            exec_mode: "maker",
+            sizing_mode: "equal_winners",
+            fill_rate: 0.75,
+            min_oos_floor: 25,
+            slot_risk: 15.0,
+            total_heat: 50.0,
+            min_fill_pct: 40.0,
+        },
+        PresetSpec {
+            id: "taker_stress_hardened",
+            label: "Taker Stress-Hardened",
+            subtitle: "12% slot / 45% heat · 100% immediate fill · Quarter-Kelly",
+            exec_mode: "taker",
+            sizing_mode: "quarter_kelly",
+            fill_rate: 1.0,
+            min_oos_floor: 30,
+            slot_risk: 12.0,
+            total_heat: 45.0,
+            min_fill_pct: 25.0,
+        },
+    ];
+
+    let small_fixture = ctx.windows_settled_oos < 60;
+    let bankroll = base_req.starting_bankroll.max(1.0);
+    let mut rows: Vec<StrategyPresetCandidate> = Vec::with_capacity(PRESETS.len());
+
+    for spec in PRESETS {
+        let min_oos = if small_fixture {
+            spec.min_oos_floor.min(base_req.min_oos_trades.max(5))
+        } else {
+            spec.min_oos_floor
+        };
+        let cand_req = AutoAllocatorRequest {
+            execution_mode: spec.exec_mode.to_string(),
+            sizing_mode: spec.sizing_mode.to_string(),
+            maker_fill_rate: spec.fill_rate,
+            min_oos_trades: min_oos,
+            max_slot_risk_pct: spec.slot_risk,
+            max_total_heat_pct: spec.total_heat,
+            starting_bankroll: base_req.starting_bankroll,
+            slippage_cents: base_req.slippage_cents,
+            require_stress_resilience: true,
+            enable_regime_throttle: true,
+            min_fill_rate_pct: spec.min_fill_pct,
+        }
+        .sanitized();
+
+        let is_maker = cand_req.execution_mode == "maker";
+        let slip_dollars = if is_maker {
+            0.0
+        } else {
+            cand_req.slippage_cents / 100.0
+        };
+        let oos_sel = evaluate_split_candidates(
+            ctx,
+            oos_by_strat,
+            &cand_req,
+            cand_req.min_oos_trades,
+            is_maker,
+            slip_dollars,
+        );
+        let is_sel = if is_total_entries > 0 {
+            Some(evaluate_split_candidates(
+                ctx,
+                is_by_strat,
+                &cand_req,
+                cand_req.min_oos_trades,
+                is_maker,
+                slip_dollars,
+            ))
+        } else {
+            None
+        };
+
+        let (replay_weights, selection_basis) = match &is_sel {
+            Some(sel) => {
+                let mut m = HashMap::with_capacity(sel.accepted.len());
+                for (i, c) in sel.accepted.iter().enumerate() {
+                    m.insert(c.strategy_idx, finite_or(sel.weights_pct[i], 0.0) / 100.0);
+                }
+                (m, "causal_is_to_oos".to_string())
+            }
+            None => {
+                let mut m = HashMap::with_capacity(oos_sel.accepted.len());
+                for (i, c) in oos_sel.accepted.iter().enumerate() {
+                    m.insert(c.strategy_idx, finite_or(oos_sel.weights_pct[i], 0.0) / 100.0);
+                }
+                (m, "oos_only_no_is_history".to_string())
+            }
+        };
+
+        let (comparison, _, _, _, oos_returns) = replay_oos_comparison(
+            ctx,
+            &cand_req,
+            oos_by_epoch,
+            &replay_weights,
+            is_maker,
+            selection_basis,
+        );
+        let boot = compute_bootstrap_stress_sim_trials(
+            &oos_returns,
+            cand_req.starting_bankroll,
+            rails.max_daily_loss_dollars,
+            500,
+        );
+
+        let w_sum: f64 = oos_sel.weights_pct.iter().sum();
+        let net_expectancy_cents = if oos_sel.accepted.is_empty() {
+            None
+        } else if w_sum > 1e-12 {
+            finite_opt(
+                oos_sel
+                    .accepted
+                    .iter()
+                    .zip(oos_sel.weights_pct.iter())
+                    .map(|(c, w)| c.net_expectancy_cents * (*w / w_sum))
+                    .sum::<f64>(),
+            )
+        } else {
+            finite_opt(
+                oos_sel
+                    .accepted
+                    .iter()
+                    .map(|c| c.net_expectancy_cents)
+                    .sum::<f64>()
+                    / (oos_sel.accepted.len() as f64),
+            )
+        };
+
+        let active_winners_count = oos_sel.accepted.len();
+        let safe_gate_passed = active_winners_count > 0
+            && net_expectancy_cents.is_some_and(|ev| ev > 0.0)
+            && boot.daily_rail_breach_prob_pct <= 1e-9
+            && boot.stress_1c_daily_rail_breach_prob_pct <= 1e-9;
+
+        let oos_ret_pct = (comparison.auto_allocator_net_pnl / bankroll) * 100.0;
+        let base_ret_pct = ((boot.p50_end_equity - bankroll) / bankroll) * 100.0;
+        let stress_ret_pct = ((boot.stress_1c_p50_end_equity - bankroll) / bankroll) * 100.0;
+        let raw_score = oos_ret_pct
+            + 0.50 * stress_ret_pct
+            + 0.25 * base_ret_pct
+            - 1.25 * boot.stress_1c_p95_max_drawdown_pct;
+        let risk_adjusted_score = if safe_gate_passed {
+            finite_or(raw_score, 0.0)
+        } else {
+            finite_or(
+                raw_score.min(0.0)
+                    - (boot.daily_rail_breach_prob_pct + boot.stress_1c_daily_rail_breach_prob_pct)
+                        * 10.0
+                    - if active_winners_count == 0 { 100.0 } else { 0.0 },
+                -100.0,
+            )
+        };
+
+        let note = if active_winners_count == 0 {
+            format!("0 qualifying winners at min_oos >= {}", cand_req.min_oos_trades)
+        } else if !safe_gate_passed {
+            format!(
+                "Rail breach gate failed: {:.1}% OOS / {:.1}% @ +1c daily breach prob",
+                boot.daily_rail_breach_prob_pct, boot.stress_1c_daily_rail_breach_prob_pct
+            )
+        } else {
+            format!(
+                "0.0% rail breach (OOS & +1c) · +1c P50 ${:.2} · +1c P95 DD {:.1}%",
+                boot.stress_1c_p50_end_equity, boot.stress_1c_p95_max_drawdown_pct
+            )
+        };
+
+        rows.push(StrategyPresetCandidate {
+            id: spec.id.to_string(),
+            label: spec.label.to_string(),
+            subtitle: spec.subtitle.to_string(),
+            config: cand_req,
+            active_winners_count,
+            net_expectancy_cents,
+            oos_net_pnl_dollars: comparison.auto_allocator_net_pnl,
+            oos_max_dd_pct: comparison.auto_allocator_max_dd_pct,
+            bootstrap_p50_equity: boot.p50_end_equity,
+            bootstrap_p95_max_dd_pct: boot.p95_max_drawdown_pct,
+            stress_1c_p50_equity: boot.stress_1c_p50_end_equity,
+            stress_1c_p95_max_dd_pct: boot.stress_1c_p95_max_drawdown_pct,
+            daily_rail_breach_prob_pct: boot.daily_rail_breach_prob_pct,
+            stress_1c_daily_rail_breach_prob_pct: boot.stress_1c_daily_rail_breach_prob_pct,
+            risk_adjusted_score,
+            safe_gate_passed,
+            is_top_safe: false,
+            note,
+        });
+    }
+
+    rows.sort_by(|a, b| {
+        b.safe_gate_passed
+            .cmp(&a.safe_gate_passed)
+            .then_with(|| b.risk_adjusted_score.total_cmp(&a.risk_adjusted_score))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let mut top_safe_preset = None;
+    if let Some(first) = rows.first_mut() {
+        if first.safe_gate_passed {
+            first.is_top_safe = true;
+            top_safe_preset = Some(first.id.clone());
+        }
+    }
+
+    (rows, top_safe_preset)
 }
 
 #[cfg(test)]
@@ -2718,5 +3043,85 @@ mod tests {
         assert!(bs.p95_max_drawdown_pct >= 0.0 && bs.p95_max_drawdown_pct <= 100.0);
         assert!(bs.daily_rail_breach_prob_pct >= 0.0 && bs.daily_rail_breach_prob_pct <= 100.0);
         assert!(bs.prob_500_day_pct >= 0.0 && bs.prob_500_day_pct <= 100.0);
+    }
+
+    #[test]
+    fn preset_leaderboard_ranks_zero_rail_breach_top_safe_and_keeps_live_disarmed() {
+        let strats = vec![
+            StrategyMeta {
+                name: "steady-maker".into(),
+                side: "yes".into(),
+            },
+            StrategyMeta {
+                name: "loser-trap".into(),
+                side: "no".into(),
+            },
+        ];
+        let mut entries = Vec::new();
+        for w in 0..80i64 {
+            let epoch = 30_000 + w * 900;
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker: format!("KXBTC15M-LB{w:02}"),
+                series: "KXBTC15M".into(),
+                strategy_idx: 0,
+                strategy: "steady-maker".into(),
+                side: "yes".into(),
+                entry_price: 0.55,
+                secs_to_close: 240,
+                won: w % 4 != 0, // 75% win rate
+            });
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker: format!("KXETH15M-LB{w:02}"),
+                series: "KXETH15M".into(),
+                strategy_idx: 1,
+                strategy: "loser-trap".into(),
+                side: "no".into(),
+                entry_price: 0.72,
+                secs_to_close: 180,
+                won: w % 4 == 0,
+            });
+        }
+        let ctx = make_ctx(strats, entries, 80, 32, 30_000 + 48 * 900);
+        let rails = RiskRailsConfig {
+            max_daily_loss_dollars: 500.0,
+            ..RiskRailsConfig::default()
+        };
+        let req = AutoAllocatorRequest {
+            starting_bankroll: 500.0,
+            min_oos_trades: 20,
+            ..AutoAllocatorRequest::default()
+        };
+        let rep = compute_auto_allocator_report(&ctx, &req, &rails, false, false);
+        assert!(!rep.live_armed);
+        assert_eq!(rep.preset_leaderboard.len(), 5);
+        let top_id = rep
+            .top_safe_preset
+            .as_ref()
+            .expect("expected a zero-rail-breach top safe preset");
+        let top = rep
+            .preset_leaderboard
+            .iter()
+            .find(|p| &p.id == top_id)
+            .expect("top preset present in leaderboard");
+        assert!(top.is_top_safe);
+        assert!(top.safe_gate_passed);
+        assert_eq!(top.daily_rail_breach_prob_pct, 0.0);
+        assert_eq!(top.stress_1c_daily_rail_breach_prob_pct, 0.0);
+        assert!(top.active_winners_count >= 1);
+
+        // Tighter daily-loss rail ($1) must disqualify breaching presets from top_safe_preset.
+        let strict_rails = RiskRailsConfig {
+            max_daily_loss_dollars: 1.0,
+            ..RiskRailsConfig::default()
+        };
+        let strict_rep = compute_auto_allocator_report(&ctx, &req, &strict_rails, false, false);
+        for p in &strict_rep.preset_leaderboard {
+            if p.daily_rail_breach_prob_pct > 0.0 || p.stress_1c_daily_rail_breach_prob_pct > 0.0 {
+                assert!(!p.safe_gate_passed);
+                assert!(!p.is_top_safe);
+            }
+        }
     }
 }

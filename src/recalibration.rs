@@ -829,7 +829,7 @@ pub fn run_recalibration_study(
 fn representative_window_market_quote(snaps: &[Snapshot], close_epoch: i64) -> Option<(f64, f64)> {
     let mut best: Option<(i64, f64, f64)> = None;
     for s in snaps {
-        let (Some(ya), Some(na)) = (s.yes_ask, s.no_ask) else {
+        let (Some(ya), Some(na)) = (s.yes_ask.get(), s.no_ask.get()) else {
             continue;
         };
         if !is_valid_whole_cent(ya) || !is_valid_whole_cent(na) {
@@ -839,7 +839,7 @@ fn representative_window_market_quote(snaps: &[Snapshot], close_epoch: i64) -> O
         if secs <= 0 {
             continue;
         }
-        let yes_bid = s.yes_bid.filter(|b| (0.0..=1.0).contains(b)).unwrap_or(1.0 - na);
+        let yes_bid = s.yes_bid.get().filter(|b| (0.0..=1.0).contains(b)).unwrap_or(1.0 - na);
         let mid = ((ya + yes_bid) * 0.5).clamp(0.01, 0.99);
         let dist = (secs - 240).abs();
         match best {

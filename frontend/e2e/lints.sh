@@ -10,6 +10,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 TASTE_DIR=${TASTE_DIR:-$HOME/refskills/taste/skills/taste-skill}
 IMPECCABLE=${IMPECCABLE:-$HOME/refskills/impeccable/.claude/skills/impeccable/scripts/impeccable}
 HALLMARK=${HALLMARK:-$HOME/.agents/skills/hallmark/scripts/sloplint.mjs}
+export LIBGL_ALWAYS_SOFTWARE=1 VK_ICD_FILENAMES=/dev/null
 export CHROME_PATH=${E2E_CHROME:-$HOME/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome} HALLMARK_PUPPETEER=${HALLMARK_PUPPETEER:-$HOME/.npm/_npx/17406ab935e1f629}
 have() { [ -e "$1" ] || { echo "SKIP $2: $1 not found"; return 1; }; }
 cd "$G" # sloplint writes .hallmark/ next to its input and in the working directory: keep both in the out dir
