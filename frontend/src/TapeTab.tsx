@@ -48,7 +48,7 @@ function spreadCentsLabel(m: Market): string {
 function CountdownBadge({ closeTime, nowMs }: { closeTime: string | null; nowMs: number }) {
   const clock = closeClock(closeTime, nowMs);
   if (!clock.isOpen) {
-    return <span className="mono text-xs text-ink-2">{clock.label}</span>;
+    return <span className="tabular-nums text-xs text-ink-2">{clock.label}</span>;
   }
   const urgent = clock.secsRemaining !== null && clock.secsRemaining <= 120;
   return (
@@ -597,13 +597,13 @@ export function TapeTab({
                           setPinnedTicker(ticker);
                           setSelected(m);
                         }}
-                        className="mono inline-flex min-h-11 w-full cursor-pointer items-center break-all text-left text-sm font-medium text-ink underline-offset-4 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+                        className="inline-flex min-h-11 w-full cursor-pointer items-center break-all text-left text-sm font-medium text-ink underline-offset-4 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
                       >
                         {ticker}
                       </button>
                     </TableCell>
                     <TableCell className="m-right">
-                      <Badge variant="outline" className="mono text-xs">
+                      <Badge variant="outline" className="text-xs">
                         {seriesShort(m.series, m.ticker)}
                       </Badge>
                     </TableCell>
@@ -614,7 +614,7 @@ export function TapeTab({
                       {cents(m.yes_bid)} / {cents(m.yes_ask)}
                     </TableCell>
                     <TableCell className="mono text-right text-xs text-ink-2">{spreadCentsLabel(m)}</TableCell>
-                    <TableCell className="mono text-right text-xs text-ink-2">
+                    <TableCell className="text-right text-xs tabular-nums text-ink-2">
                       <CountdownBadge closeTime={m.close_time} nowMs={nowMs} />
                     </TableCell>
                     <TableCell className="m-right text-right">

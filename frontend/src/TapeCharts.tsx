@@ -299,7 +299,7 @@ export function ProbBar({ yesProb }: { yesProb: number | null }) {
   const noPct = 100 - yesPct;
   return (
     <div className="flex min-w-32 flex-col gap-1">
-      <div className="flex items-center justify-between gap-2 font-mono text-xs tabular-nums">
+      <div className="flex items-center justify-between gap-2 text-xs tabular-nums">
         <span className="font-medium text-success-foreground">YES {yesPct}c</span>
         <span className="text-ink-2">NO {noPct}c</span>
       </div>

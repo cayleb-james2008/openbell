@@ -126,22 +126,81 @@ fn now_unix() -> i64 {
 // Snapshots and the forward collector (public market data — no auth)
 // ---------------------------------------------------------------------------
 
-mod arc_str {
+mod sym_intern {
     use serde::{de::Visitor, Deserializer, Serializer};
     use std::cell::RefCell;
-    use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::ops::Deref;
+    use std::sync::{Arc, LazyLock, RwLock};
+
+    #[inline]
+    fn fast_id(s: &str) -> Option<u32> {
+        Some(match s {
+            "" => 0,
+            "yes" => 1,
+            "no" => 2,
+            "scalar" => 3,
+            "active" => 4,
+            "open" => 5,
+            "closed" => 6,
+            "finalized" => 7,
+            "settled" => 8,
+            "initialized" => 9,
+            "KXBTC15M" => 10,
+            "KXETH15M" => 11,
+            "KXSOL15M" => 12,
+            "KXXRP15M" => 13,
+            "KXDOGE15M" => 14,
+            "KXBTC" => 15,
+            _ => return None,
+        })
+    }
+
+    #[inline]
+    fn fast_str(id: u32) -> Option<&'static str> {
+        Some(match id {
+            0 => "",
+            1 => "yes",
+            2 => "no",
+            3 => "scalar",
+            4 => "active",
+            5 => "open",
+            6 => "closed",
+            7 => "finalized",
+            8 => "settled",
+            9 => "initialized",
+            10 => "KXBTC15M",
+            11 => "KXETH15M",
+            12 => "KXSOL15M",
+            13 => "KXXRP15M",
+            14 => "KXDOGE15M",
+            15 => "KXBTC",
+            _ => return None,
+        })
+    }
+
+    struct SymTable {
+        vec: Vec<&'static str>,
+        map: HashMap<&'static str, u32>,
+    }
+
+    static TABLE: LazyLock<RwLock<SymTable>> = LazyLock::new(|| {
+        RwLock::new(SymTable {
+            vec: Vec::with_capacity(4096),
+            map: HashMap::with_capacity(4096),
+        })
+    });
 
     thread_local! {
-        static TAPE_POOL: RefCell<Option<HashSet<Arc<str>>>> = const { RefCell::new(None) };
+        static LOCAL_POOL: RefCell<Option<HashMap<&'static str, Sym>>> = const { RefCell::new(None) };
     }
 
     pub struct TapePoolGuard;
 
     impl TapePoolGuard {
         pub fn enter(cap: usize) -> Self {
-            TAPE_POOL.with(|c| {
-                *c.borrow_mut() = Some(HashSet::with_capacity(cap));
+            LOCAL_POOL.with(|c| {
+                *c.borrow_mut() = Some(HashMap::with_capacity(cap));
             });
             Self
         }
@@ -149,42 +208,184 @@ mod arc_str {
 
     impl Drop for TapePoolGuard {
         fn drop(&mut self) {
-            TAPE_POOL.with(|c| {
+            LOCAL_POOL.with(|c| {
                 *c.borrow_mut() = None;
             });
         }
     }
 
-    pub fn serialize<S: Serializer>(v: &Arc<str>, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(v)
+    #[derive(Copy, Clone, PartialEq, Eq, Hash)]
+    pub(crate) struct Sym(u32);
+
+    impl Sym {
+        #[inline]
+        pub(crate) fn new(s: &str) -> Self {
+            if let Some(id) = fast_id(s) {
+                return Self(id);
+            }
+            let hit = LOCAL_POOL.with(|c| {
+                c.borrow()
+                    .as_ref()
+                    .and_then(|pool| pool.get(s).copied())
+            });
+            if let Some(sym) = hit {
+                return sym;
+            }
+            let sym = {
+                let r = TABLE.read().unwrap_or_else(|p| p.into_inner());
+                if let Some(&id) = r.map.get(s) {
+                    Self(id)
+                } else {
+                    drop(r);
+                    let mut w = TABLE.write().unwrap_or_else(|p| p.into_inner());
+                    if let Some(&id) = w.map.get(s) {
+                        Self(id)
+                    } else {
+                        let id = 16u32 + (w.vec.len() as u32);
+                        let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+                        w.vec.push(leaked);
+                        w.map.insert(leaked, id);
+                        Self(id)
+                    }
+                }
+            };
+            LOCAL_POOL.with(|c| {
+                if let Some(pool) = c.borrow_mut().as_mut() {
+                    if pool.len() < 32_768 {
+                        pool.insert(sym.as_str(), sym);
+                    }
+                }
+            });
+            sym
+        }
+
+        #[inline]
+        pub(crate) fn as_str(&self) -> &'static str {
+            if let Some(s) = fast_str(self.0) {
+                return s;
+            }
+            let r = TABLE.read().unwrap_or_else(|p| p.into_inner());
+            r.vec[(self.0 - 16) as usize]
+        }
+
+        #[inline]
+        pub(crate) fn is_empty(&self) -> bool {
+            self.0 == 0
+        }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<str>, D::Error> {
-        struct StrVisitor;
-        impl<'de> Visitor<'de> for V {
-            type Value = Arc<str>;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a string")
-            }
-            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Arc<str>, E> {
-                Ok(TAPE_POOL.with(|c| {
-                    let mut borrow = c.borrow_mut();
-                    if let Some(pool) = borrow.as_mut() {
-                        if let Some(existing) = pool.get(v) {
-                            return Arc::clone(existing);
-                        }
-                        let a: Arc<str> = Arc::from(v);
-                        pool.insert(Arc::clone(&a));
-                        return a;
-                    }
-                    Arc::from(v)
-                }))
+    impl Deref for Sym {
+        type Target = str;
+        #[inline]
+        fn deref(&self) -> &str {
+            self.as_str()
+        }
+    }
+
+    impl AsRef<str> for Sym {
+        #[inline]
+        fn as_ref(&self) -> &str {
+            self.as_str()
+        }
+    }
+
+    impl PartialOrd for Sym {
+        #[inline]
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for Sym {
+        #[inline]
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            if self.0 == other.0 {
+                std::cmp::Ordering::Equal
+            } else {
+                self.as_str().cmp(other.as_str())
             }
         }
-        use StrVisitor as V;
-        d.deserialize_str(StrVisitor)
+    }
+
+    impl std::fmt::Debug for Sym {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Debug::fmt(self.as_str(), f)
+        }
+    }
+
+    impl std::fmt::Display for Sym {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+
+    impl From<&str> for Sym {
+        #[inline]
+        fn from(s: &str) -> Self {
+            Self::new(s)
+        }
+    }
+
+    impl From<String> for Sym {
+        #[inline]
+        fn from(s: String) -> Self {
+            Self::new(&s)
+        }
+    }
+
+    impl From<Arc<str>> for Sym {
+        #[inline]
+        fn from(s: Arc<str>) -> Self {
+            Self::new(&s)
+        }
+    }
+
+    impl PartialEq<str> for Sym {
+        #[inline]
+        fn eq(&self, other: &str) -> bool {
+            self.as_str() == other
+        }
+    }
+
+    impl PartialEq<&str> for Sym {
+        #[inline]
+        fn eq(&self, other: &&str) -> bool {
+            self.as_str() == *other
+        }
+    }
+
+    impl PartialEq<String> for Sym {
+        #[inline]
+        fn eq(&self, other: &String) -> bool {
+            self.as_str() == other.as_str()
+        }
+    }
+
+    impl serde::Serialize for Sym {
+        #[inline]
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(self.as_str())
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for Sym {
+        #[inline]
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Sym;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a string")
+                }
+                fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Sym, E> {
+                    Ok(Sym::new(v))
+                }
+            }
+            d.deserialize_str(V)
+        }
     }
 }
+use sym_intern::{Sym, TapePoolGuard};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct OptPrice(u32);
@@ -244,18 +445,12 @@ impl<'de> Deserialize<'de> for OptPrice {
 #[derive(Clone, Serialize, Deserialize)]
 struct Snapshot {
     fetched_at: i64,
-    #[serde(with = "arc_str")]
-    ticker: Arc<str>,
-    #[serde(with = "arc_str")]
-    event_ticker: Arc<str>,
-    #[serde(with = "arc_str")]
-    series: Arc<str>,
-    #[serde(with = "arc_str")]
-    close_time: Arc<str>,
-    #[serde(with = "arc_str")]
-    status: Arc<str>,
-    #[serde(with = "arc_str")]
-    result: Arc<str>,
+    ticker: Sym,
+    event_ticker: Sym,
+    series: Sym,
+    close_time: Sym,
+    status: Sym,
+    result: Sym,
     yes_bid: OptPrice,
     yes_ask: OptPrice,
     no_bid: OptPrice,
@@ -416,7 +611,7 @@ fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize, bo
                 fetched_at,
                 ticker: get("ticker").into(),
                 event_ticker: get("event_ticker").into(),
-                series: Arc::from(series),
+                series: Sym::new(series),
                 close_time: get("close_time").into(),
                 status: get("status").into(),
                 result: get("result").into(),
@@ -477,7 +672,7 @@ fn tape_hub() -> &'static TapeHub {
     TAPE_HUB.get_or_init(TapeHub::new)
 }
 
-type SettledKey = (Arc<str>, Arc<str>, Arc<str>);
+type SettledKey = (Sym, Sym, Sym);
 type SettledKeysCacheEntry = (PathBuf, u64, u64, std::collections::HashSet<SettledKey>);
 static SETTLED_KEYS_CACHE: std::sync::Mutex<Option<SettledKeysCacheEntry>> =
     std::sync::Mutex::new(None);
@@ -773,7 +968,7 @@ fn collect_once_detailed(data_dir: &Path) -> Result<CollectPassReport, (String, 
                         }
                     }
                     for snap in snaps {
-                        let key = (snap.ticker.clone(), snap.status.clone(), snap.result.clone());
+                        let key = (snap.ticker, snap.status, snap.result);
                         if seen_in_pass.insert(key) {
                             pass_snaps.push(snap);
                         }
@@ -804,7 +999,7 @@ fn collect_once_detailed(data_dir: &Path) -> Result<CollectPassReport, (String, 
     for snap in &pass_snaps {
         if dedup_enabled
             && !snap.result.is_empty()
-            && existing_settled.contains(&(snap.ticker.clone(), snap.status.clone(), snap.result.clone()))
+            && existing_settled.contains(&(snap.ticker, snap.status, snap.result))
         {
             deduplicated += 1;
         } else {
@@ -1321,8 +1516,8 @@ fn window_entry_keyed(
     let ticker_arc: Option<Arc<str>> = ticker.map(|t| {
         snaps
             .first()
-            .filter(|s| s.ticker.as_ref() == t)
-            .map(|s| Arc::clone(&s.ticker))
+            .filter(|s| s.ticker.as_str() == t)
+            .map(|s| Arc::from(s.ticker.as_str()))
             .unwrap_or_else(|| Arc::from(t))
     });
     if let Some(ref t_arc) = ticker_arc {
@@ -2309,9 +2504,9 @@ fn daily_report(app: &App) -> String {
 /// file, byte for byte, before any tail byte is trusted. A file
 /// that shrank, moved backwards, or fails the seam check is parsed
 /// whole. Nothing is ever keyed by less than the content it claims
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum ResultTrack {
-    One(Arc<str>),
+    One(Sym),
     Conflict,
 }
 
@@ -2336,7 +2531,7 @@ struct TapeEntry {
     /// must come from the same read.
     total_lines: usize,
     /// Collector-health aggregates over the parsed tape.
-    results_by_ticker: std::collections::HashMap<Arc<str>, ResultTrack>,
+    results_by_ticker: std::collections::HashMap<Sym, ResultTrack>,
     /// Byte offset at which the last line starts, and its raw text:
     /// the seam an append must continue.
     seam_offset: u64,
@@ -2357,20 +2552,20 @@ fn build_latest_markets_json(grouped: &BTreeMap<String, Vec<Snapshot>>) -> Arc<S
 #[inline]
 fn fold_one_health(
     s: &Snapshot,
-    results_by_ticker: &mut std::collections::HashMap<Arc<str>, ResultTrack>,
+    results_by_ticker: &mut std::collections::HashMap<Sym, ResultTrack>,
 ) {
     if !s.result.is_empty() {
         match results_by_ticker.get_mut(&s.ticker) {
             Some(entry @ ResultTrack::One(_)) => {
                 if let ResultTrack::One(prev) = entry {
-                    if prev.as_ref() != s.result.as_ref() {
+                    if *prev != s.result {
                         *entry = ResultTrack::Conflict;
                     }
                 }
             }
             Some(ResultTrack::Conflict) => {}
             None => {
-                results_by_ticker.insert(Arc::clone(&s.ticker), ResultTrack::One(Arc::clone(&s.result)));
+                results_by_ticker.insert(s.ticker, ResultTrack::One(s.result));
             }
         }
     }
@@ -2380,7 +2575,7 @@ fn fold_one_health(
 /// see TapeEntry.
 fn fold_health(
     snaps: &[Snapshot],
-    results_by_ticker: &mut std::collections::HashMap<Arc<str>, ResultTrack>,
+    results_by_ticker: &mut std::collections::HashMap<Sym, ResultTrack>,
 ) {
     for s in snaps {
         fold_one_health(s, results_by_ticker);
@@ -2792,7 +2987,7 @@ impl App {
         let mut ends_newline = true;
 
         {
-            let _pool_guard = arc_str::TapePoolGuard::enter(4096);
+            let _pool_guard = TapePoolGuard::enter(4096);
             if let Ok(file) = std::fs::File::open(path) {
                 use std::io::BufRead as _;
                 let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
@@ -3755,7 +3950,7 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
         .read_to_end(&mut tail_buf)
         .ok()?;
     let (new_snaps, tail_lines) = {
-        let _pool_guard = arc_str::TapePoolGuard::enter(64);
+        let _pool_guard = TapePoolGuard::enter(64);
         parse_tape_bytes(&tail_buf)
     };
     e.total_lines += tail_lines;
