@@ -1170,6 +1170,39 @@ struct Strategy {
     budget_deaths: std::cell::Cell<usize>,
 }
 
+static SHARED_RUNTIME: std::sync::Mutex<Option<std::sync::Weak<rune::runtime::RuntimeContext>>> =
+    std::sync::Mutex::new(None);
+
+thread_local! {
+    static ACTIVE_COMPILE_FLAG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ACTIVE_COMPILE_CTX: std::cell::RefCell<
+        Option<(rune::Context, Arc<rune::runtime::RuntimeContext>)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+struct CompileCtxGuard {
+    prev: bool,
+}
+
+impl CompileCtxGuard {
+    fn enter() -> Self {
+        let prev = ACTIVE_COMPILE_FLAG.with(|f| f.replace(true));
+        Self { prev }
+    }
+}
+
+impl Drop for CompileCtxGuard {
+    fn drop(&mut self) {
+        ACTIVE_COMPILE_FLAG.with(|f| f.set(self.prev));
+        if !self.prev {
+            let had_ctx = ACTIVE_COMPILE_CTX.with(|c| c.borrow_mut().take().is_some());
+            if had_ctx {
+                trim_heap();
+            }
+        }
+    }
+}
+
 impl Strategy {
     fn load(path: &Path) -> Result<Strategy, String> {
         let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
@@ -1229,33 +1262,81 @@ impl Strategy {
             }
         }
         let (unit, runtime) = {
-            static SHARED_RUNE: std::sync::OnceLock<
-                std::sync::Mutex<(rune::Context, Arc<rune::runtime::RuntimeContext>)>,
-            > = std::sync::OnceLock::new();
-            if SHARED_RUNE.get().is_none() {
+            let use_batch = ACTIVE_COMPILE_FLAG.with(|f| f.get());
+            if use_batch {
+                ACTIVE_COMPILE_CTX.with(|c| {
+                    let mut b = c.borrow_mut();
+                    if b.is_none() {
+                        let ctx = rune::Context::with_default_modules().map_err(|e| e.to_string())?;
+                        let existing_rt = SHARED_RUNTIME
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .as_ref()
+                            .and_then(|w| w.upgrade());
+                        let rt = match existing_rt {
+                            Some(rt) => rt,
+                            None => {
+                                let arc = Arc::new(ctx.runtime().map_err(|e| e.to_string())?);
+                                *SHARED_RUNTIME.lock().unwrap_or_else(|p| p.into_inner()) =
+                                    Some(Arc::downgrade(&arc));
+                                arc
+                            }
+                        };
+                        *b = Some((ctx, rt));
+                    }
+                    let (context, runtime) = b.as_ref().unwrap();
+                    let mut sources = rune::Sources::new();
+                    sources
+                        .insert(rune::Source::memory(&script).map_err(|e| e.to_string())?)
+                        .map_err(|e| e.to_string())?;
+                    let mut diagnostics = rune::Diagnostics::new();
+                    let unit = rune::prepare(&mut sources)
+                        .with_context(context)
+                        .with_diagnostics(&mut diagnostics)
+                        .build()
+                        .map_err(|e| {
+                            format!(
+                                "strategy {} failed to build: {}",
+                                path.display(),
+                                e.to_string().replace(" (see diagnostics for details)", "")
+                            )
+                        })?;
+                    Ok::<_, String>((Arc::new(unit), runtime.clone()))
+                })?
+            } else {
                 let context = rune::Context::with_default_modules().map_err(|e| e.to_string())?;
-                let runtime = Arc::new(context.runtime().map_err(|e| e.to_string())?);
-                let _ = SHARED_RUNE.set(std::sync::Mutex::new((context, runtime)));
+                let existing_rt = SHARED_RUNTIME
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .and_then(|w| w.upgrade());
+                let runtime = match existing_rt {
+                    Some(rt) => rt,
+                    None => {
+                        let rt = Arc::new(context.runtime().map_err(|e| e.to_string())?);
+                        *SHARED_RUNTIME.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(Arc::downgrade(&rt));
+                        rt
+                    }
+                };
+                let mut sources = rune::Sources::new();
+                sources
+                    .insert(rune::Source::memory(&script).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+                let mut diagnostics = rune::Diagnostics::new();
+                let unit = rune::prepare(&mut sources)
+                    .with_context(&context)
+                    .with_diagnostics(&mut diagnostics)
+                    .build()
+                    .map_err(|e| {
+                        format!(
+                            "strategy {} failed to build: {}",
+                            path.display(),
+                            e.to_string().replace(" (see diagnostics for details)", "")
+                        )
+                    })?;
+                (Arc::new(unit), runtime)
             }
-            let guard = SHARED_RUNE.get().unwrap().lock().unwrap_or_else(|p| p.into_inner());
-            let (context, runtime) = &*guard;
-            let mut sources = rune::Sources::new();
-            sources
-                .insert(rune::Source::memory(&script).map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
-            let mut diagnostics = rune::Diagnostics::new();
-            let unit = rune::prepare(&mut sources)
-                .with_context(context)
-                .with_diagnostics(&mut diagnostics)
-                .build()
-                .map_err(|e| {
-                    format!(
-                        "strategy {} failed to build: {}",
-                        path.display(),
-                        e.to_string().replace(" (see diagnostics for details)", "")
-                    )
-                })?;
-            (Arc::new(unit), runtime.clone())
         };
         let mut strat = Strategy {
             name: String::new(),
@@ -1470,7 +1551,7 @@ static ENTRY_CACHE: std::sync::LazyLock<EntryCache> =
 /// cut short updates neither cache: its result is a function of
 /// the budget state, not of the window.
 type PrefixCache =
-    std::sync::Mutex<std::collections::HashMap<(u64, Arc<str>), (usize, u64, Option<f64>)>>;
+    std::sync::Mutex<std::collections::HashMap<(u64, Sym), (usize, u64, Option<f64>)>>;
 static PREFIX_CACHE: std::sync::LazyLock<PrefixCache> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
@@ -1513,18 +1594,23 @@ fn window_entry_keyed(
     // Resume a previous scan of this window when its covered
     // prefix is still the window's prefix verbatim.
     let mut resume_from = 0usize;
-    let ticker_arc: Option<Arc<str>> = ticker.map(|t| {
-        snaps
-            .first()
-            .filter(|s| s.ticker.as_str() == t)
-            .map(|s| Arc::from(s.ticker.as_str()))
-            .unwrap_or_else(|| Arc::from(t))
-    });
-    if let Some(ref t_arc) = ticker_arc {
+    let is_settled = snaps.iter().any(|s| !s.result.is_empty());
+    let ticker_sym: Option<Sym> = if !is_settled {
+        ticker.map(|t| {
+            snaps
+                .first()
+                .filter(|s| s.ticker.as_str() == t)
+                .map(|s| s.ticker)
+                .unwrap_or_else(|| Sym::new(t))
+        })
+    } else {
+        None
+    };
+    if let Some(t_sym) = ticker_sym {
         let prior = PREFIX_CACHE
             .lock()
             .unwrap()
-            .get(&(strat.fingerprint, Arc::clone(t_arc)))
+            .get(&(strat.fingerprint, t_sym))
             .copied();
         if let Some((scanned, prefix_fp, prior_entry)) = prior {
             if scanned <= snaps.len()
@@ -1553,13 +1639,13 @@ fn window_entry_keyed(
         }
         guard.insert(key, entry);
         drop(guard);
-        if let Some(t_arc) = ticker_arc {
+        if let Some(t_sym) = ticker_sym {
             let mut guard = PREFIX_CACHE.lock().unwrap();
             if guard.len() > 250_000 {
                 guard.clear();
             }
             guard.insert(
-                (strat.fingerprint, t_arc),
+                (strat.fingerprint, t_sym),
                 (snaps.len(), win_fp, entry),
             );
         }
@@ -2247,6 +2333,8 @@ fn load_strategies_with_errors(dir: &Path) -> (Vec<Strategy>, Vec<(String, Strin
             .filter(|p| is_confined_regular_file(dir, p))
             .collect();
         paths.sort();
+        // Compile all uncached strategies under one transient Context, then drop it.
+        let _compile_guard = CompileCtxGuard::enter();
         for path in paths {
             let fname = path
                 .file_name()
@@ -2275,6 +2363,7 @@ fn load_strategies_with_errors(dir: &Path) -> (Vec<Strategy>, Vec<(String, Strin
                 }
             }
         }
+        drop(_compile_guard);
     }
     (out, errors)
 }
@@ -3133,7 +3222,9 @@ impl App {
         };
         drop(fps);
         drop(strategies);
-        *self.analysis_cache.write().unwrap_or_else(|p| p.into_inner()) = Some(entry);
+        let mut guard = self.analysis_cache.write().unwrap_or_else(|p| p.into_inner());
+        *guard = Some(entry);
+        drop(guard);
         trim_heap();
         out
     }
@@ -3869,6 +3960,7 @@ impl App {
         san.starting_bankroll.to_bits().hash(&mut h);
         san.require_stress_resilience.hash(&mut h);
         san.enable_regime_throttle.hash(&mut h);
+        san.enable_diversification_guard.hash(&mut h);
         san.min_fill_rate_pct.to_bits().hash(&mut h);
         live_armed.hash(&mut h);
         killed.hash(&mut h);

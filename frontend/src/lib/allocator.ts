@@ -17,7 +17,30 @@ export type AutoAllocatorRequest = {
   starting_bankroll: number;
   require_stress_resilience: boolean;
   enable_regime_throttle: boolean;
+  enable_diversification_guard: boolean;
   min_fill_rate_pct: number;
+};
+
+export type AssetClusterRisk = {
+  cluster_id: string;
+  assets: string[];
+  raw_heat_pct: number;
+  guarded_heat_pct: number;
+  max_intra_cluster_corr: number | null;
+  penalty_applied_pct: number;
+};
+
+export type DiversificationGuardReport = {
+  enabled: boolean;
+  status: "DIVERSIFIED" | "CLUSTER_CAPPED" | "NO_DATA" | string;
+  effective_diversification_score: number;
+  max_cross_asset_corr: number | null;
+  correlated_cluster_heat_pct: number;
+  cluster_heat_cap_pct: number;
+  heat_trimmed_pct: number;
+  clusters: AssetClusterRisk[];
+  diversified_safe_preset_id: string | null;
+  summary: string;
 };
 
 export type FillRateSensitivityPoint = {
@@ -245,6 +268,7 @@ export type AutoAllocatorReport = {
   starting_bankroll: number;
   require_stress_resilience: boolean;
   enable_regime_throttle: boolean;
+  enable_diversification_guard: boolean;
   min_fill_rate_pct: number;
   regime_throttle_mult: number;
   current_oos_drawdown_pct: number;
@@ -265,6 +289,7 @@ export type AutoAllocatorReport = {
   preset_leaderboard: StrategyPresetCandidate[];
   top_safe_preset: string | null;
   forward_envelope: ForwardEnvelopeMonitor;
+  diversification: DiversificationGuardReport;
   comparison: AllocatorComparison;
   planned_intents: PlannedAllocatorIntent[];
   daily_target: DailyTargetVerdict;
@@ -283,6 +308,7 @@ export const DEFAULT_ALLOCATOR_REQUEST: AutoAllocatorRequest = {
   starting_bankroll: 100,
   require_stress_resilience: true,
   enable_regime_throttle: true,
+  enable_diversification_guard: true,
   min_fill_rate_pct: 40,
 };
 
@@ -322,6 +348,8 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
   const bsTrajRaw = Array.isArray(bsRaw.trajectory) ? bsRaw.trajectory : [];
   const presetRaw = Array.isArray(o.preset_leaderboard) ? o.preset_leaderboard : [];
   const envRaw = (o.forward_envelope && typeof o.forward_envelope === "object" ? o.forward_envelope : {}) as Record<string, unknown>;
+  const divRaw = (o.diversification && typeof o.diversification === "object" ? o.diversification : {}) as Record<string, unknown>;
+  const divClustersRaw = Array.isArray(divRaw.clusters) ? divRaw.clusters : [];
   const intentsRaw = Array.isArray(o.planned_intents) ? o.planned_intents : [];
   const notesRaw = Array.isArray(o.honesty_notes) ? o.honesty_notes : [];
   const compRaw = (o.comparison && typeof o.comparison === "object" ? o.comparison : {}) as Record<string, unknown>;
@@ -340,6 +368,8 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
     starting_bankroll: startEq,
     require_stress_resilience: typeof o.require_stress_resilience === "boolean" ? o.require_stress_resilience : true,
     enable_regime_throttle: typeof o.enable_regime_throttle === "boolean" ? o.enable_regime_throttle : true,
+    enable_diversification_guard:
+      typeof o.enable_diversification_guard === "boolean" ? o.enable_diversification_guard : true,
     min_fill_rate_pct: finiteOr(o.min_fill_rate_pct, 40),
     regime_throttle_mult: finiteOr(o.regime_throttle_mult, 1.0),
     current_oos_drawdown_pct: finiteOr(o.current_oos_drawdown_pct, 0),
@@ -518,6 +548,10 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
             starting_bankroll: finiteOr(cfgRaw.starting_bankroll, startEq),
             require_stress_resilience: typeof cfgRaw.require_stress_resilience === "boolean" ? cfgRaw.require_stress_resilience : true,
             enable_regime_throttle: typeof cfgRaw.enable_regime_throttle === "boolean" ? cfgRaw.enable_regime_throttle : true,
+            enable_diversification_guard:
+              typeof cfgRaw.enable_diversification_guard === "boolean"
+                ? cfgRaw.enable_diversification_guard
+                : true,
             min_fill_rate_pct: finiteOr(cfgRaw.min_fill_rate_pct, 50),
           },
           active_winners_count: Math.max(0, Math.round(finiteOr(p.active_winners_count, 0))),
@@ -555,6 +589,36 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
       next_safe_preset_label: typeof envRaw.next_safe_preset_label === "string" && envRaw.next_safe_preset_label.trim().length > 0 ? envRaw.next_safe_preset_label : null,
       live_armed: Boolean(envRaw.live_armed),
       summary: strOr(envRaw.summary, "Awaiting active OOS winners for forward-test envelope tracking."),
+    },
+    diversification: {
+      enabled: typeof divRaw.enabled === "boolean" ? divRaw.enabled : true,
+      status: strOr(divRaw.status, "NO_DATA"),
+      effective_diversification_score: finiteOr(divRaw.effective_diversification_score, 0),
+      max_cross_asset_corr: finiteOpt(divRaw.max_cross_asset_corr),
+      correlated_cluster_heat_pct: finiteOr(divRaw.correlated_cluster_heat_pct, 0),
+      cluster_heat_cap_pct: finiteOr(divRaw.cluster_heat_cap_pct, 26),
+      heat_trimmed_pct: finiteOr(divRaw.heat_trimmed_pct, 0),
+      clusters: divClustersRaw
+        .filter((c): c is Record<string, unknown> => !!c && typeof c === "object")
+        .map((c) => ({
+          cluster_id: strOr(c.cluster_id, "BTC"),
+          assets: Array.isArray(c.assets)
+            ? c.assets.filter((a): a is string => typeof a === "string")
+            : ["BTC"],
+          raw_heat_pct: finiteOr(c.raw_heat_pct, 0),
+          guarded_heat_pct: finiteOr(c.guarded_heat_pct, 0),
+          max_intra_cluster_corr: finiteOpt(c.max_intra_cluster_corr),
+          penalty_applied_pct: finiteOr(c.penalty_applied_pct, 0),
+        })),
+      diversified_safe_preset_id:
+        typeof divRaw.diversified_safe_preset_id === "string" &&
+        divRaw.diversified_safe_preset_id.trim().length > 0
+          ? divRaw.diversified_safe_preset_id
+          : null,
+      summary: strOr(
+        divRaw.summary,
+        "Cross-asset correlation cluster guard ready (BTC/ETH/SOL/XRP/DOGE).",
+      ),
     },
     comparison: {
       selection_basis: strOr(compRaw.selection_basis, "causal_is_to_oos"),
@@ -602,6 +666,40 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
     },
     honesty_notes: notesRaw.filter((n): n is string => typeof n === "string" && n.trim().length > 0),
     source: "server",
+  };
+}
+
+function makeOfflineDiversification(
+  params: AutoAllocatorRequest,
+  totalHeatPct: number,
+  hasWinners: boolean,
+): DiversificationGuardReport {
+  return {
+    enabled: params.enable_diversification_guard,
+    status: hasWinners ? "DIVERSIFIED" : "NO_DATA",
+    effective_diversification_score: hasWinners ? 35 : 0,
+    max_cross_asset_corr: null,
+    correlated_cluster_heat_pct: 0,
+    cluster_heat_cap_pct: Number(
+      Math.max(params.max_slot_risk_pct, params.max_total_heat_pct * 0.65).toFixed(1),
+    ),
+    heat_trimmed_pct: 0,
+    clusters: hasWinners
+      ? [
+          {
+            cluster_id: "BTC",
+            assets: ["BTC"],
+            raw_heat_pct: totalHeatPct,
+            guarded_heat_pct: totalHeatPct,
+            max_intra_cluster_corr: null,
+            penalty_applied_pct: 0,
+          },
+        ]
+      : [],
+    diversified_safe_preset_id: null,
+    summary: hasWinners
+      ? "Offline preview: 1 asset cluster (BTC) · run server pipeline for full cross-asset correlation guard."
+      : "No active slots available for cross-asset correlation clustering.",
   };
 }
 
@@ -692,6 +790,7 @@ export function computeClientFallbackReport(
         live_armed: false,
         summary: "Awaiting OOS winners for paper envelope tracking.",
       },
+      diversification: makeOfflineDiversification(params, 0, false),
       comparison: {
         selection_basis: "causal_is_to_oos",
         legacy_equal_taker_end_equity: startEq,
@@ -1010,6 +1109,7 @@ export function computeClientFallbackReport(
       live_armed: false,
       summary: rawWinners.length > 0 ? "Offline paper envelope nominal." : "No active winners.",
     },
+    diversification: makeOfflineDiversification(params, Number(totalPct.toFixed(2)), rawWinners.length > 0),
     comparison: {
       selection_basis: isTrades.length > 0 ? "causal_is_to_oos" : "oos_only_no_is_history",
       legacy_equal_taker_end_equity: Number(legacyEq.toFixed(2)),

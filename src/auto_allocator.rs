@@ -110,6 +110,9 @@ fn default_require_stress_resilience() -> bool {
 fn default_enable_regime_throttle() -> bool {
     true
 }
+fn default_enable_diversification_guard() -> bool {
+    true
+}
 fn default_min_fill_rate_pct() -> f64 {
     40.0
 }
@@ -137,6 +140,8 @@ pub struct AutoAllocatorRequest {
     pub require_stress_resilience: bool,
     #[serde(default = "default_enable_regime_throttle")]
     pub enable_regime_throttle: bool,
+    #[serde(default = "default_enable_diversification_guard")]
+    pub enable_diversification_guard: bool,
     #[serde(default = "default_min_fill_rate_pct")]
     pub min_fill_rate_pct: f64,
 }
@@ -154,6 +159,7 @@ impl Default for AutoAllocatorRequest {
             starting_bankroll: default_starting_bankroll(),
             require_stress_resilience: default_require_stress_resilience(),
             enable_regime_throttle: default_enable_regime_throttle(),
+            enable_diversification_guard: default_enable_diversification_guard(),
             min_fill_rate_pct: default_min_fill_rate_pct(),
         }
     }
@@ -191,6 +197,7 @@ impl AutoAllocatorRequest {
                 .clamp(10.0, 10_000_000.0),
             require_stress_resilience: self.require_stress_resilience,
             enable_regime_throttle: self.enable_regime_throttle,
+            enable_diversification_guard: self.enable_diversification_guard,
             min_fill_rate_pct: finite_or(self.min_fill_rate_pct, default_min_fill_rate_pct())
                 .clamp(10.0, 100.0),
         }
@@ -446,6 +453,32 @@ pub struct ForwardEnvelopeMonitor {
     pub summary: String,
 }
 
+/// Connected cross-asset correlation cluster (`|r| >= 0.55`) and cluster heat cap telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetClusterRisk {
+    pub cluster_id: String,
+    pub assets: Vec<String>,
+    pub raw_heat_pct: f64,
+    pub guarded_heat_pct: f64,
+    pub max_intra_cluster_corr: Option<f64>,
+    pub penalty_applied_pct: f64,
+}
+
+/// Cross-asset (`BTC`/`ETH`/`SOL`/`XRP`/`DOGE`) window return correlation cluster guard report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiversificationGuardReport {
+    pub enabled: bool,
+    pub status: String,
+    pub effective_diversification_score: f64,
+    pub max_cross_asset_corr: Option<f64>,
+    pub correlated_cluster_heat_pct: f64,
+    pub cluster_heat_cap_pct: f64,
+    pub heat_trimmed_pct: f64,
+    pub clusters: Vec<AssetClusterRisk>,
+    pub diversified_safe_preset_id: Option<String>,
+    pub summary: String,
+}
+
 /// Complete response payload for `GET /api/allocator` and `POST /api/allocator/plan`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoAllocatorReport {
@@ -458,6 +491,7 @@ pub struct AutoAllocatorReport {
     pub starting_bankroll: f64,
     pub require_stress_resilience: bool,
     pub enable_regime_throttle: bool,
+    pub enable_diversification_guard: bool,
     pub min_fill_rate_pct: f64,
     pub regime_throttle_mult: f64,
     pub current_oos_drawdown_pct: f64,
@@ -478,6 +512,7 @@ pub struct AutoAllocatorReport {
     pub preset_leaderboard: Vec<StrategyPresetCandidate>,
     pub top_safe_preset: Option<String>,
     pub forward_envelope: ForwardEnvelopeMonitor,
+    pub diversification: DiversificationGuardReport,
     pub comparison: AllocatorComparison,
     pub planned_intents: Vec<PlannedAllocatorIntent>,
     pub daily_target: DailyTargetVerdict,
@@ -915,24 +950,25 @@ pub fn compute_auto_allocator_report(
 
     let n_winners = oos_sel.accepted.len();
 
-    // Use strictly causal IS-selected weights for OOS replay whenever IS history exists,
-    // preventing selection lookahead over OOS outcomes.
-    let (replay_weights, selection_basis) = match &is_sel {
-        Some(sel) => {
-            let mut m = HashMap::with_capacity(sel.accepted.len());
-            for (i, c) in sel.accepted.iter().enumerate() {
-                m.insert(c.strategy_idx, finite_or(sel.weights_pct[i], 0.0) / 100.0);
-            }
-            (m, "causal_is_to_oos".to_string())
-        }
-        None => {
-            let mut m = HashMap::with_capacity(n_winners);
-            for (i, c) in oos_sel.accepted.iter().enumerate() {
-                m.insert(c.strategy_idx, finite_or(oos_sel.weights_pct[i], 0.0) / 100.0);
-            }
-            (m, "oos_only_no_is_history".to_string())
-        }
-    };
+    // Apply cross-asset correlation cluster guard strictly causally on IS for OOS replay
+    // (zero lookahead), and on OOS winners for forward live allocation weights.
+    let (guarded_oos_weights_pct, mut diversification) = apply_diversification_guard(
+        &oos_by_strat,
+        &oos_sel.accepted,
+        &oos_sel.weights_pct,
+        &req,
+        is_maker,
+        slip_dollars,
+    );
+    let (replay_weights, selection_basis) = build_causal_replay_weights(
+        is_sel.as_ref(),
+        &oos_sel,
+        &guarded_oos_weights_pct,
+        &is_by_strat,
+        &req,
+        is_maker,
+        slip_dollars,
+    );
 
     let (comparison, regime_throttle_mult, current_oos_drawdown_pct, throttle_reason, oos_window_returns) =
         replay_oos_comparison(
@@ -947,7 +983,7 @@ pub fn compute_auto_allocator_report(
     let total_allocated_pct = if n_winners == 0 {
         0.0
     } else {
-        let sum_raw: f64 = oos_sel.weights_pct.iter().sum();
+        let sum_raw: f64 = guarded_oos_weights_pct.iter().sum();
         finite_or((sum_raw * regime_throttle_mult).clamp(0.0, 100.0), 0.0)
     };
     let cash_reserve_pct = finite_or((100.0 - total_allocated_pct).clamp(0.0, 100.0), 100.0);
@@ -958,7 +994,7 @@ pub fn compute_auto_allocator_report(
 
     for (i, cand) in oos_sel.accepted.iter().enumerate() {
         active_idx_set.insert(cand.strategy_idx);
-        let alloc_pct = finite_or(oos_sel.weights_pct[i] * regime_throttle_mult, 0.0);
+        let alloc_pct = finite_or(guarded_oos_weights_pct[i] * regime_throttle_mult, 0.0);
         let alloc_dollars = finite_or(req.starting_bankroll * (alloc_pct / 100.0), 0.0);
         let max_limit_cents =
             ((cand.avg_entry_price * 100.0).round() as i64).clamp(1, 99) as u8;
@@ -1077,6 +1113,11 @@ pub fn compute_auto_allocator_report(
         &oos_by_epoch,
         is_total_entries,
     );
+    diversification.diversified_safe_preset_id = preset_leaderboard
+        .iter()
+        .find(|p| p.id == "diversified_safe_basket" && p.safe_gate_passed)
+        .or_else(|| preset_leaderboard.iter().find(|p| p.safe_gate_passed))
+        .map(|p| p.id.clone());
     let forward_envelope = compute_forward_envelope_monitor(
         &req,
         &active_winners,
@@ -1153,6 +1194,12 @@ pub fn compute_auto_allocator_report(
             "Causal Regime Throttle active ({throttle_reason}): scales Kelly allocation down during live OOS drawdown or adverse streaks using strictly prior settled epochs."
         ));
     }
+    if req.enable_diversification_guard {
+        honesty_notes.push(format!(
+            "Cross-Asset Diversification Guard active: {}",
+            diversification.summary
+        ));
+    }
 
     AutoAllocatorReport {
         execution_mode: req.execution_mode,
@@ -1164,6 +1211,7 @@ pub fn compute_auto_allocator_report(
         starting_bankroll: req.starting_bankroll,
         require_stress_resilience: req.require_stress_resilience,
         enable_regime_throttle: req.enable_regime_throttle,
+        enable_diversification_guard: req.enable_diversification_guard,
         min_fill_rate_pct: req.min_fill_rate_pct,
         regime_throttle_mult,
         current_oos_drawdown_pct,
@@ -1184,6 +1232,7 @@ pub fn compute_auto_allocator_report(
         preset_leaderboard,
         top_safe_preset,
         forward_envelope,
+        diversification,
         comparison,
         planned_intents,
         daily_target,
@@ -2148,6 +2197,349 @@ fn compute_bootstrap_stress_sim_trials(
     }
 }
 
+const CLUSTER_CORRELATION_THRESHOLD: f64 = 0.55;
+const CLUSTER_HEAT_CAP_FRACTION: f64 = 0.65;
+
+fn canonical_asset_from_series(series: &str) -> String {
+    let up = series.trim().to_ascii_uppercase();
+    for asset in ["BTC", "ETH", "SOL", "XRP", "DOGE"] {
+        if up.contains(asset) {
+            return asset.to_string();
+        }
+    }
+    let trimmed = up.strip_prefix("KX").unwrap_or(&up);
+    let alpha: String = trimmed
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    if alpha.is_empty() {
+        "OTHER".to_string()
+    } else {
+        alpha
+    }
+}
+
+fn apply_diversification_guard(
+    entries_by_strat: &[Vec<&TournamentEntry>],
+    accepted: &[SplitCandidate],
+    raw_weights_pct: &[f64],
+    req: &AutoAllocatorRequest,
+    is_maker: bool,
+    slip_dollars: f64,
+) -> (Vec<f64>, DiversificationGuardReport) {
+    let cluster_heat_cap_pct = finite_or(
+        (req.max_total_heat_pct * CLUSTER_HEAT_CAP_FRACTION).max(req.max_slot_risk_pct),
+        req.max_slot_risk_pct,
+    );
+    if accepted.is_empty() || raw_weights_pct.is_empty() {
+        return (
+            Vec::new(),
+            DiversificationGuardReport {
+                enabled: req.enable_diversification_guard,
+                status: "NO_DATA".to_string(),
+                effective_diversification_score: 0.0,
+                max_cross_asset_corr: None,
+                correlated_cluster_heat_pct: 0.0,
+                cluster_heat_cap_pct,
+                heat_trimmed_pct: 0.0,
+                clusters: Vec::new(),
+                diversified_safe_preset_id: None,
+                summary: "No active slots available for cross-asset correlation clustering."
+                    .to_string(),
+            },
+        );
+    }
+
+    let winner_assets: Vec<String> = accepted
+        .iter()
+        .map(|cand| {
+            canonical_asset_from_series(&dominant_series_for_entries(
+                entries_by_strat.get(cand.strategy_idx),
+            ))
+        })
+        .collect();
+
+    let mut asset_epoch_acc: BTreeMap<String, BTreeMap<i64, (f64, usize)>> = BTreeMap::new();
+    for cand in accepted {
+        if let Some(list) = entries_by_strat.get(cand.strategy_idx) {
+            for e in list {
+                let asset = canonical_asset_from_series(&e.series);
+                let p = e.entry_price.clamp(0.01, 0.99);
+                let af = if is_maker { maker_fee(p) } else { fee(p) };
+                let payoff = if e.won { 1.0 } else { 0.0 };
+                let net_pnl = payoff - p - af - slip_dollars;
+                let cost = (p + af + slip_dollars).min(1.0);
+                let ret = if cost > 1e-9 { net_pnl / cost } else { 0.0 };
+                let entry = asset_epoch_acc
+                    .entry(asset)
+                    .or_default()
+                    .entry(e.close_epoch)
+                    .or_insert((0.0, 0));
+                entry.0 += finite_or(ret, 0.0);
+                entry.1 += 1;
+            }
+        }
+    }
+
+    let mut active_assets: Vec<String> = winner_assets.clone();
+    active_assets.sort();
+    active_assets.dedup();
+
+    let asset_returns: Vec<BTreeMap<i64, f64>> = active_assets
+        .iter()
+        .map(|asset| {
+            asset_epoch_acc
+                .get(asset)
+                .map(|m| {
+                    m.iter()
+                        .map(|(&ep, &(sum, cnt))| (ep, sum / (cnt.max(1) as f64)))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+
+    let n_assets = active_assets.len();
+    let mut adj = vec![vec![false; n_assets]; n_assets];
+    let mut pair_abs_corr: HashMap<(usize, usize), f64> = HashMap::new();
+    let mut max_cross_asset_corr: Option<f64> = None;
+
+    for i in 0..n_assets {
+        for j in (i + 1)..n_assets {
+            let mut xs = Vec::new();
+            let mut ys = Vec::new();
+            for (&ep, &ri) in &asset_returns[i] {
+                if let Some(&rj) = asset_returns[j].get(&ep) {
+                    xs.push(ri);
+                    ys.push(rj);
+                }
+            }
+            if xs.len() >= 4 {
+                if let Some(r) = pearson_correlation(&xs, &ys) {
+                    let abs_r = r.abs();
+                    max_cross_asset_corr = Some(match max_cross_asset_corr {
+                        Some(prev) => prev.max(abs_r),
+                        None => abs_r,
+                    });
+                    if abs_r >= CLUSTER_CORRELATION_THRESHOLD {
+                        adj[i][j] = true;
+                        adj[j][i] = true;
+                        pair_abs_corr.insert((i, j), abs_r);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut guarded_weights: Vec<f64> = raw_weights_pct
+        .iter()
+        .map(|&w| finite_or(w.max(0.0), 0.0))
+        .collect();
+    let mut visited = vec![false; n_assets];
+    let mut clusters: Vec<AssetClusterRisk> = Vec::new();
+
+    for start in 0..n_assets {
+        if visited[start] {
+            continue;
+        }
+        let mut stack = vec![start];
+        visited[start] = true;
+        let mut comp_idx = Vec::new();
+        while let Some(u) = stack.pop() {
+            comp_idx.push(u);
+            for (v, &connected) in adj[u].iter().enumerate() {
+                if connected && !visited[v] {
+                    visited[v] = true;
+                    stack.push(v);
+                }
+            }
+        }
+        comp_idx.sort_unstable();
+
+        let comp_assets: Vec<String> = comp_idx
+            .iter()
+            .map(|&idx| active_assets[idx].clone())
+            .collect();
+        let cluster_id = comp_assets.join("+");
+        let mut max_intra: Option<f64> = None;
+        for a in 0..comp_idx.len() {
+            for b in (a + 1)..comp_idx.len() {
+                if let Some(&c) = pair_abs_corr.get(&(comp_idx[a], comp_idx[b])) {
+                    max_intra = Some(match max_intra {
+                        Some(prev) => prev.max(c),
+                        None => c,
+                    });
+                }
+            }
+        }
+
+        let member_winners: Vec<usize> = winner_assets
+            .iter()
+            .enumerate()
+            .filter_map(|(wi, asset)| comp_assets.contains(asset).then_some(wi))
+            .collect();
+        let raw_heat_pct: f64 = member_winners.iter().map(|&wi| guarded_weights[wi]).sum();
+        let raw_heat_pct = finite_or(raw_heat_pct, 0.0);
+
+        let mut guarded_heat_pct = raw_heat_pct;
+        if req.enable_diversification_guard
+            && comp_assets.len() >= 2
+            && raw_heat_pct > cluster_heat_cap_pct + 1e-9
+        {
+            let scale = (cluster_heat_cap_pct / raw_heat_pct).clamp(0.0, 1.0);
+            for &wi in &member_winners {
+                guarded_weights[wi] = finite_or(guarded_weights[wi] * scale, 0.0);
+            }
+            guarded_heat_pct = finite_or(
+                member_winners.iter().map(|&wi| guarded_weights[wi]).sum(),
+                cluster_heat_cap_pct,
+            );
+        }
+
+        let penalty_applied_pct = finite_or((raw_heat_pct - guarded_heat_pct).max(0.0), 0.0);
+        clusters.push(AssetClusterRisk {
+            cluster_id,
+            assets: comp_assets,
+            raw_heat_pct,
+            guarded_heat_pct,
+            max_intra_cluster_corr: max_intra,
+            penalty_applied_pct,
+        });
+    }
+
+    clusters.sort_by(|a, b| {
+        b.guarded_heat_pct
+            .total_cmp(&a.guarded_heat_pct)
+            .then_with(|| a.cluster_id.cmp(&b.cluster_id))
+    });
+
+    let total_guarded: f64 = guarded_weights.iter().sum();
+    let raw_corr_heat = finite_or(
+        clusters
+            .iter()
+            .filter(|c| c.assets.len() >= 2)
+            .map(|c| c.guarded_heat_pct)
+            .sum(),
+        0.0,
+    );
+    let correlated_cluster_heat_pct = if raw_corr_heat <= 1e-12 { 0.0 } else { raw_corr_heat };
+    let raw_trimmed = finite_or(clusters.iter().map(|c| c.penalty_applied_pct).sum(), 0.0);
+    let heat_trimmed_pct = if raw_trimmed <= 1e-12 { 0.0 } else { raw_trimmed };
+
+    let (status, effective_diversification_score) = if total_guarded <= 1e-9 {
+        ("NO_DATA".to_string(), 0.0)
+    } else {
+        let hhi: f64 = clusters
+            .iter()
+            .map(|c| {
+                let w = (c.guarded_heat_pct / total_guarded).max(0.0);
+                w * w
+            })
+            .sum();
+        let n_eff = (1.0 / hhi.max(1e-9)).max(1.0);
+        let base_div = ((n_eff - 1.0) / 3.0).clamp(0.0, 1.0) * 65.0 + 35.0;
+        let corr_factor = 1.0 - 0.30 * max_cross_asset_corr.unwrap_or(0.0).clamp(0.0, 1.0);
+        let unprotected_excess_penalty = if !req.enable_diversification_guard {
+            clusters
+                .iter()
+                .filter(|c| c.assets.len() >= 2 && c.raw_heat_pct > cluster_heat_cap_pct)
+                .map(|c| {
+                    ((c.raw_heat_pct - cluster_heat_cap_pct) / cluster_heat_cap_pct.max(1.0) * 30.0)
+                        .min(30.0)
+                })
+                .sum::<f64>()
+        } else {
+            0.0
+        };
+        let score = finite_or(
+            (base_div * corr_factor - unprotected_excess_penalty).clamp(0.0, 100.0),
+            0.0,
+        );
+        let st = if heat_trimmed_pct > 1e-6 {
+            "CLUSTER_CAPPED"
+        } else {
+            "DIVERSIFIED"
+        };
+        (st.to_string(), score)
+    };
+
+    let corr_str = max_cross_asset_corr
+        .map(|r| format!("{r:.2}"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let summary = if status == "CLUSTER_CAPPED" {
+        format!(
+            "Cluster cap ({cluster_heat_cap_pct:.1}%) trimmed {heat_trimmed_pct:.1}% correlated heat (max |r| {corr_str}) -> div score {effective_diversification_score:.0}/100"
+        )
+    } else if !req.enable_diversification_guard
+        && clusters
+            .iter()
+            .any(|c| c.assets.len() >= 2 && c.raw_heat_pct > cluster_heat_cap_pct)
+    {
+        format!(
+            "Guard OFF: correlated cluster exceeds {cluster_heat_cap_pct:.1}% cap (max |r| {corr_str}) -> div score {effective_diversification_score:.0}/100"
+        )
+    } else {
+        format!(
+            "{} asset cluster(s) · max |r| {corr_str} · cluster heat {correlated_cluster_heat_pct:.1}% / {cluster_heat_cap_pct:.1}% cap -> div score {effective_diversification_score:.0}/100",
+            clusters.len()
+        )
+    };
+
+    (
+        guarded_weights,
+        DiversificationGuardReport {
+            enabled: req.enable_diversification_guard,
+            status,
+            effective_diversification_score,
+            max_cross_asset_corr,
+            correlated_cluster_heat_pct,
+            cluster_heat_cap_pct,
+            heat_trimmed_pct,
+            clusters,
+            diversified_safe_preset_id: None,
+            summary,
+        },
+    )
+}
+
+fn build_causal_replay_weights(
+    is_sel: Option<&SelectionResult>,
+    oos_sel: &SelectionResult,
+    guarded_oos_weights_pct: &[f64],
+    is_by_strat: &[Vec<&TournamentEntry>],
+    req: &AutoAllocatorRequest,
+    is_maker: bool,
+    slip_dollars: f64,
+) -> (HashMap<usize, f64>, String) {
+    match is_sel {
+        Some(sel) => {
+            let (guarded_is_weights, _) = apply_diversification_guard(
+                is_by_strat,
+                &sel.accepted,
+                &sel.weights_pct,
+                req,
+                is_maker,
+                slip_dollars,
+            );
+            let mut m = HashMap::with_capacity(sel.accepted.len());
+            for (i, c) in sel.accepted.iter().enumerate() {
+                m.insert(c.strategy_idx, finite_or(guarded_is_weights[i], 0.0) / 100.0);
+            }
+            (m, "causal_is_to_oos".to_string())
+        }
+        None => {
+            let mut m = HashMap::with_capacity(oos_sel.accepted.len());
+            for (i, c) in oos_sel.accepted.iter().enumerate() {
+                m.insert(
+                    c.strategy_idx,
+                    finite_or(guarded_oos_weights_pct[i], 0.0) / 100.0,
+                );
+            }
+            (m, "oos_only_no_is_history".to_string())
+        }
+    }
+}
+
 fn compute_preset_leaderboard(
     ctx: &TournamentTapeContext,
     base_req: &AutoAllocatorRequest,
@@ -2168,6 +2560,7 @@ fn compute_preset_leaderboard(
         slot_risk: f64,
         total_heat: f64,
         min_fill_pct: f64,
+        enable_diversification_guard: bool,
     }
 
     const PRESETS: &[PresetSpec] = &[
@@ -2182,6 +2575,20 @@ fn compute_preset_leaderboard(
             slot_risk: 2.0,
             total_heat: 10.0,
             min_fill_pct: 60.0,
+            enable_diversification_guard: true,
+        },
+        PresetSpec {
+            id: "diversified_safe_basket",
+            label: "Diversified Safe Basket",
+            subtitle: "8% slot / 30% heat · cross-asset cluster guard · 75% maker QK",
+            exec_mode: "maker",
+            sizing_mode: "quarter_kelly",
+            fill_rate: 0.75,
+            min_oos_floor: 25,
+            slot_risk: 8.0,
+            total_heat: 30.0,
+            min_fill_pct: 50.0,
+            enable_diversification_guard: true,
         },
         PresetSpec {
             id: "balanced_maker_qk",
@@ -2194,6 +2601,7 @@ fn compute_preset_leaderboard(
             slot_risk: 10.0,
             total_heat: 35.0,
             min_fill_pct: 50.0,
+            enable_diversification_guard: true,
         },
         PresetSpec {
             id: "half_kelly_guarded",
@@ -2206,6 +2614,7 @@ fn compute_preset_leaderboard(
             slot_risk: 20.0,
             total_heat: 70.0,
             min_fill_pct: 50.0,
+            enable_diversification_guard: true,
         },
         PresetSpec {
             id: "equal_winners_guarded",
@@ -2218,6 +2627,7 @@ fn compute_preset_leaderboard(
             slot_risk: 15.0,
             total_heat: 50.0,
             min_fill_pct: 40.0,
+            enable_diversification_guard: true,
         },
         PresetSpec {
             id: "taker_stress_hardened",
@@ -2230,6 +2640,7 @@ fn compute_preset_leaderboard(
             slot_risk: 12.0,
             total_heat: 45.0,
             min_fill_pct: 25.0,
+            enable_diversification_guard: true,
         },
     ];
 
@@ -2254,6 +2665,7 @@ fn compute_preset_leaderboard(
             slippage_cents: base_req.slippage_cents,
             require_stress_resilience: true,
             enable_regime_throttle: true,
+            enable_diversification_guard: spec.enable_diversification_guard,
             min_fill_rate_pct: spec.min_fill_pct,
         }
         .sanitized();
@@ -2285,22 +2697,23 @@ fn compute_preset_leaderboard(
             None
         };
 
-        let (replay_weights, selection_basis) = match &is_sel {
-            Some(sel) => {
-                let mut m = HashMap::with_capacity(sel.accepted.len());
-                for (i, c) in sel.accepted.iter().enumerate() {
-                    m.insert(c.strategy_idx, finite_or(sel.weights_pct[i], 0.0) / 100.0);
-                }
-                (m, "causal_is_to_oos".to_string())
-            }
-            None => {
-                let mut m = HashMap::with_capacity(oos_sel.accepted.len());
-                for (i, c) in oos_sel.accepted.iter().enumerate() {
-                    m.insert(c.strategy_idx, finite_or(oos_sel.weights_pct[i], 0.0) / 100.0);
-                }
-                (m, "oos_only_no_is_history".to_string())
-            }
-        };
+        let (guarded_oos_weights, _) = apply_diversification_guard(
+            oos_by_strat,
+            &oos_sel.accepted,
+            &oos_sel.weights_pct,
+            &cand_req,
+            is_maker,
+            slip_dollars,
+        );
+        let (replay_weights, selection_basis) = build_causal_replay_weights(
+            is_sel.as_ref(),
+            &oos_sel,
+            &guarded_oos_weights,
+            is_by_strat,
+            &cand_req,
+            is_maker,
+            slip_dollars,
+        );
 
         let (comparison, _, _, _, oos_returns) = replay_oos_comparison(
             ctx,
@@ -2317,7 +2730,7 @@ fn compute_preset_leaderboard(
             500,
         );
 
-        let w_sum: f64 = oos_sel.weights_pct.iter().sum();
+        let w_sum: f64 = guarded_oos_weights.iter().sum();
         let net_expectancy_cents = if oos_sel.accepted.is_empty() {
             None
         } else if w_sum > 1e-12 {
@@ -2325,7 +2738,7 @@ fn compute_preset_leaderboard(
                 oos_sel
                     .accepted
                     .iter()
-                    .zip(oos_sel.weights_pct.iter())
+                    .zip(guarded_oos_weights.iter())
                     .map(|(c, w)| c.net_expectancy_cents * (*w / w_sum))
                     .sum::<f64>(),
             )
@@ -2825,6 +3238,7 @@ mod tests {
             starting_bankroll: 1_000.0,
             require_stress_resilience: true,
             enable_regime_throttle: true,
+            enable_diversification_guard: true,
             min_fill_rate_pct: 40.0,
         };
         let qk = compute_auto_allocator_report(&ctx, &qk_req, &rails, false, false);
@@ -3292,7 +3706,11 @@ mod tests {
         };
         let rep = compute_auto_allocator_report(&ctx, &req, &rails, false, false);
         assert!(!rep.live_armed);
-        assert_eq!(rep.preset_leaderboard.len(), 5);
+        assert_eq!(rep.preset_leaderboard.len(), 6);
+        assert!(rep
+            .preset_leaderboard
+            .iter()
+            .any(|p| p.id == "diversified_safe_basket"));
         let top_id = rep
             .top_safe_preset
             .as_ref()
@@ -3409,5 +3827,116 @@ mod tests {
             assert_eq!(next_p.daily_rail_breach_prob_pct, 0.0);
             assert_eq!(next_p.stress_1c_daily_rail_breach_prob_pct, 0.0);
         }
+    }
+
+    #[test]
+    fn diversification_guard_penalizes_correlated_asset_cluster_spikes_and_keeps_rails_safe() {
+        let strats = vec![
+            StrategyMeta {
+                name: "btc-alpha".into(),
+                side: "yes".into(),
+            },
+            StrategyMeta {
+                name: "eth-corr".into(),
+                side: "yes".into(),
+            },
+            StrategyMeta {
+                name: "sol-indep".into(),
+                side: "yes".into(),
+            },
+        ];
+        let mut entries = Vec::new();
+        for w in 0..90i64 {
+            let epoch = 60_000 + w * 900;
+            // BTC and ETH move identically in every window (r = 1.00 >= 0.55) -> BTC+ETH cluster;
+            // SOL wins on a shifted orthogonal cadence -> low cross-asset correlation.
+            let btc_won = w % 5 != 0;
+            let sol_won = (w + 2) % 4 != 0;
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker: format!("KXBTC15M-D{w:03}"),
+                series: "KXBTC15M".into(),
+                strategy_idx: 0,
+                strategy: "btc-alpha".into(),
+                side: "yes".into(),
+                entry_price: 0.55,
+                secs_to_close: 240,
+                won: btc_won,
+            });
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker: format!("KXETH15M-D{w:03}"),
+                series: "KXETH15M".into(),
+                strategy_idx: 1,
+                strategy: "eth-corr".into(),
+                side: "yes".into(),
+                entry_price: 0.55,
+                secs_to_close: 240,
+                won: btc_won,
+            });
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker: format!("KXSOL15M-D{w:03}"),
+                series: "KXSOL15M".into(),
+                strategy_idx: 2,
+                strategy: "sol-indep".into(),
+                side: "yes".into(),
+                entry_price: 0.55,
+                secs_to_close: 240,
+                won: sol_won,
+            });
+        }
+
+        let ctx = make_ctx(strats, entries, 90, 36, 60_000 + 54 * 900);
+        let rails = RiskRailsConfig {
+            max_daily_loss_dollars: 500.0,
+            ..RiskRailsConfig::default()
+        };
+
+        let unguarded_req = AutoAllocatorRequest {
+            execution_mode: "maker".into(),
+            sizing_mode: "quarter_kelly".into(),
+            maker_fill_rate: 0.75,
+            min_oos_trades: 20,
+            max_slot_risk_pct: 20.0,
+            max_total_heat_pct: 40.0,
+            starting_bankroll: 1_000.0,
+            require_stress_resilience: true,
+            enable_regime_throttle: false,
+            enable_diversification_guard: false,
+            ..AutoAllocatorRequest::default()
+        };
+        let guarded_req = AutoAllocatorRequest {
+            enable_diversification_guard: true,
+            ..unguarded_req.clone()
+        };
+
+        let off = compute_auto_allocator_report(&ctx, &unguarded_req, &rails, false, false);
+        let on = compute_auto_allocator_report(&ctx, &guarded_req, &rails, false, false);
+
+        assert!(!on.live_armed);
+        assert_eq!(on.diversification.status, "CLUSTER_CAPPED");
+        assert!(on.diversification.heat_trimmed_pct > 0.0);
+        assert!(on
+            .diversification
+            .max_cross_asset_corr
+            .is_some_and(|r| r >= 0.90));
+        assert!(
+            on.diversification.correlated_cluster_heat_pct
+                <= on.diversification.cluster_heat_cap_pct + 1e-6
+        );
+        assert!(
+            on.diversification.effective_diversification_score
+                > off.diversification.effective_diversification_score
+        );
+        assert!(on.total_allocated_pct < off.total_allocated_pct);
+
+        let basket = on
+            .preset_leaderboard
+            .iter()
+            .find(|p| p.id == "diversified_safe_basket")
+            .expect("diversified_safe_basket present");
+        assert!(basket.safe_gate_passed);
+        assert_eq!(basket.daily_rail_breach_prob_pct, 0.0);
     }
 }

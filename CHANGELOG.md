@@ -4,6 +4,14 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.18.0 - 2026-11-25
+
+- **Multi-Asset Correlation & Portfolio Diversification Guard (`src/auto_allocator.rs`, `src/main.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**
+  - Added causal cross-asset (`BTC`/`ETH`/`SOL`/`XRP`/`DOGE`) window-return correlation clustering (`|r| >= 0.55` across settled windows, with IS-only clustering on historical OOS replay for zero lookahead) and automatic correlated-cluster heat capping (`cluster_heat_cap_pct = max(max_slot_risk_pct, 0.65 * max_total_heat_pct)`) before Hard Risk Rails can breach (`apply_diversification_guard`).
+  - Added the **`Diversified Safe Basket`** (`8%` slot / `30%` heat, cross-asset cluster guard, `75%` maker QK) preset (`0.0%` daily rail breach hard gate, `live_armed: false`), **`Cluster Guard: ON/OFF`** toggle (`#allocator-diversification-toggle`), compact **Diversified / Cluster Capped** pill (`#allocator-diversification-pill`), cluster breakdown strip in `#allocator-forward-envelope`, and 1-click **`Diversified Safe Basket`** button (`#allocator-diversified-basket-btn`).
+- **Sub-6.00 MB Binary & Sub-20 MB Core Peak RSS Diet (`Cargo.toml`, `src/main.rs`):**
+  - Switched release crate codegen to `opt-level = "z"` (keeping `serde`, `serde_json`, `memchr`, `itoa`, and `ryu` at `opt-level = 3`), replaced the persistent `SHARED_RUNE` compiler registry with a transient `CompileCtxGuard` + `Weak<RuntimeContext>` and `trim_heap()` before simulation, keyed `PrefixCache` by `Sym(u32)`, and skipped `PREFIX_CACHE` inserts for already-settled windows.
+
 ## 0.17.0 - 2026-11-25
 
 - **Paper Forward-Test Envelope Drift Monitor & 1-Click Safe Rotation (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**

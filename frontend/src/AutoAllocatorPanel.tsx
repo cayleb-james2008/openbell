@@ -110,6 +110,9 @@ export function AutoAllocatorPanel({
   const [enableRegimeThrottle, setEnableRegimeThrottle] = useState<boolean>(
     DEFAULT_ALLOCATOR_REQUEST.enable_regime_throttle,
   );
+  const [enableDiversificationGuard, setEnableDiversificationGuard] = useState<boolean>(
+    DEFAULT_ALLOCATOR_REQUEST.enable_diversification_guard,
+  );
   const [report, setReport] = useState<AutoAllocatorReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [quarantineOpen, setQuarantineOpen] = useState(false);
@@ -135,12 +138,14 @@ export function AutoAllocatorPanel({
       sizing: AllocatorSizingMode,
       stressGuard: boolean,
       regimeThrottle: boolean,
+      diversificationGuard: boolean,
     ): AutoAllocatorRequest => ({
       ...DEFAULT_ALLOCATOR_REQUEST,
       execution_mode: exec,
       sizing_mode: sizing,
       require_stress_resilience: stressGuard,
       enable_regime_throttle: regimeThrottle,
+      enable_diversification_guard: diversificationGuard,
     }),
     [],
   );
@@ -161,13 +166,14 @@ export function AutoAllocatorPanel({
       sizing: AllocatorSizingMode,
       stressGuard: boolean,
       regimeThrottle: boolean,
+      diversificationGuard: boolean,
       notify = false,
     ) => {
       setLoading(true);
       try {
         const next = await fetchAllocatorReport(
           dataset,
-          buildRequest(exec, sizing, stressGuard, regimeThrottle),
+          buildRequest(exec, sizing, stressGuard, regimeThrottle, diversificationGuard),
           { slots, markets },
         );
         setReport(next);
@@ -189,24 +195,65 @@ export function AutoAllocatorPanel({
 
   const handleExecChange = (nextExec: AllocatorExecutionMode) => {
     setExecutionMode(nextExec);
-    void recalculate(nextExec, sizingMode, requireStressResilience, enableRegimeThrottle, false);
+    void recalculate(
+      nextExec,
+      sizingMode,
+      requireStressResilience,
+      enableRegimeThrottle,
+      enableDiversificationGuard,
+      false,
+    );
   };
 
   const handleSizingChange = (nextSizing: AllocatorSizingMode) => {
     setSizingMode(nextSizing);
-    void recalculate(executionMode, nextSizing, requireStressResilience, enableRegimeThrottle, false);
+    void recalculate(
+      executionMode,
+      nextSizing,
+      requireStressResilience,
+      enableRegimeThrottle,
+      enableDiversificationGuard,
+      false,
+    );
   };
 
   const handleStressToggle = () => {
     const next = !requireStressResilience;
     setRequireStressResilience(next);
-    void recalculate(executionMode, sizingMode, next, enableRegimeThrottle, false);
+    void recalculate(
+      executionMode,
+      sizingMode,
+      next,
+      enableRegimeThrottle,
+      enableDiversificationGuard,
+      false,
+    );
   };
 
   const handleThrottleToggle = () => {
     const next = !enableRegimeThrottle;
     setEnableRegimeThrottle(next);
-    void recalculate(executionMode, sizingMode, requireStressResilience, next, false);
+    void recalculate(
+      executionMode,
+      sizingMode,
+      requireStressResilience,
+      next,
+      enableDiversificationGuard,
+      false,
+    );
+  };
+
+  const handleDiversificationToggle = () => {
+    const next = !enableDiversificationGuard;
+    setEnableDiversificationGuard(next);
+    void recalculate(
+      executionMode,
+      sizingMode,
+      requireStressResilience,
+      enableRegimeThrottle,
+      next,
+      false,
+    );
   };
 
   const applySafePreset = useCallback(
@@ -215,6 +262,7 @@ export function AutoAllocatorPanel({
       setSizingMode(preset.config.sizing_mode);
       setRequireStressResilience(preset.config.require_stress_resilience);
       setEnableRegimeThrottle(preset.config.enable_regime_throttle);
+      setEnableDiversificationGuard(preset.config.enable_diversification_guard);
       setLoading(true);
       try {
         const next = await fetchAllocatorReport(dataset, preset.config, { slots, markets });
@@ -540,6 +588,24 @@ export function AutoAllocatorPanel({
               ? `Regime Throttle: ${(report?.regime_throttle_mult ?? 1).toFixed(2)}x`
               : "Regime Throttle: OFF"}
           </button>
+          <button
+            id="allocator-diversification-toggle"
+            type="button"
+            aria-pressed={enableDiversificationGuard}
+            onClick={handleDiversificationToggle}
+            className={
+              "min-h-11 cursor-pointer rounded-md border px-2.5 text-xs font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8 " +
+              (enableDiversificationGuard
+                ? "border-dot-green/50 bg-pill-active-bg text-pill-active-fg"
+                : "border-hairline bg-surface text-ink-2 hover:text-ink")
+            }
+          >
+            {enableDiversificationGuard
+              ? report?.diversification?.status === "CLUSTER_CAPPED"
+                ? `Cluster Guard: -${report.diversification.heat_trimmed_pct.toFixed(1)}%`
+                : "Cluster Guard: ON"
+              : "Cluster Guard: OFF"}
+          </button>
           {filteredWinners.length > 0 && (
             <Button
               id="allocator-preflight-top-btn"
@@ -590,7 +656,16 @@ export function AutoAllocatorPanel({
             variant="default"
             size="sm"
             disabled={loading}
-            onClick={() => void recalculate(executionMode, sizingMode, requireStressResilience, enableRegimeThrottle, true)}
+            onClick={() =>
+              void recalculate(
+                executionMode,
+                sizingMode,
+                requireStressResilience,
+                enableRegimeThrottle,
+                enableDiversificationGuard,
+                true,
+              )
+            }
           >
             <RefreshCw className={`size-3.5 ${loading ? "animate-spin" : ""}`} aria-hidden />
             <span>{loading ? "Running Pipeline…" : "Run Discovery & Allocate"}</span>
@@ -944,11 +1019,50 @@ export function AutoAllocatorPanel({
                   0 Presets Clear 0% Rail-Breach Gate
                 </StatusPill>
               )}
+              {report.diversification && (
+                <StatusPill
+                  id="allocator-diversification-pill"
+                  tone={
+                    !report.diversification.enabled
+                      ? "warning"
+                      : report.diversification.status === "CLUSTER_CAPPED"
+                        ? "info"
+                        : report.diversification.status === "DIVERSIFIED"
+                          ? "success"
+                          : "neutral"
+                  }
+                >
+                  {report.diversification.status === "CLUSTER_CAPPED"
+                    ? `Cluster Capped (-${report.diversification.heat_trimmed_pct.toFixed(1)}%)`
+                    : `Diversified ${Math.round(report.diversification.effective_diversification_score)}/100`}
+                </StatusPill>
+              )}
               <Badge variant="outline" className="mono text-xs text-ink-2">
                 Hard Gate: 0.0% Rail Breach (OOS &amp; +1c) · live_armed=false
               </Badge>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              {(() => {
+                const divPresetId = report.diversification?.diversified_safe_preset_id ?? "diversified_safe_basket";
+                const divPreset = report.preset_leaderboard.find(
+                  (p) => p.id === divPresetId && p.safe_gate_passed,
+                );
+                if (!divPreset || report.forward_envelope?.active_preset_id === divPreset.id) {
+                  return null;
+                }
+                return (
+                  <Button
+                    id="allocator-diversified-basket-btn"
+                    variant="outline"
+                    size="sm"
+                    disabled={loading}
+                    onClick={() => void applySafePreset(divPreset)}
+                  >
+                    <ShieldCheck className="size-3.5" aria-hidden />
+                    <span>Diversified Safe Basket</span>
+                  </Button>
+                );
+              })()}
               {report.forward_envelope?.next_safe_preset_id && (
                 <Button
                   id="allocator-rotate-safe-btn"
@@ -1025,6 +1139,27 @@ export function AutoAllocatorPanel({
                 <div className="text-ink-3">Envelope Verdict</div>
                 <div className="mt-0.5 text-ink-2">{report.forward_envelope.summary}</div>
               </div>
+              {report.diversification && (
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-2 sm:col-span-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-semibold text-ink">Cross-Asset Cluster Risk</span>
+                    <span className="mono text-ink-2">
+                      max |r|{" "}
+                      {report.diversification.max_cross_asset_corr === null
+                        ? "n/a"
+                        : report.diversification.max_cross_asset_corr.toFixed(2)}{" "}
+                      · cluster cap {fmtPct(report.diversification.cluster_heat_cap_pct, 1)}
+                    </span>
+                    {report.diversification.clusters.slice(0, 4).map((cl) => (
+                      <Badge key={cl.cluster_id} variant="outline" className="mono text-xs text-ink-2">
+                        {cl.cluster_id}: {fmtPct(cl.guarded_heat_pct, 1)}
+                        {cl.penalty_applied_pct > 0.05 ? ` (-${cl.penalty_applied_pct.toFixed(1)}%)` : ""}
+                      </Badge>
+                    ))}
+                  </div>
+                  <span className="text-ink-2">{report.diversification.summary}</span>
+                </div>
+              )}
             </div>
           )}
 
