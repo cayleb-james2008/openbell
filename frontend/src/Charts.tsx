@@ -2015,3 +2015,188 @@ export function RegimeHeatmapChart({
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Autonomous Edge Allocator vs Legacy 1/N Taker Comparison SVG Chart
+// ---------------------------------------------------------------------------
+
+export function AllocatorComparisonChart({
+  points,
+  startingBankroll,
+  execLabel,
+}: {
+  points: Array<{ close_epoch: number; legacy_equity: number; allocator_equity: number }>;
+  startingBankroll: number;
+  execLabel: string;
+}) {
+  const [boxRef, cw] = useContainerWidth(180, 640);
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+
+  if (points.length < 2) {
+    return (
+      <div ref={boxRef} className="w-full min-w-0">
+        <div className="flex h-44 items-center justify-center rounded-md border border-dashed border-hairline bg-surface/60 px-4 text-center text-xs text-ink-2">
+          Awaiting at least 2 OOS replay checkpoints to plot Auto-Allocator vs Legacy 1/N Taker equity curves.
+        </div>
+      </div>
+    );
+  }
+
+  const W = Math.max(180, Math.round(cw));
+  const H = 220;
+  const pad = { l: 56, r: 16, t: 16, b: 28 };
+  const iw = W - pad.l - pad.r;
+  const ih = H - pad.t - pad.b;
+
+  const vals: number[] = [startingBankroll];
+  for (const pt of points) {
+    vals.push(pt.legacy_equity, pt.allocator_equity);
+  }
+  const rawMin = Math.min(...vals);
+  const rawMax = Math.max(...vals);
+  const span = Math.max(2, rawMax - rawMin);
+  const minY = rawMin - span * 0.08;
+  const maxY = rawMax + span * 0.08;
+  const ySpan = Math.max(1e-6, maxY - minY);
+
+  const xAt = (idx: number) => pad.l + (idx / Math.max(1, points.length - 1)) * iw;
+  const yAt = (v: number) => pad.t + ih - ((v - minY) / ySpan) * ih;
+
+  const allocPath = points
+    .map((pt, i) => `${i === 0 ? "M" : "L"}${xAt(i).toFixed(1)},${yAt(pt.allocator_equity).toFixed(1)}`)
+    .join(" ");
+  const legacyPath = points
+    .map((pt, i) => `${i === 0 ? "M" : "L"}${xAt(i).toFixed(1)},${yAt(pt.legacy_equity).toFixed(1)}`)
+    .join(" ");
+
+  const yTicks = [minY, (minY + maxY) / 2, maxY];
+  const baseY = yAt(startingBankroll);
+  const ai = hoverIdx !== null && hoverIdx >= 0 && hoverIdx < points.length ? hoverIdx : points.length - 1;
+  const activePt = points[ai];
+
+  return (
+    <div ref={boxRef} className="w-full space-y-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-xs text-ink-2">
+        <span>
+          {activePt.close_epoch > 0
+            ? `${dayLabel(activePt.close_epoch)} ${timeUtcLabel(activePt.close_epoch)} UTC`
+            : `Checkpoint ${ai + 1}/${points.length}`}
+        </span>
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="font-semibold text-info-foreground">
+            {execLabel}: {money(activePt.allocator_equity)}
+          </span>
+          <span className="text-ink-2">Legacy 1/N: {money(activePt.legacy_equity)}</span>
+        </div>
+      </div>
+
+      <svg
+        role="img"
+        aria-label={`OOS replay equity comparison between ${execLabel} Auto-Allocator and Legacy 1/N Taker`}
+        viewBox={`0 0 ${W} ${H}`}
+        width={W}
+        height={H}
+        className="block h-auto max-w-full select-none"
+        onMouseLeave={() => setHoverIdx(null)}
+        onMouseMove={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          const rx = ((e.clientX - rect.left) / Math.max(1, rect.width)) * W;
+          const t = Math.min(1, Math.max(0, (rx - pad.l) / Math.max(1, iw)));
+          setHoverIdx(Math.round(t * (points.length - 1)));
+        }}
+      >
+        {yTicks.map((v, idx) => {
+          const yy = yAt(v);
+          return (
+            <g key={idx}>
+              <line
+                x1={pad.l}
+                y1={yy}
+                x2={W - pad.r}
+                y2={yy}
+                style={{ stroke: "var(--hairline)", strokeDasharray: "3 3" }}
+              />
+              <text
+                x={pad.l - 8}
+                y={yy + 4}
+                textAnchor="end"
+                fontSize={12}
+                className="font-mono tabular-nums"
+                style={{ fill: "var(--ink-3)" }}
+              >
+                ${Math.round(v)}
+              </text>
+            </g>
+          );
+        })}
+
+        {baseY >= pad.t && baseY <= H - pad.b && (
+          <line
+            x1={pad.l}
+            y1={baseY}
+            x2={W - pad.r}
+            y2={baseY}
+            style={{ stroke: "var(--ink-3)", strokeDasharray: "2 4", opacity: 0.6 }}
+          />
+        )}
+
+        <path
+          d={legacyPath}
+          fill="none"
+          strokeWidth={1.75}
+          strokeDasharray="4 4"
+          style={{ stroke: "var(--ink-3)" }}
+        />
+        <path
+          d={allocPath}
+          fill="none"
+          strokeWidth={2.25}
+          style={{ stroke: "var(--blue)" }}
+        />
+
+        <line
+          x1={xAt(ai)}
+          y1={pad.t}
+          x2={xAt(ai)}
+          y2={H - pad.b}
+          style={{ stroke: "var(--hairline)" }}
+        />
+        <circle
+          cx={xAt(ai)}
+          cy={yAt(activePt.allocator_equity)}
+          r={4}
+          style={{ fill: "var(--blue)" }}
+        />
+        <circle
+          cx={xAt(ai)}
+          cy={yAt(activePt.legacy_equity)}
+          r={3.5}
+          style={{ fill: "var(--ink-3)" }}
+        />
+
+        <text
+          x={pad.l}
+          y={H - 8}
+          textAnchor="start"
+          fontSize={12}
+          className="font-mono"
+          style={{ fill: "var(--ink-3)" }}
+        >
+          {points[0].close_epoch > 0 ? dayLabel(points[0].close_epoch) : "OOS Start"}
+        </text>
+        <text
+          x={W - pad.r}
+          y={H - 8}
+          textAnchor="end"
+          fontSize={12}
+          className="font-mono"
+          style={{ fill: "var(--ink-3)" }}
+        >
+          {points[points.length - 1].close_epoch > 0
+            ? dayLabel(points[points.length - 1].close_epoch)
+            : "OOS End"}
+        </text>
+      </svg>
+    </div>
+  );
+}

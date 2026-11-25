@@ -1,0 +1,43 @@
+// Paper research shape: tail overreaction fade.
+// Contrarian NO fade when early-to-mid YES (300s to 720s remaining) overextends
+// into 78c-91c while the book stays orderly (spread <= 4c).
+// Scored strictly on paper by the shadow scorer — this file places nothing.
+
+pub fn name() {
+    "tail-overreaction-fade"
+}
+
+pub fn side() {
+    "no"
+}
+
+pub fn describe() {
+    "Fade early YES overextension (78c-91c, spread <=4c) with contrarian NO limit at 5m-12m left."
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    if secs_to_close > 720 || secs_to_close < 300 {
+        return false;
+    }
+    if yes_ask < 0.78 || yes_ask > 0.91 || no_ask < 0.09 || no_ask > 0.26 {
+        return false;
+    }
+    let spread = yes_ask + no_ask - 1.0;
+    if spread < -0.001 || spread > 0.045 {
+        return false;
+    }
+    let nc = no_ask * 100.0;
+    let yc = yes_ask * 100.0;
+    (nc - nc.round()).abs() < 0.000001 && (yc - yc.round()).abs() < 0.000001
+}
+
+pub fn entry_quote(yes_ask, no_ask, secs_to_close) {
+    if allow_entry(yes_ask, no_ask, secs_to_close) {
+        let spread = yes_ask + no_ask - 1.0;
+        let base_c = (no_ask * 100.0).round();
+        let q = if spread >= 0.019 { base_c - 1.0 } else { base_c };
+        Some(q / 100.0)
+    } else {
+        None
+    }
+}

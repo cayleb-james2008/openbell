@@ -265,12 +265,12 @@ fn scale_100k_ticks_2000_windows_30_concurrent_clients_under_300ms_p95() {
     let cal: serde_json::Value = serde_json::from_str(&body_cal).unwrap();
     assert_eq!(cal["windows_settled"], 2_000);
     assert_eq!(cal["market_calibration"]["buckets"].as_array().unwrap().len(), 10);
-    assert_eq!(cal["by_strategy"].as_array().unwrap().len(), 12);
+    assert_eq!(cal["by_strategy"].as_array().unwrap().len(), 16);
 
     let (st_wf, _, body_wf) = http_req(port, "GET", "/api/analytics/walkforward", "");
     assert_eq!(st_wf, 200, "walkforward failed: {body_wf}");
     let wf: serde_json::Value = serde_json::from_str(&body_wf).unwrap();
-    assert_eq!(wf["strategies"].as_array().unwrap().len(), 12);
+    assert_eq!(wf["strategies"].as_array().unwrap().len(), 16);
     assert!(wf["portfolio"]["in_sample"]["trades_count"].as_u64().unwrap() > 0);
     assert!(wf["portfolio"]["out_of_sample"]["trades_count"].as_u64().unwrap() > 0);
 

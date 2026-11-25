@@ -356,7 +356,7 @@ fn live_kalshi_v2_risk_rails_kill_switch_and_restart_disarm_end_to_end() {
     let (st_home, b_home) = http_req_full(port, "GET", "/api/home", &host, &[], "");
     assert_eq!(st_home, 200);
     let home: serde_json::Value = serde_json::from_str(&b_home).unwrap();
-    assert_eq!(home["version"], "0.9.0");
+    assert_eq!(home["version"], env!("CARGO_PKG_VERSION"));
     let caps = home["capabilities"].as_array().unwrap();
     assert!(caps.iter().any(|c| c == "live_kalshi"));
     assert!(caps.iter().any(|c| c == "risk_rails"));

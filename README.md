@@ -4,11 +4,12 @@
 
 
 A Live Kalshi Connected Trading & Quant Desk for Kalshi's 15-minute markets,
-rebuilt lean in Rust. OpenBell connects directly to Kalshi Trade API v2 (Demo &
+rebuilt lean in Rust (v0.10.0). OpenBell connects directly to Kalshi Trade API v2 (Demo &
 Production) with RSA-PSS SHA-256 signing under fail-closed Hard Risk Rails and
-an Emergency Kill Switch, alongside a 15-minute public tape collector, 12-strategy
-paper slot simulator, PAV isotonic recalibration, `$500/day` capital scaling
-planner, and out-of-sample strategy tournament.
+an Emergency Kill Switch, alongside a 15-minute public tape collector, 16-strategy
+paper slot simulator, Autonomous Edge & Fractional-Kelly Post-Only Allocator,
+PAV isotonic recalibration, `$500/day` capital scaling planner, and out-of-sample
+strategy tournament.
 
 Live trading is **disarmed by default (`live_armed: false`)** on every launch
 and restart. Routing a live order requires configured Kalshi v2 API credentials
@@ -49,11 +50,12 @@ each scored against the same tape:
   silently resolved in anyone's favour.
 
 Strategies are small sandboxed `.rn` scripts in
-`strategies/` — the library ships twelve paper shapes (`bid_ask_imbalance`,
+`strategies/` — the library ships sixteen paper shapes (`bid_ask_imbalance`,
 `favourite_floor`, `favourite_late`, `late_convergence_cap`, `longshot_late`,
-`mean_reversion_fade`, `mid_window_momentum`, `no_favourite`,
-`opening_range_break`, `spread_compression`, `time_decay_harvest`,
-`volatility_squeeze`). Editing one file
+`maker_late_theta_no`, `maker_spread_capture`, `mean_reversion_fade`,
+`mid_window_momentum`, `no_favourite`, `opening_range_break`,
+`spot_lead_momentum_yes`, `spread_compression`, `tail_overreaction_fade`,
+`time_decay_harvest`, `volatility_squeeze`). Editing one file
 changes only that strategy's results; the check kit proves it. The contract
 is enforced, not assumed: a strategy whose `side()` returns anything but
 "yes" or "no", a duplicate strategy name, or a file past the size cap is

@@ -389,7 +389,7 @@ pub fn build_edge_audit_report(
     let funnel = vec![
         EdgeAuditStage {
             id: "tournament".to_string(),
-            title: "12 Strategies OOS Tournament".to_string(),
+            title: format!("{strategies_total} Strategies OOS Tournament"),
             passed: strategies_oos_positive > 0 && tournament.windows_settled_oos >= 30,
             metric: stage1_metric,
             detail: format!(
