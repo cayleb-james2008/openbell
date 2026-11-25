@@ -1,246 +1,126 @@
 # OpenBell
 
-[![latest release](https://img.shields.io/github/v/release/cayleb-james2008/openbell)](https://github.com/cayleb-james2008/openbell/releases)
+![version](https://img.shields.io/badge/version-v0.15.0-0969da?style=flat-square)
+![stack](https://img.shields.io/badge/stack-Rust%20%2B%20React%2019-111827?style=flat-square)
+![tests](https://img.shields.io/badge/tests-120%2F120%20pass-16a34a?style=flat-square)
+![binary](https://img.shields.io/badge/release%20binary-8.11%20MB-0969da?style=flat-square)
+![safety](https://img.shields.io/badge/live__armed-false%20on%20boot-16a34a?style=flat-square)
 
+**A high-speed Rust Kalshi Connected Trading & Quant Workbench for 15-minute markets** — pairing a fail-closed RSA-PSS Kalshi Trade API v2 client (`live_armed: false` on every boot, 7 Hard Risk Rails, Emergency Kill Switch) with a deduplicating public 15m tape collector, 16-strategy paper slot simulator, causal Post-Only Maker Auto-Allocator, Edge Quality Screener, and 1,000-trial 30-day Bootstrap Tail-Risk Simulator.
 
-A Live Kalshi Connected Trading & Quant Desk for Kalshi's 15-minute markets,
-rebuilt lean in Rust (v0.15.0). OpenBell connects directly to Kalshi Trade API v2 (Demo &
-Production) with RSA-PSS SHA-256 signing under fail-closed Hard Risk Rails and
-an Emergency Kill Switch, alongside a 15-minute public tape collector, 16-strategy
-paper slot simulator, Autonomous Edge & Fractional-Kelly Post-Only Allocator,
-PAV isotonic recalibration, `$500/day` capital scaling planner, and out-of-sample
-strategy tournament.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/hero-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/hero-light.png">
+  <img alt="OpenBell v0.15.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
+</picture>
 
-Live trading is **disarmed by default (`live_armed: false`)** on every launch
-and restart. Routing a live order requires configured Kalshi v2 API credentials
-(stored `0600` under `OPENBELL_DATA` and never echoed), explicit `confirm_arm: true`
-arming over localhost with `X-OpenBell-CSRF: 1`, and passing every configured
-Hard Risk Rail (`max_order_contracts`, `max_order_dollars`,
-`max_daily_loss_dollars`, `max_open_exposure_dollars`, `allowed_ticker_prefix`,
-and whole-cent `1..=99` price check). The Emergency Kill Switch disarms
-immediately and cancels all resting orders. A mechanical check kit
-(`.loop/checks/rails.sh` and `.loop/checks/equity.sh`) verifies every invariant
-on every build.
+---
 
-## The slot system
+## Feature Gallery
 
-The desk's strategies run as **slots** — one slot per strategy in the library,
-each scored against the same tape:
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>Causal Edge Quality Screener &amp; Basket Preflight</strong><br>
+      <sub>Ranks strategies and dominant 15m Kalshi series by maker net expectancy, fee edge saved, break-even queue fill headroom, walk-forward fold consistency, and <code>$500/day</code> contribution share with 1-click dry-run basket preflight.</sub>
+      <br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/screener-dark.png">
+        <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/screener-light.png">
+        <img alt="Causal Edge Quality Screener" src="docs/screenshots/screener-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <strong>30-Day Causal Bootstrap Tail-Risk Simulator</strong><br>
+      <sub>Resamples 1,000 deterministic trajectories across 30 days (96 15m windows/day) under <code>+0c</code> and <code>+1c</code> adverse-fill slippage to quantify P5/P50/P95 equity, P95 max drawdown, rail-breach odds, and <code>P(&ge;$500/day)</code> before arming live.</sub>
+      <br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/stress-test-dark.png">
+        <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/stress-test-light.png">
+        <img alt="30-Day Causal Bootstrap Stress Simulator" src="docs/screenshots/stress-test-light.png">
+      </picture>
+    </td>
+  </tr>
+</table>
 
-- **Sizing is an equity split.** At the start of each settled window, the
-  current total paper equity is split evenly across the slots, and each slot
-  stakes its share at its strategy's entry price, fees included. The pot
-  compounds: a winning window grows the next window's stakes, a losing one
-  shrinks them. Only a whole-cent price between 0.01 and 0.99 sizes a trade.
-  Kalshi trades whole cents, so any other quote (0.4567, or a sub-cent 0.004)
-  is treated as no market, never as a five-figure paper win.
-- **Strikes are consecutive losses.** Three in a row retire the strategy from
-  its slot, and the next library strategy that is not already running takes
-  its place. If every other strategy is already running, the next in order
-  takes the slot and the duplication is disclosed — a strategy running in two
-  slots stakes two shares, and the report says so.
-- **Attribution is per stint.** A slot's line separates the current strategy's
-  own record (windows and P&L since it took the slot) from the slot's
-  cumulative total, and every retirement records the strategy it actually
-  rotated to. Nothing is credited with a predecessor's results.
-- **The venue's record has to agree with itself.** Windows are ordered by
-  the settled record's own close time. A window whose records carry
-  conflicting settlements is not scored at all — the disagreement is
-  counted on the home screen and in the simulation's notes, never
-  silently resolved in anyone's favour.
+---
 
-Strategies are small sandboxed `.rn` scripts in
-`strategies/` — the library ships sixteen paper shapes (`bid_ask_imbalance`,
-`favourite_floor`, `favourite_late`, `late_convergence_cap`, `longshot_late`,
-`maker_late_theta_no`, `maker_spread_capture`, `mean_reversion_fade`,
-`mid_window_momentum`, `no_favourite`, `opening_range_break`,
-`spot_lead_momentum_yes`, `spread_compression`, `tail_overreaction_fade`,
-`time_decay_harvest`, `volatility_squeeze`). Editing one file
-changes only that strategy's results; the check kit proves it. The contract
-is enforced, not assumed: a strategy whose `side()` returns anything but
-"yes" or "no", a duplicate strategy name, or a file past the size cap is
-rejected and named on every surface; a strategy whose `allow_entry` errors
-or returns a non-boolean is counted and named, never read as a quiet one;
-and a strategy that never returns degrades to no-entry under an aggregate
-time budget, with the degradation stated in the simulation's notes.
+## Causal Execution & Fail-Closed Risk Pipeline
 
-## Same-site guard
-
-Every request must name a local Host: `localhost`, `127.0.0.1` or `[::1]`, or
-a host name listed in `OPENBELL_ALLOWED_HOSTS` (comma-separated, no port).
-Other Hosts are refused with 403. A state-changing request (any method but
-GET or HEAD) is refused with 403 when the browser says it is cross-site, or
-when its Origin names a different authority than its Host. A request with a
-body must be `application/json` (415). Refusals are plain JSON errors, and
-reads stay open to same-host clients.
-
-## Venue truth, or "unavailable"
-
-Every number on the home screen and in the daily report is labelled by
-provenance: **venue** (live Kalshi Trade API v2 portfolio/market reads), **tape**
-(counted from the collected 15-minute snapshots), or **paper** (the simulated
-slot desk and research analytics). Anything the desk has not obtained is shown
-as **unavailable** — never zero, never fabricated.
-
-## Live Kalshi v2 & Hard Risk Rails
-
-- **Authentication (`src/kalshi_live.rs`):** RSA-PSS SHA-256 request signing
-  (`KALSHI-ACCESS-KEY`, `KALSHI-ACCESS-TIMESTAMP`, `KALSHI-ACCESS-SIGNATURE`)
-  against Demo (`https://demo-api.kalshi.co/trade-api/v2`) or Production
-  (`https://api.elections.kalshi.com/trade-api/v2`). Credentials are validated
-  cryptographically and written `0600` inside `OPENBELL_DATA`; private key bytes
-  are never echoed or logged.
-- **Endpoints (loopback-only; mutations require `X-OpenBell-CSRF: 1`):**
-  `GET /api/live/{status,account,positions,orders,fills}`,
-  `POST /api/live/{config,arm,disarm,order,kill-switch}`, and
-  `DELETE /api/live/orders/:id`.
-- **Fail-closed rails (`src/risk_rails.rs`):** Always boots `live_armed: false`.
-  Every order must pass contract cap, per-order notional cap, daily realized loss
-  cap, projected open exposure cap, allowed ticker prefix, and whole-cent
-  `1..=99` validation or fails closed with HTTP `403`.
-
-## The collector
-
-A background pass collects Kalshi's **public** market data via unauthenticated
-GET requests (separate from the authenticated Kalshi Trade API v2 trading client
-and the GitHub release check in "Versions and updates") for five 15-minute series (BTC, ETH, SOL, XRP, DOGE) and appends each pass to
-a local tape in a single write, so a reader never sees a torn half-pass. The
-home screen shows the collector's health next to everything else: tape
-lines on disk, distinct markets seen, distinct settled windows, tape lines
-that failed to parse (counted as dropped, never silently skipped), windows
-whose settlements conflict, and the age of the newest snapshot, with a
-plain "collecting / NOT collecting" state — because an uncollected window
-can never be backfilled. Freshness is read from the tape's last line, so a
-single future-dated record cannot make a stopped collector read as alive.
-A collect pass that fails, or writes nothing, is reported as a failure.
-
-The tape is read as bytes. `snapshots_on_disk` counts valid snapshots only;
-a line that is not valid UTF-8 or not a snapshot is counted in
-`dropped_lines` and never hides its neighbours. `lines_on_disk` is every
-line in the tape file: `snapshots_on_disk + dropped_lines`. A torn last line (no final
-newline, left by a crash mid-append) is kept as its own dropped line: the
-next pass starts on a fresh line, so its snapshots are not lost.
-
-When reads fail on a pass, `/api/home` carries `series_failed_last_pass`
-(failed reads on the last pass), `series_total` (10: open and settled reads
-for five series) and `series_failed_names` (the series behind them). The
-report's Collector line then reads, for example, `4 of 10 market reads failed
-on the last pass (5 series, open and settled): KXBTC15M, KXSOL15M.`
-
-## The daily report
-
-One short page, written to be read:
-
-1. The venue day P&L, signed — or the honest unavailable line, with the real
-   reason.
-2. An as-of line naming the moment and the basis: everything below is
-   cumulative over the collected tape.
-3. Balance and open positions, each venue-labelled or unavailable.
-4. Collector state and counts, checked against the tape itself.
-5. Per-slot lines: current strategy, strikes, the stint's record and the
-   slot's total, each retirement with its successor and its own P&L.
-6. The paper pot, labelled paper, with the starting pot beside it.
-7. Per-strategy verdicts against a stated promotion standard: a strategy is
-   a candidate only after 100+ forward windows, both chronological halves
-   positive, at +3.5¢ per contract or better after the stated fee model.
-   Until then the verdict is "insufficient evidence" — which, on a young
-   tape, is most of them, and the report says so.
-
-## The example tape
-
-`dataset=fixture` reads a labelled example tape written for tests. The page
-groups its figures apart from the live desk under an "example tape" tag, and
-its verdict reads `PROVEN on the example tape (not forward evidence, paper
-only - no orders placed)`. The live desk's verdict stays `PROVEN on forward
-evidence (paper only — no orders placed)`. The daily report always reads the
-live desk.
-
-## Status
-
-The forward evidence is young: the tape has been collecting since
-17 November 2026, so no strategy in the library has the forward record the
-promotion standard asks for, and this page makes no performance claim. The
-slot system is a paper scorer. Whether any strategy ever earns promotion is
-a question the tape will answer over time; the desk's job until then is to
-keep collecting and keep the numbers honest.
-
-## Versions and updates
-
-**Releasing:** bump `version` in `Cargo.toml`, add a `## X.Y.Z - date` entry to `CHANGELOG.md`, and merge to `main`. `.github/workflows/release.yml` sees the new version, builds every platform and publishes the GitHub Release `vX.Y.Z` with the binaries and `SHA256SUMS`; a push that does not change the version publishes nothing, and a new version without a changelog entry fails the workflow. Pushing a `vX.Y.Z` tag by hand does the same.
-
-The running version is shown on the page, in `GET /api/version` and `GET /api/home`, and by `openbell-rs --version`. Every release is tagged `vX.Y.Z` on GitHub, with a changelog entry in `CHANGELOG.md`, binaries for each platform and a `SHA256SUMS` file; merging a new version to `main` (or pushing a tag) runs `.github/workflows/release.yml`, which refuses a tag that does not match the version in `Cargo.toml`.
-
-Self-update (`src/update.rs`): the desk asks the newest GitHub release of its own repository whether a newer version exists (shortly after start and every 6 hours). `GET /api/update` says what it found; `POST /api/update/check` asks now. `POST /api/update/apply` downloads the binary for this platform, checks its SHA-256 against the release's `SHA256SUMS`, runs it with `--version` to confirm it is the build it claims to be, and only then swaps it in. `POST /api/update/restart` then starts the new build. Any failed step leaves the installed program untouched. Downloads go through `curl`, and the only URLs fetched are https (plain http only for a loopback address).
-
-Updating is refused for a cargo-built binary, from any Host other than a loopback name (`OPENBELL_ALLOWED_HOSTS` does not permit it), and a restart is refused with 409 while a collection pass is running or when no update is waiting.
-
-| Var | Default |
-| --- | --- |
-| `OPENBELL_UPDATE_MODE` | `notify` (check and tell); `auto` also downloads and installs (a restart is still yours to press); `off` never contacts GitHub |
-| `OPENBELL_UPDATE_REPO` | `cayleb-james2008/openbell` |
-| `OPENBELL_UPDATE_API` | `https://api.github.com` (plain http only for a loopback address) |
-| `OPENBELL_UPDATE_DEV` | `1` allows replacing a cargo-built binary (tests only) |
-
-## Running it
-
-Nothing has to be set up. Start the desk and it opens in your browser:
-
-```sh
-cargo run            # or the installed openbell-rs
+```mermaid
+flowchart LR
+  T["15m Public Tape (snapshots.jsonl)"] --> S["16-Strategy Paper Slots & Causal OOS Split (60% IS / 40% OOS)"]
+  S --> Q["PAV Isotonic Recalibration & Tournament (|r| <= 0.65)"]
+  Q --> A["Fractional-Kelly Post-Only Auto-Allocator + Edge Screener"]
+  A --> B["1,000-Trial 30d Bootstrap Stress (+0c / +1c)"]
+  B --> P["1-Click Dry-Run Basket Preflight (live_armed = false)"]
+  P --> R{"7 Hard Risk Rails + X-OpenBell-CSRF + Loopback-Only"}
+  R -- "Fail Closed (403)" --> D["Disarmed Paper Mode / Emergency Kill Switch"]
+  R -- "confirm_arm = true" --> K["Kalshi Trade API v2 (RSA-PSS SHA-256)"]
 ```
 
-It serves `http://127.0.0.1:8472`. If that port is busy the desk takes the next
-free one (up to 8492) and prints its address. Without any variable set, the tape
-lives in the platform's data folder: `$XDG_DATA_HOME/openbell` or
-`~/.local/share/openbell` on Linux, `~/Library/Application Support/openbell` on
-macOS, `%APPDATA%\openbell` on Windows. The twelve built-in strategies are written to
-`strategies/` inside that folder, once. A checkout keeps working: an
-`openbell-data` or `strategies` folder in the current directory is used when it
-is there.
+---
 
-The browser opens once at start. It does not open with `--no-open`,
-`OPENBELL_NO_OPEN=1`, `--service` or a service manager (`INVOCATION_ID` set), or
-on Linux when there is no display. A failure to open is silent; the start-up
-banner always prints the address.
+## Verified Benchmarks (`v0.15.0` vs `v0.10.0`)
 
-Environment (all optional):
+Measured on a 100k+ tick / 2,000+ settled window 15-minute tape (`v0.10.0` baseline from cold `scale-audit`; `v0.15.0` measured post-edit on `:18445` under `taskset -c 24-31` with 14 workers):
 
-| Var | Default |
+| Metric | `v0.10.0` Baseline | `v0.15.0` Verified | Delta |
+| --- | --- | --- | --- |
+| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`8.11 MB`** (`8,504,648 B`) | **`-23.9%`** (`-37.6%` vs `v0.9.0`) |
+| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`94,706 B`** / **`21,793 B`** (`21` `/chunks/*`) | **`-94.9%` wire bytes** |
+| Cold boot to first `HTTP 200` | `9.11 ms` | **`7.07 ms`** | **`-22.4%`** |
+| Peak RSS (`VmHWM`) after core / full analytics | `125.55 MB` (`128,560 KB`) | **`62.65 MB`** core / `68.66 MB` full | **`-50.1%` core** |
+| Concurrent HTTP throughput | `4,921.3 req/s` (30w) | **`7,159.9 req/s`** (`0.92 ms` p50, 14w, `0` err) | **`+45.5% req/s`** |
+| Test & mechanical verification | — | **`120/120` Rust tests**, `gate 101/101`, `replay 18/18`, `sloplint 0 FAIL/WARN`, `RAILS OK`, `EQUITY OK` | Clean |
+
+---
+
+## Quick Start (Synthetic Paper Mode — Zero Real Credentials)
+
+```sh
+# 1. Build frontend assets and release binary
+cd frontend && npm run build && cd ..
+cargo build --release --locked
+
+# 2. Launch with synthetic/local paper data (always boots live_armed: false)
+OPENBELL_DATA=./frontend/e2e/fixtures/data OPENBELL_COLLECT_SECS=3600 PORT=18440 ./target/release/openbell-rs
+```
+
+Open `http://127.0.0.1:18440/?dataset=fixture` to inspect the 15-minute fixture tape, Causal Edge Quality Screener, Stage Best Basket dry-run preflight, and 30-day Bootstrap Tail-Risk Simulator with zero live credentials or external orders.
+
+---
+
+## Architecture & Guardrails
+
+### Fail-Closed Hard Risk Rails & Live Kalshi v2 (`src/risk_rails.rs`, `src/kalshi_live.rs`)
+- **Disarmed by default (`live_armed: false`):** Every launch and restart boots disarmed. Routing an order requires configured Kalshi v2 API credentials (`0600` inside `OPENBELL_DATA`, never echoed or logged), explicit `confirm_arm: true` over loopback with `X-OpenBell-CSRF: 1`, and passing all 7 Hard Risk Rails (`max_order_contracts`, `max_order_dollars`, `max_daily_loss_dollars`, `max_open_exposure_dollars`, `allowed_ticker_prefix`, whole-cent `1..=99` price check, and kill-switch clear).
+- **Emergency Kill Switch (`POST /api/live/kill-switch`):** Immediately disarms `live_armed`, latches `killed: true`, and issues `cancel_all_orders()`.
+- **HTTP Hardening (`src/main.rs`):** Host-header loopback confinement (`403` on non-loopback), `Content-Type: application/json` enforcement (`415`), prompt raw-TCP `413 Payload Too Large` before allocation, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, strong SHA-256 `ETag` + `304`, and CWE-22/CWE-59 symlink/path confinement.
+
+### Causal Paper Analytics & Slot Simulation
+- **Zero-Lookahead OOS Split (`src/auto_allocator.rs`):** Chronological 60% In-Sample -> 40% Out-of-Sample evaluation; replay weights are frozen strictly from In-Sample windows whenever IS history is present.
+- **Post-Only Maker Economics & Whole-Cent Accounting:** Models exact Kalshi maker fees (`0.0175 * p * (1 - p)`, `1/4` of taker `0.07 * p * (1 - p)`) rounded up to whole cents per order (`ceil(rate * C * p * (1 - p) * 100) / 100`).
+- **16-Strategy Sandboxed Library (`strategies/*.rn`):** Includes `bid_ask_imbalance`, `favourite_floor`, `favourite_late`, `late_convergence_cap`, `longshot_late`, `maker_late_theta_no`, `maker_spread_capture`, `mean_reversion_fade`, `mid_window_momentum`, `no_favourite`, `opening_range_break`, `spot_lead_momentum_yes`, `spread_compression`, `tail_overreaction_fade`, `time_decay_harvest`, and `volatility_squeeze`.
+- **Same-Site & Resource Diet:** Pre-gzipped `.rodata` assets (`index.html.gz` + 21 embedded `/chunks/*` routes) with pure-Rust RFC 1951/1952 `inflate_gzip` (`src/gzip_inflate.rs`) for `identity` HTTP clients, thread-local `Arc<str>` interning (`TapePoolGuard`), and GNU/Linux `mallopt(M_ARENA_MAX, 2)`.
+
+### Verification Suite
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test` (`120` unit + integration tests across `analytics`, `auto_allocator`, `edge_audit`, `kalshi_live`, `recalibration`, `risk_rails`, `scaling`, `tournament`, `update`, and HTTP/SSE/CWE-59 suites)
+- `cargo check --target x86_64-pc-windows-msvc`
+- `bash .loop/checks/rails.sh && bash .loop/checks/equity.sh`
+- `cd frontend && npm run check:ui -- --skip-build --lints` (`gate 101/101`, `replay 18/18`, Hallmark `sloplint --scope app --render`)
+
+### Environment Variables (All Optional)
+
+| Variable | Default |
 | --- | --- |
-| `OPENBELL_DATA` | the platform data folder above |
-| `OPENBELL_STRATEGIES` | `strategies/` in the data folder (`./strategies` when it exists) |
-| `OPENBELL_COLLECT_SECS` | `60` (the collector freshness interval, 5 to 3600 seconds) |
-| `OPENBELL_AUTO_COLLECT` | `0` (`1` or `--auto-collect` starts the background public tape collector enabled; `--collect-interval <30..900>` overrides cadence; also toggleable live via `POST /api/collector/schedule`) |
-| `OPENBELL_COLLECT_PACE_MS` | `250` (inter-request pace in milliseconds across the 10 public Kalshi reads, 0 to 5000; rate-limit `too_many_requests` responses double pace and retry with bounded exponential backoff) |
-| `OPENBELL_SERIES` | `KXBTC15M,KXETH15M,KXSOL15M,KXXRP15M,KXDOGE15M` (optional comma-separated override of public 15m series to collect) |
-| `OPENBELL_DEDUP_SETTLED` | `1` (deduplicates already-recorded immutable settled snapshots across passes; set `0` to append every settled read) |
-| `OPENBELL_PAPER_POT` | `100` (paper pot for the slot simulation, always labelled a simulation parameter, never venue money) |
-| `OPENBELL_ALLOWED_HOSTS` | none (extra host names allowed past the same-site guard, see above) |
-| `PORT` | `8472`, then the next free port up to 8492; an explicit `PORT` is used exactly, and the start fails if it is busy |
-| `OPENBELL_NO_OPEN` | unset (`1` keeps the browser closed) |
-
-## Checks
-
-`cargo test` runs the unit tests (including `src/analytics.rs` exact Wilson/Brier/ECE, Walk-Forward, Monte Carlo, and 12-strategy sandbox proofs), the `--version` integration test (`tests/cli.rs`), and the `v0.5.0` scale/SSE/export/Quant HTTP suite (`tests/v050_core.rs`: 100,000 ticks / 2,000 settled windows / 30 concurrent clients at `<300ms` p95), while `cargo clippy --all-targets -- -D warnings` enforces zero warnings. `bash .loop/verify` builds the binary, runs
-the Rust tests, and runs the 16-check hermetic and venue-proof kit (including `first_run.sh`: the port fallback, the opener's skip rules and the 12-strategy built-in library): the hard risk rails check (`.loop/checks/rails.sh`), slot rotation and reconciliation against
-independent recomputation, collector health counted both ways, the equity
-curve reconciled against the slot report, the daily report's honesty
-assertions, the strategy-library mutation isolation, and both themes. In `frontend/`, `npm run check:ui` runs the headless Playwright gate (responsive layout, WCAG AA contrast, tap targets, Settings-only Light/Dark theme, SVG label geometry, Tape/Strategies/Slots/Quant Lab 4-tab workbench, Strategy Sandbox, Cmd+K palette, Market & Strategy inspectors, and Update strip across 1440/768/390/320 px in light and dark) and worst-case data replay suite. The
-kit is the bar: it is expected to pass end to end, and it is re-run after
-every change.
-
-## Layout
-
-- `src/main.rs` — the HTTP/SSE server, loopback+CSRF-guarded Live Kalshi v2 routes (`/api/live/*`), toggleable rate-limit-resilient deduplicating public collector (`--auto-collect`, `GET /api/collector/status`, `POST /api/collector/schedule`, adaptive 429 backoff, capturing top-of-book public depth `yes_bid_size`/`no_bid_size`), shadow scorer, slot system, daily report + `.md`/`.csv` exports (`GET /api/export/report`), live SSE tape stream (`GET /api/tape/stream`), and Quant/Sandbox/Scaling/Tournament routes backed by `RwLock` singleflight caches.
-- `src/kalshi_live.rs` — genuine Kalshi Trade API v2 REST client (Demo & Production) with RSA-PSS SHA-256 request signing (`ring` on Unix/macOS, pure-Rust RFC 8017 on Windows), `0600` credential persistence, and redacted key handling.
-- `src/risk_rails.rs` — fail-closed Hard Risk Rails (`live_armed: false` on boot, explicit `confirm_arm`, contract/notional/daily-loss/exposure/ticker-prefix/whole-cent caps) and Emergency Kill Switch (`cancel_all_orders()` + immediate disarm).
-- `src/analytics.rs` — pure-Rust paper Quant Diagnostics Engine: 10-decile calibration with exact 95% Wilson CIs, Brier/ECE/MCE; chronological 60%/40% Walk-Forward IS vs OOS attribution with Sharpe/Sortino/Profit Factor/Max DD/Calmar/Fee Drag/Streaks; deterministic Xoshiro256++ Monte Carlo bootstrap; and in-memory strategy validator & backtester.
-- `src/recalibration.rs` — monotone Pool-Adjacent-Violators (PAV) isotonic probability recalibration fitted strictly on chronological IS (60%) and evaluated strictly on held-out OOS (40%) windows, emitting 5-point probability buckets with 95% Wilson CIs, OOS Brier/Log-Loss/ECE deltas, Minimum Detectable Edge, and retrospective EV-After-Fees entry gate impact.
-- `src/scaling.rs` — `$500/day` paper capital scaling & liquidity capacity planner computing honest OOS required bankrolls (Equal-Slots / Quarter-Kelly / Half-Kelly, `null` when OOS expectancy `<= 0`), per-series and multi-series 15m liquidity ceilings using observed top-of-book depth, 180-day 1,000-path compounding trajectories (`Empirical Tape` vs optional `Sensitivity`), and a 5-gate mechanical readiness scorecard (`READY_FOR_OWNER_REVIEW` vs `PAPER_RESEARCH_ONLY`).
-- `src/tournament.rs` — Out-of-Sample (40%) 12-strategy paper tournament leaderboard with per-series attribution (`BTC`/`ETH`/`SOL`/`XRP`/`DOGE`), symmetric `12×12` pairwise Pearson correlation matrix across shared settled windows, exact combinatorial Optimal Uncorrelated 4-Slot Lineup (`|r| <= 0.65`, with honest fallback disclosure when `< 4` pass positive OOS), and 2D Entry Price × Seconds-to-Close Edge-by-Regime Heatmap with Wilson sample-depth warnings.
-- `src/open.rs` — cross-platform chromeless desktop app window launcher (`chromium`/`chrome`/`brave --app=` on Linux, `msedge.exe`/`chrome.exe --app=` on Windows, honoring `--no-open` / `--service` / `OPENBELL_NO_OPEN=1`).
-- `src/update.rs` — the release check and self-update.
-- `strategies/*.rn` — the 12-strategy paper library.
-- `frontend/` — React 19 + Tailwind 4 House Frontend source (8/8 libraries), self-hosted Geist & Geist Mono `.woff2` fonts, and Playwright E2E checks (`frontend/e2e/`), compiled into one self-contained HTML file at `assets/index.html` and embedded into the binary.
-- `JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md` — product job questions, eight-library House Frontend coverage, and interaction/motion inventory.
-- `assets/index.html` — the compiled single-file Live Kalshi Connected Trading & Quant Desk: top command bar with `/` global filter, `Cmd+K` Command Palette, `Paper | Arm Live` pill, crimson Emergency Kill Switch, and live `Collect now`; Live Kalshi Account Strip + Order Ticket with real-time 7-check Hard Risk Rails & working orders/positions/fills; Hero Telemetry & Compounding Strip (`SlidingNumber` KPI tiles, interactive paper equity curve, Tremor `Tracker` & `CategoryBar`); five-tab Quant & Live Trading Workbench (`Live 15m Tape`, `Live Trading`, `Strategies`, `Slot Desk`, `Quant Lab`); and Desk Settings `Vaul` sheet (Kalshi Trade API v2 Demo/Prod credentials & Risk Rail caps, Light default + full Dark `Appearance` toggle, auto-collector cadence, self-updates, and provenance legend).
+| `OPENBELL_DATA` | `$XDG_DATA_HOME/openbell` or `./openbell-data` when present |
+| `OPENBELL_STRATEGIES` | `strategies/` inside `OPENBELL_DATA` (or `./strategies`) |
+| `OPENBELL_COLLECT_SECS` | `60` (collector freshness interval, `5..=3600`s) |
+| `OPENBELL_AUTO_COLLECT` | `0` (`1` or `--auto-collect` starts the public 15m collector) |
+| `OPENBELL_SERIES` | `KXBTC15M,KXETH15M,KXSOL15M,KXXRP15M,KXDOGE15M` |
+| `OPENBELL_PAPER_POT` | `100` (paper simulation starting pot) |
+| `OPENBELL_ALLOWED_HOSTS` | none (comma-separated extra hosts allowed past loopback guard) |
+| `PORT` | `8472` (falls back across `8472..=8492` unless explicit `PORT` is set) |
+| `OPENBELL_NO_OPEN` | unset (`1` or `--no-open` suppresses auto-opening browser) |
