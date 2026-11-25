@@ -249,3 +249,57 @@ fn causal_signal_bar_truncation_and_1bar_lookahead_canary_via_http() {
         "1-bar lookahead canary failed: strategy entered without seeing future bar"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn cwe59_symlinks_on_tape_and_strategy_paths_are_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let base = std::env::temp_dir().join(format!("ob-v090-cwe59-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let data = base.join("data");
+    let strats = base.join("strategies");
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&strats).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+
+    let outside_tape = outside.join("outside_canary_tape.jsonl");
+    std::fs::write(
+        &outside_tape,
+        "{\"ticker\":\"CANARY_OUTSIDE_SECRET_DO_NOT_READ\",\"fetched_at\":1765000000,\"close_time\":\"2025-12-06T00:00:00Z\",\"yes_bid\":0.50,\"yes_ask\":0.51}\n",
+    )
+    .unwrap();
+    symlink(&outside_tape, data.join("escape-outside-snapshots.jsonl")).unwrap();
+
+    let outside_strat = outside.join("evil_strategy.rn");
+    std::fs::write(
+        &outside_strat,
+        "// CANARY_OUTSIDE_STRATEGY_DO_NOT_READ\npub fn strategy_name() { \"CANARY_EVIL\" }\npub fn side() { \"yes\" }\npub fn allow_entry(_t, _c, _yb, _ya, _nb, _na, _lp, _ttc) { false }\n",
+    )
+    .unwrap();
+    symlink(&outside_strat, strats.join("evil_strategy.rn")).unwrap();
+
+    let port = free_port();
+    let _guard = spawn_server(&base, port);
+
+    for path in [
+        "/api/markets?dataset=escape-outside",
+        "/api/markets/history?dataset=escape-outside&ticker=CANARY_OUTSIDE_SECRET_DO_NOT_READ",
+        "/api/strategies?dataset=escape-outside",
+        "/api/analytics/edge-audit?dataset=escape-outside",
+    ] {
+        let (st, body) = http_req(port, "GET", path, "");
+        assert_eq!(st, 403, "{path} must reject symlinked dataset with 403, got {st}: {body}");
+        assert!(
+            !body.contains("CANARY_OUTSIDE_SECRET_DO_NOT_READ"),
+            "outside canary leaked in {path}: {body}"
+        );
+    }
+
+    let (st_src, b_src) = http_req(port, "GET", "/api/strategy/source?name=CANARY_EVIL", "");
+    assert_eq!(st_src, 404, "symlinked strategy must not be loaded or exposed: {st_src} {b_src}");
+    assert!(!b_src.contains("CANARY_OUTSIDE_STRATEGY_DO_NOT_READ"));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
