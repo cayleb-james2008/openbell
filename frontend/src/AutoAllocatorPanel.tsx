@@ -111,6 +111,11 @@ export function AutoAllocatorPanel({
     strategy: string;
     result: LiveOrderPreflightResult;
   } | null>(null);
+  const [basketPreflight, setBasketPreflight] = useState<Array<{
+    strategy: string;
+    series: string;
+    result: LiveOrderPreflightResult;
+  }> | null>(null);
 
   const effectiveLiveStatus = useMemo(
     () => liveStatus ?? defaultLiveStatus("client"),
@@ -233,6 +238,59 @@ export function AutoAllocatorPanel({
     const open = markets.find((m) => m && (!m.result || m.result === ""));
     return open?.ticker || markets[0]?.ticker || "KXBTC15M-DEMO";
   }, [markets]);
+
+  const openTickerForSeries = useCallback(
+    (series: string) => {
+      const openMatch = markets.find(
+        (m) => m && (!m.result || m.result === "") && (m.series === series || m.ticker?.startsWith(series)),
+      );
+      return openMatch?.ticker || activeOpenTicker;
+    },
+    [markets, activeOpenTicker],
+  );
+
+  const stageBestBasketPreflight = useCallback(async () => {
+    const basket = report?.best_basket;
+    if (!basket || basket.legs.length === 0) return;
+    setPreflightBusy("__basket__");
+    try {
+      const seriesByStrat = new Map<string, string>();
+      for (const row of report?.edge_screener ?? []) {
+        seriesByStrat.set(row.strategy, row.top_series);
+      }
+      const checked: Array<{ strategy: string; series: string; result: LiveOrderPreflightResult }> = [];
+      for (const leg of basket.legs) {
+        const series = seriesByStrat.get(leg.strategy) || "KXBTC15M";
+        const ticker = openTickerForSeries(series);
+        const res = await preflightLiveOrder(
+          {
+            ticker,
+            action: "buy",
+            side: leg.side === "no" ? "no" : "yes",
+            count: Math.max(1, leg.target_contracts),
+            price_cents: Math.min(99, Math.max(1, leg.max_limit_cents)),
+            post_only: leg.post_only,
+          },
+          effectiveLiveStatus,
+          home,
+        );
+        checked.push({ strategy: leg.strategy, series, result: res });
+      }
+      setBasketPreflight(checked);
+      const passed = checked.filter((x) => x.result.allowed).length;
+      if (passed === checked.length) {
+        toast.success(
+          `Basket dry-run preflight passed (${passed}/${checked.length} legs); live_armed remains disarmed.`,
+        );
+      } else {
+        toast.warning(
+          `Basket preflight: ${passed}/${checked.length} legs cleared Hard Risk Rails.`,
+        );
+      }
+    } finally {
+      setPreflightBusy(null);
+    }
+  }, [report?.best_basket, report?.edge_screener, openTickerForSeries, effectiveLiveStatus, home]);
 
   const runPreflightForWinner = useCallback(
     async (w: AutoAllocatorReport["active_winners"][number]) => {
@@ -447,6 +505,18 @@ export function AutoAllocatorPanel({
               <span>{preflightBusy === filteredWinners[0].strategy ? "Checking Rails…" : "Preflight Top"}</span>
             </Button>
           )}
+          {report?.best_basket?.ready_for_dry_run_preflight && (
+            <Button
+              id="allocator-stage-basket-btn"
+              variant="outline"
+              size="sm"
+              disabled={preflightBusy !== null}
+              onClick={() => void stageBestBasketPreflight()}
+            >
+              <SlidersHorizontal className="size-3.5" aria-hidden />
+              <span>{preflightBusy === "__basket__" ? "Staging Basket…" : `Stage Best Basket (${report.best_basket.legs.length})`}</span>
+            </Button>
+          )}
           {onOpenFullAudit && (
             <Button
               variant="outline"
@@ -622,6 +692,71 @@ export function AutoAllocatorPanel({
         </div>
       )}
 
+      {/* Multi-Leg Best Basket Dry-Run Preflight Preview */}
+      {basketPreflight && basketPreflight.length > 0 && (
+        <div
+          id="allocator-basket-preflight-card"
+          role="region"
+          aria-label="Best basket dry-run preflight"
+          className="mt-3 rounded-[10px] border border-hairline bg-board/70 px-3.5 py-3 text-xs"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <StatusPill
+                tone={basketPreflight.every((b) => b.result.allowed) ? "success" : "warning"}
+              >
+                {`Basket Dry-Run: ${basketPreflight.filter((b) => b.result.allowed).length}/${basketPreflight.length} Rails OK`}
+              </StatusPill>
+              <span className="mono text-ink-2">
+                Notional {money(basketPreflight.reduce((s, b) => s + b.result.orderNotionalDollars, 0))} | Maker Fees{" "}
+                {money(basketPreflight.reduce((s, b) => s + b.result.estFeeDollars, 0))} | live_armed=false
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {onStageOrder && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    const lead = basketPreflight[0].result;
+                    onStageOrder({
+                      ticker: lead.ticker,
+                      side: lead.side,
+                      count: lead.count,
+                      priceCents: lead.priceCents,
+                      postOnly: lead.postOnly,
+                    });
+                  }}
+                >
+                  Open Lead Leg in Ticket
+                </Button>
+              )}
+              <Button size="sm" variant="ghost" onClick={() => setBasketPreflight(null)}>
+                Dismiss
+              </Button>
+            </div>
+          </div>
+          <div className="mt-2 grid grid-cols-1 gap-2 border-t border-hairline pt-2 sm:grid-cols-2">
+            {basketPreflight.map((leg) => (
+              <div
+                key={leg.strategy}
+                className="flex flex-wrap items-center justify-between gap-1.5 rounded-md border border-hairline bg-surface px-2.5 py-1.5"
+              >
+                <span className="font-medium text-ink">
+                  {leg.strategy} <span className="mono text-ink-3">({leg.series})</span>
+                </span>
+                <span className="mono text-ink-2">
+                  {leg.result.count}x {leg.result.side.toUpperCase()} @ {leg.result.priceCents}c{" "}
+                  <span className={leg.result.allowed ? "text-success-foreground" : "text-destructive-foreground"}>
+                    {leg.result.allowed ? "OK" : "Blocked"}
+                  </span>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Zero-Bloat Custom SVG Comparison Chart */}
       <div className="mt-3.5 rounded-[10px] border border-hairline bg-board/40 p-3.5">
         <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
@@ -738,6 +873,83 @@ export function AutoAllocatorPanel({
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* Multi-Market Spread / Fee / Edge Quality Screener */}
+          {report.edge_screener.length > 0 && (
+            <div
+              id="allocator-edge-screener"
+              className="overflow-hidden rounded-[10px] border border-hairline bg-surface"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-board/50 px-3.5 py-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-ink">
+                    Causal Edge Quality Screener ({report.edge_screener.length})
+                  </span>
+                  <Badge variant="outline" className="mono text-xs text-ink-2">
+                    {report.best_basket.summary}
+                  </Badge>
+                </div>
+              </div>
+              <Table className="stack">
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>#</TableHead>
+                    <TableHead>Strategy / Series</TableHead>
+                    <TableHead className="text-right">Maker Net EV</TableHead>
+                    <TableHead className="text-right">Fee Saved</TableHead>
+                    <TableHead className="text-right">Fill Headroom</TableHead>
+                    <TableHead className="text-right">WF Folds</TableHead>
+                    <TableHead className="text-right">Daily $ (% $500)</TableHead>
+                    <TableHead className="text-right">Score / Verdict</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {report.edge_screener.slice(0, 8).map((row) => (
+                    <TableRow key={row.strategy}>
+                      <TableCell className="mono text-xs text-ink-3">{row.rank}</TableCell>
+                      <TableCell className="m-grow max-w-[220px] break-all text-xs font-medium text-ink">
+                        <div>{row.strategy}</div>
+                        <div className="mono text-ink-3">
+                          {row.top_series} ({row.side.toUpperCase()} @ {row.avg_entry_cents}c)
+                        </div>
+                      </TableCell>
+                      <TableCell
+                        className={
+                          "mono text-right text-xs font-semibold " +
+                          (row.oos_net_expectancy_cents > 0 ? "text-success-foreground" : "text-destructive-foreground")
+                        }
+                      >
+                        {fmtCents(row.oos_net_expectancy_cents)}
+                      </TableCell>
+                      <TableCell className="mono text-right text-xs text-info-foreground">
+                        +{row.fee_edge_saved_cents.toFixed(2)}c
+                      </TableCell>
+                      <TableCell
+                        className={
+                          "mono text-right text-xs " +
+                          (row.fill_headroom_pct >= 0 ? "text-success-foreground" : "text-destructive-foreground")
+                        }
+                      >
+                        {row.fill_headroom_pct >= 0 ? "+" : ""}
+                        {row.fill_headroom_pct.toFixed(0)}pp
+                      </TableCell>
+                      <TableCell className="mono text-right text-xs text-ink-2">
+                        {row.folds_total > 0 ? `${row.folds_positive}/${row.folds_total}` : "-"}
+                      </TableCell>
+                      <TableCell className="mono text-right text-xs text-ink">
+                        {money(row.daily_dollar_contribution)} ({row.daily_target_share_pct.toFixed(1)}%)
+                      </TableCell>
+                      <TableCell className="m-right text-right text-xs">
+                        <StatusPill tone={row.basket_eligible ? "success" : "neutral"}>
+                          {row.edge_quality_score.toFixed(0)} | {row.basket_eligible ? "Eligible" : row.verdict}
+                        </StatusPill>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
             </div>
           )}
         </div>
