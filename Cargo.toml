@@ -1,13 +1,13 @@
 [package]
 name = "openbell-rs"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
-opt-level = "s"
+opt-level = "z"
 panic = "abort"
 
 [profile.release.package."*"]
@@ -17,6 +17,15 @@ opt-level = "z"
 opt-level = 3
 
 [profile.release.package.serde_json]
+opt-level = 3
+
+[profile.release.package.memchr]
+opt-level = 3
+
+[profile.release.package.itoa]
+opt-level = 3
+
+[profile.release.package.ryu]
 opt-level = 3
 
 [dependencies]

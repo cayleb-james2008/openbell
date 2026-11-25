@@ -1,17 +1,17 @@
 # OpenBell
 
-![version](https://img.shields.io/badge/version-v0.17.0-0969da?style=flat-square)
+![version](https://img.shields.io/badge/version-v0.18.0-0969da?style=flat-square)
 ![stack](https://img.shields.io/badge/stack-Rust%20%2B%20React%2019-111827?style=flat-square)
-![tests](https://img.shields.io/badge/tests-122%2F122%20pass-16a34a?style=flat-square)
-![binary](https://img.shields.io/badge/release%20binary-6.09%20MB-0969da?style=flat-square)
+![tests](https://img.shields.io/badge/tests-123%2F123%20pass-16a34a?style=flat-square)
+![binary](https://img.shields.io/badge/release%20binary-5.90%20MB-0969da?style=flat-square)
 ![safety](https://img.shields.io/badge/live__armed-false%20on%20boot-16a34a?style=flat-square)
 
-**A high-speed Rust Kalshi Connected Trading & Quant Workbench for 15-minute markets** — pairing a fail-closed RSA-PSS Kalshi Trade API v2 client (`live_armed: false` on every boot, 7 Hard Risk Rails, Emergency Kill Switch) with a deduplicating public 15m tape collector, 16-strategy paper slot simulator, causal Post-Only Maker Auto-Allocator, Edge Quality Screener, 1,000-trial 30-day Bootstrap Tail-Risk Simulator, Zero-Config Strategy Leaderboard, and Paper Forward-Test Envelope Drift Monitor with 1-click safe rotation.
+**A high-speed Rust Kalshi Connected Trading & Quant Workbench for 15-minute markets** — pairing a fail-closed RSA-PSS Kalshi Trade API v2 client (`live_armed: false` on every boot, 7 Hard Risk Rails, Emergency Kill Switch) with a deduplicating public 15m tape collector, 16-strategy paper slot simulator, causal Post-Only Maker Auto-Allocator with cross-asset (`BTC`/`ETH`/`SOL`/`XRP`/`DOGE`) correlation cluster guard & `Diversified Safe Basket`, Edge Quality Screener, 1,000-trial 30-day Bootstrap Tail-Risk Simulator, Zero-Config Strategy Leaderboard, and Paper Forward-Test Envelope Drift Monitor with 1-click safe rotation.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/hero-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/hero-light.png">
-  <img alt="OpenBell v0.17.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
+  <img alt="OpenBell v0.18.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
 </picture>
 
 ---
@@ -32,7 +32,7 @@
     </td>
     <td width="50%" valign="top">
       <strong>30-Day Bootstrap Simulator &amp; Zero-Config Strategy Leaderboard</strong><br>
-      <sub>Resamples 1,000 deterministic trajectories across 30 days (96 15m windows/day) under <code>+0c</code> and <code>+1c</code> adverse-fill slippage, ranks 5 calibrated presets against a hard <code>0.0%</code> daily rail-breach gate, and applies Top Safe to paper forward-testing or exports Audit JSON in 1 click.</sub>
+      <sub>Resamples 1,000 deterministic trajectories across 30 days (96 15m windows/day) under <code>+0c</code> and <code>+1c</code> adverse-fill slippage, ranks 6 calibrated presets (including <code>Diversified Safe Basket</code>) against a hard <code>0.0%</code> daily rail-breach gate, caps correlated cross-asset clusters, and exports Audit JSON in 1 click.</sub>
       <br><br>
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/stress-test-dark.png">
@@ -61,18 +61,18 @@ flowchart LR
 
 ---
 
-## Verified Benchmarks (`v0.17.0` vs `v0.10.0`)
+## Verified Benchmarks (`v0.18.0` vs `v0.10.0`)
 
-Measured on a 102k-tick / 1,020 settled window 15-minute tape (`v0.10.0` baseline from cold `scale-audit`; `v0.17.0` measured post-edit on `:18445` under `taskset -c 24-31` with 14 workers):
+Measured on a 102k-tick / 1,020 settled window 15-minute tape (`v0.10.0` baseline from cold `scale-audit`; `v0.18.0` measured post-edit on `:18445` under `taskset -c 24-31` with 14 workers):
 
-| Metric | `v0.10.0` Baseline | `v0.17.0` Verified | Delta |
+| Metric | `v0.10.0` Baseline | `v0.18.0` Verified | Delta |
 | --- | --- | --- | --- |
-| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`6.09 MB`** (`6,382,944 B`) | **`-42.9%`** (`-53.2%` vs `v0.9.0`) |
-| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`95,031 B`** / **`21,928 B`** (`21` `/chunks/*`) | **`-94.8%` wire bytes** |
-| Cold boot to first `HTTP 200` | `9.11 ms` | **`7.80 ms`** | **`-14.4%`** |
-| Peak RSS (`VmHWM`) after core / full analytics | `125.55 MB` (`128,560 KB`) | **`26.09 MB`** (`26,712 KB`) core / `42.51 MB` full | **`-79.2%` core** |
-| Concurrent HTTP throughput | `4,921.3 req/s` (30w) | **`4,275.2 req/s`** (`3.03 ms` p50, `5.90 ms` p95, 14w, `0` err) | **`+3.6x` vs `v0.9.0`** |
-| Test & mechanical verification | — | **`122/122` Rust tests**, `gate 101/101`, `replay 18/18`, `sloplint 0 FAIL/WARN`, `RAILS OK`, `EQUITY OK` | Clean |
+| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`5.90 MB`** (`6,186,336 B`) | **`-44.7%`** |
+| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`95,073 B`** / **`21,935 B`** (`21` `/chunks/*`) | **`-94.8%` wire bytes** |
+| Cold boot to first `HTTP 200` (warmed median) | `9.11 ms` | **`4.18 ms`** | **`-54.1%`** |
+| Peak RSS (`VmHWM`) after core / full analytics | `125.55 MB` (`128,560 KB`) | **`23.20 MB`** (`23,752 KB`) core / `26.62 MB` (`27,256 KB`) full | **`-81.5%` core** |
+| Concurrent HTTP throughput | `4,921.3 req/s` (30w) | **`3,673.9 req/s`** (`3.56 ms` p50, `6.61 ms` p95, 14w, `0` err) | Clean (`0` err) |
+| Test & mechanical verification | — | **`123/123` Rust tests**, `gate 101/101`, `replay 18/18`, `sloplint 0 FAIL/WARN`, `RAILS OK`, `EQUITY OK` | Clean |
 
 ---
 
@@ -106,7 +106,7 @@ Open `http://127.0.0.1:18440/?dataset=fixture` to inspect the 15-minute fixture 
 
 ### Verification Suite
 - `cargo clippy --all-targets -- -D warnings`
-- `cargo test` (`120` unit + integration tests across `analytics`, `auto_allocator`, `edge_audit`, `kalshi_live`, `recalibration`, `risk_rails`, `scaling`, `tournament`, `update`, and HTTP/SSE/CWE-59 suites)
+- `cargo test` (`123` unit + integration tests across `analytics`, `auto_allocator`, `edge_audit`, `kalshi_live`, `recalibration`, `risk_rails`, `scaling`, `tournament`, `update`, and HTTP/SSE/CWE-59 suites)
 - `cargo check --target x86_64-pc-windows-msvc`
 - `bash .loop/checks/rails.sh && bash .loop/checks/equity.sh`
 - `cd frontend && npm run check:ui -- --skip-build --lints` (`gate 101/101`, `replay 18/18`, Hallmark `sloplint --scope app --render`)
