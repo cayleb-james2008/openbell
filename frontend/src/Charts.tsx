@@ -1879,3 +1879,143 @@ export function AllocatorComparisonChart({
     </div>
   );
 }
+
+/** Zero-bloat SVG percentile fan chart for 1,000-trial 30-day causal OOS bootstrap equity stress (+0c vs +1c). */
+export function BootstrapStressFanChart({
+  trajectory,
+  startingBankroll,
+}: {
+  trajectory: Array<{
+    day: number;
+    p5_equity: number;
+    p50_equity: number;
+    p95_equity: number;
+    stress_1c_p50_equity: number;
+  }>;
+  startingBankroll: number;
+}) {
+  const [ref, width] = useContainerWidth(180, 640);
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const W = Math.max(180, Math.round(width));
+  const H = 200;
+  const pad = { l: 60, r: 16, t: 16, b: 28 };
+  const plotW = W - pad.l - pad.r;
+  const plotH = H - pad.t - pad.b;
+  const fmtTick = (v: number) =>
+    Math.abs(v) >= 1_000_000
+      ? `$${(v / 1_000_000).toFixed(1)}M`
+      : Math.abs(v) >= 10_000
+        ? `$${(v / 1_000).toFixed(1)}K`
+        : `$${Math.round(v)}`;
+
+  const geom = useMemo(() => {
+    if (trajectory.length < 2) return null;
+    let lo = startingBankroll;
+    let hi = startingBankroll;
+    for (const pt of trajectory) {
+      if (pt.p5_equity < lo) lo = pt.p5_equity;
+      if (pt.stress_1c_p50_equity < lo) lo = pt.stress_1c_p50_equity;
+      if (pt.p95_equity > hi) hi = pt.p95_equity;
+    }
+    const span = Math.max(2, hi - lo);
+    const minY = Math.max(0, lo - span * 0.08);
+    const maxY = hi + span * 0.08;
+    const ySpan = Math.max(1e-6, maxY - minY);
+    const xAt = (i: number) => pad.l + (i / Math.max(1, trajectory.length - 1)) * plotW;
+    const yAt = (v: number) => pad.t + plotH - ((v - minY) / ySpan) * plotH;
+
+    const p95Top = trajectory.map((pt, i) => `${xAt(i).toFixed(1)},${yAt(pt.p95_equity).toFixed(1)}`);
+    const p5Bot = trajectory
+      .slice()
+      .reverse()
+      .map((pt, i) => `${xAt(trajectory.length - 1 - i).toFixed(1)},${yAt(pt.p5_equity).toFixed(1)}`);
+    const bandPath = `M${p95Top.join(" L")} L${p5Bot.join(" L")} Z`;
+    const p50Path = trajectory
+      .map((pt, i) => `${i === 0 ? "M" : "L"}${xAt(i).toFixed(1)},${yAt(pt.p50_equity).toFixed(1)}`)
+      .join(" ");
+    const stress1cPath = trajectory
+      .map((pt, i) => `${i === 0 ? "M" : "L"}${xAt(i).toFixed(1)},${yAt(pt.stress_1c_p50_equity).toFixed(1)}`)
+      .join(" ");
+    return {
+      minY,
+      ySpan,
+      bandPath,
+      p50Path,
+      stress1cPath,
+      yTicks: [minY, (minY + maxY) / 2, maxY],
+      baseY: yAt(startingBankroll),
+    };
+  }, [trajectory, startingBankroll, plotW, plotH]);
+
+  if (!geom || trajectory.length < 2) {
+    return (
+      <div ref={ref} className="w-full min-w-0">
+        <div className="flex h-40 items-center justify-center rounded-md border border-dashed border-hairline bg-surface/60 px-4 text-center text-xs text-ink-2">
+          Awaiting OOS causal returns to project 1,000-trial 30-day bootstrap trajectories.
+        </div>
+      </div>
+    );
+  }
+
+  const xAt = (i: number) => pad.l + (i / Math.max(1, trajectory.length - 1)) * plotW;
+  const yAt = (v: number) => pad.t + plotH - ((v - geom.minY) / geom.ySpan) * plotH;
+  const ai = hoverIdx !== null && hoverIdx >= 0 && hoverIdx < trajectory.length ? hoverIdx : trajectory.length - 1;
+  const pt = trajectory[ai];
+
+  return (
+    <div ref={ref} className="w-full space-y-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-xs text-ink-2">
+        <span>Day {pt.day} of {trajectory[trajectory.length - 1].day}</span>
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="text-ink-2">P5 {money(pt.p5_equity)}</span>
+          <span className="font-semibold text-info-foreground">P50 {money(pt.p50_equity)}</span>
+          <span className="text-warning-foreground">+1c {money(pt.stress_1c_p50_equity)}</span>
+          <span className="text-success-foreground">P95 {money(pt.p95_equity)}</span>
+        </div>
+      </div>
+
+      <svg
+        role="img"
+        aria-label="30-day causal OOS bootstrap equity fan chart (+0c vs +1c adverse fill)"
+        viewBox={`0 0 ${W} ${H}`}
+        width={W}
+        height={H}
+        className="block h-auto max-w-full select-none"
+        onMouseLeave={() => setHoverIdx(null)}
+        onMouseMove={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          const px = ((e.clientX - rect.left) / Math.max(1, rect.width)) * W;
+          const frac = Math.min(1, Math.max(0, (px - pad.l) / Math.max(1, plotW)));
+          setHoverIdx(Math.round(frac * (trajectory.length - 1)));
+        }}
+      >
+        {geom.yTicks.map((tick, idx) => {
+          const y = yAt(tick);
+          return (
+            <g key={idx}>
+              <line x1={pad.l} y1={y} x2={W - pad.r} y2={y} style={{ stroke: "var(--hairline)", strokeDasharray: "3 3" }} />
+              <text x={pad.l - 8} y={y + 4} textAnchor="end" fontSize={12} className="font-mono tabular-nums" style={{ fill: "var(--ink-3)" }}>
+                {fmtTick(tick)}
+              </text>
+            </g>
+          );
+        })}
+        {geom.baseY >= pad.t && geom.baseY <= H - pad.b && (
+          <line x1={pad.l} y1={geom.baseY} x2={W - pad.r} y2={geom.baseY} style={{ stroke: "var(--ink-3)", strokeDasharray: "2 4", opacity: 0.6 }} />
+        )}
+        <path d={geom.bandPath} style={{ fill: "var(--blue)", opacity: 0.14 }} />
+        <path d={geom.stress1cPath} fill="none" strokeWidth={1.75} strokeDasharray="4 4" style={{ stroke: "var(--dot-amber)" }} />
+        <path d={geom.p50Path} fill="none" strokeWidth={2.25} style={{ stroke: "var(--blue)" }} />
+        <line x1={xAt(ai)} y1={pad.t} x2={xAt(ai)} y2={H - pad.b} style={{ stroke: "var(--hairline)" }} />
+        <circle cx={xAt(ai)} cy={yAt(pt.p50_equity)} r={4} style={{ fill: "var(--blue)" }} />
+        <circle cx={xAt(ai)} cy={yAt(pt.stress_1c_p50_equity)} r={3.5} style={{ fill: "var(--dot-amber)" }} />
+        <text x={pad.l} y={H - 8} textAnchor="start" fontSize={12} className="font-mono" style={{ fill: "var(--ink-3)" }}>
+          Day 0
+        </text>
+        <text x={W - pad.r} y={H - 8} textAnchor="end" fontSize={12} className="font-mono" style={{ fill: "var(--ink-3)" }}>
+          Day {trajectory[trajectory.length - 1].day}
+        </text>
+      </svg>
+    </div>
+  );
+}

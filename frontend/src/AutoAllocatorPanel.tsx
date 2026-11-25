@@ -17,7 +17,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui";
-import { AllocatorComparisonChart, ProvenanceTag } from "@/Charts";
+import { AllocatorComparisonChart, BootstrapStressFanChart, ProvenanceTag } from "@/Charts";
 import {
   type Dataset,
   type Home,
@@ -784,6 +784,69 @@ export function AutoAllocatorPanel({
           execLabel={EXEC_LABELS[activeExec]}
         />
       </div>
+
+      {/* 1,000-Trial Causal Bootstrap Equity & Drawdown Stress Simulator */}
+      {report?.bootstrap_stress && (
+        <div
+          id="allocator-bootstrap-stress"
+          className="mt-3.5 space-y-3 rounded-[10px] border border-hairline bg-board/40 p-3.5"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-semibold text-ink">
+                30-Day Causal Bootstrap Tail Risk ({report.bootstrap_stress.trials.toLocaleString()} Trials)
+              </span>
+              <Badge variant="outline" className="mono text-xs text-ink-2">
+                {report.bootstrap_stress.oos_sample_windows} OOS windows
+              </Badge>
+            </div>
+            <span className="mono text-ink-2">{report.bootstrap_stress.summary}</span>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">30d P50 Equity (+1c)</div>
+              <div className="mono mt-0.5 font-semibold text-info-foreground">
+                {money(report.bootstrap_stress.p50_end_equity)}{" "}
+                <span className="text-ink-2">({money(report.bootstrap_stress.stress_1c_p50_end_equity)})</span>
+              </div>
+            </div>
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">P95 Max DD (+1c)</div>
+              <div className="mono mt-0.5 font-semibold text-warning-foreground">
+                {fmtPct(report.bootstrap_stress.p95_max_drawdown_pct, 1)}{" "}
+                <span className="text-ink-2">({fmtPct(report.bootstrap_stress.stress_1c_p95_max_drawdown_pct, 1)})</span>
+              </div>
+            </div>
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">Daily Rail Breach Prob</div>
+              <div
+                className={
+                  "mono mt-0.5 font-semibold " +
+                  (report.bootstrap_stress.daily_rail_breach_prob_pct <= 2.0
+                    ? "text-success-foreground"
+                    : "text-destructive-foreground")
+                }
+              >
+                {fmtPct(report.bootstrap_stress.daily_rail_breach_prob_pct, 1)}{" "}
+                <span className="text-ink-2">({fmtPct(report.bootstrap_stress.stress_1c_daily_rail_breach_prob_pct, 1)} @ +1c)</span>
+              </div>
+            </div>
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">P(&ge; $500/day)</div>
+              <div className="mono mt-0.5 font-semibold text-ink">
+                {fmtPct(report.bootstrap_stress.prob_500_day_pct, 1)}{" "}
+                <span className="text-ink-2">({fmtPct(report.bootstrap_stress.stress_1c_prob_500_day_pct, 1)} @ +1c)</span>
+              </div>
+            </div>
+          </div>
+
+          <BootstrapStressFanChart
+            trajectory={report.bootstrap_stress.trajectory}
+            startingBankroll={report.starting_bankroll}
+          />
+        </div>
+      )}
 
       {/* Per-Regime, Maker Fill Sensitivity & Shadow Drift Gauge */}
       {report && (report.regime_attribution.length > 0 || report.fill_sensitivity.length > 0) && (

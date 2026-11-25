@@ -71,6 +71,35 @@ export type BestBasketPlan = {
   summary: string;
 };
 
+export type BootstrapEquityPoint = {
+  day: number;
+  p5_equity: number;
+  p50_equity: number;
+  p95_equity: number;
+  stress_1c_p50_equity: number;
+};
+
+export type BootstrapStressSummary = {
+  trials: number;
+  horizon_days: number;
+  windows_per_day: number;
+  oos_sample_windows: number;
+  p5_end_equity: number;
+  p50_end_equity: number;
+  p95_end_equity: number;
+  p95_max_drawdown_pct: number;
+  daily_rail_breach_prob_pct: number;
+  prob_500_day_pct: number;
+  stress_1c_p5_end_equity: number;
+  stress_1c_p50_end_equity: number;
+  stress_1c_p95_end_equity: number;
+  stress_1c_p95_max_drawdown_pct: number;
+  stress_1c_daily_rail_breach_prob_pct: number;
+  stress_1c_prob_500_day_pct: number;
+  trajectory: BootstrapEquityPoint[];
+  summary: string;
+};
+
 export type RegimeEdgeBucket = {
   regime: string;
   trades: number;
@@ -191,6 +220,7 @@ export type AutoAllocatorReport = {
   drift_gauge: DriftGauge;
   edge_screener: EdgeScreenerRow[];
   best_basket: BestBasketPlan;
+  bootstrap_stress: BootstrapStressSummary;
   comparison: AllocatorComparison;
   planned_intents: PlannedAllocatorIntent[];
   daily_target: DailyTargetVerdict;
@@ -244,6 +274,8 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
   const screenerRaw = Array.isArray(o.edge_screener) ? o.edge_screener : [];
   const basketRaw = (o.best_basket && typeof o.best_basket === "object" ? o.best_basket : {}) as Record<string, unknown>;
   const basketLegsRaw = Array.isArray(basketRaw.legs) ? basketRaw.legs : [];
+  const bsRaw = (o.bootstrap_stress && typeof o.bootstrap_stress === "object" ? o.bootstrap_stress : {}) as Record<string, unknown>;
+  const bsTrajRaw = Array.isArray(bsRaw.trajectory) ? bsRaw.trajectory : [];
   const intentsRaw = Array.isArray(o.planned_intents) ? o.planned_intents : [];
   const notesRaw = Array.isArray(o.honesty_notes) ? o.honesty_notes : [];
   const compRaw = (o.comparison && typeof o.comparison === "object" ? o.comparison : {}) as Record<string, unknown>;
@@ -393,6 +425,34 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
       ready_for_dry_run_preflight: Boolean(basketRaw.ready_for_dry_run_preflight),
       summary: strOr(basketRaw.summary, "No basket-eligible causal winners."),
     },
+    bootstrap_stress: {
+      trials: Math.max(0, Math.round(finiteOr(bsRaw.trials, 1000))),
+      horizon_days: Math.max(1, Math.round(finiteOr(bsRaw.horizon_days, 30))),
+      windows_per_day: Math.max(1, Math.round(finiteOr(bsRaw.windows_per_day, 96))),
+      oos_sample_windows: Math.max(0, Math.round(finiteOr(bsRaw.oos_sample_windows, 0))),
+      p5_end_equity: finiteOr(bsRaw.p5_end_equity, startEq),
+      p50_end_equity: finiteOr(bsRaw.p50_end_equity, startEq),
+      p95_end_equity: finiteOr(bsRaw.p95_end_equity, startEq),
+      p95_max_drawdown_pct: finiteOr(bsRaw.p95_max_drawdown_pct, 0),
+      daily_rail_breach_prob_pct: finiteOr(bsRaw.daily_rail_breach_prob_pct, 0),
+      prob_500_day_pct: finiteOr(bsRaw.prob_500_day_pct, 0),
+      stress_1c_p5_end_equity: finiteOr(bsRaw.stress_1c_p5_end_equity, startEq),
+      stress_1c_p50_end_equity: finiteOr(bsRaw.stress_1c_p50_end_equity, startEq),
+      stress_1c_p95_end_equity: finiteOr(bsRaw.stress_1c_p95_end_equity, startEq),
+      stress_1c_p95_max_drawdown_pct: finiteOr(bsRaw.stress_1c_p95_max_drawdown_pct, 0),
+      stress_1c_daily_rail_breach_prob_pct: finiteOr(bsRaw.stress_1c_daily_rail_breach_prob_pct, 0),
+      stress_1c_prob_500_day_pct: finiteOr(bsRaw.stress_1c_prob_500_day_pct, 0),
+      trajectory: bsTrajRaw
+        .filter((pt): pt is Record<string, unknown> => !!pt && typeof pt === "object")
+        .map((pt, i) => ({
+          day: Math.max(0, Math.round(finiteOr(pt.day, i))),
+          p5_equity: finiteOr(pt.p5_equity, startEq),
+          p50_equity: finiteOr(pt.p50_equity, startEq),
+          p95_equity: finiteOr(pt.p95_equity, startEq),
+          stress_1c_p50_equity: finiteOr(pt.stress_1c_p50_equity, startEq),
+        })),
+      summary: strOr(bsRaw.summary, "Awaiting OOS causal bootstrap stress simulation."),
+    },
     comparison: {
       selection_basis: strOr(compRaw.selection_basis, "causal_is_to_oos"),
       legacy_equal_taker_end_equity: finiteOr(compRaw.legacy_equal_taker_end_equity, startEq),
@@ -487,6 +547,26 @@ export function computeClientFallbackReport(
         avg_fill_headroom_pct: 0,
         ready_for_dry_run_preflight: false,
         summary: "No basket-eligible causal winners.",
+      },
+      bootstrap_stress: {
+        trials: 1000,
+        horizon_days: 30,
+        windows_per_day: 96,
+        oos_sample_windows: 0,
+        p5_end_equity: startEq,
+        p50_end_equity: startEq,
+        p95_end_equity: startEq,
+        p95_max_drawdown_pct: 0,
+        daily_rail_breach_prob_pct: 0,
+        prob_500_day_pct: 0,
+        stress_1c_p5_end_equity: startEq,
+        stress_1c_p50_end_equity: startEq,
+        stress_1c_p95_end_equity: startEq,
+        stress_1c_p95_max_drawdown_pct: 0,
+        stress_1c_daily_rail_breach_prob_pct: 0,
+        stress_1c_prob_500_day_pct: 0,
+        trajectory: [],
+        summary: "Awaiting OOS trades for 1,000-trial causal bootstrap simulation.",
       },
       comparison: {
         selection_basis: "causal_is_to_oos",
@@ -764,6 +844,26 @@ export function computeClientFallbackReport(
       avg_fill_headroom_pct: 0,
       ready_for_dry_run_preflight: planned_intents.some((it) => it.target_contracts >= 1),
       summary: "Offline preview basket.",
+    },
+    bootstrap_stress: {
+      trials: 1000,
+      horizon_days: 30,
+      windows_per_day: 96,
+      oos_sample_windows: settledOos,
+      p5_end_equity: startEq,
+      p50_end_equity: startEq,
+      p95_end_equity: startEq,
+      p95_max_drawdown_pct: allocMaxDd,
+      daily_rail_breach_prob_pct: 0,
+      prob_500_day_pct: 0,
+      stress_1c_p5_end_equity: startEq,
+      stress_1c_p50_end_equity: startEq,
+      stress_1c_p95_end_equity: startEq,
+      stress_1c_p95_max_drawdown_pct: allocMaxDd,
+      stress_1c_daily_rail_breach_prob_pct: 0,
+      stress_1c_prob_500_day_pct: 0,
+      trajectory: [],
+      summary: "Client fallback preview; run server pipeline for 1,000-trial bootstrap simulation.",
     },
     comparison: {
       selection_basis: isTrades.length > 0 ? "causal_is_to_oos" : "oos_only_no_is_history",
