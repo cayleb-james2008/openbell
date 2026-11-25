@@ -479,6 +479,26 @@ pub struct DiversificationGuardReport {
     pub summary: String,
 }
 
+/// Concise session briefing & slippage attribution report for 1-click copy/download (`live_armed: false`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionBriefingReport {
+    pub status: String,
+    pub live_armed: bool,
+    pub expected_fill_edge_cents: Option<f64>,
+    pub realized_fill_edge_cents: Option<f64>,
+    pub fill_edge_delta_cents: Option<f64>,
+    pub fee_drag_cents: f64,
+    pub maker_fee_savings_dollars: f64,
+    pub correlation_cluster_penalty_pct: f64,
+    pub daily_loss_rail_dollars: f64,
+    pub projected_worst_day_loss_dollars: f64,
+    pub daily_loss_headroom_dollars: f64,
+    pub daily_loss_headroom_pct: f64,
+    pub active_winners_count: usize,
+    pub projected_daily_net_dollars: f64,
+    pub summary: String,
+}
+
 /// Complete response payload for `GET /api/allocator` and `POST /api/allocator/plan`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoAllocatorReport {
@@ -513,6 +533,7 @@ pub struct AutoAllocatorReport {
     pub top_safe_preset: Option<String>,
     pub forward_envelope: ForwardEnvelopeMonitor,
     pub diversification: DiversificationGuardReport,
+    pub session_briefing: SessionBriefingReport,
     pub comparison: AllocatorComparison,
     pub planned_intents: Vec<PlannedAllocatorIntent>,
     pub daily_target: DailyTargetVerdict,
@@ -1140,6 +1161,19 @@ pub fn compute_auto_allocator_report(
         killed,
         is_maker,
     );
+    let session_briefing = compute_session_briefing(
+        &req,
+        rails,
+        &active_winners,
+        &drift_gauge,
+        &forward_envelope,
+        &diversification,
+        &bootstrap_stress,
+        &comparison,
+        &daily_target,
+        &oos_window_returns,
+        live_armed,
+    );
 
     let mut honesty_notes = Vec::new();
     if is_maker {
@@ -1233,6 +1267,7 @@ pub fn compute_auto_allocator_report(
         top_safe_preset,
         forward_envelope,
         diversification,
+        session_briefing,
         comparison,
         planned_intents,
         daily_target,
@@ -2500,6 +2535,117 @@ fn apply_diversification_guard(
             summary,
         },
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_session_briefing(
+    req: &AutoAllocatorRequest,
+    rails: &RiskRailsConfig,
+    winners: &[AllocatedWinner],
+    drift_gauge: &DriftGauge,
+    forward_envelope: &ForwardEnvelopeMonitor,
+    diversification: &DiversificationGuardReport,
+    bootstrap_stress: &BootstrapStressSummary,
+    comparison: &AllocatorComparison,
+    daily_target: &DailyTargetVerdict,
+    oos_window_returns: &[(f64, f64)],
+    live_armed: bool,
+) -> SessionBriefingReport {
+    let expected_fill_edge_cents = forward_envelope
+        .predicted_ev_cents
+        .or(drift_gauge.paper_expectancy_cents);
+    let realized_fill_edge_cents = forward_envelope
+        .observed_forward_ev_cents
+        .or(drift_gauge.shadow_expectancy_cents);
+    let fill_edge_delta_cents = expected_fill_edge_cents
+        .zip(realized_fill_edge_cents)
+        .and_then(|(e, r)| finite_opt(r - e));
+
+    let w_sum: f64 = winners.iter().map(|w| w.allocated_pct.max(0.01)).sum();
+    let fee_drag_cents = if winners.is_empty() || w_sum <= 1e-12 {
+        0.0
+    } else {
+        finite_or(
+            winners
+                .iter()
+                .map(|w| w.fee_drag_cents * (w.allocated_pct.max(0.01) / w_sum))
+                .sum::<f64>(),
+            0.0,
+        )
+    };
+    let maker_fee_savings_dollars = finite_or(comparison.fee_savings_dollars.max(0.0), 0.0);
+    let correlation_cluster_penalty_pct = finite_or(diversification.heat_trimmed_pct.max(0.0), 0.0);
+    let daily_loss_rail_dollars = finite_or(rails.max_daily_loss_dollars.max(0.0), 0.0);
+
+    // Worst historical 1-day (<=96 windows) stressed (+1c) OOS drawdown in dollars.
+    let mut worst_day_ret = 0.0f64;
+    if !oos_window_returns.is_empty() {
+        let day_len = oos_window_returns.len().min(96);
+        let mut acc = 0.0f64;
+        for (i, &(_, r_1c)) in oos_window_returns.iter().enumerate() {
+            acc += r_1c;
+            if i >= day_len {
+                acc -= oos_window_returns[i - day_len].1;
+            }
+            if acc < worst_day_ret {
+                worst_day_ret = acc;
+            }
+        }
+    }
+    let projected_worst_day_loss_dollars =
+        finite_or((-worst_day_ret).max(0.0) * req.starting_bankroll, 0.0);
+    let daily_loss_headroom_dollars = finite_or(
+        daily_loss_rail_dollars - projected_worst_day_loss_dollars,
+        0.0,
+    );
+    let daily_loss_headroom_pct = if daily_loss_rail_dollars > 1e-9 {
+        finite_or(
+            ((daily_loss_headroom_dollars / daily_loss_rail_dollars) * 100.0).clamp(-100.0, 100.0),
+            0.0,
+        )
+    } else {
+        0.0
+    };
+
+    let status = if winners.is_empty() {
+        "NO_DATA"
+    } else if daily_loss_headroom_dollars > 0.0
+        && bootstrap_stress.daily_rail_breach_prob_pct <= 1e-9
+        && drift_gauge.status == "HEALTHY"
+        && daily_target.projected_daily_net_dollars > 0.0
+    {
+        "PASS_READY"
+    } else {
+        "HOLD_PAPER"
+    };
+
+    let exp_str = expected_fill_edge_cents
+        .map(|v| format!("{v:+.2}c"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let real_str = realized_fill_edge_cents
+        .map(|v| format!("{v:+.2}c"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let summary = format!(
+        "{status}: expected {exp_str} vs realized {real_str} · fee drag {fee_drag_cents:.2}c/ct · cluster trim {correlation_cluster_penalty_pct:.1}% · daily rail headroom ${daily_loss_headroom_dollars:.2} ({daily_loss_headroom_pct:.0}%)"
+    );
+
+    SessionBriefingReport {
+        status: status.to_string(),
+        live_armed,
+        expected_fill_edge_cents,
+        realized_fill_edge_cents,
+        fill_edge_delta_cents,
+        fee_drag_cents,
+        maker_fee_savings_dollars,
+        correlation_cluster_penalty_pct,
+        daily_loss_rail_dollars,
+        projected_worst_day_loss_dollars,
+        daily_loss_headroom_dollars,
+        daily_loss_headroom_pct,
+        active_winners_count: winners.len(),
+        projected_daily_net_dollars: daily_target.projected_daily_net_dollars,
+        summary,
+    }
 }
 
 fn build_causal_replay_weights(
@@ -3938,5 +4084,17 @@ mod tests {
             .expect("diversified_safe_basket present");
         assert!(basket.safe_gate_passed);
         assert_eq!(basket.daily_rail_breach_prob_pct, 0.0);
+
+        // Session Briefing & Slippage Attribution assertions
+        assert!(!on.session_briefing.live_armed);
+        assert_eq!(on.session_briefing.active_winners_count, on.active_winners.len());
+        assert_eq!(
+            on.session_briefing.correlation_cluster_penalty_pct,
+            on.diversification.heat_trimmed_pct
+        );
+        assert!(on.session_briefing.daily_loss_rail_dollars > 0.0);
+        assert!(on.session_briefing.daily_loss_headroom_dollars <= on.session_briefing.daily_loss_rail_dollars + 1e-6);
+        assert!(on.session_briefing.expected_fill_edge_cents.is_some());
+        assert!(on.session_briefing.realized_fill_edge_cents.is_some());
     }
 }
