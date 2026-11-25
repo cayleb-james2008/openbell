@@ -27,5 +27,5 @@ fn version_flag_prints_name_and_version_and_exits() {
     }
     let out = child.wait_with_output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), format!("openbell-rs {}", env!("CARGO_PKG_VERSION")));
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.18.0");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.19.0");
 }

@@ -4,7 +4,7 @@
 // $500/day Go/No-Go verdict, custom zero-bloat SVG equity comparison, and 1-click ticket staging
 // gated behind fail-closed Hard Risk Rails (live_armed: false on boot).
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { CheckCircle2, ChevronDown, Download, RefreshCw, ShieldAlert, ShieldCheck, ShieldOff, SlidersHorizontal, TrendingUp } from "lucide-react";
+import { CheckCircle2, ChevronDown, Copy, Download, RefreshCw, ShieldAlert, ShieldCheck, ShieldOff, SlidersHorizontal, TrendingUp } from "lucide-react";
 import { toast } from "sonner";
 import {
   Badge,
@@ -276,6 +276,51 @@ export function AutoAllocatorPanel({
     },
     [dataset, slots, markets],
   );
+
+  const buildBriefingPayload = useCallback(() => {
+    if (!report) return null;
+    return {
+      generated_at: new Date().toISOString(),
+      dataset,
+      live_armed: false,
+      execution_mode: report.execution_mode,
+      sizing_mode: report.sizing_mode,
+      active_preset_id: report.forward_envelope?.active_preset_id ?? null,
+      session_briefing: {
+        ...report.session_briefing,
+        live_armed: false,
+      },
+      diversification: report.diversification,
+      daily_target: report.daily_target,
+    };
+  }, [dataset, report]);
+
+  const copyBriefingJson = useCallback(async () => {
+    const payload = buildBriefingPayload();
+    if (!payload) return;
+    const text = JSON.stringify(payload, null, 2);
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.success("Copied Session Briefing JSON (live_armed: false).");
+    } catch {
+      toast.info("Clipboard unavailable; use Download Briefing JSON.");
+    }
+  }, [buildBriefingPayload]);
+
+  const downloadBriefingJson = useCallback(() => {
+    const payload = buildBriefingPayload();
+    if (!payload) return;
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `openbell-session-briefing-${dataset}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    toast.success(`Downloaded Session Briefing JSON for ${dataset}.`);
+  }, [buildBriefingPayload, dataset]);
 
   const exportAuditJson = useCallback(() => {
     if (!report) return;
@@ -978,6 +1023,116 @@ export function AutoAllocatorPanel({
             trajectory={report.bootstrap_stress.trajectory}
             startingBankroll={report.starting_bankroll}
           />
+        </div>
+      )}
+
+      {/* 1-Click Session Briefing & Slippage Attribution */}
+      {report?.session_briefing && (
+        <div
+          id="allocator-session-briefing"
+          className="mt-3.5 space-y-2.5 rounded-[10px] border border-hairline bg-board/50 p-3.5"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-semibold text-ink">
+                Session Briefing &amp; Slippage Attribution
+              </span>
+              <StatusPill
+                id="allocator-briefing-status"
+                tone={
+                  report.session_briefing.status === "PASS_READY"
+                    ? "success"
+                    : report.session_briefing.status === "HOLD_PAPER"
+                      ? "warning"
+                      : "neutral"
+                }
+              >
+                {report.session_briefing.status === "PASS_READY"
+                  ? "PASS READY"
+                  : report.session_briefing.status === "HOLD_PAPER"
+                    ? "HOLD PAPER"
+                    : "NO DATA"}
+              </StatusPill>
+              <Badge variant="outline" className="mono text-xs text-ink-2">
+                live_armed=false · {report.session_briefing.active_winners_count}w
+              </Badge>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                id="allocator-copy-briefing-btn"
+                variant="outline"
+                size="sm"
+                onClick={() => void copyBriefingJson()}
+              >
+                <Copy className="size-3.5" aria-hidden />
+                <span>Copy Briefing JSON</span>
+              </Button>
+              <Button
+                id="allocator-download-briefing-btn"
+                variant="outline"
+                size="sm"
+                onClick={downloadBriefingJson}
+              >
+                <Download className="size-3.5" aria-hidden />
+                <span>Download Briefing JSON</span>
+              </Button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">Expected vs Realized Edge</div>
+              <div className="mono mt-0.5 font-semibold text-ink">
+                {fmtCents(report.session_briefing.expected_fill_edge_cents)} /{" "}
+                <span
+                  className={
+                    (report.session_briefing.fill_edge_delta_cents ?? 0) >= 0
+                      ? "text-success-foreground"
+                      : "text-warning-foreground"
+                  }
+                >
+                  {fmtCents(report.session_briefing.realized_fill_edge_cents)}
+                </span>{" "}
+                <span className="text-ink-3">({fmtCents(report.session_briefing.fill_edge_delta_cents)})</span>
+              </div>
+            </div>
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">Fee Drag &amp; Maker Savings</div>
+              <div className="mono mt-0.5 font-semibold text-ink">
+                {report.session_briefing.fee_drag_cents.toFixed(2)}c/ct{" "}
+                <span className="text-success-foreground">
+                  (+{money(report.session_briefing.maker_fee_savings_dollars)} saved)
+                </span>
+              </div>
+            </div>
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">Correlation Cluster Penalty</div>
+              <div className="mono mt-0.5 font-semibold text-ink">
+                {report.session_briefing.correlation_cluster_penalty_pct > 0.05 ? "-" : ""}{fmtPct(report.session_briefing.correlation_cluster_penalty_pct, 1)}{" "}
+                <span className="text-ink-3">
+                  (div {Math.round(report.diversification?.effective_diversification_score ?? 0)}/100)
+                </span>
+              </div>
+            </div>
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">Daily Loss Rail Headroom</div>
+              <div
+                className={
+                  "mono mt-0.5 font-semibold " +
+                  (report.session_briefing.daily_loss_headroom_dollars > 0
+                    ? "text-success-foreground"
+                    : "text-destructive-foreground")
+                }
+              >
+                {money(report.session_briefing.daily_loss_headroom_dollars)}{" "}
+                <span className="text-ink-3">
+                  / {money(report.session_briefing.daily_loss_rail_dollars)} (
+                  {Math.round(report.session_briefing.daily_loss_headroom_pct)}%)
+                </span>
+              </div>
+            </div>
+          </div>
+          <p className="text-xs text-ink-2">{report.session_briefing.summary}</p>
         </div>
       )}
 

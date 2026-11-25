@@ -4,6 +4,14 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.19.0 - 2026-11-25
+
+- **1-Click Session Briefing & Slippage Attribution Card (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**
+  - Added causal `SessionBriefingReport` (`compute_session_briefing`) detailing expected vs realized fill edge, weighted maker/taker fee drag & maker fee savings, cross-asset correlation cluster heat trim penalty, and daily loss rail dollar/percentage headroom against worst 1-day (`<=96` window) stressed OOS drawdowns (`PASS_READY` / `HOLD_PAPER` / `NO_DATA`, strictly preserving `live_armed: false`).
+  - Added `#allocator-session-briefing` card with 1-click **Copy Briefing JSON** (`#allocator-copy-briefing-btn`) and **Download Briefing JSON** (`#allocator-download-briefing-btn`).
+- **Zero-Copy HTTP & Cache Fast-Path (`src/main.rs`):**
+  - Added `write_all_vectored` (`IoSlice` `writev` zero-copy JSON & asset responses), precomputed `OnceLock` `/api/version`, typed `HomeBody` serialization, `read_request` stack buffer + allowlisted header parsing (eliminating per-request heap allocs for ignored headers), O(1) `TapeEntry.conflicting_settlements` + `tape_latest_json`, `symlink_metadata`-only `strategies_dir_key`, and 256 KB-stack HTTP workers — recovering `>4,500 req/s` throughput while keeping release binary `<5.95 MB` and Core Peak `VmHWM < 22 MB`.
+
 ## 0.18.0 - 2026-11-25
 
 - **Multi-Asset Correlation & Portfolio Diversification Guard (`src/auto_allocator.rs`, `src/main.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**

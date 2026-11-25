@@ -43,6 +43,24 @@ export type DiversificationGuardReport = {
   summary: string;
 };
 
+export type SessionBriefingReport = {
+  status: "PASS_READY" | "HOLD_PAPER" | "NO_DATA" | string;
+  live_armed: boolean;
+  expected_fill_edge_cents: number | null;
+  realized_fill_edge_cents: number | null;
+  fill_edge_delta_cents: number | null;
+  fee_drag_cents: number;
+  maker_fee_savings_dollars: number;
+  correlation_cluster_penalty_pct: number;
+  daily_loss_rail_dollars: number;
+  projected_worst_day_loss_dollars: number;
+  daily_loss_headroom_dollars: number;
+  daily_loss_headroom_pct: number;
+  active_winners_count: number;
+  projected_daily_net_dollars: number;
+  summary: string;
+};
+
 export type FillRateSensitivityPoint = {
   fill_rate_pct: number;
   adverse_haircut_cents: number;
@@ -290,6 +308,7 @@ export type AutoAllocatorReport = {
   top_safe_preset: string | null;
   forward_envelope: ForwardEnvelopeMonitor;
   diversification: DiversificationGuardReport;
+  session_briefing: SessionBriefingReport;
   comparison: AllocatorComparison;
   planned_intents: PlannedAllocatorIntent[];
   daily_target: DailyTargetVerdict;
@@ -350,6 +369,7 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
   const envRaw = (o.forward_envelope && typeof o.forward_envelope === "object" ? o.forward_envelope : {}) as Record<string, unknown>;
   const divRaw = (o.diversification && typeof o.diversification === "object" ? o.diversification : {}) as Record<string, unknown>;
   const divClustersRaw = Array.isArray(divRaw.clusters) ? divRaw.clusters : [];
+  const briefRaw = (o.session_briefing && typeof o.session_briefing === "object" ? o.session_briefing : {}) as Record<string, unknown>;
   const intentsRaw = Array.isArray(o.planned_intents) ? o.planned_intents : [];
   const notesRaw = Array.isArray(o.honesty_notes) ? o.honesty_notes : [];
   const compRaw = (o.comparison && typeof o.comparison === "object" ? o.comparison : {}) as Record<string, unknown>;
@@ -620,6 +640,23 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
         "Cross-asset correlation cluster guard ready (BTC/ETH/SOL/XRP/DOGE).",
       ),
     },
+    session_briefing: {
+      status: strOr(briefRaw.status, "NO_DATA"),
+      live_armed: Boolean(briefRaw.live_armed),
+      expected_fill_edge_cents: finiteOpt(briefRaw.expected_fill_edge_cents),
+      realized_fill_edge_cents: finiteOpt(briefRaw.realized_fill_edge_cents),
+      fill_edge_delta_cents: finiteOpt(briefRaw.fill_edge_delta_cents),
+      fee_drag_cents: finiteOr(briefRaw.fee_drag_cents, 0),
+      maker_fee_savings_dollars: finiteOr(briefRaw.maker_fee_savings_dollars, 0),
+      correlation_cluster_penalty_pct: finiteOr(briefRaw.correlation_cluster_penalty_pct, 0),
+      daily_loss_rail_dollars: finiteOr(briefRaw.daily_loss_rail_dollars, 25),
+      projected_worst_day_loss_dollars: finiteOr(briefRaw.projected_worst_day_loss_dollars, 0),
+      daily_loss_headroom_dollars: finiteOr(briefRaw.daily_loss_headroom_dollars, 25),
+      daily_loss_headroom_pct: finiteOr(briefRaw.daily_loss_headroom_pct, 100),
+      active_winners_count: Math.max(0, Math.round(finiteOr(briefRaw.active_winners_count, 0))),
+      projected_daily_net_dollars: finiteOr(briefRaw.projected_daily_net_dollars, 0),
+      summary: strOr(briefRaw.summary, "Awaiting OOS winners for session briefing attribution."),
+    },
     comparison: {
       selection_basis: strOr(compRaw.selection_basis, "causal_is_to_oos"),
       legacy_equal_taker_end_equity: finiteOr(compRaw.legacy_equal_taker_end_equity, startEq),
@@ -700,6 +737,34 @@ function makeOfflineDiversification(
     summary: hasWinners
       ? "Offline preview: 1 asset cluster (BTC) · run server pipeline for full cross-asset correlation guard."
       : "No active slots available for cross-asset correlation clustering.",
+  };
+}
+
+function makeOfflineSessionBriefing(
+  hasWinners: boolean,
+  expectedEvCents: number | null,
+  feeSavingsDollars: number,
+  feeDragCents: number,
+  winnersCount: number,
+): SessionBriefingReport {
+  return {
+    status: hasWinners ? "HOLD_PAPER" : "NO_DATA",
+    live_armed: false,
+    expected_fill_edge_cents: expectedEvCents,
+    realized_fill_edge_cents: expectedEvCents,
+    fill_edge_delta_cents: hasWinners ? 0 : null,
+    fee_drag_cents: feeDragCents,
+    maker_fee_savings_dollars: feeSavingsDollars,
+    correlation_cluster_penalty_pct: 0,
+    daily_loss_rail_dollars: 25,
+    projected_worst_day_loss_dollars: 0,
+    daily_loss_headroom_dollars: 25,
+    daily_loss_headroom_pct: 100,
+    active_winners_count: winnersCount,
+    projected_daily_net_dollars: 0,
+    summary: hasWinners
+      ? "Offline paper preview: slippage/rail attribution requires live server pipeline."
+      : "No active winners for session briefing attribution.",
   };
 }
 
@@ -791,6 +856,7 @@ export function computeClientFallbackReport(
         summary: "Awaiting OOS winners for paper envelope tracking.",
       },
       diversification: makeOfflineDiversification(params, 0, false),
+      session_briefing: makeOfflineSessionBriefing(false, null, 0, 0, 0),
       comparison: {
         selection_basis: "causal_is_to_oos",
         legacy_equal_taker_end_equity: startEq,
@@ -1110,6 +1176,13 @@ export function computeClientFallbackReport(
       summary: rawWinners.length > 0 ? "Offline paper envelope nominal." : "No active winners.",
     },
     diversification: makeOfflineDiversification(params, Number(totalPct.toFixed(2)), rawWinners.length > 0),
+    session_briefing: makeOfflineSessionBriefing(
+      rawWinners.length > 0,
+      rawWinners.length > 0 ? rawWinners[0].oos_net_expectancy_cents : null,
+      Number(Math.max(0, legacyFees - allocFees).toFixed(2)),
+      rawWinners.length > 0 ? rawWinners[0].fee_drag_cents : 0,
+      rawWinners.length,
+    ),
     comparison: {
       selection_basis: isTrades.length > 0 ? "causal_is_to_oos" : "oos_only_no_is_history",
       legacy_equal_taker_end_equity: Number(legacyEq.toFixed(2)),
