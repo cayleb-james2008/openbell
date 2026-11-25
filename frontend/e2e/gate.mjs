@@ -456,12 +456,19 @@ for (const m of measures) {
   await p.screenshot({ path: `${OUT}/slots-1440-light.png` })
 
   // Quant Lab (4th view): 1-Click Full Quant Edge Audit, $500/Day Scale Planner, 5-Gate Readiness Scorecard, PAV Isotonic Recalibration, Calibration Reliability, Monte Carlo Fan, Walk-Forward IS vs OOS
-  await p.locator('#run-edge-audit-btn').click(); await p.waitForTimeout(550)
+  await p.locator('#run-edge-audit-btn').click(); await p.waitForTimeout(650)
+  const edgeAuditClear = await p.evaluate(() => {
+    const hdr = document.querySelector('header')?.getBoundingClientRect()
+    const h2 = document.querySelector('#quant-edge-audit h2')?.getBoundingClientRect()
+    const verd = document.querySelector('#edge-audit-verdict')?.getBoundingClientRect()
+    return !!hdr && !!h2 && !!verd && h2.top >= hdr.bottom - 1 && verd.top >= hdr.bottom - 1
+  })
   const edgeAuditOk =
+    edgeAuditClear &&
     (await p.locator('#quant-edge-audit').isVisible()) &&
     (await p.locator('#edge-audit-verdict').isVisible()) &&
     (await p.locator('#quant-edge-audit [data-edge-audit-stage]').count()) === 5
-  ok('1-click Full Quant Edge Audit button opens Quant Lab and renders 5-stage Go/No-Go Scorecard', edgeAuditOk)
+  ok('1-click Full Quant Edge Audit button opens Quant Lab and renders 5-stage Go/No-Go Scorecard below sticky header', edgeAuditOk)
   const scaleReady =
     (await p.locator('#quant-scale-planner').isVisible()) &&
     (await p.locator('[data-scale-trajectory-chart] svg[role=img]').count()) === 1 &&

@@ -101,7 +101,7 @@ export function TournamentPanel({
       <div
         ref={tournamentRef}
         id="quant-tournament"
-        className="overflow-hidden rounded-[10px] border border-hairline bg-surface"
+        className="scroll-mt-16 overflow-hidden rounded-[10px] border border-hairline bg-surface"
       >
         <div className="flex flex-wrap items-start justify-between gap-3 border-b border-hairline bg-board/50 p-4">
           <div className="min-w-0">
@@ -338,7 +338,7 @@ export function TournamentPanel({
         <div
           ref={correlationRef}
           id="quant-correlation"
-          className="flex flex-col justify-between gap-3 rounded-[10px] border border-hairline bg-surface p-4 lg:col-span-6"
+          className="scroll-mt-16 flex flex-col justify-between gap-3 rounded-[10px] border border-hairline bg-surface p-4 lg:col-span-6"
         >
           <div>
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -369,7 +369,7 @@ export function TournamentPanel({
         <div
           ref={regimeRef}
           id="quant-regime-heatmap"
-          className="flex flex-col justify-between gap-3 rounded-[10px] border border-hairline bg-surface p-4 lg:col-span-6"
+          className="scroll-mt-16 flex flex-col justify-between gap-3 rounded-[10px] border border-hairline bg-surface p-4 lg:col-span-6"
         >
           <div>
             <div className="flex flex-wrap items-center justify-between gap-2">

@@ -109,7 +109,7 @@ export function ScalePlannerPanel({
       ref={panelRef}
       id="quant-scale-planner"
       data-scale-planner
-      className="rounded-[10px] border border-hairline bg-surface p-4 shadow-(--elev-card)"
+      className="scroll-mt-16 rounded-[10px] border border-hairline bg-surface p-4 shadow-(--elev-card)"
     >
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-hairline pb-3">
@@ -437,7 +437,7 @@ export function ScalePlannerPanel({
           ref={scorecardRef}
           id="readiness-scorecard"
           data-readiness-scorecard
-          className="flex flex-col justify-between gap-3 border-t border-hairline pt-4 lg:col-span-5 lg:border-t-0 lg:border-l lg:pl-4 lg:pt-0"
+          className="scroll-mt-16 flex flex-col justify-between gap-3 border-t border-hairline pt-4 lg:col-span-5 lg:border-t-0 lg:border-l lg:pl-4 lg:pt-0"
         >
           <div>
             <div className="flex flex-wrap items-center justify-between gap-2">

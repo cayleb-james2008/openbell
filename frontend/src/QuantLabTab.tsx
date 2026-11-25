@@ -279,7 +279,7 @@ export function QuantLabTab({
         <div
           ref={calRef}
           id="quant-calibration"
-          className="flex flex-col justify-between gap-3 rounded-[10px] border border-hairline bg-surface p-4 lg:col-span-6"
+          className="scroll-mt-16 flex flex-col justify-between gap-3 rounded-[10px] border border-hairline bg-surface p-4 lg:col-span-6"
         >
           <div>
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -345,7 +345,7 @@ export function QuantLabTab({
         <div
           ref={mcRef}
           id="quant-montecarlo"
-          className="flex flex-col justify-between gap-3 rounded-[10px] border border-hairline bg-surface p-4 lg:col-span-6"
+          className="scroll-mt-16 flex flex-col justify-between gap-3 rounded-[10px] border border-hairline bg-surface p-4 lg:col-span-6"
         >
           <div>
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -452,7 +452,7 @@ export function QuantLabTab({
       <div
         ref={wfRef}
         id="quant-walkforward"
-        className="overflow-hidden rounded-[10px] border border-hairline bg-surface"
+        className="scroll-mt-16 overflow-hidden rounded-[10px] border border-hairline bg-surface"
       >
         <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-hairline bg-board/50 px-4 py-3">
           <div>
