@@ -110,6 +110,9 @@ fn default_require_stress_resilience() -> bool {
 fn default_enable_regime_throttle() -> bool {
     true
 }
+fn default_min_fill_rate_pct() -> f64 {
+    40.0
+}
 
 /// Request parameters for `GET /api/allocator` and `POST /api/allocator/plan`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +137,8 @@ pub struct AutoAllocatorRequest {
     pub require_stress_resilience: bool,
     #[serde(default = "default_enable_regime_throttle")]
     pub enable_regime_throttle: bool,
+    #[serde(default = "default_min_fill_rate_pct")]
+    pub min_fill_rate_pct: f64,
 }
 
 impl Default for AutoAllocatorRequest {
@@ -149,6 +154,7 @@ impl Default for AutoAllocatorRequest {
             starting_bankroll: default_starting_bankroll(),
             require_stress_resilience: default_require_stress_resilience(),
             enable_regime_throttle: default_enable_regime_throttle(),
+            min_fill_rate_pct: default_min_fill_rate_pct(),
         }
     }
 }
@@ -185,6 +191,8 @@ impl AutoAllocatorRequest {
                 .clamp(10.0, 10_000_000.0),
             require_stress_resilience: self.require_stress_resilience,
             enable_regime_throttle: self.enable_regime_throttle,
+            min_fill_rate_pct: finite_or(self.min_fill_rate_pct, default_min_fill_rate_pct())
+                .clamp(10.0, 100.0),
         }
     }
 }
@@ -212,6 +220,26 @@ pub struct RegimeEdgeBucket {
     pub net_expectancy_cents: f64,
 }
 
+/// Maker fill-rate sensitivity row evaluating queue adverse selection across fill tiers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FillRateSensitivityPoint {
+    pub fill_rate_pct: f64,
+    pub adverse_haircut_cents: f64,
+    pub effective_ev_cents: Option<f64>,
+    pub projected_daily_net_dollars: f64,
+    pub clears_min_fill_gate: bool,
+}
+
+/// Paper IS / baseline vs trailing OOS live-shadow expectancy drift telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftGauge {
+    pub paper_expectancy_cents: Option<f64>,
+    pub shadow_expectancy_cents: Option<f64>,
+    pub drift_cents: Option<f64>,
+    pub status: String,
+    pub summary: String,
+}
+
 /// One strategy passing OOS depth, positive-EV, stress, and correlation gates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllocatedWinner {
@@ -228,6 +256,7 @@ pub struct AllocatedWinner {
     pub fee_drag_cents: f64,
     pub oos_net_expectancy_cents: f64,
     pub full_kelly_pct: f64,
+    pub breakeven_fill_rate_pct: f64,
     pub regime_throttle_mult: f64,
     pub allocated_pct: f64,
     pub allocated_dollars: f64,
@@ -310,6 +339,7 @@ pub struct AutoAllocatorReport {
     pub starting_bankroll: f64,
     pub require_stress_resilience: bool,
     pub enable_regime_throttle: bool,
+    pub min_fill_rate_pct: f64,
     pub regime_throttle_mult: f64,
     pub current_oos_drawdown_pct: f64,
     pub throttle_reason: String,
@@ -321,6 +351,8 @@ pub struct AutoAllocatorReport {
     pub active_winners: Vec<AllocatedWinner>,
     pub quarantined: Vec<QuarantinedStrategy>,
     pub regime_attribution: Vec<RegimeEdgeBucket>,
+    pub fill_sensitivity: Vec<FillRateSensitivityPoint>,
+    pub drift_gauge: DriftGauge,
     pub comparison: AllocatorComparison,
     pub planned_intents: Vec<PlannedAllocatorIntent>,
     pub daily_target: DailyTargetVerdict,
@@ -368,6 +400,7 @@ struct SplitCandidate {
     gross_expectancy_cents: f64,
     fee_drag_cents: f64,
     net_expectancy_cents: f64,
+    tail_fold_expectancy_cents: f64,
     full_kelly_pct: f64,
     stress: StressProfile,
     returns_by_win: HashMap<(i64, String), f64>,
@@ -483,6 +516,7 @@ fn evaluate_split_candidates(
         };
         let mut folds_positive = 0usize;
         let mut worst_fold: Option<f64> = None;
+        let mut tail_fold_ev = exp_cents;
         for f_idx in 0..folds_total {
             let start = f_idx * n / folds_total;
             let end = (f_idx + 1) * n / folds_total;
@@ -493,6 +527,7 @@ fn evaluate_split_candidates(
                     folds_positive += 1;
                 }
                 worst_fold = Some(worst_fold.map_or(fold_ev, |m| m.min(fold_ev)));
+                tail_fold_ev = fold_ev;
             }
         }
         let extra_slippage_0c_cents = exp_cents;
@@ -580,6 +615,7 @@ fn evaluate_split_candidates(
             gross_expectancy_cents: gross_exp_cents,
             fee_drag_cents,
             net_expectancy_cents: exp_cents,
+            tail_fold_expectancy_cents: tail_fold_ev,
             full_kelly_pct,
             stress,
             returns_by_win,
@@ -842,6 +878,11 @@ pub fn compute_auto_allocator_report(
             .and_then(|s| s.expectancy_by_idx.get(&cand.strategy_idx).copied())
             .and_then(finite_opt);
 
+        let breakeven_fill_rate_pct = finite_or(
+            (1.0 - (cand.net_expectancy_cents / 2.0)).clamp(0.0, 1.0) * 100.0,
+            100.0,
+        );
+
         active_winners.push(AllocatedWinner {
             strategy: cand.strategy.clone(),
             side: cand.side.clone(),
@@ -856,6 +897,7 @@ pub fn compute_auto_allocator_report(
             fee_drag_cents: cand.fee_drag_cents,
             oos_net_expectancy_cents: cand.net_expectancy_cents,
             full_kelly_pct: cand.full_kelly_pct,
+            breakeven_fill_rate_pct,
             regime_throttle_mult,
             allocated_pct: alloc_pct,
             allocated_dollars: alloc_dollars,
@@ -884,12 +926,16 @@ pub fn compute_auto_allocator_report(
         slip_dollars,
     );
 
+    let fill_sensitivity = compute_fill_sensitivity(ctx, &req, &active_winners);
+    let drift_gauge = compute_drift_gauge(&active_winners, &oos_sel.accepted);
+
     // Compute $500/day net expectancy readiness verdict with concrete blockers.
     let daily_target = compute_daily_target_verdict(
         ctx,
         &req,
         &active_winners,
         &comparison,
+        &drift_gauge,
         live_armed,
         killed,
         is_maker,
@@ -959,6 +1005,7 @@ pub fn compute_auto_allocator_report(
         starting_bankroll: req.starting_bankroll,
         require_stress_resilience: req.require_stress_resilience,
         enable_regime_throttle: req.enable_regime_throttle,
+        min_fill_rate_pct: req.min_fill_rate_pct,
         regime_throttle_mult,
         current_oos_drawdown_pct,
         throttle_reason,
@@ -970,6 +1017,8 @@ pub fn compute_auto_allocator_report(
         active_winners,
         quarantined: oos_sel.quarantined,
         regime_attribution,
+        fill_sensitivity,
+        drift_gauge,
         comparison,
         planned_intents,
         daily_target,
@@ -977,11 +1026,107 @@ pub fn compute_auto_allocator_report(
     }
 }
 
+fn compute_fill_sensitivity(
+    ctx: &TournamentTapeContext,
+    req: &AutoAllocatorRequest,
+    winners: &[AllocatedWinner],
+) -> Vec<FillRateSensitivityPoint> {
+    let oos_windows = ctx.windows_settled_oos.max(1) as f64;
+    let total_weight: f64 = winners.iter().map(|w| w.allocated_pct).sum();
+    let base_ev = if total_weight > 1e-9 {
+        Some(
+            winners
+                .iter()
+                .map(|w| w.oos_net_expectancy_cents * (w.allocated_pct / total_weight))
+                .sum::<f64>(),
+        )
+    } else {
+        None
+    };
+
+    [25.0, 50.0, 75.0, 100.0]
+        .into_iter()
+        .map(|pct| {
+            let r = pct / 100.0;
+            let adverse_haircut_cents = finite_or((1.0 - r) * 2.0, 0.0);
+            let effective_ev_cents = base_ev.and_then(|ev| finite_opt(ev - adverse_haircut_cents));
+            let daily_per_dollar: f64 = winners
+                .iter()
+                .map(|w| {
+                    let fire_rate = (w.oos_trades as f64 / oos_windows).min(1.0);
+                    let alloc_frac = w.allocated_pct / 100.0;
+                    let p = w.oos_avg_entry_price.clamp(0.01, 0.99);
+                    let eff_ev_dollars = (w.oos_net_expectancy_cents - adverse_haircut_cents) / 100.0;
+                    (alloc_frac / p) * eff_ev_dollars * fire_rate * r
+                })
+                .sum();
+            FillRateSensitivityPoint {
+                fill_rate_pct: pct,
+                adverse_haircut_cents,
+                effective_ev_cents,
+                projected_daily_net_dollars: finite_or(
+                    req.starting_bankroll * daily_per_dollar * WINDOWS_PER_DAY_15M,
+                    0.0,
+                ),
+                clears_min_fill_gate: pct + 1e-9 >= req.min_fill_rate_pct,
+            }
+        })
+        .collect()
+}
+
+fn compute_drift_gauge(winners: &[AllocatedWinner], accepted: &[SplitCandidate]) -> DriftGauge {
+    if winners.is_empty() || accepted.is_empty() {
+        return DriftGauge {
+            paper_expectancy_cents: None,
+            shadow_expectancy_cents: None,
+            drift_cents: None,
+            status: "NO_DATA".to_string(),
+            summary: "No active winners to measure IS-to-shadow expectancy drift.".to_string(),
+        };
+    }
+
+    let mut w_sum = 0.0f64;
+    let mut paper_weighted = 0.0f64;
+    let mut shadow_weighted = 0.0f64;
+    for (w, cand) in winners.iter().zip(accepted.iter()) {
+        let weight = w.allocated_pct.max(0.01);
+        let paper_ev = w.is_net_expectancy_cents.unwrap_or(w.oos_net_expectancy_cents);
+        let shadow_ev = cand.tail_fold_expectancy_cents;
+        w_sum += weight;
+        paper_weighted += paper_ev * weight;
+        shadow_weighted += shadow_ev * weight;
+    }
+
+    let paper_ev = finite_or(paper_weighted / w_sum.max(1e-9), 0.0);
+    let shadow_ev = finite_or(shadow_weighted / w_sum.max(1e-9), 0.0);
+    let drift = finite_or(shadow_ev - paper_ev, 0.0);
+
+    let (status, label) = if shadow_ev < 0.0 || drift < -5.0 {
+        ("DECAY_CRITICAL", "Critical decay")
+    } else if drift < -2.0 {
+        ("DECAY_WARNING", "Drift warning")
+    } else {
+        ("HEALTHY", "Healthy")
+    };
+
+    DriftGauge {
+        paper_expectancy_cents: finite_opt(paper_ev),
+        shadow_expectancy_cents: finite_opt(shadow_ev),
+        drift_cents: finite_opt(drift),
+        status: status.to_string(),
+        summary: format!(
+            "{label}: paper {paper_ev:+.2}c vs trailing shadow {shadow_ev:+.2}c ({drift:+.2}c drift)"
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compute_daily_target_verdict(
     ctx: &TournamentTapeContext,
     req: &AutoAllocatorRequest,
     winners: &[AllocatedWinner],
     comparison: &AllocatorComparison,
+    drift_gauge: &DriftGauge,
     live_armed: bool,
     killed: bool,
     is_maker: bool,
@@ -997,6 +1142,19 @@ fn compute_daily_target_verdict(
         blockers.push(format!(
             "0 strategies pass min_oos_trades >= {} with positive fee-adjusted OOS expectancy",
             req.min_oos_trades
+        ));
+    }
+    if is_maker && (req.maker_fill_rate * 100.0) + 1e-9 < req.min_fill_rate_pct {
+        blockers.push(format!(
+            "Maker fill rate {:.0}% below minimum queue gate ({:.0}%)",
+            req.maker_fill_rate * 100.0,
+            req.min_fill_rate_pct
+        ));
+    }
+    if drift_gauge.status == "DECAY_CRITICAL" {
+        blockers.push(format!(
+            "Paper-to-shadow expectancy decay critical ({})",
+            drift_gauge.summary
         ));
     }
     if comparison.auto_allocator_max_dd_pct >= 25.0 {
@@ -1619,6 +1777,7 @@ mod tests {
             starting_bankroll: 1_000.0,
             require_stress_resilience: true,
             enable_regime_throttle: true,
+            min_fill_rate_pct: 40.0,
         };
         let qk = compute_auto_allocator_report(&ctx, &qk_req, &rails, false, false);
         assert_eq!(qk.active_winners.len(), 2, "win-corr must be pruned for |r|>0.65");
@@ -1851,5 +2010,63 @@ mod tests {
         );
         assert!(!r_throt_rec.regime_attribution.is_empty());
         assert_eq!(r_throt_rec.regime_attribution[0].regime, "Underdog (<45c)");
+    }
+
+    #[test]
+    fn fill_rate_gate_and_shadow_drift_gauge_flag_decay_and_low_fills() {
+        let strats = vec![StrategyMeta {
+            name: "decaying-maker".into(),
+            side: "yes".into(),
+        }];
+        let mut entries = Vec::new();
+        // IS (0..30): 90% WR at 0.45 -> strong ~+44c paper EV
+        // OOS (30..60): first 20 wins (Fold 0 & Fold 1 positive), last 10 lose (Fold 2 negative -> DECAY_CRITICAL)
+        for w in 0..60i64 {
+            let epoch = 5_000 + w * 900;
+            let won = if w < 30 {
+                w % 10 != 0
+            } else {
+                w < 50
+            };
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker: format!("KXBTC15M-FG{w:02}"),
+                series: "KXBTC15M".into(),
+                strategy_idx: 0,
+                strategy: "decaying-maker".into(),
+                side: "yes".into(),
+                entry_price: 0.45,
+                secs_to_close: 240,
+                won,
+            });
+        }
+        let ctx = make_ctx(strats, entries, 60, 30, 5_000 + 30 * 900);
+        let rails = RiskRailsConfig::default();
+        let req = AutoAllocatorRequest {
+            maker_fill_rate: 0.25,
+            min_fill_rate_pct: 50.0,
+            ..AutoAllocatorRequest::default()
+        };
+        let rep = compute_auto_allocator_report(&ctx, &req, &rails, false, false);
+        assert_eq!(rep.fill_sensitivity.len(), 4);
+        assert!(!rep.fill_sensitivity[0].clears_min_fill_gate); // 25% < 50%
+        assert!(rep.fill_sensitivity[1].clears_min_fill_gate);  // 50% >= 50%
+        assert!(
+            rep.daily_target
+                .blockers
+                .iter()
+                .any(|b| b.contains("Maker fill rate 25% below minimum queue gate (50%)")),
+            "blockers={:?}",
+            rep.daily_target.blockers
+        );
+        assert_eq!(rep.drift_gauge.status, "DECAY_CRITICAL");
+        assert!(
+            rep.daily_target
+                .blockers
+                .iter()
+                .any(|b| b.contains("Paper-to-shadow expectancy decay critical")),
+            "blockers={:?}",
+            rep.daily_target.blockers
+        );
     }
 }

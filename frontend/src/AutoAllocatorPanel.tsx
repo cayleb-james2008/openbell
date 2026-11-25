@@ -650,44 +650,96 @@ export function AutoAllocatorPanel({
         />
       </div>
 
-      {/* Per-Regime & Fee-vs-Gross Edge Attribution */}
-      {report && report.regime_attribution.length > 0 && (
+      {/* Per-Regime, Maker Fill Sensitivity & Shadow Drift Gauge */}
+      {report && (report.regime_attribution.length > 0 || report.fill_sensitivity.length > 0) && (
         <div
           id="allocator-regime-attribution"
-          className="mt-3.5 rounded-[10px] border border-hairline bg-board/50 p-3.5"
+          className="mt-3.5 space-y-3 rounded-[10px] border border-hairline bg-board/50 p-3.5"
         >
-          <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs">
-            <span className="font-semibold text-ink">OOS Regime &amp; Fee-Drag Attribution</span>
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-semibold text-ink">OOS Regime &amp; Queue-Fill Telemetry</span>
+              <StatusPill
+                id="allocator-drift-pill"
+                tone={
+                  report.drift_gauge.status === "DECAY_CRITICAL"
+                    ? "error"
+                    : report.drift_gauge.status === "DECAY_WARNING"
+                      ? "warning"
+                      : report.drift_gauge.status === "HEALTHY"
+                        ? "success"
+                        : "neutral"
+                }
+              >
+                {report.drift_gauge.status === "DECAY_CRITICAL"
+                  ? "Shadow Decay"
+                  : report.drift_gauge.status === "DECAY_WARNING"
+                    ? "Drift Watch"
+                    : report.drift_gauge.status === "HEALTHY"
+                      ? "Shadow Healthy"
+                      : "Drift N/A"}
+              </StatusPill>
+            </div>
             <span className="mono text-ink-2">
               Throttle: {report.throttle_reason}
             </span>
           </div>
-          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
-            {report.regime_attribution.map((b) => (
-              <div
-                key={b.regime}
-                className="rounded-lg border border-hairline bg-surface px-3 py-2 text-xs"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-semibold text-ink">{b.regime}</span>
-                  <span className="mono text-ink-3">{b.trades}t / {(b.win_rate * 100).toFixed(0)}%</span>
+
+          {report.drift_gauge.summary && (
+            <div id="allocator-drift-summary" className="mono rounded-md border border-hairline bg-surface px-3 py-1.5 text-xs text-ink-2">
+              {report.drift_gauge.summary}
+            </div>
+          )}
+
+          {report.regime_attribution.length > 0 && (
+            <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+              {report.regime_attribution.map((b) => (
+                <div
+                  key={b.regime}
+                  className="rounded-lg border border-hairline bg-surface px-3 py-2 text-xs"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-ink">{b.regime}</span>
+                    <span className="mono text-ink-3">{b.trades}t / {(b.win_rate * 100).toFixed(0)}%</span>
+                  </div>
+                  <div className="mono mt-1 flex items-center justify-between gap-2 text-ink-2">
+                    <span>Gross {fmtCents(b.gross_expectancy_cents)}</span>
+                    <span>Drag -{b.fee_drag_cents.toFixed(2)}c</span>
+                    <span
+                      className={
+                        b.net_expectancy_cents > 0
+                          ? "font-semibold text-success-foreground"
+                          : "font-semibold text-destructive-foreground"
+                      }
+                    >
+                      Net {fmtCents(b.net_expectancy_cents)}
+                    </span>
+                  </div>
                 </div>
-                <div className="mono mt-1 flex items-center justify-between gap-2 text-ink-2">
-                  <span>Gross {fmtCents(b.gross_expectancy_cents)}</span>
-                  <span>Drag -{b.fee_drag_cents.toFixed(2)}c</span>
-                  <span
-                    className={
-                      b.net_expectancy_cents > 0
-                        ? "font-semibold text-success-foreground"
-                        : "font-semibold text-destructive-foreground"
-                    }
-                  >
-                    Net {fmtCents(b.net_expectancy_cents)}
-                  </span>
+              ))}
+            </div>
+          )}
+
+          {report.fill_sensitivity.length > 0 && (
+            <div id="allocator-fill-sensitivity" className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {report.fill_sensitivity.map((pt) => (
+                <div
+                  key={pt.fill_rate_pct}
+                  className="rounded-lg border border-hairline bg-surface px-2.5 py-1.5 text-xs"
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="mono font-semibold text-ink">{pt.fill_rate_pct.toFixed(0)}% Fill</span>
+                    <span className={pt.clears_min_fill_gate ? "mono text-success-foreground" : "mono text-destructive-foreground"}>
+                      {pt.clears_min_fill_gate ? "Pass" : "< Gate"}
+                    </span>
+                  </div>
+                  <div className="mono mt-0.5 text-ink-2">
+                    EV {fmtCents(pt.effective_ev_cents)} | {money(pt.projected_daily_net_dollars)}/d
+                  </div>
                 </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -763,7 +815,8 @@ export function AutoAllocatorPanel({
                       </span>
                     </TableCell>
                     <TableCell className="mono text-right text-xs text-ink-2">
-                      {w.maker_fee_cents.toFixed(2)}c vs {w.taker_fee_cents.toFixed(2)}c
+                      <div>{w.maker_fee_cents.toFixed(2)}c vs {w.taker_fee_cents.toFixed(2)}c</div>
+                      <div className="text-ink-3">BE Fill {w.breakeven_fill_rate_pct.toFixed(0)}%</div>
                     </TableCell>
                     <TableCell className="mono text-right text-xs text-ink-2">
                       {fmtPct(w.full_kelly_pct)}

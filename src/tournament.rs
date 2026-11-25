@@ -507,6 +507,7 @@ pub fn build_tournament_context(
             }
         }
     }
+    entries.shrink_to_fit();
 
     let strategy_metas = strategies
         .iter()
