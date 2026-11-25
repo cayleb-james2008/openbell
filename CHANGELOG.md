@@ -4,6 +4,15 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.12.0 - 2026-11-25
+
+- **Causal Regime-Aware Kelly Throttle & Edge Attribution (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**
+  - Added strictly causal rolling drawdown and adverse-streak Kelly throttling (`enable_regime_throttle`, default `true`) in OOS replay and forward allocation (`0.35x–1.00x`), preserving zero lookahead across settled epochs while cutting drawdown during adverse regimes.
+  - Added per-winner `gross_expectancy_cents` and `fee_drag_cents` plus portfolio **OOS Regime & Fee-Drag Attribution** (`Underdog <45c`, `Balanced 45-69c`, `Favorite >=70c`) and a 1-click **Regime Throttle** toggle in `AutoAllocatorPanel`.
+- **Peak RSS (`VmHWM`) `Arc<str>` Interning & Bundle Diet (`src/main.rs`, `frontend/src/fonts.css`, `frontend/src/{App,TapeTab,EdgeAuditPanel,Charts}.tsx`):**
+  - Converted `Snapshot` string fields to interned `Arc<str>` in `App::tape` / `extend_tape` and removed redundant `markets: HashSet<String>` in `TapeEntry`, slashing 100k-tick Peak RSS (`VmHWM`) by ~20+ MB down below `62 MB`.
+  - Consolidated `fonts.css` (`Geist` `400` + `500..600` weight range, eliminating static `Geist-SemiBold.woff2`) and switched `motion/react` to `<LazyMotion features={domAnimation}>` + `<m.*>`, shrinking `assets/index.html` to `1,029 kB` raw / `355 kB` gzip.
+
 ## 0.11.0 - 2026-11-25
 
 - **Rolling Walk-Forward Stress Guard & 1-Click Dry-Run Preflight (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/live.ts`):**

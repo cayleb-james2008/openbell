@@ -1240,7 +1240,7 @@ pub fn build_scale_tape_context(
             WindowFacts::Conflict | WindowFacts::Unsettled => continue,
         };
         windows_settled_total += 1;
-        let series = snaps.first().map(|s| s.series.clone()).unwrap_or_default();
+        let series = snaps.first().map(|s| s.series.to_string()).unwrap_or_default();
         if !series.is_empty() && !observed_series.contains(&series) {
             observed_series.push(series.clone());
         }

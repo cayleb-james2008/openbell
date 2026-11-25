@@ -2,7 +2,7 @@
 // interactive market price + spread history with crosshair tooltip, calibration reliability
 // with 95% Wilson error bars, 1,000-path Monte Carlo percentile fan, and Tremor sparklines.
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { motion, useReducedMotion } from "motion/react";
+import { m, useReducedMotion } from "motion/react";
 import { StatusPill } from "@/components/ui";
 import {
   type Market,
@@ -251,7 +251,7 @@ export function HeroEquityChart({
         ))}
         <line x1={PADL} x2={W - PADR} y1={Y(s0)} y2={Y(s0)} strokeDasharray="3 3" style={{ stroke: "var(--ink-3)" }} />
         <path d={areaD} fill={`url(#ob-hero-eq-${gradId})`} />
-        <motion.path
+        <m.path
           key={lineD.length}
           d={lineD}
           fill="none"
@@ -434,7 +434,7 @@ export function EquityDrawdownChart({
         ))}
         <line x1={PADL} x2={W - PADR} y1={Yeq(s0)} y2={Yeq(s0)} strokeDasharray="3 3" style={{ stroke: "var(--ink-3)" }} />
         <path d={eqArea} fill={`url(#ob-dd-eq-${gradId})`} />
-        <motion.path
+        <m.path
           key={eqLine.length}
           d={eqLine}
           fill="none"
@@ -582,7 +582,7 @@ export function StrategyEquityChart({
           </g>
         ))}
         <line x1={PADL} x2={W - PADR} y1={Y(s0)} y2={Y(s0)} strokeDasharray="3 3" style={{ stroke: "var(--ink-3)" }} />
-        <motion.path
+        <m.path
           key={d.length}
           d={d}
           fill="none"
@@ -799,7 +799,7 @@ export function MarketHistoryChart({
 
         {/* Mid implied probability line */}
         {series.length >= 2 && (
-          <motion.path
+          <m.path
             key={priceD.length}
             d={priceD}
             fill="none"
@@ -991,7 +991,7 @@ export function CalibrationReliabilityChart({
 
         {/* Reliability curve connecting populated deciles */}
         {populated.length >= 2 && (
-          <motion.path
+          <m.path
             key={lineD.length}
             d={lineD}
             fill="none"
@@ -1166,7 +1166,7 @@ export function MonteCarloFanChart({
         {/* P25-P75 interquartile band */}
         <path d={innerFan} style={{ fill: "var(--dot-blue)", opacity: 0.24 }} />
         {/* P50 median curve */}
-        <motion.path
+        <m.path
           key={`${mc.seed}-${medianD.length}`}
           d={medianD}
           fill="none"
@@ -1329,7 +1329,7 @@ export function CompoundingTrajectoryChart({
         <path d={bandD} style={{ fill: "var(--dot-blue)", opacity: 0.16 }} />
 
         {/* P50 median curve */}
-        <motion.path
+        <m.path
           key={`${plan.seed}-${metric}-${medianD.length}`}
           d={medianD}
           fill="none"
@@ -1474,7 +1474,7 @@ export function IsotonicRecalibrationChart({
 
         {/* After: Monotone PAV recalibrated curve (solid cobalt) */}
         {populated.length >= 2 && (
-          <motion.path
+          <m.path
             key={calD.length}
             d={calD}
             fill="none"

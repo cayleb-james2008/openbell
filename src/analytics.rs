@@ -967,7 +967,7 @@ fn standalone_strategy_trades(
         }
         let series = snaps
             .first()
-            .map(|s| s.series.clone())
+            .map(|s| s.series.to_string())
             .unwrap_or_default();
         entries.push(SettledEntry {
             close_epoch,
@@ -1796,11 +1796,11 @@ impl CompiledSandboxStrategy {
             }
             let close_epoch = if let Some(c) = known_close {
                 Some(c)
-            } else if last_close_str == Some(snap.close_time.as_str()) {
+            } else if last_close_str == Some(snap.close_time.as_ref()) {
                 last_close_epoch
             } else {
                 let parsed = parse_iso_z(&snap.close_time);
-                last_close_str = Some(snap.close_time.as_str());
+                last_close_str = Some(snap.close_time.as_ref());
                 last_close_epoch = parsed;
                 parsed
             };
@@ -2009,7 +2009,7 @@ pub fn validate_and_backtest_rune_source_with_config(
         let pnl_per_contract = payoff - price - fee(price);
         let series = snaps
             .first()
-            .map(|s| s.series.clone())
+            .map(|s| s.series.to_string())
             .unwrap_or_default();
 
         cal_obs.push(CalibrationObservation {
@@ -2227,16 +2227,16 @@ mod tests {
     ) -> Snapshot {
         Snapshot {
             fetched_at,
-            ticker: ticker.to_string(),
-            event_ticker: ticker.to_string(),
-            series: series.to_string(),
-            close_time: close_time.to_string(),
+            ticker: ticker.into(),
+            event_ticker: ticker.into(),
+            series: series.into(),
+            close_time: close_time.into(),
             status: if result.is_empty() {
-                "active".to_string()
+                "active".into()
             } else {
-                "settled".to_string()
+                "settled".into()
             },
-            result: result.to_string(),
+            result: result.into(),
             yes_bid: no_ask.map(|na| ((1.0 - na) * 100.0).round() / 100.0),
             yes_ask,
             no_bid: yes_ask.map(|ya| ((1.0 - ya) * 100.0).round() / 100.0),

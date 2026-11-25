@@ -100,6 +100,9 @@ export function AutoAllocatorPanel({
   const [requireStressResilience, setRequireStressResilience] = useState<boolean>(
     DEFAULT_ALLOCATOR_REQUEST.require_stress_resilience,
   );
+  const [enableRegimeThrottle, setEnableRegimeThrottle] = useState<boolean>(
+    DEFAULT_ALLOCATOR_REQUEST.enable_regime_throttle,
+  );
   const [report, setReport] = useState<AutoAllocatorReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [quarantineOpen, setQuarantineOpen] = useState(false);
@@ -119,11 +122,13 @@ export function AutoAllocatorPanel({
       exec: AllocatorExecutionMode,
       sizing: AllocatorSizingMode,
       stressGuard: boolean,
+      regimeThrottle: boolean,
     ): AutoAllocatorRequest => ({
       ...DEFAULT_ALLOCATOR_REQUEST,
       execution_mode: exec,
       sizing_mode: sizing,
       require_stress_resilience: stressGuard,
+      enable_regime_throttle: regimeThrottle,
     }),
     [],
   );
@@ -143,13 +148,14 @@ export function AutoAllocatorPanel({
       exec: AllocatorExecutionMode,
       sizing: AllocatorSizingMode,
       stressGuard: boolean,
+      regimeThrottle: boolean,
       notify = false,
     ) => {
       setLoading(true);
       try {
         const next = await fetchAllocatorReport(
           dataset,
-          buildRequest(exec, sizing, stressGuard),
+          buildRequest(exec, sizing, stressGuard, regimeThrottle),
           { slots, markets },
         );
         setReport(next);
@@ -171,18 +177,24 @@ export function AutoAllocatorPanel({
 
   const handleExecChange = (nextExec: AllocatorExecutionMode) => {
     setExecutionMode(nextExec);
-    void recalculate(nextExec, sizingMode, requireStressResilience, false);
+    void recalculate(nextExec, sizingMode, requireStressResilience, enableRegimeThrottle, false);
   };
 
   const handleSizingChange = (nextSizing: AllocatorSizingMode) => {
     setSizingMode(nextSizing);
-    void recalculate(executionMode, nextSizing, requireStressResilience, false);
+    void recalculate(executionMode, nextSizing, requireStressResilience, enableRegimeThrottle, false);
   };
 
   const handleStressToggle = () => {
     const next = !requireStressResilience;
     setRequireStressResilience(next);
-    void recalculate(executionMode, sizingMode, next, false);
+    void recalculate(executionMode, sizingMode, next, enableRegimeThrottle, false);
+  };
+
+  const handleThrottleToggle = () => {
+    const next = !enableRegimeThrottle;
+    setEnableRegimeThrottle(next);
+    void recalculate(executionMode, sizingMode, requireStressResilience, next, false);
   };
 
   const q = search.trim().toLowerCase();
@@ -407,6 +419,22 @@ export function AutoAllocatorPanel({
           >
             {requireStressResilience ? "Stress Guard: ON (+1c & WF)" : "Stress Guard: OFF"}
           </button>
+          <button
+            id="allocator-throttle-toggle"
+            type="button"
+            aria-pressed={enableRegimeThrottle}
+            onClick={handleThrottleToggle}
+            className={
+              "min-h-11 cursor-pointer rounded-md border px-2.5 text-xs font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8 " +
+              (enableRegimeThrottle
+                ? "border-dot-green/50 bg-pill-active-bg text-pill-active-fg"
+                : "border-hairline bg-surface text-ink-2 hover:text-ink")
+            }
+          >
+            {enableRegimeThrottle
+              ? `Regime Throttle: ${(report?.regime_throttle_mult ?? 1).toFixed(2)}x`
+              : "Regime Throttle: OFF"}
+          </button>
           {filteredWinners.length > 0 && (
             <Button
               id="allocator-preflight-top-btn"
@@ -434,7 +462,7 @@ export function AutoAllocatorPanel({
             variant="default"
             size="sm"
             disabled={loading}
-            onClick={() => void recalculate(executionMode, sizingMode, requireStressResilience, true)}
+            onClick={() => void recalculate(executionMode, sizingMode, requireStressResilience, enableRegimeThrottle, true)}
           >
             <RefreshCw className={`size-3.5 ${loading ? "animate-spin" : ""}`} aria-hidden />
             <span>{loading ? "Running Pipeline…" : "Run Discovery & Allocate"}</span>
@@ -622,6 +650,47 @@ export function AutoAllocatorPanel({
         />
       </div>
 
+      {/* Per-Regime & Fee-vs-Gross Edge Attribution */}
+      {report && report.regime_attribution.length > 0 && (
+        <div
+          id="allocator-regime-attribution"
+          className="mt-3.5 rounded-[10px] border border-hairline bg-board/50 p-3.5"
+        >
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+            <span className="font-semibold text-ink">OOS Regime &amp; Fee-Drag Attribution</span>
+            <span className="mono text-ink-2">
+              Throttle: {report.throttle_reason}
+            </span>
+          </div>
+          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+            {report.regime_attribution.map((b) => (
+              <div
+                key={b.regime}
+                className="rounded-lg border border-hairline bg-surface px-3 py-2 text-xs"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-ink">{b.regime}</span>
+                  <span className="mono text-ink-3">{b.trades}t / {(b.win_rate * 100).toFixed(0)}%</span>
+                </div>
+                <div className="mono mt-1 flex items-center justify-between gap-2 text-ink-2">
+                  <span>Gross {fmtCents(b.gross_expectancy_cents)}</span>
+                  <span>Drag -{b.fee_drag_cents.toFixed(2)}c</span>
+                  <span
+                    className={
+                      b.net_expectancy_cents > 0
+                        ? "font-semibold text-success-foreground"
+                        : "font-semibold text-destructive-foreground"
+                    }
+                  >
+                    Net {fmtCents(b.net_expectancy_cents)}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Active OOS Winners Table */}
       <div className="mt-3.5 overflow-hidden rounded-[10px] border border-hairline bg-surface">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-board/50 px-4 py-2.5">
@@ -650,7 +719,7 @@ export function AutoAllocatorPanel({
                 <TableHead>Strategy</TableHead>
                 <TableHead>Side</TableHead>
                 <TableHead className="text-right">OOS Trades / WR</TableHead>
-                <TableHead className="text-right">IS / OOS EV</TableHead>
+                <TableHead className="text-right">IS / OOS EV (Gross-Drag)</TableHead>
                 <TableHead className="text-right">WF Folds / +1c</TableHead>
                 <TableHead className="text-right">Maker vs Taker</TableHead>
                 <TableHead className="text-right">Full Kelly</TableHead>
@@ -677,9 +746,14 @@ export function AutoAllocatorPanel({
                     <TableCell className="mono text-right text-xs text-ink-2">
                       {w.oos_trades} ({(w.oos_win_rate * 100).toFixed(1)}%)
                     </TableCell>
-                    <TableCell className="mono text-right text-xs font-semibold text-success-foreground">
-                      {w.is_net_expectancy_cents !== null ? `${fmtCents(w.is_net_expectancy_cents)} / ` : ""}
-                      {fmtCents(w.oos_net_expectancy_cents)}
+                    <TableCell className="mono text-right text-xs">
+                      <div className="font-semibold text-success-foreground">
+                        {w.is_net_expectancy_cents !== null ? `${fmtCents(w.is_net_expectancy_cents)} / ` : ""}
+                        {fmtCents(w.oos_net_expectancy_cents)}
+                      </div>
+                      <div className="text-ink-3">
+                        {fmtCents(w.gross_expectancy_cents)} - {w.fee_drag_cents.toFixed(2)}c
+                      </div>
                     </TableCell>
                     <TableCell className="mono text-right text-xs text-ink-2">
                       <span>{w.stress.folds_positive}/{w.stress.folds_total}</span>

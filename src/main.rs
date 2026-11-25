@@ -128,15 +128,54 @@ fn now_unix() -> i64 {
 // Snapshots and the forward collector (public market data — no auth)
 // ---------------------------------------------------------------------------
 
+mod arc_str {
+    use serde::{de::Visitor, Deserializer, Serializer};
+    use std::sync::Arc;
+
+    pub fn serialize<S: Serializer>(v: &Arc<str>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(v)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<str>, D::Error> {
+        struct StrVisitor;
+        impl<'de> Visitor<'de> for V {
+            type Value = Arc<str>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Arc<str>, E> {
+                Ok(Arc::from(v))
+            }
+        }
+        use StrVisitor as V;
+        d.deserialize_str(StrVisitor)
+    }
+}
+
+#[inline]
+fn intern_arc(pool: &mut std::collections::HashSet<Arc<str>>, val: &mut Arc<str>) {
+    if let Some(existing) = pool.get(val.as_ref()) {
+        *val = Arc::clone(existing);
+    } else {
+        pool.insert(Arc::clone(val));
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Snapshot {
     fetched_at: i64,
-    ticker: String,
-    event_ticker: String,
-    series: String,
-    close_time: String,
-    status: String,
-    result: String,
+    #[serde(with = "arc_str")]
+    ticker: Arc<str>,
+    #[serde(with = "arc_str")]
+    event_ticker: Arc<str>,
+    #[serde(with = "arc_str")]
+    series: Arc<str>,
+    #[serde(with = "arc_str")]
+    close_time: Arc<str>,
+    #[serde(with = "arc_str")]
+    status: Arc<str>,
+    #[serde(with = "arc_str")]
+    result: Arc<str>,
     yes_bid: Option<f64>,
     yes_ask: Option<f64>,
     no_bid: Option<f64>,
@@ -290,12 +329,12 @@ fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize, bo
             }
             snaps.push(Snapshot {
                 fetched_at,
-                ticker: get("ticker"),
-                event_ticker: get("event_ticker"),
-                series: series.to_string(),
-                close_time: get("close_time"),
-                status: get("status"),
-                result: get("result"),
+                ticker: get("ticker").into(),
+                event_ticker: get("event_ticker").into(),
+                series: Arc::from(series),
+                close_time: get("close_time").into(),
+                status: get("status").into(),
+                result: get("result").into(),
                 yes_bid: dollars(m, "yes_bid_dollars"),
                 yes_ask: dollars(m, "yes_ask_dollars"),
                 no_bid: dollars(m, "no_bid_dollars"),
@@ -353,14 +392,15 @@ fn tape_hub() -> &'static TapeHub {
     TAPE_HUB.get_or_init(TapeHub::new)
 }
 
-type SettledKeysCacheEntry = (PathBuf, u64, u64, std::collections::HashSet<(String, String, String)>);
+type SettledKey = (Arc<str>, Arc<str>, Arc<str>);
+type SettledKeysCacheEntry = (PathBuf, u64, u64, std::collections::HashSet<SettledKey>);
 static SETTLED_KEYS_CACHE: std::sync::Mutex<Option<SettledKeysCacheEntry>> =
     std::sync::Mutex::new(None);
 
 /// Already-recorded settled snapshot keys on disk `(ticker, status, result)` so
 /// repeat passes do not duplicate hundreds of immutable historical settlements.
 /// Cached by `(path, len, mtime)` so 100k-line tapes are not re-parsed every pass.
-fn existing_settled_keys(path: &Path) -> std::collections::HashSet<(String, String, String)> {
+fn existing_settled_keys(path: &Path) -> std::collections::HashSet<SettledKey> {
     let stat = tape_stat(path);
     if let Some((len, mtime)) = stat {
         let guard = SETTLED_KEYS_CACHE.lock().unwrap_or_else(|p| p.into_inner());
@@ -614,7 +654,7 @@ fn collect_once_detailed(data_dir: &Path) -> Result<CollectPassReport, (String, 
     let series_list = active_series();
     let existing_settled = existing_settled_keys(&path);
     let mut pass_snaps: Vec<Snapshot> = Vec::new();
-    let mut seen_in_pass: std::collections::HashSet<(String, String, String)> =
+    let mut seen_in_pass: std::collections::HashSet<SettledKey> =
         std::collections::HashSet::new();
     let mut errors: Vec<String> = Vec::new();
     let mut failed_series: Vec<String> = Vec::new();
@@ -1304,8 +1344,8 @@ fn window_facts_keyed(snaps: &[Snapshot], key: u64) -> WindowFacts {
 fn window_facts_scan(snaps: &[Snapshot]) -> WindowFacts {
     let mut distinct: Vec<&str> = Vec::new();
     for s in snaps {
-        if !s.result.is_empty() && !distinct.contains(&s.result.as_str()) {
-            distinct.push(s.result.as_str());
+        if !s.result.is_empty() && !distinct.contains(&s.result.as_ref()) {
+            distinct.push(s.result.as_ref());
         }
     }
     if distinct.len() > 1 {
@@ -1322,7 +1362,7 @@ fn window_facts_scan(snaps: &[Snapshot]) -> WindowFacts {
     let epoch = snaps
         .iter()
         .rev()
-        .find(|s| s.result == result)
+        .find(|s| s.result.as_ref() == result)
         .and_then(|s| parse_iso_z(&s.close_time))
         .or_else(|| snaps.iter().filter_map(|s| parse_iso_z(&s.close_time)).max());
     match epoch {
@@ -1340,7 +1380,7 @@ fn window_facts_scan(snaps: &[Snapshot]) -> WindowFacts {
 fn group_windows(snapshots: &[Snapshot]) -> BTreeMap<String, Vec<Snapshot>> {
     let mut windows: BTreeMap<String, Vec<Snapshot>> = BTreeMap::new();
     for snap in snapshots {
-        windows.entry(snap.ticker.clone()).or_default().push(snap.clone());
+        windows.entry(snap.ticker.to_string()).or_default().push(snap.clone());
     }
     for snaps in windows.values_mut() {
         snaps.sort_by_key(|s| s.fetched_at);
@@ -2188,7 +2228,6 @@ struct TapeEntry {
     /// must come from the same read.
     total_lines: usize,
     /// Collector-health aggregates over the parsed tape.
-    markets: std::collections::HashSet<String>,
     results_by_ticker: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// Byte offset at which the last line starts, and its raw text:
     /// the seam an append must continue.
@@ -2210,15 +2249,13 @@ fn build_latest_markets_json(grouped: &BTreeMap<String, Vec<Snapshot>>) -> Arc<S
 #[inline]
 fn fold_one_health(
     s: &Snapshot,
-    markets: &mut std::collections::HashSet<String>,
     results_by_ticker: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
 ) {
-    markets.insert(s.ticker.clone());
     if !s.result.is_empty() {
         results_by_ticker
-            .entry(s.ticker.clone())
+            .entry(s.ticker.to_string())
             .or_default()
-            .insert(s.result.clone());
+            .insert(s.result.to_string());
     }
 }
 
@@ -2226,11 +2263,10 @@ fn fold_one_health(
 /// see TapeEntry.
 fn fold_health(
     snaps: &[Snapshot],
-    markets: &mut std::collections::HashSet<String>,
     results_by_ticker: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
 ) {
     for s in snaps {
-        fold_one_health(s, markets, results_by_ticker);
+        fold_one_health(s, results_by_ticker);
     }
 }
 
@@ -2562,7 +2598,7 @@ impl App {
                 latest_json: e.latest_json.clone(),
                 snaps_count: e.snaps_count,
                 total_lines: e.total_lines,
-                markets: e.markets.len(),
+                markets: e.grouped.len(),
                 settled_windows: e.results_by_ticker.len(),
                 conflicting_settlements: e
                     .results_by_ticker
@@ -2630,7 +2666,7 @@ impl App {
         }
 
         let mut grouped_map: BTreeMap<String, Vec<Snapshot>> = BTreeMap::new();
-        let mut markets = std::collections::HashSet::new();
+        let mut pool: std::collections::HashSet<Arc<str>> = std::collections::HashSet::with_capacity(4096);
         let mut results_by_ticker = std::collections::HashMap::new();
         let mut total_lines = 0usize;
         let mut snaps_count = 0usize;
@@ -2657,11 +2693,17 @@ impl App {
                         seam_bytes.clear();
                         seam_bytes.extend_from_slice(raw);
                         offset += n as u64;
-                        if let Ok(s) = serde_json::from_slice::<Snapshot>(raw) {
+                        if let Ok(mut s) = serde_json::from_slice::<Snapshot>(raw) {
                             snaps_count += 1;
                             newest_fetched_at = Some(s.fetched_at);
-                            fold_one_health(&s, &mut markets, &mut results_by_ticker);
-                            grouped_map.entry(s.ticker.clone()).or_default().push(s);
+                            intern_arc(&mut pool, &mut s.ticker);
+                            intern_arc(&mut pool, &mut s.event_ticker);
+                            intern_arc(&mut pool, &mut s.series);
+                            intern_arc(&mut pool, &mut s.close_time);
+                            intern_arc(&mut pool, &mut s.status);
+                            intern_arc(&mut pool, &mut s.result);
+                            fold_one_health(&s, &mut results_by_ticker);
+                            grouped_map.entry(s.ticker.to_string()).or_default().push(s);
                         }
                     }
                 }
@@ -2683,7 +2725,6 @@ impl App {
             snaps_count,
             newest_fetched_at,
             total_lines,
-            markets,
             results_by_ticker,
             seam_offset,
             seam_line,
@@ -3451,6 +3492,7 @@ impl App {
         san.slippage_cents.to_bits().hash(&mut h);
         san.starting_bankroll.to_bits().hash(&mut h);
         san.require_stress_resilience.hash(&mut h);
+        san.enable_regime_throttle.hash(&mut h);
         live_armed.hash(&mut h);
         killed.hash(&mut h);
         rails.max_order_contracts.hash(&mut h);
@@ -3530,20 +3572,27 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
         .take(len - e.len)
         .read_to_end(&mut tail_buf)
         .ok()?;
-    let (new_snaps, tail_lines) = parse_tape_bytes(&tail_buf);
+    let (mut new_snaps, tail_lines) = parse_tape_bytes(&tail_buf);
     e.total_lines += tail_lines;
     // The held parse is shared with readers; extending it mutates
     // in place when this entry is the only holder (the common
     // case), and every fold touches only the new snapshots.
-    fold_health(&new_snaps, &mut e.markets, &mut e.results_by_ticker);
+    fold_health(&new_snaps, &mut e.results_by_ticker);
     e.snaps_count += new_snaps.len();
     if let Some(last) = new_snaps.last() {
         e.newest_fetched_at = Some(last.fetched_at);
     }
     {
+        let mut pool: std::collections::HashSet<Arc<str>> = std::collections::HashSet::with_capacity(64);
         let grouped = Arc::make_mut(&mut e.grouped);
-        for s in new_snaps {
-            let w = grouped.entry(s.ticker.clone()).or_default();
+        for mut s in new_snaps.drain(..) {
+            intern_arc(&mut pool, &mut s.ticker);
+            intern_arc(&mut pool, &mut s.event_ticker);
+            intern_arc(&mut pool, &mut s.series);
+            intern_arc(&mut pool, &mut s.close_time);
+            intern_arc(&mut pool, &mut s.status);
+            intern_arc(&mut pool, &mut s.result);
+            let w = grouped.entry(s.ticker.to_string()).or_default();
             // Appends arrive in fetch order, so the window stays
             // sorted; an out-of-order tail re-sorts its window
             // instead of silently corrupting the order.
@@ -4140,7 +4189,7 @@ fn serve_sse_stream(stream: &mut std::net::TcpStream, app: &App) {
         .grouped
         .values()
         .filter_map(|w| w.last())
-        .filter(|m| m.result.is_empty() && matches!(m.status.as_str(), "open" | "active"))
+        .filter(|m| m.result.is_empty() && matches!(m.status.as_ref(), "open" | "active"))
         .take(25)
         .collect();
     let initial = serde_json::json!({
@@ -6154,12 +6203,12 @@ mod tests {
     fn snap(ticker: &str, fetched_at: i64, close: &str, result: &str, ya: Option<f64>, na: Option<f64>) -> Snapshot {
         Snapshot {
             fetched_at,
-            ticker: ticker.to_string(),
-            event_ticker: "EV".to_string(),
-            series: "KXBTC15M".to_string(),
-            close_time: close.to_string(),
+            ticker: ticker.into(),
+            event_ticker: "EV".into(),
+            series: "KXBTC15M".into(),
+            close_time: close.into(),
             status: if result.is_empty() { "active".into() } else { "settled".into() },
-            result: result.to_string(),
+            result: result.into(),
             yes_bid: ya.map(|v| v - 0.02),
             yes_ask: ya,
             no_bid: na.map(|v| v - 0.02),
@@ -6925,12 +6974,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let s1 = Snapshot {
             fetched_at: 1000,
-            ticker: "KXBTC15M-TEST".to_string(),
-            event_ticker: "KXBTC15M".to_string(),
-            series: "KXBTC15M".to_string(),
-            close_time: "2026-11-21T23:00:00Z".to_string(),
-            status: "open".to_string(),
-            result: String::new(),
+            ticker: "KXBTC15M-TEST".into(),
+            event_ticker: "KXBTC15M".into(),
+            series: "KXBTC15M".into(),
+            close_time: "2026-11-21T23:00:00Z".into(),
+            status: "open".into(),
+            result: "".into(),
             yes_bid: Some(0.51),
             yes_ask: Some(0.54),
             no_bid: Some(0.46),
