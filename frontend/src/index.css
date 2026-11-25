@@ -7,10 +7,12 @@
 @import "./theme.css";
 @import "./fonts.css";
 
-/* Vaul sheets travel at the house's 250ms enter token and obey prefers-reduced-motion cleanly. */
+/* Vaul sheets travel at the house's 220ms enter token and obey prefers-reduced-motion cleanly. */
 [data-vaul-drawer], [data-vaul-overlay] {
   animation-duration: var(--dur-enter) !important;
+  animation-timing-function: var(--ease-house) !important;
   transition-duration: var(--dur-enter) !important;
+  transition-timing-function: var(--ease-house) !important;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -18,6 +20,52 @@
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* Browser surfaces: 6px custom scrollbars, themed caret, selection, and Sonner dark surface parity. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--hairline) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--hairline);
+  border-radius: 9999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--icon);
+}
+
+input, textarea, select, [contenteditable] {
+  caret-color: var(--blue);
+}
+
+[data-sonner-toaster] [data-sonner-toast] {
+  background: var(--surface) !important;
+  color: var(--ink) !important;
+  border: 1px solid var(--hairline) !important;
+  box-shadow: var(--elev-raised) !important;
+}
+
+[data-sonner-toaster] [data-sonner-toast] [data-description] {
+  color: var(--ink-2) !important;
+}
+
+[data-sonner-toaster] [data-sonner-toast] [data-button],
+[data-sonner-toaster] [data-sonner-toast] [data-close-button] {
+  background: var(--board) !important;
+  color: var(--ink) !important;
+  border-color: var(--hairline) !important;
 }
 
 /* Phone (<768px): data tables render as compact stacked rows without horizontal squeeze or scroll. */

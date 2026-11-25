@@ -3,6 +3,7 @@
 // slim left desk rail (15m Tape, Strategies, Paper Slots, Quant Lab & Tournament, Live & Rails),
 // 1-click Full Quant Edge Audit trigger, and collapsible Order Ticket & Strategy Rule Editor drawers.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { MotionConfig, motion } from "motion/react";
 import { Drawer } from "vaul";
 import { Toaster, toast } from "sonner";
 import {
@@ -10,6 +11,7 @@ import {
   AlertOctagon,
   Code2,
   FlaskConical,
+  Gauge,
   Layers,
   ListChecks,
   Lock,
@@ -18,11 +20,11 @@ import {
   Settings,
   ShieldAlert,
   SlidersHorizontal,
-  Sparkles,
   Unlock,
   X,
 } from "lucide-react";
 import { Badge, Button, Kbd, StatusPill } from "@/components/ui";
+import { glide } from "@/motion";
 import { CommandPalette, type DeskTabId } from "@/CommandPalette";
 import {
   ArmLiveModal,
@@ -147,6 +149,7 @@ export function App() {
   const upd = useUpdates();
 
   useEffect(() => {
+    document.documentElement.dataset.world = "terminal";
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("openbell-theme", theme);
   }, [theme]);
@@ -485,6 +488,7 @@ export function App() {
       : "DISARMED (PAPER)";
 
   return (
+    <MotionConfig reducedMotion="user">
     <div className="min-h-screen bg-canvas text-ink">
       {/* Persistent Quiet Risk / Kill-Switch Header Bar (48px desktop) */}
       <header className="sticky top-0 z-30 border-b border-hairline bg-surface">
@@ -534,7 +538,7 @@ export function App() {
                 ) : (
                   <Lock className="size-3" strokeWidth={1.5} aria-hidden />
                 )}
-                <span className="mono">{liveModeLabel}</span>
+                <span className="font-medium">{liveModeLabel}</span>
               </StatusPill>
             </button>
           </div>
@@ -564,7 +568,7 @@ export function App() {
               onClick={handleRunEdgeAudit}
               title="Run 1-click Full Quant Edge Audit across all 12 strategies"
             >
-              <Sparkles className="size-3.5" strokeWidth={1.5} aria-hidden />
+              <Gauge className="size-3.5" strokeWidth={1.5} aria-hidden />
               <span>Edge Audit</span>
             </Button>
 
@@ -593,6 +597,11 @@ export function App() {
               disabled={liveBusy}
               onClick={() => void handleKillSwitch()}
               title="Cancel all resting Kalshi orders immediately and disarm live trading"
+              style={
+                liveStatus.liveArmed
+                  ? { backgroundColor: "#c93746", borderColor: "#c93746", color: "#ffffff" }
+                  : undefined
+              }
             >
               <AlertOctagon className="size-3.5" strokeWidth={1.5} aria-hidden />
               <span>Kill Switch</span>
@@ -653,13 +662,23 @@ export function App() {
                       aria-selected={active}
                       onClick={() => setTab(item.id)}
                       className={
-                        "flex min-h-11 shrink-0 cursor-pointer items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-left text-sm font-medium outline-none transition-[background-color,color,border-color] duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring lg:min-h-9 lg:w-full " +
+                        "relative flex min-h-11 shrink-0 cursor-pointer items-center justify-between gap-2 rounded-md border border-transparent px-2.5 py-1.5 text-left text-sm font-medium outline-none transition-[color,transform] duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring motion-safe:active:scale-[0.98] lg:min-h-9 lg:w-full " +
                         (active
-                          ? "border-hairline bg-board text-ink shadow-xs"
-                          : "border-transparent bg-transparent text-ink-2 hover:bg-board/60 hover:text-ink")
+                          ? "text-ink"
+                          : "bg-transparent text-ink-2 [@media(hover:hover)_and_(pointer:fine)]:hover:bg-board/70 [@media(hover:hover)_and_(pointer:fine)]:hover:text-ink")
                       }
                     >
-                      <span className="flex items-center gap-2">
+                      {active && (
+                        <motion.span
+                          layoutId="desk-nav-pill"
+                          transition={glide}
+                          aria-hidden
+                          className="pointer-events-none absolute inset-0 rounded-md border border-hairline bg-board shadow-(--elev-card)"
+                        >
+                          <span className="absolute top-1.5 bottom-1.5 left-0 hidden w-0.5 rounded-full bg-blue lg:block" />
+                        </motion.span>
+                      )}
+                      <span className="relative z-10 flex items-center gap-2">
                         <Icon
                           className={`size-4 shrink-0 ${active ? "text-info-foreground" : "text-ink-3"}`}
                           strokeWidth={1.5}
@@ -668,7 +687,7 @@ export function App() {
                         <span className="lg:hidden">{item.shortLabel}</span>
                         <span className="hidden lg:inline">{item.label}</span>
                       </span>
-                      <span className="mono hidden text-xs text-ink-3 lg:inline">{item.meta}</span>
+                      <span className="mono relative z-10 hidden text-xs text-ink-3 lg:inline">{item.meta}</span>
                     </button>
                   );
                 })}
@@ -903,10 +922,10 @@ export function App() {
           )}
 
           <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-3 pb-4 text-xs text-ink-3">
-            <span className="mono">
-              OpenBell v{versionText} — Kalshi 15m Quant &amp; Execution Workbench (Hard Risk Rails Enforced)
+            <span>
+              OpenBell v{versionText}: Kalshi 15m Quant &amp; Execution Workbench (Hard Risk Rails Enforced)
             </span>
-            <span className="mono">
+            <span>
               {liveStatus.liveArmed
                 ? `Kalshi ${liveStatus.environment.toUpperCase()} Live Armed`
                 : "Fail-Closed Disarmed (Paper Mode)"}
@@ -922,7 +941,7 @@ export function App() {
         direction={wide ? "right" : "bottom"}
       >
         <Drawer.Portal>
-          <Drawer.Overlay className="fixed inset-0 z-40 bg-ink/30" />
+          <Drawer.Overlay className="fixed inset-0 z-40 bg-ink/35 backdrop-blur-[2px]" />
           <Drawer.Content
             id="order-ticket-drawer"
             data-order-ticket-drawer
@@ -977,7 +996,7 @@ export function App() {
         direction={wide ? "right" : "bottom"}
       >
         <Drawer.Portal>
-          <Drawer.Overlay className="fixed inset-0 z-40 bg-ink/30" />
+          <Drawer.Overlay className="fixed inset-0 z-40 bg-ink/35 backdrop-blur-[2px]" />
           <Drawer.Content
             id="rule-editor-drawer"
             data-rule-editor-drawer
@@ -1087,8 +1106,21 @@ export function App() {
         onOpenSettings={() => setSettingsOpen(true)}
       />
 
-      <Toaster position="bottom-right" />
+      <Toaster
+        position="bottom-right"
+        theme={theme}
+        toastOptions={{
+          style: {
+            background: "var(--surface)",
+            color: "var(--ink)",
+            border: "1px solid var(--hairline)",
+            boxShadow: "var(--elev-raised)",
+          },
+          className: "font-sans text-sm",
+        }}
+      />
     </div>
+    </MotionConfig>
   );
 }
 

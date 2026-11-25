@@ -122,7 +122,7 @@ export function RuneSandbox({
       const res = await validateRuneStrategy(source, home);
       setValidation(res);
       if (res.valid) {
-        toast.success(`Strategy syntax valid (${res.name} · ${res.side.toUpperCase()}).`);
+        toast.success(`Strategy syntax valid (${res.name}, ${res.side.toUpperCase()}).`);
       } else {
         toast.error(`Validation found ${res.diagnostics.filter((d) => d.level === "error").length} issue(s).`);
       }

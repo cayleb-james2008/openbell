@@ -1,83 +1,88 @@
-/* Calm Square UI quant desk theme for OpenBell v0.9.0.
- * Light is the default crisp hairline surface stack; dark is the full second theme
- * (toggled exclusively inside the Settings Vaul sheet). Cobalt (--blue) is the single
- * interactive accent; emerald and crimson mark paper gain/loss and status only.
+/* Institutional Terminal Material World (data-world="terminal") for OpenBell v0.9.0.
+ * Light: Surgical cool alabaster (#F7F8FA / #EFF1F4 / #FFFFFF).
+ * Dark: True obsidian (#090B0E / #0F1217 / #141820), toggled exclusively inside Settings (#67).
+ * Primary CTAs use high-contrast monochrome ink (#111318 light / #F3F4F6 dark).
+ * Emerald, crimson, and terminal teal mark price/PnL/edge, risk rails, focus, and live indicators only.
  */
 :root[data-theme="light"] {
   color-scheme: light;
-  --canvas: #f0f2f5;
-  --board: #f5f7fa;
+  --canvas: #f7f8fa;
+  --board: #eff1f4;
   --surface: #ffffff;
-  --hairline: #dfe4ec;
-  --input: #80899a;
-  --track: #e9edf4;
+  --hairline: #e1e5ec;
+  --input: #7c8598;
+  --track: #e8ebf0;
   --raised: #ffffff;
-  --ink: #13151a;
-  --ink-2: #4c5568;
+  --ink: #111318;
+  --ink-2: #4b5366;
   --ink-3: #5e677a;
   --icon: #646e82;
   --disabled: #b8c0ce;
-  --blue: #1562fc;
+  --blue: #0d9488;
   --blue-fg: #ffffff;
-  --blue-hover: #0f52d6;
-  --blue-soft: #e8f0ff;
-  --focus: #1562fc;
-  --ink-button: #14161b;
+  --blue-hover: #0f766e;
+  --blue-soft: rgba(13, 148, 136, 0.1);
+  --focus: #0d9488;
+  --ink-button: #111318;
   --ink-button-fg: #ffffff;
   --dot-green: #109468;
-  --dot-blue: #1562fc;
+  --dot-blue: #0d9488;
   --dot-red: #c93746;
   --dot-clay: #c58e76;
   --dot-amber: #d48906;
   --dot-online: #109468;
   --unread: #c93746;
   --destructive-foreground: #b4232f;
-  --info-foreground: #144ec4;
+  --info-foreground: #0b6e65;
   --success-foreground: #066e4c;
   --warning-foreground: #855600;
   --pill-active-bg: #dcf7e9;
   --pill-active-fg: #066e4c;
   --pill-warn-bg: #fdf0d3;
   --pill-warn-fg: #855600;
-  --pill-inactive-bg: #e9edf4;
+  --pill-inactive-bg: #e8ebf0;
   --pill-inactive-fg: #444c5e;
-  --elev-shell: 0 24px 64px rgba(16, 24, 40, 0.08);
-  --elev-card: 0 1px 2px rgba(16, 24, 40, 0.04);
-  --elev-raised: 0 1px 2px rgba(16, 24, 40, 0.08);
-  --elev-lift: 0 10px 28px rgba(16, 24, 40, 0.12);
-  --elev-primary: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 1px 2px rgba(21, 98, 252, 0.28);
+  --elev-shell: 0 24px 64px rgba(17, 19, 24, 0.08);
+  --elev-card: 0 1px 2px rgba(17, 19, 24, 0.04);
+  --elev-raised: 0 1px 2px rgba(17, 19, 24, 0.08);
+  --elev-lift: 0 10px 28px rgba(17, 19, 24, 0.12);
+  --elev-primary: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 1px 2px rgba(17, 19, 24, 0.18);
+  --primary: var(--ink-button);
+  --primary-foreground: var(--ink-button-fg);
+  --ring: var(--focus);
+  --info: var(--blue);
 }
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --canvas: #0e1013;
-  --board: #13161c;
-  --surface: #181c23;
-  --hairline: #282e39;
-  --input: #6d778c;
-  --track: #20252f;
-  --raised: #2d3442;
-  --ink: #eef0f5;
-  --ink-2: #a5adbe;
-  --ink-3: #8992a5;
-  --icon: #8a93a6;
-  --disabled: #4c5363;
-  --blue: #4a86ff;
-  --blue-fg: #081020;
-  --blue-hover: #699cff;
-  --blue-soft: rgba(74, 134, 255, 0.16);
-  --focus: #699cff;
-  --ink-button: #eef0f5;
-  --ink-button-fg: #12151a;
-  --dot-green: #40c997;
-  --dot-blue: #4a86ff;
+  --canvas: #090b0e;
+  --board: #0f1217;
+  --surface: #141820;
+  --hairline: #232833;
+  --input: #6a748a;
+  --track: #1b2029;
+  --raised: #282e3a;
+  --ink: #f0f2f5;
+  --ink-2: #a0a9ba;
+  --ink-3: #8790a3;
+  --icon: #8892a6;
+  --disabled: #4a5161;
+  --blue: #2dd4bf;
+  --blue-fg: #090b0e;
+  --blue-hover: #5eead4;
+  --blue-soft: rgba(45, 212, 191, 0.14);
+  --focus: #2dd4bf;
+  --ink-button: #f3f4f6;
+  --ink-button-fg: #111318;
+  --dot-green: #38c996;
+  --dot-blue: #2dd4bf;
   --dot-red: #f26d7a;
   --dot-clay: #c58e76;
   --dot-amber: #f5b338;
-  --dot-online: #40c997;
+  --dot-online: #38c996;
   --unread: #f26d7a;
   --destructive-foreground: #f7929c;
-  --info-foreground: #8fb4ff;
+  --info-foreground: #5eead4;
   --success-foreground: #5ee0b0;
   --warning-foreground: #f6c462;
   --pill-active-bg: rgba(49, 184, 138, 0.16);
@@ -86,11 +91,15 @@
   --pill-warn-fg: #f6c462;
   --pill-inactive-bg: rgba(255, 255, 255, 0.08);
   --pill-inactive-fg: #c2c8d6;
-  --elev-shell: 0 32px 80px rgba(0, 0, 0, 0.48);
+  --elev-shell: 0 32px 80px rgba(0, 0, 0, 0.56);
   --elev-card: 0 0 #0000;
-  --elev-raised: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --elev-lift: 0 12px 28px rgba(0, 0, 0, 0.55);
-  --elev-primary: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  --elev-raised: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --elev-lift: 0 12px 28px rgba(0, 0, 0, 0.6);
+  --elev-primary: inset 0 1px 0 rgba(255, 255, 255, 0.55), 0 1px 2px rgba(0, 0, 0, 0.35);
+  --primary: var(--ink-button);
+  --primary-foreground: var(--ink-button-fg);
+  --ring: var(--focus);
+  --info: var(--blue);
 }
 
 :root {
@@ -122,5 +131,6 @@ h1, h2, h3, .font-heading {
 }
 
 ::selection {
-  background: color-mix(in oklab, var(--blue) 26%, transparent);
+  background: var(--blue-soft);
+  color: var(--ink);
 }

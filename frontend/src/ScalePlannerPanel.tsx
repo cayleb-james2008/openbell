@@ -85,7 +85,7 @@ export function ScalePlannerPanel({
         setSeed(res.seed);
         if (notify) {
           toast.success(
-            `Scale plan updated (${res.modeLabel} · ${SIZING_LABELS[res.sizingMode]} · ${res.elapsedMs}ms).`,
+            `Scale plan updated (${res.modeLabel}, ${SIZING_LABELS[res.sizingMode]}, ${res.elapsedMs}ms).`,
           );
         }
       } finally {

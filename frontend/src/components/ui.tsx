@@ -26,18 +26,18 @@ export function Button({
     <button
       type={type}
       className={cn(
-        "inline-flex cursor-pointer items-center justify-center gap-1.5 whitespace-nowrap rounded-md border font-medium transition-[background-color,color,border-color] duration-(--dur-press) ease-(--ease-house) outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:bg-track disabled:text-ink-3 disabled:border-hairline",
+        "inline-flex cursor-pointer items-center justify-center gap-1.5 whitespace-nowrap rounded-md border font-medium transition-[background-color,color,border-color,opacity,transform] duration-(--dur-press) ease-(--ease-house) outline-none focus-visible:ring-2 focus-visible:ring-ring motion-safe:active:scale-[0.97] disabled:pointer-events-none disabled:bg-track disabled:text-ink-3 disabled:border-hairline",
         size === "default" && "min-h-11 px-3.5 text-sm sm:min-h-9",
         size === "sm" && "min-h-11 px-2.5 text-sm sm:min-h-8 sm:text-xs",
         size === "icon" && "size-11 shrink-0 sm:size-9",
         variant === "default" &&
-          "border-blue bg-blue text-blue-fg shadow-(--elev-primary) hover:border-blue-hover hover:bg-blue-hover",
+          "border-ink-button bg-ink-button text-ink-button-fg shadow-(--elev-primary) [@media(hover:hover)_and_(pointer:fine)]:hover:opacity-90",
         variant === "outline" &&
-          "border-hairline bg-surface text-ink hover:bg-board",
+          "border-hairline bg-surface text-ink [@media(hover:hover)_and_(pointer:fine)]:hover:bg-board",
         variant === "ghost" &&
-          "border-transparent bg-transparent text-ink-2 hover:bg-board hover:text-ink",
+          "border-transparent bg-transparent text-ink-2 [@media(hover:hover)_and_(pointer:fine)]:hover:bg-board [@media(hover:hover)_and_(pointer:fine)]:hover:text-ink",
         variant === "danger" &&
-          "border-dot-red bg-surface text-destructive-foreground hover:bg-board",
+          "border-dot-red/55 bg-surface text-destructive-foreground [@media(hover:hover)_and_(pointer:fine)]:hover:bg-board",
         className,
       )}
       {...props}
@@ -136,7 +136,7 @@ export function TableBody({ className, ...props }: HTMLAttributes<HTMLTableSecti
 }
 
 export function TableRow({ className, ...props }: HTMLAttributes<HTMLTableRowElement>) {
-  return <tr className={cn("transition-[background-color] duration-100 hover:bg-board/50", className)} {...props} />;
+  return <tr className={cn("transition-[background-color] duration-(--dur-reveal) ease-(--ease-house) [@media(hover:hover)_and_(pointer:fine)]:hover:bg-board/50", className)} {...props} />;
 }
 
 export function TableHead({ className, ...props }: HTMLAttributes<HTMLTableCellElement>) {
@@ -190,7 +190,7 @@ export function Disclosure({
       >
         <span>{label}</span>
         <ChevronDown
-          className={cn("size-4 shrink-0 text-ink-2 transition-transform duration-150", open && "rotate-180")}
+          className={cn("size-4 shrink-0 text-ink-2 transition-transform duration-(--dur-press) ease-(--ease-house)", open && "rotate-180")}
           aria-hidden
         />
       </button>
