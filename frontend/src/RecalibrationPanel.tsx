@@ -69,7 +69,7 @@ export function RecalibrationPanel({
       ref={panelRef}
       id="quant-recalibration"
       data-recalibration-panel
-      className="rounded-[10px] border border-hairline bg-surface p-4 shadow-(--elev-card)"
+      className="scroll-mt-16 rounded-[10px] border border-hairline bg-surface p-4 shadow-(--elev-card)"
     >
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-hairline pb-3">

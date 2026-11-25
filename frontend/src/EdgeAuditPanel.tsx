@@ -73,7 +73,7 @@ export function EdgeAuditPanel({
       id="quant-edge-audit"
       data-edge-audit
       aria-label="Full Quant Edge Audit Scorecard"
-      className="overflow-hidden rounded-[10px] border border-hairline bg-surface"
+      className="scroll-mt-16 overflow-hidden rounded-[10px] border border-hairline bg-surface"
     >
       {/* Top Action Header */}
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-hairline bg-board/60 px-4 py-3.5">
