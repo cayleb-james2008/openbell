@@ -2,7 +2,7 @@
 // Aligned with loopback-only /api/live/* routes and X-OpenBell-CSRF: 1 + Content-Type: application/json guard.
 // NEVER logs, stores in localStorage, or echoes private key PEM bytes.
 import { type Home, cleanStr, isNum, supportsV080 } from "@/lib/desk";
-import { kalshiFeeDollars } from "@/lib/quant";
+import { kalshiFeeDollars } from "@/lib/fees";
 
 export type LiveEnvironment = "demo" | "prod";
 

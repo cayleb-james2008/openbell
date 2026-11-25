@@ -46,7 +46,30 @@ done
 
 # The page draws the curves: it fetches /api/equity, builds an inline
 # SVG (no external chart library), and labels the figures paper.
-page=$(curl -s "http://127.0.0.1:$PORT/")
+# Traverse `/` plus any code-split `/chunks/*.js` imported by the shell or lazy tabs.
+page=$(python3 - "http://127.0.0.1:$PORT" <<'PYEOF'
+import re, sys, urllib.request
+base = sys.argv[1]
+seen, queue, out = set(), ["/"], []
+while queue:
+    path = queue.pop(0)
+    if path in seen:
+        continue
+    seen.add(path)
+    with urllib.request.urlopen(base + path, timeout=5) as r:
+        txt = r.read().decode("utf-8", "replace")
+    out.append(txt)
+    for m in re.findall(r"""(?:"|'|`)(/chunks/[^"'`]+\.js)(?:"|'|`)""", txt):
+        if m not in seen:
+            queue.append(m)
+    if path.startswith("/chunks/"):
+        for m in re.findall(r"""(?:"|'|`)\./([^"'`]+\.js)(?:"|'|`)""", txt):
+            nxt = "/chunks/" + m
+            if nxt not in seen:
+                queue.append(nxt)
+print("\n".join(out))
+PYEOF
+)
 echo "$page" | grep -q '/api/equity' || { echo "FAIL: the page never fetches /api/equity"; exit 1; }
 # The chart is an SVG the bundle builds at run time: the labelled-SVG intent is the img role, its aria-label
 # naming the paper equity curves, and the viewBox the bundle gives every SVG chart.

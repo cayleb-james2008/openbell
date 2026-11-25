@@ -4,6 +4,16 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.13.0 - 2026-11-25
+
+- **Initial-Shell `React.lazy` `/chunks/*` Code-Splitting (`frontend/vite.config.ts`, `src/embedded_chunks.rs`, `src/main.rs`):**
+  - Split secondary tabs, Quant Lab diagnostics, Command Palette, Order Ticket, and Settings into 21 compile-time embedded pre-gzipped `/chunks/*` assets with strong SHA-256 `ETag` + `304`, `Vary: Accept-Encoding`, `Cache-Control: public, max-age=31536000, immutable`, `SEC_HEADERS`, CWE-22 traversal guard, and zero entry back-imports.
+  - Reduced initial `GET /` shell from `1,054 KB` (`363 KB` gzip) down to `92 KB` raw / `21 KB` gzip.
+- **Maker Queue Fill-Rate Sensitivity & Shadow Drift Gauge (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**
+  - Added causal break-even maker fill-rate (`breakeven_fill_rate_pct`), configurable `min_fill_rate_pct` queue-fill gate (default `40%`), `25% / 50% / 75% / 100%` daily profit fill sensitivity table, and live-shadow vs paper expectancy drift gauge (`drift_gauge`) with concrete scaling blockers.
+- **Peak RSS (`VmHWM`) Optimization (`src/main.rs`, `src/tournament.rs`):**
+  - Replaced post-deserialize `Snapshot` interning with thread-local RAII `TapePoolGuard` for zero-throwaway `Arc<str>` interning during JSON parsing, switched `PREFIX_CACHE` keys from `String` to shared `Arc<str>`, and shrunk `TournamentTapeContext` allocations.
+
 ## 0.12.0 - 2026-11-25
 
 - **Causal Regime-Aware Kelly Throttle & Edge Attribution (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**

@@ -1,7 +1,7 @@
 // OpenBell Autonomous Edge & Auto-Allocator client + deterministic offline/fixture preview fallback.
 // Aligned with GET /api/allocator and POST /api/allocator/plan (X-OpenBell-CSRF: 1).
 import { type Dataset, type Market, type Slots, isNum } from "@/lib/desk";
-import { kalshiFeeDollars } from "@/lib/quant";
+import { kalshiFeeDollars } from "@/lib/fees";
 
 export type AllocatorSizingMode = "quarter_kelly" | "half_kelly" | "equal_winners";
 export type AllocatorExecutionMode = "maker" | "taker";
@@ -17,6 +17,23 @@ export type AutoAllocatorRequest = {
   starting_bankroll: number;
   require_stress_resilience: boolean;
   enable_regime_throttle: boolean;
+  min_fill_rate_pct: number;
+};
+
+export type FillRateSensitivityPoint = {
+  fill_rate_pct: number;
+  adverse_haircut_cents: number;
+  effective_ev_cents: number | null;
+  projected_daily_net_dollars: number;
+  clears_min_fill_gate: boolean;
+};
+
+export type DriftGauge = {
+  paper_expectancy_cents: number | null;
+  shadow_expectancy_cents: number | null;
+  drift_cents: number | null;
+  status: "HEALTHY" | "DECAY_WARNING" | "DECAY_CRITICAL" | "NO_DATA" | string;
+  summary: string;
 };
 
 export type RegimeEdgeBucket = {
@@ -52,6 +69,7 @@ export type AllocatedWinner = {
   fee_drag_cents: number;
   oos_net_expectancy_cents: number;
   full_kelly_pct: number;
+  breakeven_fill_rate_pct: number;
   regime_throttle_mult: number;
   allocated_pct: number;
   allocated_dollars: number;
@@ -122,6 +140,7 @@ export type AutoAllocatorReport = {
   starting_bankroll: number;
   require_stress_resilience: boolean;
   enable_regime_throttle: boolean;
+  min_fill_rate_pct: number;
   regime_throttle_mult: number;
   current_oos_drawdown_pct: number;
   throttle_reason: string;
@@ -133,6 +152,8 @@ export type AutoAllocatorReport = {
   active_winners: AllocatedWinner[];
   quarantined: QuarantinedStrategy[];
   regime_attribution: RegimeEdgeBucket[];
+  fill_sensitivity: FillRateSensitivityPoint[];
+  drift_gauge: DriftGauge;
   comparison: AllocatorComparison;
   planned_intents: PlannedAllocatorIntent[];
   daily_target: DailyTargetVerdict;
@@ -151,6 +172,7 @@ export const DEFAULT_ALLOCATOR_REQUEST: AutoAllocatorRequest = {
   starting_bankroll: 100,
   require_stress_resilience: true,
   enable_regime_throttle: true,
+  min_fill_rate_pct: 40,
 };
 
 const MUTATION_HEADERS: HeadersInit = {
@@ -180,6 +202,8 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
   const winnersRaw = Array.isArray(o.active_winners) ? o.active_winners : [];
   const quarantinedRaw = Array.isArray(o.quarantined) ? o.quarantined : [];
   const regRaw = Array.isArray(o.regime_attribution) ? o.regime_attribution : [];
+  const fillRaw = Array.isArray(o.fill_sensitivity) ? o.fill_sensitivity : [];
+  const driftRaw = (o.drift_gauge && typeof o.drift_gauge === "object" ? o.drift_gauge : {}) as Record<string, unknown>;
   const intentsRaw = Array.isArray(o.planned_intents) ? o.planned_intents : [];
   const notesRaw = Array.isArray(o.honesty_notes) ? o.honesty_notes : [];
   const compRaw = (o.comparison && typeof o.comparison === "object" ? o.comparison : {}) as Record<string, unknown>;
@@ -198,6 +222,7 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
     starting_bankroll: startEq,
     require_stress_resilience: typeof o.require_stress_resilience === "boolean" ? o.require_stress_resilience : true,
     enable_regime_throttle: typeof o.enable_regime_throttle === "boolean" ? o.enable_regime_throttle : true,
+    min_fill_rate_pct: finiteOr(o.min_fill_rate_pct, 40),
     regime_throttle_mult: finiteOr(o.regime_throttle_mult, 1.0),
     current_oos_drawdown_pct: finiteOr(o.current_oos_drawdown_pct, 0),
     throttle_reason: strOr(o.throttle_reason, "1.00x Normal"),
@@ -229,6 +254,7 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
           fee_drag_cents: finiteOr(w.fee_drag_cents, estDrag),
           oos_net_expectancy_cents: exp,
           full_kelly_pct: finiteOr(w.full_kelly_pct, 0),
+          breakeven_fill_rate_pct: finiteOr(w.breakeven_fill_rate_pct, Math.max(0, Math.min(100, (1 - exp / 2) * 100))),
           regime_throttle_mult: finiteOr(w.regime_throttle_mult, 1.0),
           allocated_pct: finiteOr(w.allocated_pct, 0),
           allocated_dollars: finiteOr(w.allocated_dollars, 0),
@@ -265,6 +291,22 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
         fee_drag_cents: finiteOr(r.fee_drag_cents, 0),
         net_expectancy_cents: finiteOr(r.net_expectancy_cents, 0),
       })),
+    fill_sensitivity: fillRaw
+      .filter((f): f is Record<string, unknown> => !!f && typeof f === "object")
+      .map((f) => ({
+        fill_rate_pct: finiteOr(f.fill_rate_pct, 75),
+        adverse_haircut_cents: finiteOr(f.adverse_haircut_cents, 0),
+        effective_ev_cents: finiteOpt(f.effective_ev_cents),
+        projected_daily_net_dollars: finiteOr(f.projected_daily_net_dollars, 0),
+        clears_min_fill_gate: Boolean(f.clears_min_fill_gate),
+      })),
+    drift_gauge: {
+      paper_expectancy_cents: finiteOpt(driftRaw.paper_expectancy_cents),
+      shadow_expectancy_cents: finiteOpt(driftRaw.shadow_expectancy_cents),
+      drift_cents: finiteOpt(driftRaw.drift_cents),
+      status: strOr(driftRaw.status, "NO_DATA"),
+      summary: strOr(driftRaw.summary, "Awaiting OOS drift readout."),
+    },
     comparison: {
       selection_basis: strOr(compRaw.selection_basis, "causal_is_to_oos"),
       legacy_equal_taker_end_equity: finiteOr(compRaw.legacy_equal_taker_end_equity, startEq),
@@ -342,6 +384,14 @@ export function computeClientFallbackReport(
       active_winners: [],
       quarantined: [],
       regime_attribution: [],
+      fill_sensitivity: [],
+      drift_gauge: {
+        paper_expectancy_cents: null,
+        shadow_expectancy_cents: null,
+        drift_cents: null,
+        status: "NO_DATA",
+        summary: "No settled paper trades loaded yet.",
+      },
       comparison: {
         selection_basis: "causal_is_to_oos",
         legacy_equal_taker_end_equity: startEq,
@@ -472,6 +522,7 @@ export function computeClientFallbackReport(
       fee_drag_cents: feeDragCents,
       oos_net_expectancy_cents: Number(meanNetCents.toFixed(2)),
       full_kelly_pct: Number(fullKelly.toFixed(2)),
+      breakeven_fill_rate_pct: Number((Math.max(0, Math.min(1, 1 - meanNetCents / 2)) * 100).toFixed(1)),
       regime_throttle_mult: 1.0,
       allocated_pct: Number(rawPct.toFixed(2)),
       allocated_dollars: 0,
@@ -577,6 +628,14 @@ export function computeClientFallbackReport(
     active_winners: rawWinners,
     quarantined,
     regime_attribution: [],
+    fill_sensitivity: [],
+    drift_gauge: {
+      paper_expectancy_cents: rawWinners.length > 0 ? rawWinners[0].oos_net_expectancy_cents : null,
+      shadow_expectancy_cents: rawWinners.length > 0 ? rawWinners[0].oos_net_expectancy_cents : null,
+      drift_cents: rawWinners.length > 0 ? 0 : null,
+      status: rawWinners.length > 0 ? "HEALTHY" : "NO_DATA",
+      summary: rawWinners.length > 0 ? "Offline preview drift nominal." : "No active winners.",
+    },
     comparison: {
       selection_basis: isTrades.length > 0 ? "causal_is_to_oos" : "oos_only_no_is_history",
       legacy_equal_taker_end_equity: Number(legacyEq.toFixed(2)),

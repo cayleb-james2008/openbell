@@ -15,7 +15,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui";
-import { MarketHistoryChart, ProbBar, ProvenanceTag } from "@/Charts";
+import { MarketHistoryChart, ProbBar, ProvenanceTag } from "@/TapeCharts";
 import { AutoCollectorStrip } from "@/AutoCollectorStrip";
 import { useWide } from "@/lib/media";
 import {

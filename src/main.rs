@@ -10,6 +10,7 @@
 mod analytics;
 mod auto_allocator;
 mod edge_audit;
+mod embedded_chunks;
 mod kalshi_live;
 mod open;
 mod recalibration;
@@ -130,7 +131,32 @@ fn now_unix() -> i64 {
 
 mod arc_str {
     use serde::{de::Visitor, Deserializer, Serializer};
+    use std::cell::RefCell;
+    use std::collections::HashSet;
     use std::sync::Arc;
+
+    thread_local! {
+        static TAPE_POOL: RefCell<Option<HashSet<Arc<str>>>> = const { RefCell::new(None) };
+    }
+
+    pub struct TapePoolGuard;
+
+    impl TapePoolGuard {
+        pub fn enter(cap: usize) -> Self {
+            TAPE_POOL.with(|c| {
+                *c.borrow_mut() = Some(HashSet::with_capacity(cap));
+            });
+            Self
+        }
+    }
+
+    impl Drop for TapePoolGuard {
+        fn drop(&mut self) {
+            TAPE_POOL.with(|c| {
+                *c.borrow_mut() = None;
+            });
+        }
+    }
 
     pub fn serialize<S: Serializer>(v: &Arc<str>, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(v)
@@ -144,20 +170,22 @@ mod arc_str {
                 f.write_str("a string")
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Arc<str>, E> {
-                Ok(Arc::from(v))
+                Ok(TAPE_POOL.with(|c| {
+                    let mut borrow = c.borrow_mut();
+                    if let Some(pool) = borrow.as_mut() {
+                        if let Some(existing) = pool.get(v) {
+                            return Arc::clone(existing);
+                        }
+                        let a: Arc<str> = Arc::from(v);
+                        pool.insert(Arc::clone(&a));
+                        return a;
+                    }
+                    Arc::from(v)
+                }))
             }
         }
         use StrVisitor as V;
         d.deserialize_str(StrVisitor)
-    }
-}
-
-#[inline]
-fn intern_arc(pool: &mut std::collections::HashSet<Arc<str>>, val: &mut Arc<str>) {
-    if let Some(existing) = pool.get(val.as_ref()) {
-        *val = Arc::clone(existing);
-    } else {
-        pool.insert(Arc::clone(val));
     }
 }
 
@@ -1180,7 +1208,7 @@ static ENTRY_CACHE: std::sync::LazyLock<EntryCache> =
 /// cut short updates neither cache: its result is a function of
 /// the budget state, not of the window.
 type PrefixCache =
-    std::sync::Mutex<std::collections::HashMap<(u64, String), (usize, u64, Option<f64>)>>;
+    std::sync::Mutex<std::collections::HashMap<(u64, Arc<str>), (usize, u64, Option<f64>)>>;
 static PREFIX_CACHE: std::sync::LazyLock<PrefixCache> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
@@ -1223,11 +1251,18 @@ fn window_entry_keyed(
     // Resume a previous scan of this window when its covered
     // prefix is still the window's prefix verbatim.
     let mut resume_from = 0usize;
-    if let Some(t) = ticker {
+    let ticker_arc: Option<Arc<str>> = ticker.map(|t| {
+        snaps
+            .first()
+            .filter(|s| s.ticker.as_ref() == t)
+            .map(|s| Arc::clone(&s.ticker))
+            .unwrap_or_else(|| Arc::from(t))
+    });
+    if let Some(ref t_arc) = ticker_arc {
         let prior = PREFIX_CACHE
             .lock()
             .unwrap()
-            .get(&(strat.fingerprint, t.to_string()))
+            .get(&(strat.fingerprint, Arc::clone(t_arc)))
             .copied();
         if let Some((scanned, prefix_fp, prior_entry)) = prior {
             if scanned <= snaps.len()
@@ -1256,13 +1291,13 @@ fn window_entry_keyed(
         }
         guard.insert(key, entry);
         drop(guard);
-        if let Some(t) = ticker {
+        if let Some(t_arc) = ticker_arc {
             let mut guard = PREFIX_CACHE.lock().unwrap();
             if guard.len() > 250_000 {
                 guard.clear();
             }
             guard.insert(
-                (strat.fingerprint, t.to_string()),
+                (strat.fingerprint, t_arc),
                 (snaps.len(), win_fp, entry),
             );
         }
@@ -2207,6 +2242,12 @@ fn daily_report(app: &App) -> String {
 /// file, byte for byte, before any tail byte is trusted. A file
 /// that shrank, moved backwards, or fails the seam check is parsed
 /// whole. Nothing is ever keyed by less than the content it claims
+#[derive(Clone)]
+enum ResultTrack {
+    One(Arc<str>),
+    Conflict,
+}
+
 /// to summarise.
 struct TapeEntry {
     path: PathBuf,
@@ -2228,7 +2269,7 @@ struct TapeEntry {
     /// must come from the same read.
     total_lines: usize,
     /// Collector-health aggregates over the parsed tape.
-    results_by_ticker: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    results_by_ticker: std::collections::HashMap<Arc<str>, ResultTrack>,
     /// Byte offset at which the last line starts, and its raw text:
     /// the seam an append must continue.
     seam_offset: u64,
@@ -2249,13 +2290,22 @@ fn build_latest_markets_json(grouped: &BTreeMap<String, Vec<Snapshot>>) -> Arc<S
 #[inline]
 fn fold_one_health(
     s: &Snapshot,
-    results_by_ticker: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+    results_by_ticker: &mut std::collections::HashMap<Arc<str>, ResultTrack>,
 ) {
     if !s.result.is_empty() {
-        results_by_ticker
-            .entry(s.ticker.to_string())
-            .or_default()
-            .insert(s.result.to_string());
+        match results_by_ticker.get_mut(&s.ticker) {
+            Some(entry @ ResultTrack::One(_)) => {
+                if let ResultTrack::One(prev) = entry {
+                    if prev.as_ref() != s.result.as_ref() {
+                        *entry = ResultTrack::Conflict;
+                    }
+                }
+            }
+            Some(ResultTrack::Conflict) => {}
+            None => {
+                results_by_ticker.insert(Arc::clone(&s.ticker), ResultTrack::One(Arc::clone(&s.result)));
+            }
+        }
     }
 }
 
@@ -2263,7 +2313,7 @@ fn fold_one_health(
 /// see TapeEntry.
 fn fold_health(
     snaps: &[Snapshot],
-    results_by_ticker: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+    results_by_ticker: &mut std::collections::HashMap<Arc<str>, ResultTrack>,
 ) {
     for s in snaps {
         fold_one_health(s, results_by_ticker);
@@ -2603,7 +2653,7 @@ impl App {
                 conflicting_settlements: e
                     .results_by_ticker
                     .values()
-                    .filter(|r| r.len() > 1)
+                    .filter(|r| matches!(r, ResultTrack::Conflict))
                     .count(),
                 newest_fetched_at: e.newest_fetched_at,
             }
@@ -2666,7 +2716,6 @@ impl App {
         }
 
         let mut grouped_map: BTreeMap<String, Vec<Snapshot>> = BTreeMap::new();
-        let mut pool: std::collections::HashSet<Arc<str>> = std::collections::HashSet::with_capacity(4096);
         let mut results_by_ticker = std::collections::HashMap::new();
         let mut total_lines = 0usize;
         let mut snaps_count = 0usize;
@@ -2675,35 +2724,39 @@ impl App {
         let mut seam_bytes = Vec::with_capacity(512);
         let mut ends_newline = true;
 
-        if let Ok(file) = std::fs::File::open(path) {
-            use std::io::BufRead as _;
-            let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
-            let mut line = Vec::with_capacity(512);
-            let mut offset = 0u64;
-            loop {
-                line.clear();
-                match reader.read_until(b'\n', &mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        total_lines += 1;
-                        let has_nl = line.last() == Some(&b'\n');
-                        ends_newline = has_nl;
-                        let raw = if has_nl { &line[..line.len() - 1] } else { &line[..] };
-                        seam_offset = offset;
-                        seam_bytes.clear();
-                        seam_bytes.extend_from_slice(raw);
-                        offset += n as u64;
-                        if let Ok(mut s) = serde_json::from_slice::<Snapshot>(raw) {
-                            snaps_count += 1;
-                            newest_fetched_at = Some(s.fetched_at);
-                            intern_arc(&mut pool, &mut s.ticker);
-                            intern_arc(&mut pool, &mut s.event_ticker);
-                            intern_arc(&mut pool, &mut s.series);
-                            intern_arc(&mut pool, &mut s.close_time);
-                            intern_arc(&mut pool, &mut s.status);
-                            intern_arc(&mut pool, &mut s.result);
-                            fold_one_health(&s, &mut results_by_ticker);
-                            grouped_map.entry(s.ticker.to_string()).or_default().push(s);
+        {
+            let _pool_guard = arc_str::TapePoolGuard::enter(4096);
+            if let Ok(file) = std::fs::File::open(path) {
+                use std::io::BufRead as _;
+                let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+                let mut line = Vec::with_capacity(512);
+                let mut offset = 0u64;
+                loop {
+                    line.clear();
+                    match reader.read_until(b'\n', &mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            total_lines += 1;
+                            let has_nl = line.last() == Some(&b'\n');
+                            ends_newline = has_nl;
+                            let raw = if has_nl { &line[..line.len() - 1] } else { &line[..] };
+                            seam_offset = offset;
+                            seam_bytes.clear();
+                            seam_bytes.extend_from_slice(raw);
+                            offset += n as u64;
+                            if let Ok(s) = serde_json::from_slice::<Snapshot>(raw) {
+                                snaps_count += 1;
+                                newest_fetched_at = Some(s.fetched_at);
+                                fold_one_health(&s, &mut results_by_ticker);
+                                if let Some(vec) = grouped_map.get_mut(s.ticker.as_ref()) {
+                                    vec.push(s);
+                                } else {
+                                    let key = s.ticker.to_string();
+                                    let mut vec = Vec::with_capacity(16);
+                                    vec.push(s);
+                                    grouped_map.insert(key, vec);
+                                }
+                            }
                         }
                     }
                 }
@@ -3493,6 +3546,7 @@ impl App {
         san.starting_bankroll.to_bits().hash(&mut h);
         san.require_stress_resilience.hash(&mut h);
         san.enable_regime_throttle.hash(&mut h);
+        san.min_fill_rate_pct.to_bits().hash(&mut h);
         live_armed.hash(&mut h);
         killed.hash(&mut h);
         rails.max_order_contracts.hash(&mut h);
@@ -3572,7 +3626,10 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
         .take(len - e.len)
         .read_to_end(&mut tail_buf)
         .ok()?;
-    let (mut new_snaps, tail_lines) = parse_tape_bytes(&tail_buf);
+    let (new_snaps, tail_lines) = {
+        let _pool_guard = arc_str::TapePoolGuard::enter(64);
+        parse_tape_bytes(&tail_buf)
+    };
     e.total_lines += tail_lines;
     // The held parse is shared with readers; extending it mutates
     // in place when this entry is the only holder (the common
@@ -3583,15 +3640,8 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
         e.newest_fetched_at = Some(last.fetched_at);
     }
     {
-        let mut pool: std::collections::HashSet<Arc<str>> = std::collections::HashSet::with_capacity(64);
         let grouped = Arc::make_mut(&mut e.grouped);
-        for mut s in new_snaps.drain(..) {
-            intern_arc(&mut pool, &mut s.ticker);
-            intern_arc(&mut pool, &mut s.event_ticker);
-            intern_arc(&mut pool, &mut s.series);
-            intern_arc(&mut pool, &mut s.close_time);
-            intern_arc(&mut pool, &mut s.status);
-            intern_arc(&mut pool, &mut s.result);
+        for s in new_snaps {
             let w = grouped.entry(s.ticker.to_string()).or_default();
             // Appends arrive in fetch order, so the window stays
             // sorted; an out-of-order tail re-sorts its window
@@ -3755,32 +3805,33 @@ fn etag_matches(headers: &[(String, String)], etag: &str) -> bool {
     })
 }
 
-fn write_index_response<W: std::io::Write>(
+#[allow(clippy::too_many_arguments)]
+fn write_cached_asset<W: std::io::Write>(
     stream: &mut W,
     method: &str,
     headers: &[(String, String)],
+    content_type: &str,
+    cache_control: &str,
+    etag: &str,
+    raw: &[u8],
+    gz: &[u8],
 ) -> std::io::Result<()> {
-    let etag = index_etag();
     if etag_matches(headers, etag) {
         let hdr = format!(
-            "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nVary: Accept-Encoding\r\nCache-Control: no-cache\r\n{SEC_HEADERS}Connection: close\r\n\r\n"
+            "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nVary: Accept-Encoding\r\nCache-Control: {cache_control}\r\n{SEC_HEADERS}Connection: close\r\n\r\n"
         );
         return stream.write_all(hdr.as_bytes());
     }
     let is_head = method == "HEAD";
-    let use_gzip = accepts_gzip(headers);
-    let body: &[u8] = if use_gzip {
-        INDEX_HTML_GZ
-    } else {
-        INDEX_HTML.as_bytes()
-    };
+    let use_gzip = gz.len() < raw.len() && accepts_gzip(headers);
+    let body: &[u8] = if use_gzip { gz } else { raw };
     let enc_hdr = if use_gzip {
         "Content-Encoding: gzip\r\n"
     } else {
         ""
     };
     let hdr = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{enc_hdr}Vary: Accept-Encoding\r\nETag: {etag}\r\nCache-Control: no-cache\r\n{SEC_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{enc_hdr}Vary: Accept-Encoding\r\nETag: {etag}\r\nCache-Control: {cache_control}\r\n{SEC_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(hdr.as_bytes())?;
@@ -3788,6 +3839,41 @@ fn write_index_response<W: std::io::Write>(
         stream.write_all(body)?;
     }
     Ok(())
+}
+
+fn write_index_response<W: std::io::Write>(
+    stream: &mut W,
+    method: &str,
+    headers: &[(String, String)],
+) -> std::io::Result<()> {
+    write_cached_asset(
+        stream,
+        method,
+        headers,
+        "text/html; charset=utf-8",
+        "no-cache",
+        index_etag(),
+        INDEX_HTML.as_bytes(),
+        INDEX_HTML_GZ,
+    )
+}
+
+fn write_embedded_chunk<W: std::io::Write>(
+    stream: &mut W,
+    method: &str,
+    headers: &[(String, String)],
+    chunk: &embedded_chunks::EmbeddedChunk,
+) -> std::io::Result<()> {
+    write_cached_asset(
+        stream,
+        method,
+        headers,
+        chunk.content_type,
+        "public, max-age=31536000, immutable",
+        chunk.etag,
+        chunk.raw,
+        chunk.gz,
+    )
 }
 
 /// Declared-body cap. Anything larger is refused without being
@@ -5822,7 +5908,18 @@ fn start_background_collector(app: Arc<App>) {
     });
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+unsafe extern "C" {
+    fn mallopt(param: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
+}
+
 fn main() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: M_ARENA_MAX (-8) with value 2 is a process-wide glibc allocator hint before threads spawn,
+    // bounding per-thread heap arenas so 32 HTTP workers reuse freed pages instead of ballooning RSS.
+    unsafe {
+        mallopt(-8, 2);
+    }
     if std::env::args().nth(1).as_deref().is_some_and(|a| a == "--version" || a == "-V") {
         println!("openbell-rs {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -5985,6 +6082,19 @@ fn main() {
                 if matches!(method.as_str(), "GET" | "HEAD") && route == "/" {
                     let _ = write_index_response(&mut stream, &method, &headers);
                     continue;
+                }
+                if matches!(method.as_str(), "GET" | "HEAD") {
+                    if let Some(chunk_name) = route.strip_prefix("/chunks/") {
+                        if !chunk_name.contains('/') && !chunk_name.contains("..") {
+                            if let Some(chunk) = embedded_chunks::lookup(chunk_name) {
+                                let _ = write_embedded_chunk(&mut stream, &method, &headers, chunk);
+                                continue;
+                            }
+                        }
+                        let resp = json_response(404, "{\"error\":\"chunk not found\"}");
+                        let _ = stream.write_all(resp.as_bytes());
+                        continue;
+                    }
                 }
                 let response = update_response(&method, &path, host)
                     .unwrap_or_else(|| handle_with_body(&app, &method, &path, &body));
@@ -7258,5 +7368,40 @@ mod tests {
         assert_eq!(refuse_live_request("DELETE", "localhost:8472", &no_hdrs).map(|x| x.0), Some(403));
         assert!(refuse_live_request("POST", "127.0.0.1:8472", &with_csrf).is_none());
         assert!(refuse_live_request("DELETE", "127.0.0.1:8472", &with_csrf).is_none());
+    }
+
+    #[test]
+    fn embedded_chunks_serve_gzip_etag_304_immutable_and_block_woff2_recompress() {
+        let js_chunk = embedded_chunks::CHUNKS
+            .iter()
+            .find(|c| c.name.ends_with(".js") && c.gz.len() < c.raw.len())
+            .expect("at least one embedded js chunk");
+        let mut buf = Vec::new();
+        let gzip_hdrs = vec![("accept-encoding".to_string(), "gzip, deflate".to_string())];
+        write_embedded_chunk(&mut buf, "GET", &gzip_hdrs, js_chunk).unwrap();
+        let split_pos = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let hdr = std::str::from_utf8(&buf[..split_pos]).unwrap();
+        assert!(hdr.starts_with("HTTP/1.1 200 OK"));
+        assert!(hdr.contains("Content-Encoding: gzip"));
+        assert!(hdr.contains("Cache-Control: public, max-age=31536000, immutable"));
+        assert!(hdr.contains(&format!("ETag: {}", js_chunk.etag)));
+        assert_eq!(&buf[split_pos + 4..], js_chunk.gz);
+
+        let mut buf_304 = Vec::new();
+        let inm_hdrs = vec![("if-none-match".to_string(), js_chunk.etag.to_string())];
+        write_embedded_chunk(&mut buf_304, "GET", &inm_hdrs, js_chunk).unwrap();
+        let resp_304 = std::str::from_utf8(&buf_304).unwrap();
+        assert!(resp_304.starts_with("HTTP/1.1 304 Not Modified"));
+        assert!(resp_304.contains("Cache-Control: public, max-age=31536000, immutable"));
+
+        if let Some(font) = embedded_chunks::CHUNKS.iter().find(|c| c.name.ends_with(".woff2")) {
+            let mut font_buf = Vec::new();
+            write_embedded_chunk(&mut font_buf, "GET", &gzip_hdrs, font).unwrap();
+            let f_split = font_buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let f_hdr = std::str::from_utf8(&font_buf[..f_split]).unwrap();
+            assert!(!f_hdr.contains("Content-Encoding: gzip"));
+            assert!(f_hdr.contains("Content-Type: font/woff2"));
+            assert_eq!(&font_buf[f_split + 4..], font.raw);
+        }
     }
 }

@@ -2,7 +2,7 @@
 // Persistent quiet Risk / Kill-Switch header strip (fail-closed DISARMED badge + 1-click Kill Switch),
 // slim left desk rail (15m Tape, Strategies, Paper Slots, Quant Lab & Tournament, Live & Rails),
 // 1-click Full Quant Edge Audit trigger, and collapsible Order Ticket & Strategy Rule Editor drawers.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LazyMotion, MotionConfig, domAnimation } from "motion/react";
 import { Drawer } from "vaul";
 import { Toaster, toast } from "sonner";
@@ -24,19 +24,21 @@ import {
   X,
 } from "lucide-react";
 import { Badge, Button, Kbd, StatusPill } from "@/components/ui";
-import { CommandPalette, type DeskTabId } from "@/CommandPalette";
-import {
-  ArmLiveModal,
-  LiveAccountStrip,
-  LiveDeskWorkspace,
-} from "@/LiveTradingPanel";
-import { QuantLabTab, type QuantSectionId } from "@/QuantLabTab";
-import { RuneSandbox } from "@/RuneSandbox";
-import { SettingsSheet } from "@/SettingsSheet";
-import { SlotsTab } from "@/SlotsTab";
-import { StrategiesTab } from "@/StrategiesTab";
+import type { DeskTabId } from "@/CommandPalette";
+import type { QuantSectionId } from "@/QuantLabTab";
 import { TapeTab } from "@/TapeTab";
 import { UpdateStrip, useUpdates } from "@/Update";
+import { lazyComponent } from "@/lib/lazy";
+
+const CommandPalette = lazyComponent(() => import("@/CommandPalette"), (m) => m.CommandPalette);
+const ArmLiveModal = lazyComponent(() => import("@/LiveTradingPanel"), (m) => m.ArmLiveModal);
+const LiveAccountStrip = lazyComponent(() => import("@/LiveTradingPanel"), (m) => m.LiveAccountStrip);
+const LiveDeskWorkspace = lazyComponent(() => import("@/LiveTradingPanel"), (m) => m.LiveDeskWorkspace);
+const QuantLabTab = lazyComponent(() => import("@/QuantLabTab"), (m) => m.QuantLabTab);
+const RuneSandbox = lazyComponent(() => import("@/RuneSandbox"), (m) => m.RuneSandbox);
+const SettingsSheet = lazyComponent(() => import("@/SettingsSheet"), (m) => m.SettingsSheet);
+const SlotsTab = lazyComponent(() => import("@/SlotsTab"), (m) => m.SlotsTab);
+const StrategiesTab = lazyComponent(() => import("@/StrategiesTab"), (m) => m.StrategiesTab);
 import {
   type CollectorScheduleStatus,
   type Dataset,
@@ -155,6 +157,22 @@ export function App() {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("openbell-theme", theme);
   }, [theme]);
+
+  // Warm lazy route and drawer chunks after initial shell mount so tab/shortcut switches stay instantaneous.
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void LiveAccountStrip.preload();
+      void LiveDeskWorkspace.preload();
+      void ArmLiveModal.preload();
+      void StrategiesTab.preload();
+      void SlotsTab.preload();
+      void QuantLabTab.preload();
+      void RuneSandbox.preload();
+      void SettingsSheet.preload();
+      void CommandPalette.preload();
+    }, 60);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   const home = reads?.home?.ok ? reads.home.v : null;
   const slots = reads?.slots?.ok ? reads.slots.v : null;
@@ -867,90 +885,98 @@ export function App() {
           )}
 
           {tab === "strategies" && (
-            <StrategiesTab
-              strategiesRead={reads?.strategies}
-              slotsRead={reads?.slots}
-              equityRead={reads?.equity}
-              marketsRead={reads?.markets}
-              home={home}
-              dataset={dataset}
-              search={search}
-              onRetry={() => void reload()}
-              isActiveTab={tab === "strategies"}
-              jumpStrategy={jumpStrategy}
-              sandboxSignal={sandboxSignal}
-              onClearJump={() => setJumpStrategy(null)}
-            />
+            <Suspense fallback={null}>
+              <StrategiesTab
+                strategiesRead={reads?.strategies}
+                slotsRead={reads?.slots}
+                equityRead={reads?.equity}
+                marketsRead={reads?.markets}
+                home={home}
+                dataset={dataset}
+                search={search}
+                onRetry={() => void reload()}
+                isActiveTab={tab === "strategies"}
+                jumpStrategy={jumpStrategy}
+                sandboxSignal={sandboxSignal}
+                onClearJump={() => setJumpStrategy(null)}
+              />
+            </Suspense>
           )}
 
           {tab === "slots" && (
-            <SlotsTab
-              slotsRead={reads?.slots}
-              equityRead={reads?.equity}
-              homeRead={reads?.home}
-              reportRead={reads?.report}
-              marketsRead={reads?.markets}
-              liveBundle={liveBundle}
-              onOpenOrderTicket={() => setTicketDrawerOpen(true)}
-              onStageOrder={(draft) => {
-                setTicketTicker(draft.ticker);
-                setTicketSide(draft.side);
-                setTicketCount(draft.count);
-                setTicketPriceCents(draft.priceCents);
-                setTicketPostOnly(draft.postOnly);
-                setTicketDrawerOpen(true);
-              }}
-              onOpenFullAudit={handleRunEdgeAudit}
-              onOpenSettings={() => setSettingsOpen(true)}
-              dataset={dataset}
-              search={search}
-              onRetry={() => void reload()}
-            />
+            <Suspense fallback={null}>
+              <SlotsTab
+                slotsRead={reads?.slots}
+                equityRead={reads?.equity}
+                homeRead={reads?.home}
+                reportRead={reads?.report}
+                marketsRead={reads?.markets}
+                liveBundle={liveBundle}
+                onOpenOrderTicket={() => setTicketDrawerOpen(true)}
+                onStageOrder={(draft) => {
+                  setTicketTicker(draft.ticker);
+                  setTicketSide(draft.side);
+                  setTicketCount(draft.count);
+                  setTicketPriceCents(draft.priceCents);
+                  setTicketPostOnly(draft.postOnly);
+                  setTicketDrawerOpen(true);
+                }}
+                onOpenFullAudit={handleRunEdgeAudit}
+                onOpenSettings={() => setSettingsOpen(true)}
+                dataset={dataset}
+                search={search}
+                onRetry={() => void reload()}
+              />
+            </Suspense>
           )}
 
           {tab === "quant" && (
-            <QuantLabTab
-              dataset={dataset}
-              home={home}
-              marketsRead={reads?.markets}
-              slotsRead={reads?.slots}
-              strategiesRead={reads?.strategies}
-              search={search}
-              focusSection={quantFocus}
-              reseedSignal={reseedSignal}
-              auditSignal={auditSignal}
-              onClearFocus={() => setQuantFocus(null)}
-            />
+            <Suspense fallback={null}>
+              <QuantLabTab
+                dataset={dataset}
+                home={home}
+                marketsRead={reads?.markets}
+                slotsRead={reads?.slots}
+                strategiesRead={reads?.strategies}
+                search={search}
+                focusSection={quantFocus}
+                reseedSignal={reseedSignal}
+                auditSignal={auditSignal}
+                onClearFocus={() => setQuantFocus(null)}
+              />
+            </Suspense>
           )}
 
           {tab === "live" && (
-            <div className="space-y-4">
-              <LiveAccountStrip
-                bundle={liveBundle}
-                busy={liveBusy}
-                workspaceOpen={true}
-                onToggleWorkspace={() => setTicketDrawerOpen(true)}
-                onArmConfirm={() => void handleArmLive()}
-                onDisarm={() => void handleDisarmLive()}
-                onKillSwitch={() => void handleKillSwitch()}
-                onRefresh={() => void refreshLive()}
-                onOpenSettings={() => setSettingsOpen(true)}
-              />
-              <LiveDeskWorkspace
-                bundle={liveBundle}
-                markets={markets}
-                prefillTicker={ticketTicker}
-                prefillPriceCents={ticketPriceCents}
-                prefillSide={ticketSide}
-                prefillCount={ticketCount}
-                prefillPostOnly={ticketPostOnly}
-                busy={liveBusy}
-                onSubmitOrder={handleSubmitLiveOrder}
-                onCancelOrder={handleCancelLiveOrder}
-                onRequestArm={() => setArmModalOpen(true)}
-                onOpenSettings={() => setSettingsOpen(true)}
-              />
-            </div>
+            <Suspense fallback={null}>
+              <div className="space-y-4">
+                <LiveAccountStrip
+                  bundle={liveBundle}
+                  busy={liveBusy}
+                  workspaceOpen={true}
+                  onToggleWorkspace={() => setTicketDrawerOpen(true)}
+                  onArmConfirm={() => void handleArmLive()}
+                  onDisarm={() => void handleDisarmLive()}
+                  onKillSwitch={() => void handleKillSwitch()}
+                  onRefresh={() => void refreshLive()}
+                  onOpenSettings={() => setSettingsOpen(true)}
+                />
+                <LiveDeskWorkspace
+                  bundle={liveBundle}
+                  markets={markets}
+                  prefillTicker={ticketTicker}
+                  prefillPriceCents={ticketPriceCents}
+                  prefillSide={ticketSide}
+                  prefillCount={ticketCount}
+                  prefillPostOnly={ticketPostOnly}
+                  busy={liveBusy}
+                  onSubmitOrder={handleSubmitLiveOrder}
+                  onCancelOrder={handleCancelLiveOrder}
+                  onRequestArm={() => setArmModalOpen(true)}
+                  onOpenSettings={() => setSettingsOpen(true)}
+                />
+              </div>
+            </Suspense>
           )}
 
           <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-3 pb-4 text-xs text-ink-3">
@@ -1002,23 +1028,25 @@ export function App() {
               </Button>
             </div>
             <div className="flex-1 overflow-y-auto p-4 sm:p-5">
-              <LiveDeskWorkspace
-                bundle={liveBundle}
-                markets={markets}
-                prefillTicker={ticketTicker}
-                prefillPriceCents={ticketPriceCents}
-                prefillSide={ticketSide}
-                prefillCount={ticketCount}
-                prefillPostOnly={ticketPostOnly}
-                busy={liveBusy}
-                onSubmitOrder={handleSubmitLiveOrder}
-                onCancelOrder={handleCancelLiveOrder}
-                onRequestArm={() => setArmModalOpen(true)}
-                onOpenSettings={() => {
-                  setTicketDrawerOpen(false);
-                  setSettingsOpen(true);
-                }}
-              />
+              <Suspense fallback={null}>
+                <LiveDeskWorkspace
+                  bundle={liveBundle}
+                  markets={markets}
+                  prefillTicker={ticketTicker}
+                  prefillPriceCents={ticketPriceCents}
+                  prefillSide={ticketSide}
+                  prefillCount={ticketCount}
+                  prefillPostOnly={ticketPostOnly}
+                  busy={liveBusy}
+                  onSubmitOrder={handleSubmitLiveOrder}
+                  onCancelOrder={handleCancelLiveOrder}
+                  onRequestArm={() => setArmModalOpen(true)}
+                  onOpenSettings={() => {
+                    setTicketDrawerOpen(false);
+                    setSettingsOpen(true);
+                  }}
+                />
+              </Suspense>
             </div>
           </Drawer.Content>
         </Drawer.Portal>
@@ -1060,86 +1088,96 @@ export function App() {
               </Button>
             </div>
             <div className="flex-1 overflow-y-auto p-4 sm:p-5">
-              <RuneSandbox
-                strategies={strategies}
-                markets={markets}
-                slots={slots}
-                home={home}
-                dataset={dataset}
-                initialStrategyName={editorInitStrategy}
-                onClose={() => setEditorDrawerOpen(false)}
-              />
+              <Suspense fallback={null}>
+                <RuneSandbox
+                  strategies={strategies}
+                  markets={markets}
+                  slots={slots}
+                  home={home}
+                  dataset={dataset}
+                  initialStrategyName={editorInitStrategy}
+                  onClose={() => setEditorDrawerOpen(false)}
+                />
+              </Suspense>
             </div>
           </Drawer.Content>
         </Drawer.Portal>
       </Drawer.Root>
 
-      <ArmLiveModal
-        open={armModalOpen}
-        onOpenChange={setArmModalOpen}
-        status={liveStatus}
-        busy={liveBusy}
-        onConfirmArm={() => void handleArmLive()}
-        onOpenSettings={() => setSettingsOpen(true)}
-      />
+      <Suspense fallback={null}>
+        {armModalOpen && (
+          <ArmLiveModal
+            open={armModalOpen}
+            onOpenChange={setArmModalOpen}
+            status={liveStatus}
+            busy={liveBusy}
+            onConfirmArm={() => void handleArmLive()}
+            onOpenSettings={() => setSettingsOpen(true)}
+          />
+        )}
 
-      <SettingsSheet
-        open={settingsOpen}
-        onOpenChange={setSettingsOpen}
-        theme={theme}
-        onThemeChange={setTheme}
-        home={home}
-        collectorStatus={collectorStatus}
-        updatingSchedule={updatingSchedule}
-        onSelectSchedule={(enabled, secs) => void handleSelectSchedule(enabled, secs)}
-        liveStatus={liveStatus}
-        savingLiveConfig={savingLiveConfig}
-        onSaveLiveConfig={handleSaveLiveConfig}
-        collectingNow={collectingNow}
-        onCollect={() => void runCollect()}
-        upd={upd}
-      />
+        {settingsOpen && (
+          <SettingsSheet
+            open={settingsOpen}
+            onOpenChange={setSettingsOpen}
+            theme={theme}
+            onThemeChange={setTheme}
+            home={home}
+            collectorStatus={collectorStatus}
+            updatingSchedule={updatingSchedule}
+            onSelectSchedule={(enabled, secs) => void handleSelectSchedule(enabled, secs)}
+            liveStatus={liveStatus}
+            savingLiveConfig={savingLiveConfig}
+            onSaveLiveConfig={handleSaveLiveConfig}
+            collectingNow={collectingNow}
+            onCollect={() => void runCollect()}
+            upd={upd}
+          />
+        )}
 
-      <CommandPalette
-        open={cmdOpen}
-        onOpenChange={setCmdOpen}
-        markets={markets}
-        strategies={strategies}
-        slots={slots?.slots || []}
-        onSelectTab={setTab}
-        onJumpMarket={(ticker) => {
-          setTab("tape");
-          setJumpTicker(ticker);
-        }}
-        onJumpStrategy={(name) => {
-          setTab("strategies");
-          setJumpStrategy(name);
-        }}
-        onOpenSandbox={() => {
-          setEditorInitStrategy(null);
-          setEditorDrawerOpen(true);
-          setSandboxSignal((s) => s + 1);
-        }}
-        onJumpSlot={(_slotNumber, strategyName) => {
-          setTab("slots");
-          if (strategyName) setSearch(strategyName);
-        }}
-        onJumpQuantSection={(section) => {
-          setTab("quant");
-          setQuantFocus(section);
-          if (section === "audit") setAuditSignal((s) => s + 1);
-        }}
-        onCollect={() => void runCollect()}
-        onExportReport={(fmt) => void handlePaletteExport(fmt)}
-        onReseedMonteCarlo={() => {
-          setTab("quant");
-          setQuantFocus("montecarlo");
-          setReseedSignal((s) => s + 1);
-        }}
-        onOpenOrderTicket={() => setTicketDrawerOpen(true)}
-        onKillSwitch={() => void handleKillSwitch()}
-        onOpenSettings={() => setSettingsOpen(true)}
-      />
+        {cmdOpen && (
+          <CommandPalette
+            open={cmdOpen}
+            onOpenChange={setCmdOpen}
+            markets={markets}
+            strategies={strategies}
+            slots={slots?.slots || []}
+            onSelectTab={setTab}
+            onJumpMarket={(ticker) => {
+              setTab("tape");
+              setJumpTicker(ticker);
+            }}
+            onJumpStrategy={(name) => {
+              setTab("strategies");
+              setJumpStrategy(name);
+            }}
+            onOpenSandbox={() => {
+              setEditorInitStrategy(null);
+              setEditorDrawerOpen(true);
+              setSandboxSignal((s) => s + 1);
+            }}
+            onJumpSlot={(_slotNumber, strategyName) => {
+              setTab("slots");
+              if (strategyName) setSearch(strategyName);
+            }}
+            onJumpQuantSection={(section) => {
+              setTab("quant");
+              setQuantFocus(section);
+              if (section === "audit") setAuditSignal((s) => s + 1);
+            }}
+            onCollect={() => void runCollect()}
+            onExportReport={(fmt) => void handlePaletteExport(fmt)}
+            onReseedMonteCarlo={() => {
+              setTab("quant");
+              setQuantFocus("montecarlo");
+              setReseedSignal((s) => s + 1);
+            }}
+            onOpenOrderTicket={() => setTicketDrawerOpen(true)}
+            onKillSwitch={() => void handleKillSwitch()}
+            onOpenSettings={() => setSettingsOpen(true)}
+          />
+        )}
+      </Suspense>
 
       <Toaster
         position="bottom-right"

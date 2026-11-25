@@ -1,7 +1,7 @@
 // Rune Strategies workbench tab: ranked leaderboard for all 12+ Rune strategies with null/malformed guards,
 // j/k/Enter keyboard navigation, Tremor SparkAreaChart + Tracker evidence bar, Vaul Strategy Inspector
 // with Cult UI Expandable Rune source, and Interactive Rune Sandbox Editor + Backtester.
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import { Drawer } from "vaul";
 import { Code2, Play, X } from "lucide-react";
 import {
@@ -19,7 +19,10 @@ import {
   type TrackerBlock,
 } from "@/components/ui";
 import { StrategyEquityChart, TremorSpark, validPoints, type Point } from "@/Charts";
-import { RuneSandbox } from "@/RuneSandbox";
+import { lazyComponent } from "@/lib/lazy";
+
+const RuneSandbox = lazyComponent(() => import("@/RuneSandbox"), (m) => m.RuneSandbox);
+void RuneSandbox.preload();
 import { useWide } from "@/lib/media";
 import {
   type Dataset,
@@ -506,15 +509,17 @@ export function StrategiesTab({
 
       {/* Interactive Strategy Sandbox Editor & Backtest Panel */}
       {sandboxOpen && (
-        <RuneSandbox
-          strategies={validRows}
-          markets={markets}
-          slots={slots}
-          home={home}
-          dataset={dataset}
-          initialStrategyName={sandboxInitName}
-          onClose={() => setSandboxOpen(false)}
-        />
+        <Suspense fallback={null}>
+          <RuneSandbox
+            strategies={validRows}
+            markets={markets}
+            slots={slots}
+            home={home}
+            dataset={dataset}
+            initialStrategyName={sandboxInitName}
+            onClose={() => setSandboxOpen(false)}
+          />
+        </Suspense>
       )}
 
       {!strategiesRead ? (

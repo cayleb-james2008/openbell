@@ -1,6 +1,6 @@
 // Quant Lab (4th workbench tab): Calibration Reliability SVG with 95% Wilson error bars + Brier/ECE,
 // 1,000-path Monte Carlo Bootstrap Fan Chart with Run/Reseed, and Walk-Forward In-Sample vs Out-of-Sample Table.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Dices, RefreshCw, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -15,10 +15,16 @@ import {
   TableRow,
 } from "@/components/ui";
 import { CalibrationReliabilityChart, MonteCarloFanChart, ProvenanceTag } from "@/Charts";
-import { EdgeAuditPanel } from "@/EdgeAuditPanel";
-import { ScalePlannerPanel } from "@/ScalePlannerPanel";
-import { RecalibrationPanel } from "@/RecalibrationPanel";
-import { TournamentPanel } from "@/TournamentPanel";
+import { lazyComponent } from "@/lib/lazy";
+
+const EdgeAuditPanel = lazyComponent(() => import("@/EdgeAuditPanel"), (m) => m.EdgeAuditPanel);
+const ScalePlannerPanel = lazyComponent(() => import("@/ScalePlannerPanel"), (m) => m.ScalePlannerPanel);
+const RecalibrationPanel = lazyComponent(() => import("@/RecalibrationPanel"), (m) => m.RecalibrationPanel);
+const TournamentPanel = lazyComponent(() => import("@/TournamentPanel"), (m) => m.TournamentPanel);
+void EdgeAuditPanel.preload();
+void ScalePlannerPanel.preload();
+void RecalibrationPanel.preload();
+void TournamentPanel.preload();
 import {
   type Dataset,
   type Home,
@@ -230,48 +236,50 @@ export function QuantLabTab({
         ))}
       </div>
 
-      {/* 1-Click Full Quant Edge Audit Scorecard */}
-      <EdgeAuditPanel
-        dataset={dataset}
-        home={home}
-        strategies={strategies}
-        markets={markets}
-        slots={slots}
-        auditSignal={auditSignal}
-        panelRef={auditRef}
-      />
+      <Suspense fallback={null}>
+        {/* 1-Click Full Quant Edge Audit Scorecard */}
+        <EdgeAuditPanel
+          dataset={dataset}
+          home={home}
+          strategies={strategies}
+          markets={markets}
+          slots={slots}
+          auditSignal={auditSignal}
+          panelRef={auditRef}
+        />
 
-      {/* $500/Day Paper Capital Scale Planner, 180-Day Trajectory & 5-Gate Readiness Scorecard */}
-      <ScalePlannerPanel
-        dataset={dataset}
-        home={home}
-        markets={markets}
-        slots={slots}
-        panelRef={scaleRef}
-        scorecardRef={scorecardRef}
-      />
+        {/* $500/Day Paper Capital Scale Planner, 180-Day Trajectory & 5-Gate Readiness Scorecard */}
+        <ScalePlannerPanel
+          dataset={dataset}
+          home={home}
+          markets={markets}
+          slots={slots}
+          panelRef={scaleRef}
+          scorecardRef={scorecardRef}
+        />
 
-      {/* OOS Strategy Tournament, Optimal Uncorrelated 4-Slot Lineup, 12x12 Correlation & Edge-by-Regime Heatmap */}
-      <TournamentPanel
-        dataset={dataset}
-        home={home}
-        strategies={strategies}
-        markets={markets}
-        slots={slots}
-        search={search}
-        tournamentRef={tournamentRef}
-        correlationRef={correlationRef}
-        regimeRef={regimeRef}
-      />
+        {/* OOS Strategy Tournament, Optimal Uncorrelated 4-Slot Lineup, 12x12 Correlation & Edge-by-Regime Heatmap */}
+        <TournamentPanel
+          dataset={dataset}
+          home={home}
+          strategies={strategies}
+          markets={markets}
+          slots={slots}
+          search={search}
+          tournamentRef={tournamentRef}
+          correlationRef={correlationRef}
+          regimeRef={regimeRef}
+        />
 
-      {/* PAV Isotonic Probability Recalibration & EV-After-Fees Entry Gate */}
-      <RecalibrationPanel
-        dataset={dataset}
-        home={home}
-        markets={markets}
-        slots={slots}
-        panelRef={recalRef}
-      />
+        {/* PAV Isotonic Probability Recalibration & EV-After-Fees Entry Gate */}
+        <RecalibrationPanel
+          dataset={dataset}
+          home={home}
+          markets={markets}
+          slots={slots}
+          panelRef={recalRef}
+        />
+      </Suspense>
 
       {/* Row 1: Calibration Reliability SVG Chart + Monte Carlo 1,000-Path Fan Chart */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
