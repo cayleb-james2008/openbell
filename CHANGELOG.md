@@ -4,6 +4,18 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.9.0 - 2026-11-25
+
+- **Institutional Desktop Quant Workbench (`frontend/src/App.tsx`, `frontend/src/components/ui.tsx`, `frontend/src/EdgeAuditPanel.tsx` -> slimmed `assets/index.html`):**
+  - Replaced stacked telemetry/hero cards with a persistent 48px opaque Risk / Kill-Switch header (`DISARMED` fail-closed status pill + 1-click **Emergency Kill Switch** + 1-click **Edge Audit**), a slim 224px left desk rail (`15m Tape`, `Strategies`, `Paper Slots`, `Quant Lab & Tournament`, `Live & Rails`), collapsible Vaul drawers for **Order Ticket** and **Strategy Rule Editor**, and above-the-fold market/strategy tables while keeping `#67` Settings-only Light/Dark theme and `#155` zero `"Rune"` jargon.
+  - Replaced `recharts`, `@number-flow/react`, `react-use-measure`, `@base-ui/react`, and `@radix-ui/react-dialog` wrappers with lean SVG + DOM primitives (`frontend/src/components/ui.tsx`, native SVG `TremorSpark`), cutting `assets/index.html` by ~38% (`1,733 kB -> 1,081 kB`).
+- **1-Click Full Quant Edge Audit & Causal Lookahead-Canary Tests (`src/edge_audit.rs`, `GET /api/analytics/edge-audit`, `tests/v090_edge_audit.rs`):**
+  - Added `GET /api/analytics/edge-audit[?dataset=fixture&slippage_cents=0..5]` and the `EdgeAuditPanel` UI evaluating all 12 strategies -> OOS Tournament -> uncorrelated 4-slot lineup (`|r| <= 0.65`) -> PAV isotonic recalibration -> Kalshi fee & slippage-adjusted net EV -> Monte Carlo drawdown & 5-gate readiness in one click.
+  - Added causal lookahead-canary unit & HTTP integration tests proving signal-bar truncation is strictly invariant to post-signal future bars while a 1-bar lookahead canary fails immediately.
+- **Backend Security, Bounds & Tape-Caching Hardening (`src/kalshi_live.rs`, `src/risk_rails.rs`, `src/update.rs`, `src/main.rs`):**
+  - Enforced `symlink_metadata` regular-file & 64 KB cap checks before reading PEM files, atomic `O_EXCL` (`create_new(true)`) `0600` credential writes, and private `0700` temp download directories for self-updates.
+  - Added finite-bounds guards on risk-rail notional/exposure math, query-parameter-exact `dataset` parsing, malformed `Content-Length` `400` rejections, bounded HTTP connection concurrency (`128`), `SETTLED_KEYS_CACHE`, and singleflight `tape_compute_lock` / `edge_audit_compute_lock`.
+
 ## 0.8.0 - 2026-11-22
 
 - **Live Connected Kalshi Trade API v2 Client & RSA-PSS SHA-256 Signer (`src/kalshi_live.rs`):**

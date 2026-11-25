@@ -185,16 +185,42 @@ impl PersistedLiveConfig {
     }
 }
 
-/// Write a file atomically with `0600` permissions on Unix.
+/// Read a regular non-symlink file with a strict byte cap (prevents CWE-59 symlink
+/// traversal and unbounded reads on private key paths).
+pub fn read_regular_file_no_symlink(path: &Path, max_bytes: u64, label: &str) -> Result<String, String> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("unable to stat {label}: {e}"))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("refusing to read {label}: symlinks are not permitted"));
+    }
+    if !meta.file_type().is_file() {
+        return Err(format!("refusing to read {label}: not a regular file"));
+    }
+    if meta.len() > max_bytes {
+        return Err(format!("{label} exceeds {max_bytes}-byte limit"));
+    }
+    std::fs::read_to_string(path).map_err(|e| format!("unable to read {label}: {e}"))
+}
+
+/// Write a file atomically with `0600` permissions on Unix and CWE-59 symlink/O_EXCL guards.
 pub fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("failed to create directory: {e}"))?;
     }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err("refusing to overwrite symlink secret path".to_string());
+        }
+    }
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp-{}-{seq}", std::process::id()));
     {
         use std::io::Write as _;
         let mut opts = std::fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
+        opts.create_new(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
@@ -203,8 +229,10 @@ pub fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
         let mut f = opts
             .open(&tmp)
             .map_err(|e| format!("failed to create temp file: {e}"))?;
-        f.write_all(bytes)
-            .map_err(|e| format!("failed to write secret file: {e}"))?;
+        if let Err(e) = f.write_all(bytes) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("failed to write secret file: {e}"));
+        }
         let _ = f.sync_all();
     }
     #[cfg(unix)]
@@ -282,8 +310,7 @@ pub fn save_live_config(
         }
     } else if !cfg.private_key_path.trim().is_empty() {
         let p = Path::new(cfg.private_key_path.trim());
-        let pem = std::fs::read_to_string(p)
-            .map_err(|e| format!("unable to read private key file: {e}"))?;
+        let pem = read_regular_file_no_symlink(p, 64 * 1024, "private key file")?;
         let _ = RsaSigningKey::from_pem(&pem)?;
     }
     let body = serde_json::to_vec_pretty(&cfg).map_err(|e| format!("serialize config: {e}"))?;
@@ -578,8 +605,7 @@ impl RsaSigningKey {
     }
 
     pub fn from_file(path: &Path) -> Result<Self, String> {
-        let pem = std::fs::read_to_string(path)
-            .map_err(|e| format!("unable to read private key file: {e}"))?;
+        let pem = read_regular_file_no_symlink(path, 64 * 1024, "private key file")?;
         Self::from_pem(&pem)
     }
 

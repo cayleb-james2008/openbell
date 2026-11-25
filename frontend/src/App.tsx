@@ -1,34 +1,53 @@
-// OpenBell v0.8.0 — Live Kalshi Connected Trading & 15-Minute Quant Desk.
-// Light default + full Dark inside Settings Vaul sheet ONLY (#67); opaque sticky header (zero backdrop-blur);
-// Live Kalshi v2 account/positions/orders/fills + Hard Risk Rails + Emergency Kill Switch + 4-tab workbench + Cmd+K.
-import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { MotionConfig } from "motion/react";
-import { Bell, RefreshCw, Search, Settings, X } from "lucide-react";
+// OpenBell Desktop Quant Workbench shell (v0.9.0):
+// Persistent quiet Risk / Kill-Switch header strip (fail-closed DISARMED badge + 1-click Kill Switch),
+// slim left desk rail (15m Tape, Strategies, Paper Slots, Quant Lab & Tournament, Live & Rails),
+// 1-click Full Quant Edge Audit trigger, and collapsible Order Ticket & Strategy Rule Editor drawers.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Drawer } from "vaul";
 import { Toaster, toast } from "sonner";
-import { AnimatedBackground } from "@/components/ui/animated-background";
-import { TextMorph } from "@/components/ui/text-morph";
-import { TextShimmer } from "@/components/ui/text-shimmer";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
-import { Kbd } from "@/components/ui/kbd";
-import { Tabs, TabsList, TabsPanel, TabsTab } from "@/components/ui/tabs";
-import { TooltipProvider } from "@/components/ui/tooltip";
-import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
-import { sectionGlide } from "@/motionProps";
+import {
+  Activity,
+  AlertOctagon,
+  Code2,
+  FlaskConical,
+  Layers,
+  ListChecks,
+  Lock,
+  RefreshCw,
+  Search,
+  Settings,
+  ShieldAlert,
+  SlidersHorizontal,
+  Sparkles,
+  Unlock,
+  X,
+} from "lucide-react";
+import { Badge, Button, Kbd, StatusPill } from "@/components/ui";
+import { CommandPalette, type DeskTabId } from "@/CommandPalette";
+import {
+  ArmLiveModal,
+  LiveAccountStrip,
+  LiveDeskWorkspace,
+} from "@/LiveTradingPanel";
+import { QuantLabTab, type QuantSectionId } from "@/QuantLabTab";
+import { RuneSandbox } from "@/RuneSandbox";
+import { SettingsSheet } from "@/SettingsSheet";
+import { SlotsTab } from "@/SlotsTab";
+import { StrategiesTab } from "@/StrategiesTab";
+import { TapeTab } from "@/TapeTab";
+import { UpdateStrip, useUpdates } from "@/Update";
 import {
   type CollectorScheduleStatus,
   type Dataset,
   type Home,
-  type Market,
-  type Read,
-  type Slot,
-  type Strategy,
   ageWords,
   computeStanding,
   exportDailyReport,
   fetchCollectorStatus,
   isNum,
+  marketIsOpen,
+  money,
+  moneySigned,
   setCollectorSchedule,
   useDesk,
 } from "@/lib/desk";
@@ -45,72 +64,35 @@ import {
   submitLiveOrder,
   triggerKillSwitch,
 } from "@/lib/live";
-import { HeroStrip } from "@/HeroStrip";
-import { LiveAccountStrip, LiveDeskWorkspace } from "@/LiveTradingPanel";
-import { TapeTab } from "@/TapeTab";
-import { StrategiesTab } from "@/StrategiesTab";
-import { SlotsTab } from "@/SlotsTab";
-import { QuantLabTab, type QuantSectionId } from "@/QuantLabTab";
-import { CommandPalette, type DeskTabId } from "@/CommandPalette";
-import { SettingsSheet } from "@/SettingsSheet";
-import { UpdateStrip, useUpdates } from "@/Update";
+import { useWide } from "@/lib/media";
 
-const ok = <T,>(r: Read<T> | undefined): T | null => (r && r.ok ? r.v : null);
-
-function readDataset(): Dataset {
-  return new URLSearchParams(location.search).get("dataset") === "fixture" ? "fixture" : "live";
+function initialDataset(): Dataset {
+  const qs = new URLSearchParams(location.search);
+  return qs.get("dataset") === "fixture" ? "fixture" : "live";
 }
 
-function readInitialTab(): DeskTabId {
-  const t = new URLSearchParams(location.search).get("tab");
-  if (t === "strategies" || t === "slots" || t === "tape" || t === "quant") return t;
-  return "tape";
-}
-
-function readTheme(): "light" | "dark" {
-  return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
-}
-
-function collectorBadge(home: Home | null, allFailed: boolean): { dot: string; label: string; title: string } {
-  if (allFailed) return { dot: "bg-unread", label: "Unavailable", title: "Could not reach the OpenBell server" };
-  if (!home || !home.collector) return { dot: "bg-track", label: "Checking", title: "Checking collector status" };
-  const c = home.collector;
-  const failed = isNum(c.series_failed_last_pass) ? c.series_failed_last_pass : 0;
-  const dropped = isNum(c.dropped_lines) ? c.dropped_lines : 0;
-  const conflicts = isNum(c.conflicting_settlements) ? c.conflicting_settlements : 0;
-  if (c.snapshots_on_disk === 0) {
-    return { dot: "bg-dot-amber", label: "Ready to collect", title: "No snapshots on disk yet, click Collect now" };
+function collectorText(home: Home | null): { fresh: boolean; label: string; detail: string } {
+  const c = home?.collector;
+  if (!c) {
+    return {
+      fresh: false,
+      label: "Collector idle",
+      detail: "Collector unavailable on this view",
+    };
   }
-  const healthy = c.collecting && failed === 0 && dropped === 0 && conflicts === 0;
-  const dot = c.collecting ? (healthy ? "bg-dot-green" : "bg-dot-amber") : "bg-unread";
-  const label = c.collecting
-    ? failed > 0
-      ? `Partial (${failed} err)`
-      : `Live · ${ageWords(c.newest_snapshot_age_secs)}`
-    : `Stale · ${ageWords(c.newest_snapshot_age_secs)}`;
-  const title = c.collecting
-    ? `Collector active · newest snapshot ${ageWords(c.newest_snapshot_age_secs)}`
-    : `Collector stale · newest snapshot ${ageWords(c.newest_snapshot_age_secs)}`;
-  return { dot, label, title };
+  const fresh = !!c.collecting;
+  const age = ageWords(c.newest_snapshot_age_secs);
+  const failed = isNum(c.series_failed_last_pass) ? c.series_failed_last_pass : 0;
+  const failNote = failed > 0 ? ` (${failed} market read${failed === 1 ? "" : "s"} failed)` : "";
+  return {
+    fresh,
+    label: fresh ? `Live (${age})` : `Stale (${age})`,
+    detail: (fresh ? `Collector active, newest snapshot ${age}` : `Collector stale, newest snapshot ${age}`) + failNote,
+  };
 }
 
-function Shell() {
-  const [dataset, setDataset] = useState<Dataset>(readDataset);
-  const [theme, setTheme] = useState<"light" | "dark">(readTheme);
-  const [tab, setTab] = useState<DeskTabId>(readInitialTab);
-  const [search, setSearch] = useState("");
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [cmdOpen, setCmdOpen] = useState(false);
-  const [collectingNow, setCollectingNow] = useState(false);
-  const [collectNotice, setCollectNotice] = useState<{ kind: "ok" | "warn" | "err"; text: string } | null>(null);
-  const [jumpTicker, setJumpTicker] = useState<string | null>(null);
-  const [jumpStrategy, setJumpStrategy] = useState<string | null>(null);
-  const [sandboxSignal, setSandboxSignal] = useState(0);
-  const [quantFocus, setQuantFocus] = useState<QuantSectionId | null>(null);
-  const [reseedSignal, setReseedSignal] = useState(0);
-  const [collectorStatus, setCollectorStatus] = useState<CollectorScheduleStatus | null>(null);
-  const [updatingSchedule, setUpdatingSchedule] = useState(false);
-  const [liveBundle, setLiveBundle] = useState<LiveDeskBundle>(() => ({
+function initialLiveBundle(): LiveDeskBundle {
+  return {
     status: defaultLiveStatus("client"),
     account: {
       configured: false,
@@ -118,186 +100,199 @@ function Shell() {
       balanceDollars: null,
       portfolioValueDollars: null,
       dailyPnlDollars: null,
-      note: "Configure Kalshi v2 API credentials in Desk Settings to connect.",
+      note: "Checking live desk state...",
     },
     positions: [],
     orders: [],
     fills: [],
-  }));
+  };
+}
+
+export function App() {
+  const wide = useWide();
+  const [dataset, setDataset] = useState<Dataset>(initialDataset);
+  const [theme, setTheme] = useState<"light" | "dark">(() =>
+    localStorage.getItem("openbell-theme") === "dark" ? "dark" : "light",
+  );
+  const [tab, setTab] = useState<DeskTabId>("tape");
+  const [search, setSearch] = useState("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [cmdOpen, setCmdOpen] = useState(false);
+  const [collectingNow, setCollectingNow] = useState(false);
+  const [collectNotice, setCollectNotice] = useState("");
+  const [jumpTicker, setJumpTicker] = useState<string | null>(null);
+  const [jumpStrategy, setJumpStrategy] = useState<string | null>(null);
+  const [sandboxSignal, setSandboxSignal] = useState(0);
+  const [quantFocus, setQuantFocus] = useState<QuantSectionId | null>(null);
+  const [reseedSignal, setReseedSignal] = useState(0);
+  const [auditSignal, setAuditSignal] = useState(0);
+  const [collectorStatus, setCollectorStatus] = useState<CollectorScheduleStatus | null>(null);
+  const [updatingSchedule, setUpdatingSchedule] = useState(false);
+
+  // Live Kalshi v2 trading state (FAIL-CLOSED DISARMED by default)
+  const [liveBundle, setLiveBundle] = useState<LiveDeskBundle>(initialLiveBundle);
   const [liveBusy, setLiveBusy] = useState(false);
   const [savingLiveConfig, setSavingLiveConfig] = useState(false);
-  const [liveWorkspaceOpen, setLiveWorkspaceOpen] = useState(false);
+  const [armModalOpen, setArmModalOpen] = useState(false);
+
+  // Collapsible workbench drawers
+  const [ticketDrawerOpen, setTicketDrawerOpen] = useState(false);
+  const [editorDrawerOpen, setEditorDrawerOpen] = useState(false);
+  const [editorInitStrategy, setEditorInitStrategy] = useState<string | null>(null);
   const [ticketTicker, setTicketTicker] = useState<string | null>(null);
   const [ticketPriceCents, setTicketPriceCents] = useState<number | null>(null);
-  const searchRef = useRef<HTMLInputElement>(null);
 
-  const { reads, load, stream } = useDesk(dataset);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const { reads, stream, load: reload } = useDesk(dataset);
   const upd = useUpdates();
 
-  const home = ok(reads?.home);
-  const slots = ok(reads?.slots);
-  const markets = ok(reads?.markets);
-  const strategies = ok(reads?.strategies);
-  const reportText = ok(reads?.report)?.report || "";
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("openbell-theme", theme);
+  }, [theme]);
+
+  const home = reads?.home?.ok ? reads.home.v : null;
+  const slots = reads?.slots?.ok ? reads.slots.v : null;
+  const markets = useMemo(
+    () => (reads?.markets?.ok ? reads.markets.v.filter((m) => !!m && typeof m === "object") : []),
+    [reads?.markets],
+  );
+  const strategies = useMemo(
+    () => (reads?.strategies?.ok ? reads.strategies.v.filter((s) => !!s && typeof s === "object") : []),
+    [reads?.strategies],
+  );
+
+  const openMarketsCount = useMemo(() => markets.filter(marketIsOpen).length, [markets]);
+  const settledMarketsCount = Math.max(0, markets.length - openMarketsCount);
   const standing = useMemo(() => computeStanding(reads?.strategies), [reads?.strategies]);
-  const allFailed = !!reads && Object.values(reads).every((r) => !r.ok);
-  const failMsg = reads && !reads.home.ok ? reads.home.msg : "";
-  const isFixture = dataset === "fixture";
-  const versionText = home?.version || upd.version?.version || "0.8.0";
+  const collector = collectorText(home);
+  const versionText = home?.version || upd.version?.version || "0.9.0";
 
-  const validMarkets = useMemo(
-    () => (markets ? markets.filter((m): m is Market => !!m && typeof m === "object") : []),
-    [markets],
-  );
-  const validStrategies = useMemo(
-    () => (strategies ? strategies.filter((s): s is Strategy => !!s && typeof s === "object") : []),
-    [strategies],
-  );
-  const validSlots = useMemo(
-    () => (slots ? slots.slots.filter((s): s is Slot => !!s && typeof s === "object") : []),
-    [slots],
-  );
+  const potValue = slots && isNum(slots.paper_equity_dollars) ? slots.paper_equity_dollars : null;
+  const potStart = slots && isNum(slots.paper_pot_start) ? slots.paper_pot_start : 100;
+  const potDelta = potValue !== null ? potValue - potStart : null;
+  const potStage =
+    home?.mode === "example_only"
+      ? "Example only"
+      : home?.mode === "collecting"
+        ? "Collecting"
+        : "Paper simulation";
 
-  const pickTheme = (t: "light" | "dark") => {
-    document.documentElement.dataset.theme = t;
-    try {
-      localStorage.setItem("openbell-theme", t);
-    } catch {
-      /* private mode: preference stays for this session */
+  const standingTitle =
+    standing.state === "loading"
+      ? "Strategies"
+      : standing.state === "error"
+        ? "Strategy state unavailable"
+        : standing.state === "empty"
+          ? "No strategies in the library"
+          : standing.provenForward > 0
+            ? "Forward proven"
+            : "Evidence standing";
+  const standingFigure =
+    standing.state === "loading"
+      ? "Loading..."
+      : standing.state === "error"
+        ? "Unavailable"
+        : `${standing.provenForward} of ${standing.total}`;
+  const standingLines =
+    standing.lines.length > 0
+      ? standing.lines
+      : [standing.commonMinWindows ? `Target ${standing.commonMinWindows} windows` : "Collecting OOS windows"];
+
+  const anyReadError = useMemo(() => {
+    const entries: Array<[string, { ok: boolean; msg?: string } | undefined]> = [
+      ["home", reads?.home],
+      ["slots", reads?.slots],
+      ["markets", reads?.markets],
+      ["strategies", reads?.strategies],
+    ];
+    for (const [k, r] of entries) {
+      if (r && !r.ok) return `${k}: ${r.msg || "unavailable"}`;
     }
-    setTheme(t);
-  };
+    return "";
+  }, [reads]);
 
-  const returnToLive = () => {
-    setDataset("live");
-    const url = new URL(location.href);
-    url.searchParams.delete("dataset");
-    history.replaceState(null, "", url);
-  };
+  const refreshCollectorStatus = useCallback(async () => {
+    const st = await fetchCollectorStatus(home, settledMarketsCount);
+    setCollectorStatus(st);
+  }, [home, settledMarketsCount]);
+
+  const refreshLive = useCallback(async () => {
+    const b = await fetchLiveBundle(home);
+    setLiveBundle(b);
+  }, [home]);
+
+  useEffect(() => {
+    void refreshCollectorStatus();
+    void refreshLive();
+  }, [refreshCollectorStatus, refreshLive]);
 
   const runCollect = useCallback(async () => {
     if (collectingNow) return;
     setCollectingNow(true);
-    setCollectNotice(null);
+    setCollectNotice("Collecting 15m Kalshi markets...");
     try {
       const r = await fetch("/api/collect", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}",
+        headers: { "X-OpenBell-CSRF": "1" },
       });
-      const data = (await r.json().catch(() => ({}))) as {
-        snapshots_written?: number;
-        written?: number;
-        errors?: string[];
-        error?: string;
-      };
       if (!r.ok) {
-        const msg = "Collection failed. Nothing was written. Try again in a moment.";
-        setCollectNotice({ kind: "err", text: msg });
+        const msg = `Nothing was written. Collection failed (${r.status}).`;
+        setCollectNotice(msg);
         toast.error(msg);
       } else {
-        const n = isNum(data.snapshots_written) ? data.snapshots_written : isNum(data.written) ? data.written : 0;
-        const errs = Array.isArray(data.errors) ? data.errors : [];
-        if (errs.length > 0) {
-          const msg = `Collected ${n.toLocaleString()} snapshots, but ${errs.length} market read${errs.length === 1 ? "" : "s"} failed.`;
-          setCollectNotice({ kind: "warn", text: msg });
+        const body = (await r.json().catch(() => null)) as { snapshots_written?: number; errors?: unknown[] } | null;
+        const errCount = Array.isArray(body?.errors) ? body.errors.length : 0;
+        if (errCount > 0) {
+          const msg = `${errCount} market read${errCount === 1 ? "" : "s"} failed (${body?.snapshots_written ?? 0} written).`;
+          setCollectNotice(msg);
           toast.warning(msg);
         } else {
-          const msg = n > 0
-            ? `Collected ${n.toLocaleString()} live snapshots into the tape.`
-            : "Collected one pass into the tape.";
-          setCollectNotice({ kind: "ok", text: msg });
-          toast.success(msg);
+          setCollectNotice("Latest 15m snapshot recorded.");
+          toast.success("Collected latest 15m Kalshi market snapshot.");
         }
-        await load();
+        await reload();
+        await refreshCollectorStatus();
       }
     } catch {
-      const msg = "Could not reach OpenBell to collect. Nothing was written. Try again.";
-      setCollectNotice({ kind: "err", text: msg });
+      const msg = "Nothing was written. Collection request could not reach the server.";
+      setCollectNotice(msg);
       toast.error(msg);
     } finally {
       setCollectingNow(false);
     }
-  }, [collectingNow, load]);
+  }, [collectingNow, reload, refreshCollectorStatus]);
 
-  const handlePaletteExport = useCallback(
-    async (format: "md" | "csv") => {
+  const handleSelectSchedule = useCallback(
+    async (enabled: boolean, intervalSecs: number) => {
+      if (updatingSchedule) return;
+      setUpdatingSchedule(true);
       try {
-        const res = await exportDailyReport(format, dataset, home, reportText, slots);
-        toast.success(`Exported ${res.filename} (${res.bytes.toLocaleString()} bytes).`);
+        const next = await setCollectorSchedule(enabled, intervalSecs, home, settledMarketsCount);
+        setCollectorStatus(next);
+        toast.success(
+          enabled
+            ? `Auto-collector scheduled every ${next.intervalSecs}s.`
+            : "Background auto-collector paused.",
+        );
       } catch (e) {
-        toast.error(`Export failed: ${e instanceof Error ? e.message : String(e)}`);
+        toast.error(`Schedule update failed: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setUpdatingSchedule(false);
       }
     },
-    [dataset, home, reportText, slots],
+    [updatingSchedule, home, settledMarketsCount],
   );
-
-  // Global keyboard shortcuts: Cmd/Ctrl+K opens Command Palette, `/` focuses filter, `1`-`4` switch tabs.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setCmdOpen((v) => !v);
-        return;
-      }
-      const target = e.target as HTMLElement | null;
-      const tag = target?.tagName;
-      const inField = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || !!target?.isContentEditable;
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-      if (e.key === "/" && !inField && !cmdOpen && !settingsOpen) {
-        e.preventDefault();
-        searchRef.current?.focus();
-        searchRef.current?.select();
-        return;
-      }
-      if (!inField && !settingsOpen && !cmdOpen) {
-        if (e.key === "1") setTab("tape");
-        else if (e.key === "2") setTab("strategies");
-        else if (e.key === "3") setTab("slots");
-        else if (e.key === "4") setTab("quant");
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [settingsOpen, cmdOpen]);
-
-  const badge = collectorBadge(home, allFailed);
-  const marketCount = markets ? validMarkets.length : null;
-  const strategyCount = strategies ? validStrategies.length : null;
-  const slotCount = slots ? validSlots.length : null;
-  const settledCount = useMemo(
-    () => validMarkets.filter((m) => m.result === "yes" || m.result === "no").length,
-    [validMarkets],
-  );
-
-  const refreshCollectorStatus = useCallback(async () => {
-    const next = await fetchCollectorStatus(home, settledCount);
-    setCollectorStatus(next);
-  }, [home, settledCount]);
-
-  useEffect(() => {
-    void refreshCollectorStatus();
-  }, [refreshCollectorStatus]);
-
-  const refreshLive = useCallback(async () => {
-    const next = await fetchLiveBundle(home);
-    setLiveBundle(next);
-  }, [home]);
-
-  useEffect(() => {
-    void refreshLive();
-  }, [refreshLive]);
 
   const handleSaveLiveConfig = useCallback(
     async (payload: LiveConfigPayload) => {
       setSavingLiveConfig(true);
       try {
-        const nextStatus = await saveLiveConfig(payload, home);
-        setLiveBundle((prev) => ({ ...prev, status: nextStatus }));
-        toast.success(`Saved Kalshi ${nextStatus.environment.toUpperCase()} API & hard risk rails.`);
+        await saveLiveConfig(payload, home);
         await refreshLive();
+        toast.success("Kalshi API settings and hard risk rails saved (0600 permissions).");
       } catch (e) {
-        toast.error(`Could not save Kalshi config: ${e instanceof Error ? e.message : String(e)}`);
+        toast.error(`Could not save live config: ${e instanceof Error ? e.message : String(e)}`);
       } finally {
         setSavingLiveConfig(false);
       }
@@ -306,642 +301,794 @@ function Shell() {
   );
 
   const handleArmLive = useCallback(async () => {
+    if (liveBusy) return;
     setLiveBusy(true);
     try {
-      const nextStatus = await armLiveTrading(home);
-      setLiveBundle((prev) => ({ ...prev, status: nextStatus }));
-      setLiveWorkspaceOpen(true);
-      toast.warning(`Live Kalshi ${nextStatus.environment.toUpperCase()} trading ARMED with hard risk rails.`);
+      await armLiveTrading(home);
       await refreshLive();
+      toast.success("Live Kalshi v2 order routing armed.");
     } catch (e) {
-      toast.error(`Arm failed: ${e instanceof Error ? e.message : String(e)}`);
+      toast.error(`Arm live failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setLiveBusy(false);
     }
-  }, [home, refreshLive]);
+  }, [liveBusy, home, refreshLive]);
 
   const handleDisarmLive = useCallback(async () => {
+    if (liveBusy) return;
     setLiveBusy(true);
     try {
-      const nextStatus = await disarmLiveTrading(home);
-      setLiveBundle((prev) => ({ ...prev, status: nextStatus }));
-      toast.success("Returned to Paper Mode (live order routing disarmed).");
+      await disarmLiveTrading(home);
       await refreshLive();
+      toast.success("Live trading disarmed. Returned to paper mode.");
     } catch (e) {
       toast.error(`Disarm failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setLiveBusy(false);
     }
-  }, [home, refreshLive]);
+  }, [liveBusy, home, refreshLive]);
 
   const handleSubmitLiveOrder = useCallback(
     async (payload: LiveOrderPayload) => {
+      if (liveBusy) return;
       setLiveBusy(true);
       try {
         const res = await submitLiveOrder(payload, home);
-        toast.success(
-          `Order ${res.orderId} submitted (${payload.action.toUpperCase()} ${payload.count} ${payload.side.toUpperCase()} @ ${payload.price_cents}c).`,
-        );
         await refreshLive();
+        toast.success(
+          `Order accepted (${res.orderId}, ${res.status}): ${payload.action.toUpperCase()} ${payload.side.toUpperCase()} ${payload.count}x ${payload.ticker} @ ${payload.price_cents}c.`,
+        );
       } catch (e) {
-        toast.error(`Order blocked: ${e instanceof Error ? e.message : String(e)}`);
+        toast.error(`Order rejected: ${e instanceof Error ? e.message : String(e)}`);
       } finally {
         setLiveBusy(false);
       }
     },
-    [home, refreshLive],
+    [liveBusy, home, refreshLive],
   );
 
   const handleCancelLiveOrder = useCallback(
     async (orderId: string) => {
+      if (liveBusy) return;
       setLiveBusy(true);
       try {
         await cancelLiveOrder(orderId, home);
-        toast.success(`Cancelled resting order ${orderId}.`);
         await refreshLive();
+        toast.success(`Canceled resting order ${orderId}.`);
       } catch (e) {
         toast.error(`Cancel failed: ${e instanceof Error ? e.message : String(e)}`);
       } finally {
         setLiveBusy(false);
       }
     },
-    [home, refreshLive],
+    [liveBusy, home, refreshLive],
   );
 
   const handleKillSwitch = useCallback(async () => {
+    if (liveBusy) return;
     setLiveBusy(true);
     try {
       const res = await triggerKillSwitch(home);
-      setLiveBundle((prev) => ({ ...prev, status: res.status }));
-      toast.error(
-        `Emergency Kill Switch triggered — disarmed live trading and cancelled ${res.cancelledCount} resting order${res.cancelledCount === 1 ? "" : "s"}.`,
-      );
       await refreshLive();
+      toast.error(
+        `Emergency Kill Switch triggered: ${res.cancelledCount} resting order(s) canceled, live routing disarmed.`,
+      );
     } catch (e) {
       toast.error(`Kill switch error: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setLiveBusy(false);
     }
-  }, [home, refreshLive]);
+  }, [liveBusy, home, refreshLive]);
 
-  const handleSelectSchedule = useCallback(
-    async (enabled: boolean, intervalSecs: number) => {
-      setUpdatingSchedule(true);
+  const handlePaletteExport = useCallback(
+    async (format: "md" | "csv") => {
       try {
-        const next = await setCollectorSchedule(enabled, intervalSecs, home, settledCount);
-        setCollectorStatus(next);
-        toast.success(
-          enabled
-            ? `Auto-collector set to every ${next.intervalSecs}s (public read-only GET).`
-            : "Background auto-collector paused.",
-        );
+        const rep = reads?.report?.ok ? reads.report.v.report : "";
+        const res = await exportDailyReport(format, dataset, home, rep, slots);
+        toast.success(`Exported ${res.filename} (${res.bytes.toLocaleString()} bytes).`);
       } catch (e) {
-        toast.error(`Could not update auto-collector: ${e instanceof Error ? e.message : String(e)}`);
-      } finally {
-        setUpdatingSchedule(false);
+        toast.error(`Export failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     },
-    [home, settledCount],
+    [dataset, home, reads?.report, slots],
   );
 
-  const searchPlaceholder =
-    tab === "tape"
-      ? "Filter 15m tickers…"
-      : tab === "strategies"
-        ? "Filter strategies…"
-        : tab === "slots"
-          ? "Filter slots…"
-          : "Filter Quant Lab…";
+  const handleRunEdgeAudit = useCallback(() => {
+    setTab("quant");
+    setQuantFocus("audit");
+    setAuditSignal((s) => s + 1);
+  }, []);
+
+  // Global keyboard shortcuts: Cmd/Ctrl+K, /, and 1-5 view switching
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      const inInput = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable;
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setCmdOpen((v) => !v);
+        return;
+      }
+      if (inInput) return;
+      if (e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        searchRef.current?.focus();
+        searchRef.current?.select();
+        return;
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === "1") setTab("tape");
+      else if (e.key === "2") setTab("strategies");
+      else if (e.key === "3") setTab("slots");
+      else if (e.key === "4") setTab("quant");
+      else if (e.key === "5") setTab("live");
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const navItems: Array<{
+    id: DeskTabId;
+    label: string;
+    shortLabel: string;
+    meta: string;
+    icon: typeof Activity;
+  }> = [
+    {
+      id: "tape",
+      label: "15m Tape",
+      shortLabel: "Tape",
+      meta: `${openMarketsCount} open`,
+      icon: Activity,
+    },
+    {
+      id: "strategies",
+      label: "Strategies",
+      shortLabel: "Strategies",
+      meta: `${strategies.length || 12}`,
+      icon: ListChecks,
+    },
+    {
+      id: "slots",
+      label: "Paper Slots",
+      shortLabel: "Slots",
+      meta: `${slots?.slots?.length ?? 4} active`,
+      icon: Layers,
+    },
+    {
+      id: "quant",
+      label: "Quant Lab & Tournament",
+      shortLabel: "Quant Lab",
+      meta: "Audit + OOS",
+      icon: FlaskConical,
+    },
+    {
+      id: "live",
+      label: "Live & Rails",
+      shortLabel: "Live & Rails",
+      meta: liveBundle.status.liveArmed ? "ARMED" : "DISARMED",
+      icon: ShieldAlert,
+    },
+  ];
+
+  const liveStatus = liveBundle.status;
+  const liveModeTone = liveStatus.killed
+    ? "error"
+    : liveStatus.liveArmed
+      ? "warning"
+      : "neutral";
+  const liveModeLabel = liveStatus.killed
+    ? "KILLED"
+    : liveStatus.liveArmed
+      ? `ARMED (${liveStatus.environment.toUpperCase()})`
+      : "DISARMED (PAPER)";
 
   return (
-    <TooltipProvider>
-      <div className="flex min-h-dvh flex-col bg-canvas text-ink">
-        {/* Opaque Sticky Command & Live Collector Bar — ZERO backdrop-blur, NO Light/Dark switch (#67) */}
-        <header className="sticky top-0 z-30 border-b border-hairline bg-surface">
-          <div className="mx-auto flex max-w-[1360px] flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5 sm:px-6">
-            {/* Brand + Paper-only provenance */}
-            <div className="mr-auto flex items-center gap-2.5">
-              <div className="flex items-center gap-2">
-                <span className="inline-flex size-8 items-center justify-center rounded-lg border border-hairline bg-board text-ink">
-                  <Bell className="size-4" strokeWidth={1.75} aria-hidden />
-                </span>
-                <div className="flex items-baseline gap-2">
-                  <h1 className="text-base font-semibold tracking-tight text-ink">OpenBell</h1>
-                  <span className="mono text-xs text-ink-3">v{versionText}</span>
-                </div>
-              </div>
-              <Pill
-                id="live-mode-pill"
-                variant="outline"
+    <div className="min-h-screen bg-canvas text-ink">
+      {/* Persistent Quiet Risk / Kill-Switch Header Bar (48px desktop) */}
+      <header className="sticky top-0 z-30 border-b border-hairline bg-surface">
+        <div className="mx-auto flex h-auto min-h-12 max-w-[1600px] flex-wrap items-center justify-between gap-2 px-3 py-1.5 sm:px-5 lg:flex-nowrap lg:py-0">
+          {/* Left: Brand + Fail-Closed Live State Badge */}
+          <div className="flex items-center gap-2.5">
+            <span className="inline-flex items-center gap-2 text-base font-semibold tracking-tight text-ink">
+              <span aria-hidden className="inline-block size-2 rounded-full bg-dot-green" />
+              <span>OpenBell</span>
+            </span>
+            <span className="mono hidden text-xs text-ink-3 sm:inline">v{versionText}</span>
+            {dataset === "fixture" && (
+              <Badge variant="outline" className="mono text-xs text-warning-foreground">
+                Fixture
+              </Badge>
+            )}
+            <button
+              id="live-mode-pill"
+              type="button"
+              onClick={() => {
+                if (liveStatus.liveArmed) {
+                  setTab("live");
+                } else {
+                  setArmModalOpen(true);
+                }
+              }}
+              title={
+                liveStatus.liveArmed
+                  ? "Live Kalshi v2 order routing is armed. Click to open Live & Rails."
+                  : "Fail-closed DISARMED (Paper Mode). Click to inspect or arm live routing."
+              }
+              className="inline-flex min-h-11 cursor-pointer items-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-7"
+            >
+              <StatusPill
+                tone={liveModeTone}
                 className={
-                  "hidden min-h-7 px-2.5 py-0.5 text-xs sm:inline-flex " +
-                  (liveBundle.status.liveArmed
-                    ? liveBundle.status.environment === "prod"
-                      ? "border-dot-red text-destructive-foreground"
-                      : "border-dot-amber text-warning-foreground"
-                    : "text-ink-2")
-                }
-                title={
-                  liveBundle.status.liveArmed
-                    ? `Live Kalshi ${liveBundle.status.environment.toUpperCase()} order routing ARMED with hard risk rails`
-                    : "Kalshi v2 connected desk · Disarmed (Paper Mode)"
+                  "min-h-7 px-2.5 py-0.5 text-xs font-medium " +
+                  (liveStatus.killed
+                    ? "border-dot-red/60 text-destructive-foreground"
+                    : liveStatus.liveArmed
+                      ? "border-dot-amber/70 text-warning-foreground"
+                      : "text-ink-2")
                 }
               >
-                <PillStatus className="border-r-0 pr-0">
-                  <PillIndicator
-                    variant={
-                      liveBundle.status.killed
-                        ? "error"
-                        : liveBundle.status.liveArmed
-                          ? liveBundle.status.environment === "prod"
-                            ? "error"
-                            : "warning"
-                          : "info"
-                    }
-                  />
-                  {liveBundle.status.liveArmed
-                    ? `Kalshi ${liveBundle.status.environment.toUpperCase()} · Live Armed`
-                    : "Kalshi v2 · Paper Mode"}
-                </PillStatus>
-              </Pill>
-            </div>
-
-            {/* Global `/` command filter */}
-            <div className="order-last w-full sm:order-none sm:w-64 md:w-72">
-              <InputGroup className="bg-board/70">
-                <InputGroupAddon align="inline-start">
-                  <Search className="size-4 text-ink-3" aria-hidden />
-                </InputGroupAddon>
-                <InputGroupInput
-                  ref={searchRef}
-                  id="desk-search"
-                  type="search"
-                  role="searchbox"
-                  aria-label="Filter active workbench"
-                  placeholder={searchPlaceholder}
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Escape") {
-                      if (search) setSearch("");
-                      else searchRef.current?.blur();
-                    }
-                  }}
-                />
-                {search ? (
-                  <InputGroupAddon align="inline-end">
-                    <button
-                      type="button"
-                      aria-label="Clear filter"
-                      onClick={() => setSearch("")}
-                      className="inline-flex size-8 cursor-pointer items-center justify-center rounded text-ink-2 hover:text-ink"
-                    >
-                      <X className="size-3.5" aria-hidden />
-                    </button>
-                  </InputGroupAddon>
+                {liveStatus.liveArmed ? (
+                  <Unlock className="size-3" strokeWidth={1.5} aria-hidden />
                 ) : (
-                  <InputGroupAddon align="inline-end">
-                    <Kbd>/</Kbd>
-                  </InputGroupAddon>
+                  <Lock className="size-3" strokeWidth={1.5} aria-hidden />
                 )}
-              </InputGroup>
-            </div>
+                <span className="mono">{liveModeLabel}</span>
+              </StatusPill>
+            </button>
+          </div>
 
-            {/* Live collector health + Collect now + Settings trigger */}
-            <div className="flex items-center gap-2">
-              <Pill
-                id="chip"
-                variant="outline"
-                className="hidden min-h-8 max-w-full px-2.5 py-1 text-xs text-ink-2 md:inline-flex"
-                title={badge.title}
+          {/* Right: Filter + 1-Click Edge Audit + Collect + Persistent Kill Switch + Settings */}
+          <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+            <label className="relative flex items-center" aria-label="Filter markets, strategies, and slots">
+              <Search className="pointer-events-none absolute left-2.5 size-3.5 text-ink-3" strokeWidth={1.5} aria-hidden />
+              <input
+                ref={searchRef}
+                id="desk-search"
+                type="search"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Filter desk"
+                className="min-h-11 w-40 rounded-md border border-[var(--input)] bg-board pr-8 pl-8 text-xs text-ink placeholder:text-ink-3 outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8 sm:w-44"
+              />
+              <span className="pointer-events-none absolute right-2 hidden sm:inline-flex">
+                <Kbd>/</Kbd>
+              </span>
+            </label>
+
+            <Button
+              id="run-edge-audit-btn"
+              variant="default"
+              size="sm"
+              onClick={handleRunEdgeAudit}
+              title="Run 1-click Full Quant Edge Audit across all 12 strategies"
+            >
+              <Sparkles className="size-3.5" strokeWidth={1.5} aria-hidden />
+              <span>Edge Audit</span>
+            </Button>
+
+            <Button
+              id="collect-btn"
+              variant="outline"
+              size="sm"
+              disabled={collectingNow}
+              onClick={() => void runCollect()}
+              aria-label={collectingNow ? "Collecting live tape" : "Collect live tape"}
+              title="Fetch the latest 15m Kalshi market snapshot"
+              className="min-w-11 sm:min-w-0"
+            >
+              <RefreshCw
+                className={`size-3.5 ${collectingNow ? "animate-spin" : ""}`}
+                strokeWidth={1.5}
+                aria-hidden
+              />
+              <span className="hidden sm:inline">{collectingNow ? "Collecting…" : "Collect"}</span>
+            </Button>
+
+            <Button
+              id="kill-switch-btn"
+              variant="danger"
+              size="sm"
+              disabled={liveBusy}
+              onClick={() => void handleKillSwitch()}
+              title="Cancel all resting Kalshi orders immediately and disarm live trading"
+            >
+              <AlertOctagon className="size-3.5" strokeWidth={1.5} aria-hidden />
+              <span>Kill Switch</span>
+            </Button>
+
+            <Button
+              id="cmdk-btn"
+              variant="outline"
+              size="sm"
+              onClick={() => setCmdOpen(true)}
+              aria-label="Open command palette"
+              className="hidden md:inline-flex"
+            >
+              <span>Jump</span>
+              <Kbd>⌘K</Kbd>
+            </Button>
+
+            <Button
+              id="settings-btn"
+              variant="outline"
+              size="icon"
+              aria-label="Open desk settings"
+              onClick={() => setSettingsOpen(true)}
+              className="size-11 sm:size-8"
+            >
+              <Settings className="size-4" strokeWidth={1.5} aria-hidden />
+            </Button>
+          </div>
+        </div>
+      </header>
+
+      <UpdateStrip u={upd} />
+
+      {/* Desktop Workbench Split: Slim Left Desk Rail + Main Tabular Workspace */}
+      <div className="mx-auto flex max-w-[1600px] flex-col lg:flex-row">
+        {/* Left Desk Navigation Rail */}
+        <aside
+          aria-label="Desk sidebar"
+          className="flex flex-col justify-start border-b border-hairline bg-surface lg:sticky lg:top-12 lg:max-h-[calc(100vh-49px)] lg:w-56 lg:shrink-0 lg:self-start lg:overflow-y-auto lg:border-r lg:border-b-0"
+        >
+          <div className="p-2.5 lg:p-3">
+            {/* Primary 5 Desk Views */}
+            <nav aria-label="Desk views">
+              <div
+                role="tablist"
+                aria-label="Desk sections"
+                className="flex gap-1 overflow-x-auto lg:flex-col"
               >
-                <span id="chip-dot" aria-hidden="true" className={"size-2 shrink-0 rounded-full " + badge.dot} />
-                <span id="chip-text" className="min-w-0 truncate">
-                  {collectingNow ? (
-                    <TextShimmer as="span" className="text-xs font-medium">
-                      Collecting live…
-                    </TextShimmer>
-                  ) : (
-                    <TextMorph as="span" className="text-xs font-medium text-ink">
-                      {badge.label}
-                    </TextMorph>
-                  )}
-                </span>
-              </Pill>
+                {navItems.map((item) => {
+                  const Icon = item.icon;
+                  const active = tab === item.id;
+                  return (
+                    <button
+                      key={item.id}
+                      id={`tab-${item.id}`}
+                      role="tab"
+                      type="button"
+                      aria-selected={active}
+                      onClick={() => setTab(item.id)}
+                      className={
+                        "flex min-h-11 shrink-0 cursor-pointer items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-left text-sm font-medium outline-none transition-[background-color,color,border-color] duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring lg:min-h-9 lg:w-full " +
+                        (active
+                          ? "border-hairline bg-board text-ink shadow-xs"
+                          : "border-transparent bg-transparent text-ink-2 hover:bg-board/60 hover:text-ink")
+                      }
+                    >
+                      <span className="flex items-center gap-2">
+                        <Icon
+                          className={`size-4 shrink-0 ${active ? "text-info-foreground" : "text-ink-3"}`}
+                          strokeWidth={1.5}
+                          aria-hidden
+                        />
+                        <span className="lg:hidden">{item.shortLabel}</span>
+                        <span className="hidden lg:inline">{item.label}</span>
+                      </span>
+                      <span className="mono hidden text-xs text-ink-3 lg:inline">{item.meta}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </nav>
 
+            {/* Collapsible Workbench Drawer Triggers */}
+            <div className="mt-2 flex flex-wrap gap-1.5 border-t border-hairline pt-2.5 lg:mt-4 lg:flex-col">
               <Button
-                id="collect-btn"
-                variant="default"
-                className="min-h-11 gap-2 px-3.5 text-xs font-medium sm:min-h-10"
-                disabled={collectingNow}
-                onClick={runCollect}
+                id="drawer-order-ticket-btn"
+                variant={ticketDrawerOpen ? "default" : "outline"}
+                size="sm"
+                className="justify-start lg:w-full"
+                onClick={() => setTicketDrawerOpen(true)}
               >
-                <RefreshCw className={`size-3.5 ${collectingNow ? "animate-spin" : ""}`} aria-hidden />
-                <span>{collectingNow ? "Collecting…" : "Collect now"}</span>
+                <SlidersHorizontal className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
+                <span>Order Ticket</span>
               </Button>
-
               <Button
-                id="settings-btn"
-                variant="outline"
-                size="icon"
-                aria-label="Settings"
-                className="size-11 shrink-0 sm:size-10"
-                onClick={() => setSettingsOpen(true)}
+                id="drawer-rule-editor-btn"
+                variant={editorDrawerOpen ? "default" : "outline"}
+                size="sm"
+                className="justify-start lg:w-full"
+                onClick={() => {
+                  setEditorInitStrategy(null);
+                  setEditorDrawerOpen(true);
+                }}
               >
-                <Settings className="size-4" strokeWidth={1.75} aria-hidden />
+                <Code2 className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
+                <span>Rule Editor</span>
               </Button>
             </div>
           </div>
-        </header>
 
-        <main className="mx-auto flex w-full max-w-[1360px] flex-1 flex-col gap-4 px-4 py-4 sm:px-6 sm:py-5">
-          {/* Self-update banner (only visible when update available/staged or dismissed pill) */}
-          <UpdateStrip u={upd} />
-
-          {/* Example fixture tape banner — NEVER rendered in live mode! */}
-          {isFixture && (
-            <div
-              role="status"
-              className="flex flex-wrap items-center justify-between gap-3 rounded-[10px] border border-hairline bg-surface px-4 py-2.5 text-xs"
-            >
-              <div className="flex flex-wrap items-center gap-2">
-                <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-warning-foreground">
-                  <PillStatus className="border-r-0 pr-0">
-                    <PillIndicator variant="warning" />
-                    Example fixture
-                  </PillStatus>
-                </Pill>
-                <span className="text-ink-2">
-                  Example tape. Figures below are illustrative test data, never forward evidence.
+          {/* Quiet Telemetry Readout (#readings) */}
+          <div
+            id="readings"
+            aria-label="Desk status telemetry"
+            className="grid grid-cols-1 gap-2.5 border-t border-hairline px-3 py-2.5 text-xs sm:grid-cols-3 lg:grid-cols-1 lg:space-y-3 lg:py-3"
+          >
+            <div id="pot">
+              <div className="text-ink-3">Paper Pot</div>
+              <div className="mt-0.5 flex items-baseline justify-between gap-2">
+                <span id="pot-figure" className="mono text-base font-semibold text-ink">
+                  {potValue !== null ? money(potValue) : "$100.00"}
+                </span>
+                <span
+                  id="pot-change"
+                  className={
+                    "mono text-xs font-medium " +
+                    (potDelta !== null && potDelta > 0
+                      ? "text-success-foreground"
+                      : potDelta !== null && potDelta < 0
+                        ? "text-destructive-foreground"
+                        : "text-ink-2")
+                  }
+                >
+                  {potDelta !== null ? moneySigned(potDelta) : "$0.00"}
                 </span>
               </div>
-              <Button variant="outline" className="min-h-11 text-xs sm:min-h-9" onClick={returnToLive}>
+              <div id="stage-figure" className="text-xs text-ink-3">
+                {potStage}
+              </div>
+            </div>
+
+            <div id="standing" className="border-hairline pt-2 sm:border-l sm:pl-3 sm:pt-0 lg:border-t lg:border-l-0 lg:pl-0 lg:pt-2.5">
+              <div id="standing-label" className="text-ink-3">
+                {standingTitle}
+              </div>
+              <div id="standing-figure" className="mono mt-0.5 text-sm font-semibold text-ink">
+                {standingFigure}
+              </div>
+              <ul id="standing-detail" className="mt-0.5 space-y-0.5 text-xs text-ink-3">
+                {standingLines.map((line, i) => (
+                  <li key={i} className="break-words">{line}</li>
+                ))}
+              </ul>
+            </div>
+
+            <div id="chip" className="border-hairline pt-2 sm:border-l sm:pl-3 sm:pt-0 lg:border-t lg:border-l-0 lg:pl-0 lg:pt-2.5">
+              <div className="flex items-center gap-1.5">
+                <span
+                  id="chip-dot"
+                  aria-hidden
+                  className={`size-2 rounded-full ${collector.fresh ? "bg-dot-green" : "bg-dot-amber"}`}
+                />
+                <span id="chip-text" className="mono text-xs font-medium text-ink">
+                  {collector.label}
+                </span>
+              </div>
+              <div id="collect-status" role="status" className="mt-0.5 text-xs text-ink-3">
+                {collectNotice || collector.detail}
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        {/* Main Tabular Workspace */}
+        <main className="min-w-0 flex-1 space-y-4 px-3 py-4 sm:px-5 lg:px-6">
+          {dataset === "fixture" && (
+            <div
+              role="status"
+              className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-hairline bg-surface px-3.5 py-2 text-xs text-ink-2"
+            >
+              <span>Example tape. Loaded from bundled offline fixture snapshots for testing.</span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  const url = new URL(location.href);
+                  url.searchParams.delete("dataset");
+                  history.replaceState(null, "", url.pathname + url.search + url.hash);
+                  setDataset("live");
+                }}
+              >
                 Return to live tape
               </Button>
             </div>
           )}
-
-          {/* Inline feedback from Collect now */}
-          {collectNotice && (
-            <div
-              id="collect-status"
-              role={collectNotice.kind === "err" ? "alert" : "status"}
-              className={
-                "flex flex-wrap items-center justify-between gap-2 rounded-[10px] border border-hairline bg-surface px-4 py-2.5 text-xs " +
-                (collectNotice.kind === "err"
-                  ? "text-destructive-foreground"
-                  : collectNotice.kind === "warn"
-                    ? "text-warning-foreground"
-                    : "text-success-foreground")
-              }
-            >
-              <span>{collectNotice.text}</span>
-              <button
-                type="button"
-                aria-label="Dismiss collector status"
-                onClick={() => setCollectNotice(null)}
-                className="inline-flex min-h-11 cursor-pointer items-center px-2 text-xs text-ink-2 hover:text-ink sm:min-h-8"
-              >
-                Dismiss
-              </button>
-            </div>
-          )}
-
-          {/* Complete connectivity error banner */}
-          {allFailed && (
+          {anyReadError && (
             <div
               id="load-error"
               role="alert"
-              className="flex flex-wrap items-center justify-between gap-3 rounded-[10px] border border-hairline bg-surface px-4 py-3"
+              className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dot-red/50 bg-surface px-4 py-2.5 text-sm text-destructive-foreground"
             >
-              <div>
-                <p className="text-sm font-semibold text-destructive-foreground">Could not reach the OpenBell server.</p>
-                <p className="mt-0.5 text-xs text-ink-2">{failMsg || "Check that openbell-rs is running, then retry."}</p>
-              </div>
-              <Button variant="outline" className="min-h-11" onClick={load}>
+              <span>Could not reach one or more desk feeds ({anyReadError}).</span>
+              <Button variant="outline" size="sm" onClick={() => void reload()}>
                 Retry
               </Button>
             </div>
           )}
 
-          {/* First-fold Hero Telemetry & Compounding Strip */}
-          <HeroStrip
-            dataset={dataset}
-            homeRead={reads?.home}
-            slotsRead={reads?.slots}
-            equityRead={reads?.equity}
-            marketsRead={reads?.markets}
-            standing={standing}
-            collectingNow={collectingNow}
-          />
-
-          {/* Live Kalshi v2 Connected Account Strip, Paper/Live Switcher & Emergency Kill Switch */}
-          <LiveAccountStrip
-            bundle={liveBundle}
-            busy={liveBusy}
-            workspaceOpen={liveWorkspaceOpen}
-            onToggleWorkspace={() => setLiveWorkspaceOpen((v) => !v)}
-            onArmConfirm={() => void handleArmLive()}
-            onDisarm={() => void handleDisarmLive()}
-            onKillSwitch={() => void handleKillSwitch()}
-            onRefresh={() => void refreshLive()}
-            onOpenSettings={() => setSettingsOpen(true)}
-          />
-
-          {liveWorkspaceOpen && (
-            <LiveDeskWorkspace
-              bundle={liveBundle}
-              markets={validMarkets}
-              prefillTicker={ticketTicker}
-              prefillPriceCents={ticketPriceCents}
-              busy={liveBusy}
-              onSubmitOrder={handleSubmitLiveOrder}
-              onCancelOrder={handleCancelLiveOrder}
-              onRequestArm={() => {
-                document.getElementById("trading-mode-live")?.click();
+          {tab === "tape" && (
+            <TapeTab
+              marketsRead={reads?.markets}
+              home={home}
+              dataset={dataset}
+              search={search}
+              stream={stream}
+              collectorStatus={collectorStatus}
+              updatingSchedule={updatingSchedule}
+              onSelectSchedule={(enabled, secs) => void handleSelectSchedule(enabled, secs)}
+              onOpenScorecard={() => {
+                setTab("quant");
+                setQuantFocus("scorecard");
               }}
-              onOpenSettings={() => setSettingsOpen(true)}
+              onTradeMarket={(ticker, askCents) => {
+                setTicketTicker(ticker);
+                setTicketPriceCents(askCents);
+                setTicketDrawerOpen(true);
+              }}
+              onRetry={() => void reload()}
+              onCollect={() => void runCollect()}
+              collectingNow={collectingNow}
+              jumpTicker={jumpTicker}
+              onClearJump={() => setJumpTicker(null)}
             />
           )}
 
-          {/* 4-Tab Institutional Quant Workbench: COSS UI Tabs + Motion Primitives AnimatedBackground */}
-          <section aria-label="Quant research workbench" className="space-y-3">
-            <Tabs value={tab} onValueChange={(v) => setTab(v as DeskTabId)}>
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <TabsList variant="plain" className="w-full max-w-full bg-track p-1 sm:w-fit">
-                  <AnimatedBackground
-                    defaultValue={tab}
-                    onValueChange={(v) => {
-                      if (v === "tape" || v === "strategies" || v === "slots" || v === "quant") setTab(v);
-                    }}
-                    className="rounded-md bg-raised shadow-(--elev-raised)"
-                    {...sectionGlide}
-                  >
-                    <TabsTab
-                      id="tab-tape"
-                      value="tape"
-                      data-id="tape"
-                      className="min-h-11 flex-1 px-2 text-xs sm:min-h-9 sm:flex-none sm:px-3.5 sm:text-sm"
-                    >
-                      <span className="inline-flex items-center gap-1.5 sm:gap-2">
-                        <span className="sm:hidden">Tape</span>
-                        <span className="hidden sm:inline">Live 15m Tape</span>
-                        {marketCount !== null && (
-                          <Badge variant="outline" className="mono hidden text-xs sm:inline-flex">
-                            {marketCount}
-                          </Badge>
-                        )}
-                      </span>
-                    </TabsTab>
-                    <TabsTab
-                      id="tab-strategies"
-                      value="strategies"
-                      data-id="strategies"
-                      className="min-h-11 flex-1 px-2 text-xs sm:min-h-9 sm:flex-none sm:px-3.5 sm:text-sm"
-                    >
-                      <span className="inline-flex items-center gap-1.5 sm:gap-2">
-                        <span className="sm:hidden">Strategies</span>
-                        <span className="hidden sm:inline">Strategies</span>
-                        {strategyCount !== null && (
-                          <Badge variant="outline" className="mono hidden text-xs sm:inline-flex">
-                            {strategyCount}
-                          </Badge>
-                        )}
-                      </span>
-                    </TabsTab>
-                    <TabsTab
-                      id="tab-slots"
-                      value="slots"
-                      data-id="slots"
-                      className="min-h-11 flex-1 px-2 text-xs sm:min-h-9 sm:flex-none sm:px-3.5 sm:text-sm"
-                    >
-                      <span className="inline-flex items-center gap-1.5 sm:gap-2">
-                        <span className="sm:hidden">Slots</span>
-                        <span className="hidden sm:inline">Slot Desk</span>
-                        {slotCount !== null && (
-                          <Badge variant="outline" className="mono hidden text-xs sm:inline-flex">
-                            {slotCount}
-                          </Badge>
-                        )}
-                      </span>
-                    </TabsTab>
-                    <TabsTab
-                      id="tab-quant"
-                      value="quant"
-                      data-id="quant"
-                      className="min-h-11 flex-1 px-2 text-xs sm:min-h-9 sm:flex-none sm:px-3.5 sm:text-sm"
-                    >
-                      <span className="inline-flex items-center gap-1.5 sm:gap-2">
-                        <span className="sm:hidden">Quant</span>
-                        <span className="hidden sm:inline">Quant Lab</span>
-                        {settledCount > 0 && (
-                          <Badge variant="outline" className="mono hidden text-xs sm:inline-flex">
-                            {settledCount}
-                          </Badge>
-                        )}
-                      </span>
-                    </TabsTab>
-                  </AnimatedBackground>
-                </TabsList>
+          {tab === "strategies" && (
+            <StrategiesTab
+              strategiesRead={reads?.strategies}
+              slotsRead={reads?.slots}
+              equityRead={reads?.equity}
+              marketsRead={reads?.markets}
+              home={home}
+              dataset={dataset}
+              search={search}
+              onRetry={() => void reload()}
+              isActiveTab={tab === "strategies"}
+              jumpStrategy={jumpStrategy}
+              sandboxSignal={sandboxSignal}
+              onClearJump={() => setJumpStrategy(null)}
+            />
+          )}
 
-                <div className="flex items-center gap-2 text-xs text-ink-3">
-                  <Button
-                    id="cmdk-btn"
-                    variant="outline"
-                    className="min-h-11 gap-1.5 px-2.5 text-xs text-ink-2 sm:min-h-9"
-                    aria-label="Open command palette"
-                    onClick={() => setCmdOpen(true)}
-                  >
-                    <Search className="size-3.5" aria-hidden />
-                    <span>Jump</span>
-                    <Kbd>⌘K</Kbd>
-                  </Button>
-                  <div className="hidden items-center gap-1.5 lg:flex">
-                    <Kbd>/</Kbd>
-                    <span>filter</span>
-                    <Kbd>1</Kbd>
-                    <Kbd>2</Kbd>
-                    <Kbd>3</Kbd>
-                    <Kbd>4</Kbd>
-                    <span>tabs</span>
-                  </div>
-                </div>
-              </div>
+          {tab === "slots" && (
+            <SlotsTab
+              slotsRead={reads?.slots}
+              equityRead={reads?.equity}
+              homeRead={reads?.home}
+              reportRead={reads?.report}
+              liveBundle={liveBundle}
+              onOpenOrderTicket={() => setTicketDrawerOpen(true)}
+              onOpenSettings={() => setSettingsOpen(true)}
+              dataset={dataset}
+              search={search}
+              onRetry={() => void reload()}
+            />
+          )}
 
-              <TabsPanel value="tape" className="mt-3">
-                <TapeTab
-                  marketsRead={reads?.markets}
-                  home={home}
-                  dataset={dataset}
-                  search={search}
-                  stream={stream}
-                  collectorStatus={collectorStatus}
-                  updatingSchedule={updatingSchedule}
-                  onSelectSchedule={(en, sec) => void handleSelectSchedule(en, sec)}
-                  onOpenScorecard={() => {
-                    setTab("quant");
-                    setQuantFocus("scorecard");
-                  }}
-                  onTradeMarket={(ticker, askCents) => {
-                    setTicketTicker(ticker);
-                    setTicketPriceCents(askCents);
-                    setLiveWorkspaceOpen(true);
-                    document.getElementById("live-account-strip")?.scrollIntoView({ behavior: "smooth", block: "start" });
-                  }}
-                  onRetry={load}
-                  onCollect={runCollect}
-                  collectingNow={collectingNow}
-                  jumpTicker={jumpTicker}
-                  onClearJump={() => setJumpTicker(null)}
-                />
-              </TabsPanel>
+          {tab === "quant" && (
+            <QuantLabTab
+              dataset={dataset}
+              home={home}
+              marketsRead={reads?.markets}
+              slotsRead={reads?.slots}
+              strategiesRead={reads?.strategies}
+              search={search}
+              focusSection={quantFocus}
+              reseedSignal={reseedSignal}
+              auditSignal={auditSignal}
+              onClearFocus={() => setQuantFocus(null)}
+            />
+          )}
 
-              <TabsPanel value="strategies" className="mt-3">
-                <StrategiesTab
-                  strategiesRead={reads?.strategies}
-                  slotsRead={reads?.slots}
-                  equityRead={reads?.equity}
-                  marketsRead={reads?.markets}
-                  home={home}
-                  dataset={dataset}
-                  search={search}
-                  onRetry={load}
-                  isActiveTab={tab === "strategies"}
-                  jumpStrategy={jumpStrategy}
-                  sandboxSignal={sandboxSignal}
-                  onClearJump={() => setJumpStrategy(null)}
-                />
-              </TabsPanel>
+          {tab === "live" && (
+            <div className="space-y-4">
+              <LiveAccountStrip
+                bundle={liveBundle}
+                busy={liveBusy}
+                workspaceOpen={true}
+                onToggleWorkspace={() => setTicketDrawerOpen(true)}
+                onArmConfirm={() => void handleArmLive()}
+                onDisarm={() => void handleDisarmLive()}
+                onKillSwitch={() => void handleKillSwitch()}
+                onRefresh={() => void refreshLive()}
+                onOpenSettings={() => setSettingsOpen(true)}
+              />
+              <LiveDeskWorkspace
+                bundle={liveBundle}
+                markets={markets}
+                prefillTicker={ticketTicker}
+                prefillPriceCents={ticketPriceCents}
+                busy={liveBusy}
+                onSubmitOrder={handleSubmitLiveOrder}
+                onCancelOrder={handleCancelLiveOrder}
+                onRequestArm={() => setArmModalOpen(true)}
+                onOpenSettings={() => setSettingsOpen(true)}
+              />
+            </div>
+          )}
 
-              <TabsPanel value="slots" className="mt-3">
-                <SlotsTab
-                  slotsRead={reads?.slots}
-                  equityRead={reads?.equity}
-                  homeRead={reads?.home}
-                  reportRead={reads?.report}
-                  liveBundle={liveBundle}
-                  onOpenOrderTicket={() => {
-                    setLiveWorkspaceOpen(true);
-                    document.getElementById("live-account-strip")?.scrollIntoView({ behavior: "smooth", block: "start" });
-                  }}
-                  onOpenSettings={() => setSettingsOpen(true)}
-                  dataset={dataset}
-                  search={search}
-                  onRetry={load}
-                />
-              </TabsPanel>
-
-              <TabsPanel value="quant" className="mt-3">
-                <QuantLabTab
-                  dataset={dataset}
-                  home={home}
-                  marketsRead={reads?.markets}
-                  slotsRead={reads?.slots}
-                  strategiesRead={reads?.strategies}
-                  search={search}
-                  focusSection={quantFocus}
-                  reseedSignal={reseedSignal}
-                  onClearFocus={() => setQuantFocus(null)}
-                />
-              </TabsPanel>
-            </Tabs>
-          </section>
+          <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-3 pb-4 text-xs text-ink-3">
+            <span className="mono">
+              OpenBell v{versionText} — Kalshi 15m Quant &amp; Execution Workbench (Hard Risk Rails Enforced)
+            </span>
+            <span className="mono">
+              {liveStatus.liveArmed
+                ? `Kalshi ${liveStatus.environment.toUpperCase()} Live Armed`
+                : "Fail-Closed Disarmed (Paper Mode)"}
+            </span>
+          </footer>
         </main>
-
-        <footer className="mt-auto border-t border-hairline bg-surface">
-          <div className="mx-auto flex max-w-[1360px] flex-wrap items-center justify-between gap-2 px-4 py-3 text-xs text-ink-2 sm:px-6">
-            <span className="mono">OpenBell v{versionText} · Live Kalshi Connected Trading &amp; Quant Desk · Hard Risk Rails</span>
-            <button
-              type="button"
-              onClick={() => setSettingsOpen(true)}
-              className="inline-flex min-h-11 cursor-pointer items-center rounded-md px-2 text-xs font-medium text-ink underline-offset-4 hover:underline sm:min-h-8"
-            >
-              Settings, API Keys &amp; Risk Rails
-            </button>
-          </div>
-        </footer>
-
-        <CommandPalette
-          open={cmdOpen}
-          onOpenChange={setCmdOpen}
-          markets={validMarkets}
-          strategies={validStrategies}
-          slots={validSlots}
-          onSelectTab={(t) => setTab(t)}
-          onJumpMarket={(ticker) => {
-            setSearch("");
-            setTab("tape");
-            setJumpTicker(ticker);
-          }}
-          onJumpStrategy={(name) => {
-            setSearch("");
-            setTab("strategies");
-            setJumpStrategy(name);
-          }}
-          onOpenSandbox={() => {
-            setTab("strategies");
-            setSandboxSignal((n) => n + 1);
-          }}
-          onJumpSlot={(_slotNum, strategyName) => {
-            setTab("slots");
-            setSearch(strategyName);
-          }}
-          onJumpQuantSection={(sec) => {
-            setTab("quant");
-            setQuantFocus(sec);
-          }}
-          onCollect={() => void runCollect()}
-          onExportReport={(fmt) => void handlePaletteExport(fmt)}
-          onReseedMonteCarlo={() => {
-            setTab("quant");
-            setQuantFocus("montecarlo");
-            setReseedSignal((n) => n + 1);
-          }}
-          onOpenOrderTicket={() => {
-            setLiveWorkspaceOpen(true);
-            document.getElementById("live-account-strip")?.scrollIntoView({ behavior: "smooth", block: "start" });
-          }}
-          onKillSwitch={() => void handleKillSwitch()}
-          onOpenSettings={() => setSettingsOpen(true)}
-        />
-
-        <SettingsSheet
-          open={settingsOpen}
-          onOpenChange={setSettingsOpen}
-          theme={theme}
-          onThemeChange={pickTheme}
-          home={home}
-          collectorStatus={collectorStatus}
-          updatingSchedule={updatingSchedule}
-          onSelectSchedule={(en, sec) => void handleSelectSchedule(en, sec)}
-          liveStatus={liveBundle.status}
-          savingLiveConfig={savingLiveConfig}
-          onSaveLiveConfig={handleSaveLiveConfig}
-          collectingNow={collectingNow}
-          onCollect={runCollect}
-          upd={upd}
-        />
-
-        <Toaster
-          position="bottom-right"
-          toastOptions={{
-            style: {
-              background: "var(--surface)",
-              color: "var(--ink)",
-              border: "1px solid var(--hairline)",
-            } as CSSProperties,
-          }}
-        />
       </div>
-    </TooltipProvider>
-  );
-}
 
-export function App() {
-  return (
-    <MotionConfig reducedMotion="user">
-      <Shell />
-    </MotionConfig>
+      {/* Collapsible Live Order Ticket Drawer */}
+      <Drawer.Root
+        open={ticketDrawerOpen}
+        onOpenChange={setTicketDrawerOpen}
+        direction={wide ? "right" : "bottom"}
+      >
+        <Drawer.Portal>
+          <Drawer.Overlay className="fixed inset-0 z-40 bg-ink/30" />
+          <Drawer.Content
+            id="order-ticket-drawer"
+            data-order-ticket-drawer
+            className={
+              wide
+                ? "fixed inset-y-0 right-0 z-50 flex w-full max-w-[920px] flex-col border-l border-hairline bg-canvas text-ink shadow-(--elev-lift) outline-none"
+                : "fixed inset-x-0 bottom-0 z-50 flex max-h-[90dvh] flex-col rounded-t-[14px] border-t border-hairline bg-canvas text-ink shadow-(--elev-lift) outline-none"
+            }
+          >
+            <div className="flex items-center justify-between gap-3 border-b border-hairline bg-surface px-5 py-3.5">
+              <div>
+                <Drawer.Title className="text-base font-semibold text-ink">
+                  Order Ticket &amp; Live Rails
+                </Drawer.Title>
+                <Drawer.Description className="text-xs text-ink-2">
+                  Pre-flight risk rail verification before any Kalshi v2 order submission.
+                </Drawer.Description>
+              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="Close order ticket drawer"
+                onClick={() => setTicketDrawerOpen(false)}
+              >
+                <X className="size-4" strokeWidth={1.5} aria-hidden />
+              </Button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-4 sm:p-5">
+              <LiveDeskWorkspace
+                bundle={liveBundle}
+                markets={markets}
+                prefillTicker={ticketTicker}
+                prefillPriceCents={ticketPriceCents}
+                busy={liveBusy}
+                onSubmitOrder={handleSubmitLiveOrder}
+                onCancelOrder={handleCancelLiveOrder}
+                onRequestArm={() => setArmModalOpen(true)}
+                onOpenSettings={() => {
+                  setTicketDrawerOpen(false);
+                  setSettingsOpen(true);
+                }}
+              />
+            </div>
+          </Drawer.Content>
+        </Drawer.Portal>
+      </Drawer.Root>
+
+      {/* Collapsible Strategy Rule Editor Drawer */}
+      <Drawer.Root
+        open={editorDrawerOpen}
+        onOpenChange={setEditorDrawerOpen}
+        direction={wide ? "right" : "bottom"}
+      >
+        <Drawer.Portal>
+          <Drawer.Overlay className="fixed inset-0 z-40 bg-ink/30" />
+          <Drawer.Content
+            id="rule-editor-drawer"
+            data-rule-editor-drawer
+            className={
+              wide
+                ? "fixed inset-y-0 right-0 z-50 flex w-full max-w-[960px] flex-col border-l border-hairline bg-canvas text-ink shadow-(--elev-lift) outline-none"
+                : "fixed inset-x-0 bottom-0 z-50 flex max-h-[90dvh] flex-col rounded-t-[14px] border-t border-hairline bg-canvas text-ink shadow-(--elev-lift) outline-none"
+            }
+          >
+            <div className="flex items-center justify-between gap-3 border-b border-hairline bg-surface px-5 py-3.5">
+              <div>
+                <Drawer.Title className="text-base font-semibold text-ink">
+                  Strategy Rule Editor &amp; Backtester
+                </Drawer.Title>
+                <Drawer.Description className="text-xs text-ink-2">
+                  Validate syntax and score strategy rule modifications directly against the active 15m tape.
+                </Drawer.Description>
+              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="Close rule editor drawer"
+                onClick={() => setEditorDrawerOpen(false)}
+              >
+                <X className="size-4" strokeWidth={1.5} aria-hidden />
+              </Button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-4 sm:p-5">
+              <RuneSandbox
+                strategies={strategies}
+                markets={markets}
+                slots={slots}
+                home={home}
+                dataset={dataset}
+                initialStrategyName={editorInitStrategy}
+                onClose={() => setEditorDrawerOpen(false)}
+              />
+            </div>
+          </Drawer.Content>
+        </Drawer.Portal>
+      </Drawer.Root>
+
+      <ArmLiveModal
+        open={armModalOpen}
+        onOpenChange={setArmModalOpen}
+        status={liveStatus}
+        busy={liveBusy}
+        onConfirmArm={() => void handleArmLive()}
+        onOpenSettings={() => setSettingsOpen(true)}
+      />
+
+      <SettingsSheet
+        open={settingsOpen}
+        onOpenChange={setSettingsOpen}
+        theme={theme}
+        onThemeChange={setTheme}
+        home={home}
+        collectorStatus={collectorStatus}
+        updatingSchedule={updatingSchedule}
+        onSelectSchedule={(enabled, secs) => void handleSelectSchedule(enabled, secs)}
+        liveStatus={liveStatus}
+        savingLiveConfig={savingLiveConfig}
+        onSaveLiveConfig={handleSaveLiveConfig}
+        collectingNow={collectingNow}
+        onCollect={() => void runCollect()}
+        upd={upd}
+      />
+
+      <CommandPalette
+        open={cmdOpen}
+        onOpenChange={setCmdOpen}
+        markets={markets}
+        strategies={strategies}
+        slots={slots?.slots || []}
+        onSelectTab={setTab}
+        onJumpMarket={(ticker) => {
+          setTab("tape");
+          setJumpTicker(ticker);
+        }}
+        onJumpStrategy={(name) => {
+          setTab("strategies");
+          setJumpStrategy(name);
+        }}
+        onOpenSandbox={() => {
+          setEditorInitStrategy(null);
+          setEditorDrawerOpen(true);
+          setSandboxSignal((s) => s + 1);
+        }}
+        onJumpSlot={(_slotNumber, strategyName) => {
+          setTab("slots");
+          if (strategyName) setSearch(strategyName);
+        }}
+        onJumpQuantSection={(section) => {
+          setTab("quant");
+          setQuantFocus(section);
+          if (section === "audit") setAuditSignal((s) => s + 1);
+        }}
+        onCollect={() => void runCollect()}
+        onExportReport={(fmt) => void handlePaletteExport(fmt)}
+        onReseedMonteCarlo={() => {
+          setTab("quant");
+          setQuantFocus("montecarlo");
+          setReseedSignal((s) => s + 1);
+        }}
+        onOpenOrderTicket={() => setTicketDrawerOpen(true)}
+        onKillSwitch={() => void handleKillSwitch()}
+        onOpenSettings={() => setSettingsOpen(true)}
+      />
+
+      <Toaster position="bottom-right" />
+    </div>
   );
 }
 

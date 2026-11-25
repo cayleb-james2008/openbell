@@ -1,4 +1,4 @@
-/* Calm Square UI quant desk theme for OpenBell v0.4.0.
+/* Calm Square UI quant desk theme for OpenBell v0.9.0.
  * Light is the default crisp hairline surface stack; dark is the full second theme
  * (toggled exclusively inside the Settings Vaul sheet). Cobalt (--blue) is the single
  * interactive accent; emerald and crimson mark paper gain/loss and status only.
@@ -9,7 +9,7 @@
   --board: #f5f7fa;
   --surface: #ffffff;
   --hairline: #dfe4ec;
-  --input: #8c95a6;
+  --input: #80899a;
   --track: #e9edf4;
   --raised: #ffffff;
   --ink: #13151a;
@@ -54,7 +54,7 @@
   --board: #13161c;
   --surface: #181c23;
   --hairline: #282e39;
-  --input: #626c80;
+  --input: #6d778c;
   --track: #20252f;
   --raised: #2d3442;
   --ink: #eef0f5;

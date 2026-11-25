@@ -2,7 +2,6 @@
 // Live Order Ticket with Real-Time Hard Risk Rails, Positions/Orders/Fills tables, Kill Switch,
 // and Settings API & Risk Rails configuration panel. NEVER echoes private key PEM bytes.
 import { useEffect, useMemo, useState } from "react";
-import * as Dialog from "@radix-ui/react-dialog";
 import {
   AlertOctagon,
   AlertTriangle,
@@ -18,10 +17,17 @@ import {
   X,
   XCircle,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
+import {
+  Badge,
+  Button,
+  StatusPill,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui";
 import { type Market, cleanStr, isNum, money, moneySigned } from "@/lib/desk";
 import {
   type LiveConfigPayload,
@@ -41,7 +47,7 @@ function shortTs(iso: string): string {
 // Arm Live Trading Explicit Confirmation Modal (Radix Dialog)
 // ---------------------------------------------------------------------------
 
-function ArmLiveModal({
+export function ArmLiveModal({
   open,
   onOpenChange,
   status,
@@ -59,155 +65,170 @@ function ArmLiveModal({
   const [acknowledged, setAcknowledged] = useState(false);
 
   useEffect(() => {
-    if (!open) setAcknowledged(false);
-  }, [open]);
+    if (!open) {
+      setAcknowledged(false);
+      return;
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onOpenChange(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onOpenChange]);
+
+  if (!open) return null;
 
   const envLabel = status.environment === "prod" ? "PRODUCTION (Real Kalshi Funds)" : "DEMO (demo-api.kalshi.co)";
 
   return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-ink/40" />
-        <Dialog.Content
-          id="arm-live-modal"
-          data-arm-live-modal
-          className="fixed top-[10vh] left-1/2 z-50 w-[calc(100%-24px)] max-w-[520px] -translate-x-1/2 overflow-hidden rounded-[12px] border border-hairline bg-surface text-ink shadow-(--elev-lift) outline-none"
-        >
-          <div className="flex items-start justify-between gap-3 border-b border-hairline px-5 py-4">
-            <div className="flex items-start gap-2.5">
-              <ShieldAlert className="mt-0.5 size-5 shrink-0 text-warning-foreground" aria-hidden />
-              <div>
-                <Dialog.Title className="text-base font-semibold text-ink">
-                  Arm Live Kalshi v2 Trading
-                </Dialog.Title>
-                <Dialog.Description className="mt-0.5 text-xs text-ink-2">
-                  Confirm active venue environment and hard risk rails before enabling order routing.
-                </Dialog.Description>
-              </div>
+    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh]">
+      <div
+        aria-hidden="true"
+        className="fixed inset-0 bg-ink/40"
+        onClick={() => onOpenChange(false)}
+      />
+      <div
+        id="arm-live-modal"
+        data-arm-live-modal
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="arm-live-title"
+        className="relative z-10 w-[calc(100%-24px)] max-w-[520px] overflow-hidden rounded-[12px] border border-hairline bg-surface text-ink shadow-(--elev-lift) outline-none"
+      >
+        <div className="flex items-start justify-between gap-3 border-b border-hairline px-5 py-4">
+          <div className="flex items-start gap-2.5">
+            <ShieldAlert className="mt-0.5 size-5 shrink-0 text-warning-foreground" strokeWidth={1.5} aria-hidden />
+            <div>
+              <h2 id="arm-live-title" className="text-base font-semibold text-ink">
+                Arm Live Kalshi v2 Trading
+              </h2>
+              <p className="mt-0.5 text-xs text-ink-2">
+                Confirm active venue environment and hard risk rails before enabling order routing.
+              </p>
             </div>
-            <Button
-              variant="ghost"
-              size="icon"
-              aria-label="Close arm confirmation"
-              className="size-11 shrink-0 sm:size-9"
-              onClick={() => onOpenChange(false)}
-            >
-              <X className="size-4" aria-hidden />
-            </Button>
+          </div>
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Close arm confirmation"
+            className="size-11 shrink-0 sm:size-9"
+            onClick={() => onOpenChange(false)}
+          >
+            <X className="size-4" strokeWidth={1.5} aria-hidden />
+          </Button>
+        </div>
+
+        <div className="space-y-4 px-5 py-4">
+          <div className="border-b border-hairline pb-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <span className="text-ink-3">Venue Environment</span>
+              <Badge
+                variant="outline"
+                className={
+                  "mono text-xs " +
+                  (status.environment === "prod"
+                    ? "border-dot-red text-destructive-foreground"
+                    : "border-blue bg-blue-soft text-info-foreground")
+                }
+              >
+                {envLabel}
+              </Badge>
+            </div>
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+              <span className="text-ink-3">API Credentials</span>
+              <span className="mono font-medium text-ink">
+                {status.configured
+                  ? `${status.keyIdMasked || "Configured"} (PEM loaded)`
+                  : "Not configured yet"}
+              </span>
+            </div>
           </div>
 
-          <div className="space-y-4 px-5 py-4">
-            <div className="rounded-lg border border-hairline bg-board p-3">
-              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                <span className="text-ink-3">Venue Environment</span>
-                <Badge
-                  variant="outline"
-                  className={
-                    "mono text-xs " +
-                    (status.environment === "prod"
-                      ? "border-dot-red text-destructive-foreground"
-                      : "border-blue bg-blue-soft text-info-foreground")
-                  }
-                >
-                  {envLabel}
-                </Badge>
-              </div>
-              <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs">
-                <span className="text-ink-3">API Credentials</span>
-                <span className="mono font-medium text-ink">
-                  {status.configured
-                    ? `${status.keyIdMasked || "Configured"} · PEM loaded`
-                    : "Not configured yet"}
+          {!status.configured ? (
+            <div role="alert" className="rounded-lg border border-dot-amber/50 bg-board p-3 text-xs text-warning-foreground">
+              Kalshi v2 API credentials are not saved yet. Open Desk Settings to enter your API Key ID and local PEM file path before arming live trading.
+            </div>
+          ) : (
+            <>
+              <dl className="grid grid-cols-2 gap-3 border-b border-hairline pb-3 text-xs">
+                <div>
+                  <dt className="text-ink-3">Max Contracts / Order</dt>
+                  <dd className="mono mt-0.5 font-semibold text-ink">{status.rails.maxOrderContracts}</dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-ink-3">Max Order Notional</dt>
+                  <dd className="mono mt-0.5 font-semibold text-ink">{money(status.rails.maxOrderDollars)}</dd>
+                </div>
+                <div>
+                  <dt className="text-ink-3">Max Daily Loss</dt>
+                  <dd className="mono mt-0.5 font-semibold text-ink">{money(status.rails.maxDailyLossDollars)}</dd>
+                </div>
+                <div>
+                  <dt className="text-ink-3">Max Open Exposure</dt>
+                  <dd className="mono mt-0.5 font-semibold text-ink">{money(status.rails.maxOpenExposureDollars)}</dd>
+                </div>
+                <div className="col-span-2">
+                  <dt className="text-ink-3">Allowed Ticker Prefix</dt>
+                  <dd className="mono mt-0.5 font-semibold text-ink">
+                    {status.rails.allowedTickerPrefix || "(any Kalshi ticker)"}
+                  </dd>
+                </div>
+              </dl>
+
+              <label className="flex min-h-11 cursor-pointer items-start gap-2.5 rounded-lg border border-hairline bg-board/60 p-3 text-xs text-ink">
+                <input
+                  id="arm-live-checkbox"
+                  type="checkbox"
+                  checked={acknowledged}
+                  onChange={(e) => setAcknowledged(e.target.checked)}
+                  className="mt-0.5 size-4 shrink-0 accent-blue"
+                />
+                <span>
+                  I reviewed these hard risk rails and authorize live Kalshi v2 order routing ({status.environment.toUpperCase()}). Emergency Kill Switch remains one click away.
                 </span>
-              </div>
-            </div>
+              </label>
+            </>
+          )}
+        </div>
 
-            {!status.configured ? (
-              <div role="alert" className="rounded-lg border border-dot-amber/50 bg-board p-3 text-xs text-warning-foreground">
-                Kalshi v2 API credentials are not saved yet. Open Desk Settings to enter your API Key ID and local PEM file path before arming live trading.
-              </div>
-            ) : (
-              <>
-                <dl className="grid grid-cols-2 gap-2 rounded-lg border border-hairline bg-board p-3 text-xs">
-                  <div>
-                    <dt className="text-ink-3">Max Contracts / Order</dt>
-                    <dd className="mono mt-0.5 font-semibold text-ink">{status.rails.maxOrderContracts}</dd>
-                  </div>
-                  <div>
-                    <dt className="text-ink-3">Max Order Notional</dt>
-                    <dd className="mono mt-0.5 font-semibold text-ink">{money(status.rails.maxOrderDollars)}</dd>
-                  </div>
-                  <div>
-                    <dt className="text-ink-3">Max Daily Loss</dt>
-                    <dd className="mono mt-0.5 font-semibold text-ink">{money(status.rails.maxDailyLossDollars)}</dd>
-                  </div>
-                  <div>
-                    <dt className="text-ink-3">Max Open Exposure</dt>
-                    <dd className="mono mt-0.5 font-semibold text-ink">{money(status.rails.maxOpenExposureDollars)}</dd>
-                  </div>
-                  <div className="col-span-2">
-                    <dt className="text-ink-3">Allowed Ticker Prefix</dt>
-                    <dd className="mono mt-0.5 font-semibold text-ink">
-                      {status.rails.allowedTickerPrefix || "(any Kalshi ticker)"}
-                    </dd>
-                  </div>
-                </dl>
-
-                <label className="flex min-h-11 cursor-pointer items-start gap-2.5 rounded-lg border border-hairline bg-board/60 p-3 text-xs text-ink">
-                  <input
-                    id="arm-live-checkbox"
-                    type="checkbox"
-                    checked={acknowledged}
-                    onChange={(e) => setAcknowledged(e.target.checked)}
-                    className="mt-0.5 size-4 shrink-0 accent-blue"
-                  />
-                  <span>
-                    I reviewed these hard risk rails and authorize live Kalshi v2 order routing ({status.environment.toUpperCase()}). Emergency Kill Switch remains one click away.
-                  </span>
-                </label>
-              </>
-            )}
-          </div>
-
-          <div className="flex flex-wrap items-center justify-end gap-2 border-t border-hairline bg-board/50 px-5 py-3">
+        <div className="flex flex-wrap items-center justify-end gap-2 border-t border-hairline bg-board/50 px-5 py-3">
+          <Button
+            variant="outline"
+            className="min-h-11 text-xs sm:min-h-9"
+            onClick={() => onOpenChange(false)}
+          >
+            Stay in Paper Mode
+          </Button>
+          {!status.configured ? (
             <Button
-              variant="outline"
-              className="min-h-11 text-xs sm:min-h-9"
-              onClick={() => onOpenChange(false)}
+              variant="default"
+              className="min-h-11 gap-1.5 text-xs sm:min-h-9"
+              onClick={() => {
+                onOpenChange(false);
+                onOpenSettings();
+              }}
             >
-              Stay in Paper Mode
+              <KeyRound className="size-3.5" strokeWidth={1.5} aria-hidden />
+              Configure Kalshi API
             </Button>
-            {!status.configured ? (
-              <Button
-                variant="default"
-                className="min-h-11 gap-1.5 text-xs sm:min-h-9"
-                onClick={() => {
-                  onOpenChange(false);
-                  onOpenSettings();
-                }}
-              >
-                <KeyRound className="size-3.5" aria-hidden />
-                Configure Kalshi API
-              </Button>
-            ) : (
-              <Button
-                id="confirm-arm-live-btn"
-                variant="default"
-                disabled={!acknowledged || busy}
-                className="min-h-11 gap-1.5 text-xs sm:min-h-9"
-                onClick={() => {
-                  onConfirmArm();
-                  onOpenChange(false);
-                }}
-              >
-                <Unlock className="size-3.5" aria-hidden />
-                {busy ? "Arming…" : "Confirm & Arm Live"}
-              </Button>
-            )}
-          </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+          ) : (
+            <Button
+              id="confirm-arm-live-btn"
+              variant="default"
+              disabled={!acknowledged || busy}
+              className="min-h-11 gap-1.5 text-xs sm:min-h-9"
+              onClick={() => {
+                onConfirmArm();
+                onOpenChange(false);
+              }}
+            >
+              <Unlock className="size-3.5" strokeWidth={1.5} aria-hidden />
+              {busy ? "Arming…" : "Confirm & Arm Live"}
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -293,34 +314,29 @@ export function LiveAccountStrip({
               </button>
             </div>
 
-            <Pill
+            <StatusPill
               id="live-connection-pill"
-              variant="outline"
+              tone={
+                status.killed
+                  ? "error"
+                  : status.connected
+                    ? "success"
+                    : status.configured
+                      ? "warning"
+                      : "info"
+              }
               className="min-h-7 px-2.5 py-0.5 text-xs text-ink-2"
             >
-              <PillStatus className="border-r-0 pr-0">
-                <PillIndicator
-                  variant={
-                    status.killed
-                      ? "error"
-                      : status.connected
-                        ? "success"
-                        : status.configured
-                          ? "warning"
-                          : "info"
-                  }
-                />
-                <span className="mono">
-                  {status.killed
-                    ? "Kill switch active"
-                    : status.connected
-                      ? `Kalshi ${status.environment.toUpperCase()} connected`
-                      : status.configured
-                        ? `Kalshi ${status.environment.toUpperCase()} saved`
-                        : "Kalshi API not configured"}
-                </span>
-              </PillStatus>
-            </Pill>
+              <span className="mono">
+                {status.killed
+                  ? "Kill switch active"
+                  : status.connected
+                    ? `Kalshi ${status.environment.toUpperCase()} connected`
+                    : status.configured
+                      ? `Kalshi ${status.environment.toUpperCase()} saved`
+                      : "Kalshi API not configured"}
+              </span>
+            </StatusPill>
           </div>
 
           {/* Center: Live Kalshi Account KPIs */}
@@ -387,7 +403,7 @@ export function LiveAccountStrip({
             </Button>
 
             <Button
-              id="kill-switch-btn"
+              id="live-strip-kill-switch-btn"
               variant="outline"
               disabled={busy}
               onClick={onKillSwitch}
@@ -589,13 +605,13 @@ export function LiveDeskWorkspace({
                     aria-pressed={action === act}
                     onClick={() => setAction(act)}
                     className={
-                      "min-h-11 cursor-pointer rounded-md border px-2 text-xs font-medium uppercase outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9 " +
+                      "min-h-11 cursor-pointer rounded-md border px-2 text-xs font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9 " +
                       (action === act
                         ? "border-ink bg-ink text-canvas"
                         : "border-hairline bg-board text-ink-2 hover:text-ink")
                     }
                   >
-                    {act}
+                    {act.toUpperCase()}
                   </button>
                 ))}
               </div>
@@ -612,13 +628,13 @@ export function LiveDeskWorkspace({
                     aria-pressed={side === s}
                     onClick={() => setSide(s)}
                     className={
-                      "min-h-11 cursor-pointer rounded-md border px-2 text-xs font-medium uppercase outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9 " +
+                      "min-h-11 cursor-pointer rounded-md border px-2 text-xs font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9 " +
                       (side === s
                         ? "border-blue bg-blue-soft text-info-foreground"
                         : "border-hairline bg-board text-ink-2 hover:text-ink")
                     }
                   >
-                    {s}
+                    {s.toUpperCase()}
                   </button>
                 ))}
               </div>
@@ -658,19 +674,19 @@ export function LiveDeskWorkspace({
           </div>
 
           {/* Notional & Fee Preview */}
-          <dl className="grid grid-cols-2 gap-2 rounded-lg border border-hairline bg-board p-2.5 text-xs">
-            <div>
+          <dl className="grid grid-cols-2 divide-x divide-hairline border-y border-hairline py-2 text-xs">
+            <div className="pr-3">
               <dt className="text-ink-3">Order Notional</dt>
               <dd className="mono mt-0.5 font-semibold text-ink">{money(railEval.orderNotionalDollars)}</dd>
             </div>
-            <div>
+            <div className="pl-3">
               <dt className="text-ink-3">Est. Kalshi Fee</dt>
               <dd className="mono mt-0.5 font-semibold text-ink">{money(railEval.estFeeDollars)}</dd>
             </div>
           </dl>
 
           {/* Real-time Hard Risk Rails Indicator */}
-          <div id="live-risk-rails-check" className="space-y-1.5 rounded-lg border border-hairline bg-board/60 p-3">
+          <div id="live-risk-rails-check" className="space-y-1.5 pt-1">
             <div className="flex items-center justify-between text-xs">
               <span className="font-semibold text-ink">Hard Risk Rails Pre-Check</span>
               <button
@@ -729,7 +745,7 @@ export function LiveDeskWorkspace({
               <span>
                 {submitting
                   ? "Submitting signed order…"
-                  : `Submit ${action.toUpperCase()} ${side.toUpperCase()} · ${Math.max(0, Math.floor(parsedCount || 0))} @ ${Math.round(parsedPrice || 0)}c`}
+                  : `Submit ${action.toUpperCase()} ${side.toUpperCase()} (${Math.max(0, Math.floor(parsedCount || 0))} @ ${Math.round(parsedPrice || 0)}c)`}
               </span>
             </Button>
           )}
@@ -798,8 +814,8 @@ export function LiveDeskWorkspace({
                         <TableCell className="mono m-grow max-w-[200px] break-all text-xs font-semibold text-ink">
                           {ord.ticker}
                         </TableCell>
-                        <TableCell className="mono text-xs uppercase text-ink-2">
-                          {ord.action} {ord.side}
+                        <TableCell className="mono text-xs text-ink-2">
+                          {`${ord.action} ${ord.side}`.toUpperCase()}
                         </TableCell>
                         <TableCell className="mono text-right text-xs font-semibold text-ink">
                           {ord.priceCents}c
@@ -855,8 +871,8 @@ export function LiveDeskWorkspace({
                           {pos.ticker}
                         </TableCell>
                         <TableCell>
-                          <Badge variant="outline" className="mono text-xs uppercase">
-                            {pos.side}
+                          <Badge variant="outline" className="mono text-xs">
+                            {pos.side.toUpperCase()}
                           </Badge>
                         </TableCell>
                         <TableCell className="mono text-right text-xs font-semibold text-ink">
@@ -909,8 +925,8 @@ export function LiveDeskWorkspace({
                         <TableCell className="mono m-grow max-w-[200px] break-all text-xs font-semibold text-ink">
                           {f.ticker}
                         </TableCell>
-                        <TableCell className="mono text-xs uppercase text-ink-2">
-                          {f.action} {f.side}
+                        <TableCell className="mono text-xs text-ink-2">
+                          {`${f.action} ${f.side}`.toUpperCase()}
                         </TableCell>
                         <TableCell className="mono text-right text-xs font-semibold text-ink">
                           {f.count} @ {f.priceCents}c

@@ -223,6 +223,12 @@ export function supportsV080(home: Home | null, capability?: string): boolean {
   return semverAtLeast(home.version, [0, 8, 0]);
 }
 
+export function supportsV090(home: Home | null, capability?: string): boolean {
+  if (!home) return false;
+  if (capability && hasCapability(home.capabilities, capability)) return true;
+  return semverAtLeast(home.version, [0, 9, 0]);
+}
+
 export type CollectorScheduleStatus = {
   enabled: boolean;
   intervalSecs: number;

@@ -381,7 +381,9 @@ impl RiskRailsState {
         }
 
         let order_notional = (intent.count as f64) * (intent.price_cents as f64 / 100.0);
-        if order_notional > self.rails.max_order_dollars + 1e-9 {
+        if !order_notional.is_finite() {
+            violations.push("order notional is not finite".to_string());
+        } else if order_notional > self.rails.max_order_dollars + 1e-9 {
             violations.push(format!(
                 "order notional ${order_notional:.2} exceeds max_order_dollars (${:.2})",
                 self.rails.max_order_dollars
@@ -400,7 +402,9 @@ impl RiskRailsState {
         } else {
             (self.open_exposure_dollars - order_notional).max(0.0)
         };
-        if action == "buy" && projected_exposure > self.rails.max_open_exposure_dollars + 1e-9 {
+        if !projected_exposure.is_finite() {
+            violations.push("projected exposure is not finite".to_string());
+        } else if action == "buy" && projected_exposure > self.rails.max_open_exposure_dollars + 1e-9 {
             violations.push(format!(
                 "projected open exposure ${projected_exposure:.2} exceeds max_open_exposure_dollars (${:.2})",
                 self.rails.max_open_exposure_dollars
@@ -409,8 +413,8 @@ impl RiskRailsState {
 
         RiskCheckResult {
             allowed: violations.is_empty(),
-            order_notional_dollars: order_notional,
-            projected_exposure_dollars: projected_exposure,
+            order_notional_dollars: if order_notional.is_finite() { order_notional } else { 0.0 },
+            projected_exposure_dollars: if projected_exposure.is_finite() { projected_exposure } else { self.open_exposure_dollars },
             rail_violations: violations,
         }
     }
@@ -419,8 +423,8 @@ impl RiskRailsState {
     pub fn record_submitted_order(&mut self, action: &str, notional_dollars: f64) {
         self.refresh_utc_day();
         self.orders_placed_today = self.orders_placed_today.saturating_add(1);
-        if action.eq_ignore_ascii_case("buy") {
-            self.open_exposure_dollars += notional_dollars.max(0.0);
+        if action.eq_ignore_ascii_case("buy") && notional_dollars.is_finite() && notional_dollars > 0.0 {
+            self.open_exposure_dollars += notional_dollars;
         }
     }
 

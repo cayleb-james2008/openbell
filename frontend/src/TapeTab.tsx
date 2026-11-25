@@ -4,10 +4,17 @@
 import { useEffect, useMemo, useState } from "react";
 import { Drawer } from "vaul";
 import { Activity, Clock, RefreshCw, X } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
+import {
+  Badge,
+  Button,
+  StatusPill,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui";
 import { MarketHistoryChart, ProbBar, ProvenanceTag } from "@/Charts";
 import { AutoCollectorStrip } from "@/AutoCollectorStrip";
 import { useWide } from "@/lib/media";
@@ -125,16 +132,13 @@ function MarketInspector({
                       {seriesShort(market.series, market.ticker)} 15m
                     </Badge>
                     {open ? (
-                      <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-success-foreground">
-                        <PillStatus className="border-r-0 pr-0">
-                          <PillIndicator variant="success" />
-                          Open
-                        </PillStatus>
-                      </Pill>
+                      <StatusPill tone="success" className="min-h-6 px-2 py-0.5 text-xs text-success-foreground">
+                        Open
+                      </StatusPill>
                     ) : (
-                      <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-ink-2">
+                      <StatusPill tone="neutral" className="min-h-6 px-2 py-0.5 text-xs text-ink-2">
                         {res ? `Settled ${res}` : "Closed"}
-                      </Pill>
+                      </StatusPill>
                     )}
                   </div>
                   <Drawer.Title className="mono mt-2 break-all text-base font-semibold text-ink">
@@ -156,30 +160,30 @@ function MarketInspector({
               </div>
 
               <div className="flex-1 space-y-5 overflow-y-auto px-5 py-5">
-                <dl className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
-                  <div className="rounded-lg border border-hairline bg-board p-3">
+                <dl className="grid grid-cols-2 divide-y divide-hairline border border-hairline rounded-lg sm:grid-cols-4 sm:divide-x sm:divide-y-0">
+                  <div className="p-3">
                     <dt className="text-xs text-ink-3">YES Bid / Ask</dt>
                     <dd className="mono mt-1 text-sm font-semibold text-ink">
                       {cents(market.yes_bid)} / {cents(market.yes_ask)}
                     </dd>
                   </div>
-                  <div className="rounded-lg border border-hairline bg-board p-3">
+                  <div className="p-3">
                     <dt className="text-xs text-ink-3">NO Bid / Ask</dt>
                     <dd className="mono mt-1 text-sm font-semibold text-ink">
                       {cents(market.no_bid)} / {cents(market.no_ask)}
                     </dd>
                   </div>
-                  <div className="rounded-lg border border-hairline bg-board p-3">
+                  <div className="p-3">
                     <dt className="text-xs text-ink-3">Spread</dt>
                     <dd className="mono mt-1 text-sm font-semibold text-ink">{spreadCentsLabel(market)}</dd>
                   </div>
-                  <div className="rounded-lg border border-hairline bg-board p-3">
+                  <div className="p-3">
                     <dt className="text-xs text-ink-3">Last Trade</dt>
                     <dd className="mono mt-1 text-sm font-semibold text-ink">{cents(market.last_price)}</dd>
                   </div>
                 </dl>
 
-                <div className="rounded-lg border border-hairline bg-board/50 p-3.5">
+                <div className="border-t border-hairline pt-4">
                   <div className="mb-2 flex items-center justify-between text-xs">
                     <span className="font-medium text-ink">Implied YES / NO Probability</span>
                     <ProvenanceTag kind="venue" />
@@ -187,7 +191,7 @@ function MarketInspector({
                   <ProbBar yesProb={prob} />
                 </div>
 
-                <div className="rounded-lg border border-hairline bg-board/50 p-3.5">
+                <div className="border-t border-hairline pt-4">
                   <div className="mb-2 flex items-center justify-between text-xs">
                     <span className="font-semibold text-ink">Price &amp; Spread History</span>
                     <span className="font-mono text-ink-3">
@@ -205,20 +209,20 @@ function MarketInspector({
                   )}
                 </div>
 
-                <div>
-                  <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-3">
+                <div className="border-t border-hairline pt-4">
+                  <h3 className="mb-2 text-xs font-semibold text-ink-2">
                     Snapshot Tape ({history?.length ?? 1})
                   </h3>
-                  <ul className="divide-y divide-hairline rounded-lg border border-hairline bg-board/40">
+                  <ul className="divide-y divide-hairline border-t border-hairline">
                     {(history && history.length > 0 ? [...history].reverse().slice(0, 30) : [market]).map((pt, idx) => (
-                      <li key={idx} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 font-mono text-xs">
+                      <li key={idx} className="flex flex-wrap items-center justify-between gap-2 py-2 font-mono text-xs">
                         <span className="text-ink-2">{timeUtcFullLabel(pt.fetched_at)}</span>
                         <span className="text-ink">
-                          YES {cents(pt.yes_bid)}/{cents(pt.yes_ask)} · NO {cents(pt.no_bid)}/{cents(pt.no_ask)}
+                          YES {cents(pt.yes_bid)}/{cents(pt.yes_ask)} | NO {cents(pt.no_bid)}/{cents(pt.no_ask)}
                         </span>
                         <span className="text-ink-3">
                           spread {spreadCentsLabel(pt)}
-                          {pt.result ? ` · ${pt.result.toUpperCase()}` : ""}
+                          {pt.result ? ` (${pt.result.toUpperCase()})` : ""}
                         </span>
                       </li>
                     ))}
@@ -424,9 +428,9 @@ export function TapeTab({
             ))}
           </div>
 
-          <Pill
+          <StatusPill
             id="tape-stream-pill"
-            variant="outline"
+            tone={stream.mode === "sse" ? "success" : "info"}
             className="min-h-7 px-2.5 py-0.5 text-xs text-ink-2"
             title={
               stream.mode === "sse"
@@ -434,29 +438,17 @@ export function TapeTab({
                 : "Polling /api/markets every 30s (auto-upgrades when /api/tape/stream is live)"
             }
           >
-            <PillStatus className="border-r-0 pr-0">
-              <PillIndicator variant={stream.mode === "sse" ? "success" : "info"} />
-              <Activity className="size-3" aria-hidden />
-              <span className="mono">{stream.mode === "sse" ? "SSE live" : "30s poll"}</span>
-            </PillStatus>
-          </Pill>
+            <Activity className="size-3" strokeWidth={1.5} aria-hidden />
+            <span className="mono">{stream.mode === "sse" ? "SSE live" : "30s poll"}</span>
+          </StatusPill>
         </div>
       </div>
-
-      {/* Background Auto-Collector Control Strip + 200-Window Readiness Gate Progress Bar */}
-      <AutoCollectorStrip
-        status={collectorStatus}
-        updating={updatingSchedule}
-        onSelectSchedule={onSelectSchedule}
-        onOpenScorecard={onOpenScorecard}
-        variant="banner"
-      />
 
       {/* Inline interactive SVG Price + Spread History card for leading/pinned 15m market */}
       {featuredMarket && (
         <div
           id="tape-inline-chart"
-          className="rounded-[10px] border border-hairline bg-surface p-3.5 sm:p-4"
+          className="rounded-[10px] border border-hairline bg-surface p-3.5"
         >
           <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
             <div className="flex flex-wrap items-center gap-2">
@@ -496,7 +488,7 @@ export function TapeTab({
           <MarketHistoryChart
             points={inlineHistory && inlineHistory.length > 0 ? inlineHistory : [featuredMarket]}
             ticker={featuredTicker}
-            height={212}
+            height={204}
           />
         </div>
       )}
@@ -614,24 +606,21 @@ export function TapeTab({
                     </TableCell>
                     <TableCell className="m-right text-right">
                       {isOpen ? (
-                        <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-success-foreground">
-                          <PillStatus className="border-r-0 pr-0">
-                            <PillIndicator variant="success" />
-                            Open
-                          </PillStatus>
-                        </Pill>
+                        <StatusPill tone="success" className="min-h-6 px-2 py-0.5 text-xs text-success-foreground">
+                          Open
+                        </StatusPill>
                       ) : res === "YES" ? (
-                        <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-success-foreground">
+                        <StatusPill tone="success" className="min-h-6 px-2 py-0.5 text-xs text-success-foreground">
                           YES
-                        </Pill>
+                        </StatusPill>
                       ) : res === "NO" ? (
-                        <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-info-foreground">
+                        <StatusPill tone="info" className="min-h-6 px-2 py-0.5 text-xs text-info-foreground">
                           NO
-                        </Pill>
+                        </StatusPill>
                       ) : (
-                        <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-ink-2">
+                        <StatusPill tone="neutral" className="min-h-6 px-2 py-0.5 text-xs text-ink-2">
                           Closed
-                        </Pill>
+                        </StatusPill>
                       )}
                     </TableCell>
                   </TableRow>
@@ -648,6 +637,15 @@ export function TapeTab({
           )}
         </div>
       )}
+
+      {/* Background Auto-Collector Control Strip + 200-Window Readiness Gate Progress Bar */}
+      <AutoCollectorStrip
+        status={collectorStatus}
+        updating={updatingSchedule}
+        onSelectSchedule={onSelectSchedule}
+        onOpenScorecard={onOpenScorecard}
+        variant="banner"
+      />
 
       <MarketInspector market={selected} dataset={dataset} onClose={() => setSelected(null)} />
     </section>

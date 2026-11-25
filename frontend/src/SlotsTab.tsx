@@ -2,13 +2,21 @@
 // breakdown, compound-sized slot allocation with 0/3..3/3 strike history, one-click .md/.csv report
 // export (GET /api/export/report), verbatim audit trail (Cult UI Expandable), and Read-Only Venue Account.
 import { useMemo, useState } from "react";
-import { ChevronDown, Download, FileText } from "lucide-react";
+import { Download, FileText } from "lucide-react";
 import { toast } from "sonner";
-import { Button } from "@/components/ui/button";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
-import { Tracker, type TrackerBlockProps } from "@/components/Tracker/Tracker";
-import { Expandable, ExpandableContent, ExpandableTrigger } from "@/components/ui/expandable";
+import {
+  Button,
+  Disclosure,
+  StatusPill,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+  TrackerBar,
+  type TrackerBlock,
+} from "@/components/ui";
 import { EquityDrawdownChart, ProvenanceTag, validPoints } from "@/Charts";
 import {
   type Dataset,
@@ -29,14 +37,14 @@ import type { LiveDeskBundle } from "@/lib/live";
 
 function StrikeTracker({ strikes = 0 }: { strikes?: number }) {
   const n = isNum(strikes) ? Math.min(3, Math.max(0, Math.round(strikes))) : 0;
-  const data: TrackerBlockProps[] = [0, 1, 2].map((i) => ({
+  const data: TrackerBlock[] = [0, 1, 2].map((i) => ({
     color: i < n ? "bg-dot-red" : "bg-dot-green",
     tooltip: i < n ? `Strike ${i + 1} of 3` : "Clean slot standing",
   }));
   return (
     <div className="flex items-center gap-2">
       <div className="w-12 shrink-0">
-        <Tracker data={data} />
+        <TrackerBar data={data} />
       </div>
       <span className="mono text-xs text-ink-2">{n}/3</span>
     </div>
@@ -225,7 +233,7 @@ export function SlotsTab({
                               : "text-ink-2")
                         }
                       >
-                        {moneySigned(item.pnl)} · {item.windows}w
+                        {moneySigned(item.pnl)} ({item.windows}w)
                       </span>
                     </div>
                     <div className="h-1.5 w-full overflow-hidden rounded-full bg-track" aria-hidden="true">
@@ -245,9 +253,9 @@ export function SlotsTab({
               <span className="font-medium text-ink">Strike Standing (0/3 to 3/3)</span>
               <span className="mono text-ink-3">3 losses rotate</span>
             </div>
-            <div className="grid grid-cols-4 gap-1.5 font-mono text-xs">
+            <div className="grid grid-cols-4 divide-x divide-hairline border-y border-hairline font-mono text-xs">
               {[0, 1, 2, 3].map((k) => (
-                <div key={k} className="rounded-md border border-hairline bg-board px-2 py-1.5 text-center">
+                <div key={k} className="px-2 py-1.5 text-center">
                   <div className="text-ink-3">{k}/3</div>
                   <div className={"font-semibold " + (k === 3 && strikeDistribution[k] > 0 ? "text-destructive-foreground" : "text-ink")}>
                     {strikeDistribution[k]}
@@ -283,7 +291,7 @@ export function SlotsTab({
               <ProvenanceTag kind="paper" />
             </div>
             <span className="mono text-xs text-ink-2">
-              Pot {money(slots?.paper_equity_dollars)} · 3 consecutive losses rotate a slot
+              Pot {money(slots?.paper_equity_dollars)}, 3 consecutive losses rotate a slot
             </span>
           </div>
           {activeSlots.length === 0 ? (
@@ -336,12 +344,9 @@ export function SlotsTab({
                       </TableCell>
                       <TableCell className="mono text-right text-sm text-ink">{money(eq)}</TableCell>
                       <TableCell className="m-right text-right">
-                        <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-success-foreground">
-                          <PillStatus className="border-r-0 pr-0">
-                            <PillIndicator variant="success" />
-                            {status}
-                          </PillStatus>
-                        </Pill>
+                        <StatusPill tone="success" className="min-h-6 px-2 py-0.5 text-xs text-success-foreground">
+                          {status}
+                        </StatusPill>
                       </TableCell>
                     </TableRow>
                   );
@@ -352,23 +357,23 @@ export function SlotsTab({
 
           {retiredSlots.length > 0 && (
             <div className="border-t border-hairline bg-board/40 px-4 py-3">
-              <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-3">
+              <p className="mb-2 text-xs font-semibold text-ink-2">
                 Strike Rotation History ({retiredSlots.length})
               </p>
-              <ul className="space-y-1.5 text-xs">
+              <ul className="divide-y divide-hairline border-t border-hairline text-xs">
                 {retiredSlots.map((r, i) => (
-                  <li key={i} className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-hairline bg-surface px-3 py-2">
+                  <li key={i} className="flex flex-wrap items-center justify-between gap-2 py-2">
                     <div className="flex flex-wrap items-center gap-2">
-                      <Pill variant="outline" className="min-h-6 px-2 py-0.5 font-mono text-xs text-destructive-foreground">
+                      <StatusPill tone="error" className="min-h-6 px-2 py-0.5 font-mono text-xs text-destructive-foreground">
                         3/3 strikes
-                      </Pill>
+                      </StatusPill>
                       <span className="break-all font-medium text-ink">
-                        Slot #{r.slot} · {cleanStr(r.strategy, "unnamed")}
-                        {r.rotated_to ? ` -> ${r.rotated_to}` : ""}
+                        Slot #{r.slot}: {cleanStr(r.strategy, "unnamed")}
+                        {r.rotated_to ? ` replaced by ${r.rotated_to}` : ""}
                       </span>
                     </div>
                     <span className="mono text-ink-2">
-                      {r.windows_traded} windows · {moneySigned(r.paper_pnl_dollars)}
+                      {r.windows_traded} windows, {moneySigned(r.paper_pnl_dollars)}
                     </span>
                   </li>
                 ))}
@@ -411,21 +416,15 @@ export function SlotsTab({
             </div>
           </div>
           <p className="mt-2 text-xs text-ink-2">{firstReportLine}</p>
-          <div id="report-body" className="mt-3">
-            <Expandable expandDirection="vertical" expandBehavior="push" className="w-full">
-              <ExpandableTrigger className="inline-flex min-h-11 cursor-pointer items-center gap-1.5 rounded-md border border-hairline bg-board px-3 text-xs font-medium text-ink outline-none hover:bg-track focus-visible:ring-2 focus-visible:ring-ring">
-                <span>Show full report</span>
-                <ChevronDown className="size-3.5 text-ink-2" aria-hidden />
-              </ExpandableTrigger>
-              <ExpandableContent preset="fade">
-                <pre
-                  id="report"
-                  className="mono mt-3 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-hairline bg-board p-3.5 text-xs text-ink"
-                >
-                  {reportText || (reportRead && !reportRead.ok ? `Report unavailable: ${reportRead.msg}` : "Loading report…")}
-                </pre>
-              </ExpandableContent>
-            </Expandable>
+          <div id="report-body" className="mt-3 border-t border-hairline pt-2">
+            <Disclosure label="Show full report">
+              <pre
+                id="report"
+                className="mono max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-hairline bg-board p-3.5 text-xs text-ink"
+              >
+                {reportText || (reportRead && !reportRead.ok ? `Report unavailable: ${reportRead.msg}` : "Loading report…")}
+              </pre>
+            </Disclosure>
           </div>
         </div>
 
@@ -436,14 +435,14 @@ export function SlotsTab({
           </div>
           {liveBundle.status.configured || home?.account ? (
             <>
-              <dl className="mt-3 grid grid-cols-3 gap-2">
-                <div className="rounded-lg border border-hairline bg-board p-2.5">
+              <dl className="mt-3 grid grid-cols-3 divide-x divide-hairline border-y border-hairline">
+                <div className="px-2 py-2.5">
                   <dt className="text-xs text-ink-3">Cash Balance</dt>
                   <dd className="mono mt-1 text-xs font-semibold text-ink">
                     {money(liveBundle.account.balanceDollars ?? home?.account.balance ?? null)}
                   </dd>
                 </div>
-                <div className="rounded-lg border border-hairline bg-board p-2.5">
+                <div className="px-2 py-2.5">
                   <dt className="text-xs text-ink-3">Portfolio / Day</dt>
                   <dd className="mono mt-1 text-xs font-semibold text-ink">
                     {liveBundle.account.portfolioValueDollars !== null
@@ -451,7 +450,7 @@ export function SlotsTab({
                       : moneySigned(home?.account.day_pnl ?? null)}
                   </dd>
                 </div>
-                <div className="rounded-lg border border-hairline bg-board p-2.5">
+                <div className="px-2 py-2.5">
                   <dt className="text-xs text-ink-3">Pos / Orders</dt>
                   <dd className="mono mt-1 text-xs font-semibold text-ink">
                     {liveBundle.status.configured
@@ -464,7 +463,7 @@ export function SlotsTab({
               </dl>
               <p className="mt-3 text-xs text-ink-2">
                 {liveBundle.status.configured
-                  ? `${liveBundle.status.environment.toUpperCase()} · ${liveBundle.status.liveArmed ? "Live Armed" : "Disarmed (Paper Mode)"} · ${liveBundle.account.note}`
+                  ? `${liveBundle.status.environment.toUpperCase()} (${liveBundle.status.liveArmed ? "Live Armed" : "Disarmed, Paper Mode"}) — ${liveBundle.account.note}`
                   : home?.account.note || "Configure Kalshi v2 API credentials in Settings to connect."}
               </p>
               <div className="mt-3 flex flex-wrap items-center gap-2">

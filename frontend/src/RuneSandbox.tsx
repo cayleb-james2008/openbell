@@ -4,9 +4,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { CheckCircle2, Code2, Play, RotateCcw, ShieldCheck, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
+import { Badge, Button, StatusPill } from "@/components/ui";
 import { StrategyEquityChart, ProvenanceTag } from "@/Charts";
 import {
   type Dataset,
@@ -213,7 +211,7 @@ export function RuneSandbox({
           <div className="overflow-hidden rounded-lg border border-hairline bg-board">
             <div className="flex items-center justify-between border-b border-hairline bg-surface px-3 py-1.5 font-mono text-xs text-ink-3">
               <span>{loadedFrom === "template" ? "sandbox.rn" : `${loadedFrom}.rn`}</span>
-              <span>{lineCount} lines · whole-cent sim</span>
+              <span>{lineCount} lines, whole-cent sim</span>
             </div>
             <div className="flex">
               <div
@@ -304,7 +302,7 @@ export function RuneSandbox({
                   <span>{validation.valid ? "Compile passed" : "Compile diagnostics"}</span>
                 </span>
                 <span className="mono text-ink-3">
-                  {validation.source === "server" ? "Server Sandbox" : "Local evaluator"} · {validation.elapsedMs}ms
+                  {validation.source === "server" ? "Server Sandbox" : "Local evaluator"} ({validation.elapsedMs}ms)
                 </span>
               </div>
               <ul className="mt-2 space-y-1">
@@ -362,20 +360,17 @@ export function RuneSandbox({
                   <Badge variant="outline" className="mono text-xs">
                     {result.strategy}
                   </Badge>
-                  <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-info-foreground">
-                    <PillStatus className="border-r-0 pr-0">
-                      <PillIndicator variant={result.valid ? "success" : "error"} />
-                      {result.side.toUpperCase()}
-                    </PillStatus>
-                  </Pill>
+                  <StatusPill tone={result.valid ? "success" : "error"} className="min-h-6 px-2 py-0.5 text-xs text-info-foreground">
+                    {result.side.toUpperCase()}
+                  </StatusPill>
                 </div>
                 <span className="mono text-xs text-ink-3">
-                  {result.summary.windowsTraded} trades · {result.elapsedMs}ms
+                  {result.summary.windowsTraded} trades, {result.elapsedMs}ms
                 </span>
               </div>
 
-              <dl className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                <div className="rounded-lg border border-hairline bg-board p-2.5">
+              <dl className="grid grid-cols-2 divide-y divide-hairline border-y border-hairline sm:grid-cols-3 sm:divide-x sm:divide-y-0">
+                <div className="p-2.5">
                   <dt className="text-xs text-ink-3">Paper Net P&amp;L</dt>
                   <dd
                     className={
@@ -391,7 +386,7 @@ export function RuneSandbox({
                     </span>
                   )}
                 </div>
-                <div className="rounded-lg border border-hairline bg-board p-2.5">
+                <div className="p-2.5">
                   <dt className="text-xs text-ink-3">Sharpe</dt>
                   <dd className="mono mt-0.5 text-sm font-semibold text-ink">
                     {result.summary.sharpe !== null ? result.summary.sharpe.toFixed(2) : "-"}
@@ -400,26 +395,26 @@ export function RuneSandbox({
                     Sortino {result.summary.sortino !== null ? result.summary.sortino.toFixed(2) : "-"}
                   </span>
                 </div>
-                <div className="rounded-lg border border-hairline bg-board p-2.5">
+                <div className="p-2.5">
                   <dt className="text-xs text-ink-3">Max Drawdown</dt>
                   <dd className="mono mt-0.5 text-sm font-semibold text-destructive-foreground">
                     -{result.summary.maxDrawdownPct.toFixed(2)}%
                   </dd>
                   <span className="mono text-xs text-ink-3">Fee drag {result.summary.feeDragPct.toFixed(1)}%</span>
                 </div>
-                <div className="rounded-lg border border-hairline bg-board p-2.5">
+                <div className="p-2.5">
                   <dt className="text-xs text-ink-3">Brier Score</dt>
                   <dd className="mono mt-0.5 text-sm font-semibold text-ink">
                     {result.summary.brierScore !== null ? result.summary.brierScore.toFixed(4) : "-"}
                   </dd>
                 </div>
-                <div className="rounded-lg border border-hairline bg-board p-2.5">
+                <div className="p-2.5">
                   <dt className="text-xs text-ink-3">Win Rate</dt>
                   <dd className="mono mt-0.5 text-sm font-semibold text-ink">
                     {result.summary.winRatePct.toFixed(1)}%
                   </dd>
                 </div>
-                <div className="rounded-lg border border-hairline bg-board p-2.5">
+                <div className="p-2.5">
                   <dt className="text-xs text-ink-3">Mean / Contract</dt>
                   <dd className="mono mt-0.5 text-sm font-semibold text-ink">
                     {result.summary.meanCentsPerContract >= 0 ? "+" : ""}
@@ -429,7 +424,7 @@ export function RuneSandbox({
               </dl>
 
               {/* Equity curve */}
-              <div className="rounded-lg border border-hairline bg-board/50 p-3">
+              <div className="pt-1">
                 <StrategyEquityChart
                   points={result.equityCurve}
                   start={0}
@@ -445,18 +440,18 @@ export function RuneSandbox({
                   <span className="mono text-ink-3">Latest 12 shown</span>
                 </div>
                 {result.trades.length === 0 ? (
-                  <p className="rounded-md border border-hairline bg-board/40 px-3 py-2 text-xs text-ink-2">
+                  <p className="py-2 text-xs text-ink-2">
                     Zero settled windows matched `allow_entry(...)` on this tape.
                   </p>
                 ) : (
-                  <ul className="max-h-44 divide-y divide-hairline overflow-y-auto rounded-lg border border-hairline bg-board/40">
+                  <ul className="max-h-44 divide-y divide-hairline overflow-y-auto border-t border-hairline">
                     {[...result.trades].reverse().slice(0, 12).map((t, idx) => (
-                      <li key={idx} className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 font-mono text-xs">
+                      <li key={idx} className="flex flex-wrap items-center justify-between gap-2 py-1.5 font-mono text-xs">
                         <span className="text-ink-2">
                           {dayLabel(t.closeEpoch)} {timeUtcLabel(t.closeEpoch)}
                         </span>
                         <span className="truncate text-ink">
-                          {t.ticker} · {t.contracts}x @ {Math.round(t.price * 100)}c
+                          {t.ticker} | {t.contracts}x @ {Math.round(t.price * 100)}c
                         </span>
                         <span className={t.pnlDollars >= 0 ? "font-medium text-success-foreground" : "font-medium text-destructive-foreground"}>
                           {moneySigned(t.pnlDollars)}

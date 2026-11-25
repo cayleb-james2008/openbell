@@ -70,6 +70,25 @@ const MEASURE = () => {
     })
     .map(e => e.tagName + '.' + String(e.className?.baseVal ?? e.className).slice(0, 40) + ' r=' + Math.round(e.getBoundingClientRect().right))
     .slice(0, 5)
+  const textClipped = []
+  const textRange = document.createRange()
+  for (const el of document.querySelectorAll('header button, header input, aside button, nav button, [role=tab], h1, h2, h3')) {
+    if (!vis(el) || el.closest('[aria-hidden="true"]')) continue
+    const cs = getComputedStyle(el)
+    if (cs.textOverflow === 'ellipsis' || el.classList.contains('truncate')) continue
+    const er = el.getBoundingClientRect()
+    const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+    let tn
+    while ((tn = w.nextNode())) {
+      if (!tn.textContent || !tn.textContent.trim()) continue
+      textRange.selectNodeContents(tn)
+      const tr = textRange.getBoundingClientRect()
+      if (tr.width > 0 && (tr.right > er.right + 2 || tr.left < er.left - 2)) {
+        textClipped.push(`${el.tagName}:${(tn.textContent || '').trim().slice(0, 24)}`)
+        break
+      }
+    }
+  }
   const svgs = [...document.querySelectorAll('svg')].filter(s => vis(s) && s.querySelector('text'))
   const svgOut = [], svgOverlap = [], svgSmall = []
   for (const s of svgs) {
@@ -94,6 +113,7 @@ const MEASURE = () => {
   }
   return {
     clipped,
+    textClipped: textClipped.slice(0, 5),
     docOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
     interactive: inter.length,
     smallTargets: small.length,
@@ -205,25 +225,25 @@ for (const [dn, url] of [['live', BASE], ['fixture', FX]]) {
 for (const m of measures) {
   ok(
     `measure ${m.data} ${m.size} ${m.theme}`,
-    m.docOverflow <= 0 && m.clipped.length === 0 && m.smallTargets === 0 && m.lowContrast === 0 && m.unnamed.length === 0 && m.transitionClass === 0 && m.svgBad === 0,
-    `overflow=${m.docOverflow} clipped=${m.clipped.join('|')} small=${m.smallTargets}(${m.smallSample.join('|')}) low=${m.lowContrast}(${m.lowSample.join('|')}) unnamed=${m.unnamed.join('|')} tr=${m.transitionClass} svg=${m.svgBad}(${m.svgDetail.join('|')}) minRatio=${m.minRatio}`,
+    m.docOverflow <= 0 && m.clipped.length === 0 && m.textClipped.length === 0 && m.smallTargets === 0 && m.lowContrast === 0 && m.unnamed.length === 0 && m.transitionClass === 0 && m.svgBad === 0,
+    `overflow=${m.docOverflow} clipped=${m.clipped.join('|')} textClip=${m.textClipped.join('|')} small=${m.smallTargets}(${m.smallSample.join('|')}) low=${m.lowContrast}(${m.lowSample.join('|')}) unnamed=${m.unnamed.join('|')} tr=${m.transitionClass} svg=${m.svgBad}(${m.svgDetail.join('|')}) minRatio=${m.minRatio}`,
   )
 }
 
-// 2. Settings-only Light/Dark switch (#67), opaque header, & #desk-search non-truncation on ALL 4 tabs
+// 2. Settings-only Light/Dark switch (#67), opaque header, & #desk-search non-truncation on ALL 5 workbench views
 {
   const { ctx, p } = await open(1440, 900, 'light')
   await p.goto(BASE); await ready(p); await p.waitForTimeout(500)
-  ok('no Light/Dark buttons visible on top bar at rest',
-    (await p.locator('header').getByRole('button', { name: 'Dark', exact: true }).count()) === 0 &&
-    (await p.locator('header').getByRole('button', { name: 'Light', exact: true }).count()) === 0)
+  ok('no Light/Dark buttons visible on top bar or left rail at rest',
+    (await p.locator('header, aside').getByRole('button', { name: 'Dark', exact: true }).count()) === 0 &&
+    (await p.locator('header, aside').getByRole('button', { name: 'Light', exact: true }).count()) === 0)
   ok('sticky header uses opaque surface with zero backdrop blur',
     await p.locator('header').evaluate(el => {
       const s = getComputedStyle(el)
       return (!s.backdropFilter || s.backdropFilter === 'none') && (!s.webkitBackdropFilter || s.webkitBackdropFilter === 'none')
     }))
   const phFits = []
-  for (const tid of ['#tab-tape', '#tab-strategies', '#tab-slots', '#tab-quant']) {
+  for (const tid of ['#tab-tape', '#tab-strategies', '#tab-slots', '#tab-quant', '#tab-live']) {
     await p.locator(tid).click(); await p.waitForTimeout(120)
     const info = await p.locator('#desk-search').evaluate(el => {
       const s = getComputedStyle(el)
@@ -236,7 +256,7 @@ for (const m of measures) {
     phFits.push(info)
   }
   await p.locator('#tab-tape').click(); await p.waitForTimeout(100)
-  ok('search placeholder fits without mid-word clipping on all 4 tabs', phFits.every(x => x.ok), JSON.stringify(phFits))
+  ok('search placeholder fits without mid-word clipping on all 5 views', phFits.every(x => x.ok), JSON.stringify(phFits))
   ok('live mode shows zero Example fixture pill', (await p.locator('text=Example fixture').count()) === 0)
   const lum = () => p.evaluate(() => {
     const cx = document.createElement('canvas').getContext('2d')
@@ -272,11 +292,14 @@ for (const m of measures) {
   const { ctx, p } = await open(1440, 900)
   await p.goto(FX); await ready(p); await p.waitForTimeout(550)
   ok('fixture notice visible only on ?dataset=fixture', (await p.locator('text=Example tape.').count()) === 1)
-  ok('hero telemetry strip + Collect now sit above the fold at 1440', await p.evaluate(() =>
-    ['#pot-figure', '#standing', '#markets-kpi', '#snapshots-kpi', '#collect-btn'].every(s => {
+  ok('left desk rail, Risk/Kill-Switch header & live market table sit above the fold at 1440', await p.evaluate(() => {
+    const controlsVisible = ['#pot-figure', '#standing', '#collect-btn', '#kill-switch-btn', '#run-edge-audit-btn', '#tab-live'].every(s => {
       const r = document.querySelector(s)?.getBoundingClientRect()
       return !!r && r.top >= 0 && r.bottom <= innerHeight
-    })))
+    })
+    const tableRow = document.querySelector('#markets-card tbody tr')?.getBoundingClientRect()
+    return controlsVisible && !!tableRow && tableRow.top >= 0 && tableRow.top < innerHeight - 24
+  }))
   const fontsOk = await p.evaluate(async () => {
     await document.fonts.ready
     return document.fonts.check('14px "Geist"') && [...document.fonts].some(f => f.family.includes('Geist Mono') && f.status === 'loaded')
@@ -289,10 +312,22 @@ for (const m of measures) {
     stratTotal >= 5 && (await p.locator('#standing-figure').textContent()).trim() === `0 of ${stratTotal}` && tally.some(t => /passed on the example tape only/.test(t)),
     `total=${stratTotal} tally=${JSON.stringify(tally)}`)
 
-  // v0.8.0: zero outdated "paper-only / no orders" claims + Live Account Strip, Order Ticket, Risk Rails & Kill Switch
+  // v0.9.0: zero outdated "paper-only / no orders" claims + Live & Rails view, collapsible Order Ticket & Rule Editor drawers
   const noStalePaperOnly = await p.evaluate(() => !/paper-only|no orders|zero order paths|zero live order paths|places no orders/i.test(document.body.innerText))
-  ok('zero outdated paper-only or no-orders copy across desk chrome (v0.8.0)', noStalePaperOnly)
-  await p.locator('#toggle-live-ticket-btn').click(); await p.waitForTimeout(200)
+  ok('zero outdated paper-only or no-orders copy across desk chrome (v0.9.0)', noStalePaperOnly)
+  await p.locator('#drawer-order-ticket-btn').click(); await p.waitForTimeout(350)
+  const drawerTicketOk =
+    (await p.locator('[data-order-ticket-drawer]').isVisible()) &&
+    (await p.locator('[data-order-ticket-drawer] #live-order-ticket').isVisible()) &&
+    (await p.locator('[data-order-ticket-drawer] #live-risk-rails-check [data-risk-rail]').count()) === 7
+  await p.keyboard.press('Escape'); await p.waitForTimeout(350)
+  await p.locator('#drawer-rule-editor-btn').click(); await p.waitForTimeout(350)
+  const drawerEditorOk =
+    (await p.locator('[data-rule-editor-drawer]').isVisible()) &&
+    (await p.locator('[data-rule-editor-drawer] #rune-editor').isVisible())
+  await p.keyboard.press('Escape'); await p.waitForTimeout(350)
+  ok('collapsible Order Ticket & Strategy Rule Editor drawers open and close via Escape', drawerTicketOk && drawerEditorOk)
+  await p.locator('#tab-live').click(); await p.waitForTimeout(250)
   const liveTicketOk =
     (await p.locator('#live-account-strip').isVisible()) &&
     (await p.locator('#trading-mode-paper').isVisible()) &&
@@ -300,10 +335,9 @@ for (const m of measures) {
     (await p.locator('#kill-switch-btn').isVisible()) &&
     (await p.locator('#live-order-ticket').isVisible()) &&
     (await p.locator('#live-risk-rails-check [data-risk-rail]').count()) === 7
-  ok('Live Kalshi Account Strip, Order Ticket, 7 Hard Risk Rails & Emergency Kill Switch render', liveTicketOk)
-  await p.locator('#live-account-strip').scrollIntoViewIfNeeded(); await p.waitForTimeout(150)
+  ok('Live & Rails view renders Account Strip, Order Ticket, 7 Hard Risk Rails & Emergency Kill Switch', liveTicketOk)
   await p.screenshot({ path: `${OUT}/live-desk-1440-light.png` })
-  await p.locator('#toggle-live-ticket-btn').click(); await p.waitForTimeout(150)
+  await p.locator('#tab-tape').click(); await p.waitForTimeout(200)
 
   // Live 15m Tape: Auto-Collector strip (Off / 60s / 180s + 200-window Readiness Gate bar), dynamic series chips, Price & Spread crosshair, Market Inspector
   const autoCollectorOk =
@@ -338,15 +372,17 @@ for (const m of measures) {
   await p.keyboard.press('Escape'); await p.waitForTimeout(450)
   await p.locator('#desk-search').fill(''); await p.waitForTimeout(150)
 
-  // Keyboard shortcuts 1-4 switch all 4 tabs cleanly
+  // Keyboard shortcuts 1-5 switch all 5 workbench views cleanly
   await p.locator('body').click({ position: { x: 5, y: 300 } })
+  await p.keyboard.press('5'); await p.waitForTimeout(200)
+  const k5Ok = await p.locator('#live-account-strip').isVisible()
   await p.keyboard.press('4'); await p.waitForTimeout(200)
   const k4Ok = await p.locator('#quant-lab').isVisible()
   await p.keyboard.press('3'); await p.waitForTimeout(200)
   const k3Ok = await p.locator('#slots-card').isVisible()
   await p.keyboard.press('2'); await p.waitForTimeout(200)
   const k2Ok = await p.locator('#strategies').isVisible()
-  ok('keyboard shortcuts 2/3/4 switch Strategies, Slot Desk & Quant Lab tabs', k4Ok && k3Ok && k2Ok)
+  ok('keyboard shortcuts 2/3/4/5 switch Strategies, Slots, Quant Lab & Live views', k5Ok && k4Ok && k3Ok && k2Ok)
 
   // Strategies tab + filters + Sandbox Editor + Validate + Backtest + j/k/Enter + Inspector
   ok('Strategies leaderboard renders full strategy library', (await stratRows(p)) === stratTotal && stratTotal >= 5, String(await stratRows(p)))
@@ -419,8 +455,13 @@ for (const m of measures) {
     `low=${slotsM.lowContrast} svg=${slotsM.svgBad} small=${slotsM.smallTargets}`)
   await p.screenshot({ path: `${OUT}/slots-1440-light.png` })
 
-  // Quant Lab (4th tab): $500/Day Scale Planner, 5-Gate Readiness Scorecard, PAV Isotonic Recalibration, Calibration Reliability, Monte Carlo Fan, Walk-Forward IS vs OOS
-  await p.locator('#tab-quant').click(); await p.waitForTimeout(550)
+  // Quant Lab (4th view): 1-Click Full Quant Edge Audit, $500/Day Scale Planner, 5-Gate Readiness Scorecard, PAV Isotonic Recalibration, Calibration Reliability, Monte Carlo Fan, Walk-Forward IS vs OOS
+  await p.locator('#run-edge-audit-btn').click(); await p.waitForTimeout(550)
+  const edgeAuditOk =
+    (await p.locator('#quant-edge-audit').isVisible()) &&
+    (await p.locator('#edge-audit-verdict').isVisible()) &&
+    (await p.locator('#quant-edge-audit [data-edge-audit-stage]').count()) === 5
+  ok('1-click Full Quant Edge Audit button opens Quant Lab and renders 5-stage Go/No-Go Scorecard', edgeAuditOk)
   const scaleReady =
     (await p.locator('#quant-scale-planner').isVisible()) &&
     (await p.locator('[data-scale-trajectory-chart] svg[role=img]').count()) === 1 &&
@@ -465,7 +506,7 @@ for (const m of measures) {
 
   const recalChartOk =
     (await p.locator('[data-recalibration-chart] svg[role=img]').count()) === 1 &&
-    (await p.locator('#recal-brier').innerText()).includes('->') &&
+    (await p.locator('#recal-brier').innerText()).includes(' to ') &&
     (await p.locator('#ev-gate-impact tbody tr').count()) === 3
   ok('Quant Lab renders PAV Isotonic Recalibration Before vs After SVG & EV-After-Fees Gate impact', recalChartOk)
   await p.locator('#quant-recalibration').scrollIntoViewIfNeeded(); await p.waitForTimeout(150)
@@ -521,24 +562,24 @@ for (const m of measures) {
   await ctx.close()
 }
 
-// 4. 390x844 mobile sweep across ALL 4 tabs: zero overflow, zero 1-word orphan wraps, 44px targets, bottom Settings sheet
+// 4. 390x844 mobile sweep across ALL 5 views: zero overflow, zero 1-word orphan wraps, 44px targets, bottom Settings sheet
 {
   const { ctx, p } = await open(390, 844)
   await p.goto(FX); await ready(p); await p.waitForTimeout(450)
   const orphanIssues = []
   const tabMeasures = []
-  for (const [tid, label] of [['#tab-tape', 'tape'], ['#tab-strategies', 'strategies'], ['#tab-slots', 'slots'], ['#tab-quant', 'quant']]) {
+  for (const [tid, label] of [['#tab-tape', 'tape'], ['#tab-strategies', 'strategies'], ['#tab-slots', 'slots'], ['#tab-quant', 'quant'], ['#tab-live', 'live']]) {
     await p.locator(tid).click(); await p.waitForTimeout(350)
     const m = await p.evaluate(MEASURE)
     const orph = await p.evaluate(ORPHAN_WRAPS)
-    tabMeasures.push({ label, ok: m.docOverflow <= 0 && m.clipped.length === 0 && m.smallTargets === 0 && m.lowContrast === 0 && m.svgBad === 0, m })
+    tabMeasures.push({ label, ok: m.docOverflow <= 0 && m.clipped.length === 0 && m.textClipped.length === 0 && m.smallTargets === 0 && m.lowContrast === 0 && m.svgBad === 0, m })
     for (const o of orph) orphanIssues.push(`${label}: ${o}`)
     if (label === 'quant') await p.screenshot({ path: `${OUT}/quant-lab-390-light.png` })
   }
-  ok('all 4 tabs pass 390x844 touch, contrast, overflow & SVG geometry',
+  ok('all 5 views pass 390x844 touch, contrast, overflow & SVG geometry',
     tabMeasures.every(x => x.ok),
-    tabMeasures.filter(x => !x.ok).map(x => `${x.label}:overflow=${x.m.docOverflow},small=${x.m.smallTargets}(${x.m.smallSample.join('|')}),low=${x.m.lowContrast},svg=${x.m.svgBad}(${x.m.svgDetail.join('|')})`).join(' ; '))
-  ok('zero 1-word orphan wraps at 390x844 across all 4 tabs', orphanIssues.length === 0, orphanIssues.slice(0, 6).join(' | '))
+    tabMeasures.filter(x => !x.ok).map(x => `${x.label}:overflow=${x.m.docOverflow},textClip=${x.m.textClipped.join('|')},small=${x.m.smallTargets}(${x.m.smallSample.join('|')}),low=${x.m.lowContrast},svg=${x.m.svgBad}(${x.m.svgDetail.join('|')})`).join(' ; '))
+  ok('zero 1-word orphan wraps at 390x844 across all 5 views', orphanIssues.length === 0, orphanIssues.slice(0, 6).join(' | '))
 
   await p.locator('#settings-btn').click(); await p.waitForTimeout(500)
   const box = await p.locator('[data-settings-drawer]').boundingBox()
@@ -611,8 +652,8 @@ for (const m of measures) {
   await p.route('**/api/home', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.8.0'
-    j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan', 'tournament', 'auto_collector', 'live_kalshi', 'risk_rails']
+    j.version = '0.9.0'
+    j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan', 'tournament', 'auto_collector', 'live_kalshi', 'risk_rails', 'edge_audit']
     j.collector = {
       ...j.collector,
       auto_collect_enabled: schedState.enabled,
@@ -900,6 +941,68 @@ for (const m of measures) {
       }),
     })
   })
+  await p.route('**/api/analytics/edge-audit*', r => {
+    hits.add('edge-audit')
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        mode_notice: 'Paper edge audit — strictly read-only simulation, no venue capital at risk.',
+        dataset: 'live',
+        verdict: 'NO_GO',
+        verdict_label: 'NO-GO — Paper Research Only',
+        blocking_reasons: ['OOS net expectancy > 0 after fees & slippage: OOS net expectancy is -0.65c/contract.'],
+        slippage_cents: 1,
+        strategies_total: 12,
+        strategies_oos_positive: 2,
+        strategies_forward_proven: 0,
+        windows_settled_total: 240,
+        windows_settled_is: 144,
+        windows_settled_oos: 96,
+        windows_conflicted: 0,
+        top_strategy: { strategy: 'late-favourite-edge', side: 'yes', oos_trades: 48, oos_win_rate: 0.812, oos_avg_entry_price: 0.76, oos_avg_fee_cents: 1.28, oos_net_expectancy_cents: 3.45, oos_sharpe: 1.92, oos_max_drawdown_pct: 4.1 },
+        lineup: {
+          slots: [
+            { slot_number: 1, strategy: 'late-favourite-edge', side: 'yes', oos_trades: 48, oos_net_expectancy_cents: 3.45, oos_sharpe: 1.92, oos_max_drawdown_pct: 4.1, max_abs_corr_with_lineup: 0.22 },
+            { slot_number: 2, strategy: 'mid-band-reversion', side: 'no', oos_trades: 42, oos_net_expectancy_cents: 1.85, oos_sharpe: 1.24, oos_max_drawdown_pct: 6.2, max_abs_corr_with_lineup: 0.22 },
+          ],
+          correlation_cap: 0.65,
+          max_abs_correlation: 0.22,
+          mean_abs_correlation: 0.22,
+          lineup_complete: false,
+          fallback_used: true,
+          combined_oos_expectancy_cents: 2.65,
+          honesty_note: 'Honest fallback: only 2 of 12 strategies pass positive OOS expectancy.',
+        },
+        recalibration: {
+          is_count: 144, oos_count: 96, oos_brier_before: 0.194, oos_brier_after: 0.171,
+          oos_ece_before: 0.068, oos_ece_after: 0.031, oos_improved: true, min_detectable_edge: 0.098,
+          ev_gate_total: 96, ev_gate_accepted: 56, ev_gate_refused: 40, ev_gate_accepted_win_rate: 0.804,
+          ev_gate_before_pnl_dollars: 14.2, ev_gate_after_pnl_dollars: 22.8, ev_gate_pnl_delta_dollars: 8.6,
+        },
+        fee_ev: { avg_entry_price: 0.76, gross_edge_cents: 5.73, kalshi_fee_drag_cents: 1.28, slippage_drag_cents: 1, net_ev_cents: 3.45, realized_oos_win_rate_pct: 81.2, break_even_win_rate_pct: 78.3 },
+        monte_carlo: { seed: 42, paths: 1000, start_equity_dollars: 100, p5_final_equity_dollars: 92, p50_final_equity_dollars: 121, p95_final_equity_dollars: 162, median_max_drawdown_pct: 5.1, prob_dd_gte_10_pct: 0.12, prob_dd_gte_25_pct: 0.015, prob_profit: 0.74 },
+        readiness: {
+          verdict: 'PAPER_RESEARCH_ONLY', gates_passed: 3, gates_total: 5,
+          gates: [
+            { id: 'sample_depth', label: 'Sample depth >= 200 settled trades', passed: true, observed: 240, threshold: 200, unit: 'trades', detail: '240 settled paper trades recorded.' },
+            { id: 'oos_net_expectancy', label: 'OOS net expectancy > 0 after fees & slippage', passed: false, observed: -0.65, threshold: 0.0, unit: 'cents/contract', detail: 'OOS net expectancy is -0.65c/contract.' },
+            { id: 'oos_ece', label: 'OOS calibration ECE < 0.05', passed: true, observed: 0.031, threshold: 0.05, unit: 'ECE', detail: 'OOS ECE is 0.0310.' },
+            { id: 'max_drawdown_pct', label: 'Max paper drawdown < 20%', passed: true, observed: 9.4, threshold: 20.0, unit: '%', detail: 'Max drawdown is 9.4%.' },
+            { id: 'liquidity_fill_ratio', label: 'Liquidity fill ratio >= 75% at target', passed: false, observed: 0.0, threshold: 0.75, unit: 'ratio', detail: 'Book capacity covers 0.0% of target.' },
+          ],
+          observed_median_depth: 250, fill_ratio_at_target: 0.0,
+        },
+        funnel: [
+          { id: 'tournament', title: '12 Strategies OOS Tournament', passed: true, metric: '+3.45c/ct', detail: '2/12 positive OOS across 96 OOS windows' },
+          { id: 'lineup', title: 'Uncorrelated 4-Slot Lineup', passed: false, metric: '2/4 slots', detail: 'Only 2 qualified' },
+          { id: 'recalibration', title: 'PAV Isotonic Recalibration', passed: true, metric: 'OOS Improved', detail: 'EV gate accepted 56/96 OOS quotes' },
+          { id: 'net_ev', title: 'Kalshi Fee & Slippage Net EV', passed: true, metric: '+3.45c net/ct', detail: 'Slippage 1.0c' },
+          { id: 'readiness', title: 'Monte Carlo DD & 5-Gate Readiness', passed: false, metric: '3/5 gates', detail: 'OOS net expectancy <= 0' },
+        ],
+      }),
+    })
+  })
   await p.route('**/api/tape/stream', r => {
     hits.add('sse')
     return r.fulfill({
@@ -984,32 +1087,32 @@ for (const m of measures) {
   })
 
   await p.goto(BASE); await ready(p); await p.waitForTimeout(450)
-  // Full Live Kalshi v2 flow: Settings Config -> Arm Confirmation Modal -> Submit Order -> Cancel Order -> Kill Switch
+  // Full Live Kalshi v2 flow: Settings Config -> Live & Rails View -> Arm Confirmation Modal -> Submit Order -> Cancel Order -> Kill Switch
   await p.locator('#settings-btn').click(); await p.waitForTimeout(350)
   await p.locator('#live-api-key-id').fill('demo-key-123456789ab')
   await p.locator('#live-pem-path').fill('/tmp/mock-kalshi-demo.pem')
   await p.locator('#save-live-config-btn').click(); await p.waitForTimeout(450)
   await p.getByRole('button', { name: 'Close settings', exact: true }).click(); await p.waitForTimeout(500)
+  await p.locator('#tab-live').click(); await p.waitForTimeout(250)
   const balanceShown = (await p.locator('#live-balance-val').innerText()).includes('$1250.00') ||
     (await p.locator('#live-balance-val').innerText()).includes('$1,250.00')
   await p.locator('#trading-mode-live').click(); await p.waitForTimeout(300)
   await p.locator('#arm-live-checkbox').check()
   await p.locator('#confirm-arm-live-btn').click(); await p.waitForTimeout(400)
-  const armedPillOk = (await p.locator('#live-mode-pill').innerText()).includes('Live Armed')
+  const armedPillOk = (await p.locator('#live-mode-pill').innerText()).includes('ARMED')
   await p.locator('#live-ticket-ticker').fill('KXBTC15M-MOCK')
   await p.locator('#live-ticket-count').fill('5')
   await p.locator('#live-ticket-price').fill('55')
   await p.waitForTimeout(100)
   await p.locator('#submit-live-order-btn').click(); await p.waitForTimeout(300)
-  await p.locator('#live-account-strip').scrollIntoViewIfNeeded(); await p.waitForTimeout(150)
   await p.screenshot({ path: `${OUT}/live-armed-1440-light.png` })
   await p.locator('[data-cancel-order="ord-demo-1"]').click(); await p.waitForTimeout(250)
   await p.locator('#kill-switch-btn').click(); await p.waitForTimeout(300)
-  const disarmedAfterKill = (await p.locator('#live-mode-pill').innerText()).includes('Paper Mode')
-  await p.locator('#toggle-live-ticket-btn').click(); await p.waitForTimeout(150)
+  const disarmedAfterKill = /KILLED|DISARMED/.test(await p.locator('#live-mode-pill').innerText())
+  await p.locator('#tab-tape').click(); await p.waitForTimeout(200)
 
   await p.locator('#auto-collector-strip [data-collector-mode="60"]').click(); await p.waitForTimeout(250)
-  const schedUpdated = (await p.locator('#auto-collector-status-pill').innerText()).includes('Auto · 60s') &&
+  const schedUpdated = (await p.locator('#auto-collector-status-pill').innerText()).includes('Auto') &&
     (await p.locator('#readiness-progress').innerText()).includes('140 / 200')
   await p.locator('#tab-strategies').click(); await p.waitForTimeout(150)
   await p.locator('#open-sandbox-btn').click(); await p.waitForTimeout(150)
@@ -1017,16 +1120,18 @@ for (const m of measures) {
   await p.locator('#sandbox-backtest-btn').click(); await p.waitForTimeout(200)
   await p.locator('#tab-slots').click(); await p.waitForTimeout(200)
   await Promise.all([p.waitForEvent('download'), p.locator('#export-report-md').click()])
-  await p.locator('#tab-quant').click(); await p.waitForTimeout(450)
+  await p.locator('#run-edge-audit-btn').click(); await p.waitForTimeout(450)
   const scorecardText = await p.locator('#readiness-scorecard').innerText()
   const evGateText = await p.locator('#ev-gate-impact').innerText()
   const tournamentText = await p.locator('#quant-tournament').innerText()
+  const edgeAuditText = await p.locator('#quant-edge-audit').innerText()
   const serverEngineShown =
     balanceShown &&
     armedPillOk &&
     disarmedAfterKill &&
     csrfChecked >= 5 &&
     schedUpdated &&
+    edgeAuditText.includes('Server Edge Audit') &&
     (await p.locator('#quant-calibration').innerText()).includes('Server Quant Engine') &&
     (await p.locator('#quant-scale-planner').innerText()).includes('Server Scale Engine') &&
     (await p.locator('#quant-recalibration').innerText()).includes('Server PAV Engine') &&
@@ -1037,8 +1142,8 @@ for (const m of measures) {
     scorecardText.includes('-0.65c/ct') &&
     scorecardText.includes('3.10%') &&
     evGateText.includes('+$8.60')
-  ok('v0.8.0 live API contract integrates Kalshi v2 config/arm/order/cancel/kill-switch + CSRF, SSE, auto-collector, tournament, recalibration, scale-plan, validate, backtest, export, calibration, walkforward & montecarlo',
-    ['live-status', 'live-account', 'live-positions', 'live-orders', 'live-fills', 'live-config', 'live-arm', 'live-order', 'live-cancel', 'live-kill', 'sse', 'collector-status', 'collector-schedule', 'tournament', 'recalibration', 'scale-plan', 'calibration', 'walkforward', 'montecarlo', 'validate', 'backtest', 'export'].every(k => hits.has(k)) && serverEngineShown,
+  ok('v0.9.0 live API contract integrates Kalshi v2 config/arm/order/cancel/kill-switch + CSRF, SSE, edge-audit, auto-collector, tournament, recalibration, scale-plan, validate, backtest, export, calibration, walkforward & montecarlo',
+    ['edge-audit', 'live-status', 'live-account', 'live-positions', 'live-orders', 'live-fills', 'live-config', 'live-arm', 'live-order', 'live-cancel', 'live-kill', 'sse', 'collector-status', 'collector-schedule', 'tournament', 'recalibration', 'scale-plan', 'calibration', 'walkforward', 'montecarlo', 'validate', 'backtest', 'export'].every(k => hits.has(k)) && serverEngineShown,
     `hits=${[...hits].sort().join(',')} csrf=${csrfChecked} bal=${balanceShown} armed=${armedPillOk} kill=${disarmedAfterKill} serverEngine=${serverEngineShown}`)
   await ctx.close()
 }
@@ -1051,7 +1156,7 @@ for (const m of measures) {
   await p.route('**/api/collect', r => r.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"venue unreachable"}' }))
   await p.goto(FX); await ready(p)
   await p.locator('#collect-btn').click()
-  await p.waitForSelector('#collect-status', { timeout: 5000 }).catch(() => {})
+  await p.waitForFunction(() => /Nothing was written/.test(document.querySelector('#collect-status')?.textContent || ''), { timeout: 5000 }).catch(() => {})
   ok('collect failure says Nothing was written', /Nothing was written/.test(await p.locator('#collect-status').innerText().catch(() => '')))
   await ctx.close()
 }

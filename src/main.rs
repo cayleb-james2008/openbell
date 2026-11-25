@@ -8,6 +8,7 @@
 //! capital scaling engine, and out-of-sample strategy tournament.
 
 mod analytics;
+mod edge_audit;
 mod kalshi_live;
 mod open;
 mod recalibration;
@@ -324,9 +325,23 @@ fn tape_hub() -> &'static TapeHub {
     TAPE_HUB.get_or_init(TapeHub::new)
 }
 
+type SettledKeysCacheEntry = (PathBuf, u64, u64, std::collections::HashSet<(String, String, String)>);
+static SETTLED_KEYS_CACHE: std::sync::Mutex<Option<SettledKeysCacheEntry>> =
+    std::sync::Mutex::new(None);
+
 /// Already-recorded settled snapshot keys on disk `(ticker, status, result)` so
 /// repeat passes do not duplicate hundreds of immutable historical settlements.
+/// Cached by `(path, len, mtime)` so 100k-line tapes are not re-parsed every pass.
 fn existing_settled_keys(path: &Path) -> std::collections::HashSet<(String, String, String)> {
+    let stat = tape_stat(path);
+    if let Some((len, mtime)) = stat {
+        let guard = SETTLED_KEYS_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((ref cp, clen, cmtime, ref cached)) = *guard {
+            if cp == path && clen == len && cmtime == mtime {
+                return cached.clone();
+            }
+        }
+    }
     let mut keys = std::collections::HashSet::new();
     let Ok(bytes) = std::fs::read(path) else {
         return keys;
@@ -336,6 +351,10 @@ fn existing_settled_keys(path: &Path) -> std::collections::HashSet<(String, Stri
         if !s.result.is_empty() {
             keys.insert((s.ticker, s.status, s.result));
         }
+    }
+    if let Some((len, mtime)) = stat {
+        *SETTLED_KEYS_CACHE.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((path.to_path_buf(), len, mtime, keys.clone()));
     }
     keys
 }
@@ -2263,6 +2282,16 @@ struct ScaleCtxCacheEntry {
     ctx: Arc<scaling::ScaleTapeContext>,
 }
 
+struct EdgeAuditCacheEntry {
+    path: PathBuf,
+    len: u64,
+    mtime: u64,
+    key: u64,
+    dataset: String,
+    slippage_bits: u64,
+    json: Arc<String>,
+}
+
 const BACKTEST_CACHE_CAP: usize = 16;
 const SCALE_PLAN_CACHE_CAP: usize = 32;
 const SLIPPAGE_CACHE_CAP: usize = 16;
@@ -2290,6 +2319,8 @@ struct App {
     /// Live Kalshi Trade API v2 connection config & fail-closed risk rails (always boots disarmed).
     live_desk: std::sync::Mutex<LiveDeskManager>,
     tape_cache: std::sync::RwLock<Option<TapeEntry>>,
+    /// Serializes cold tape parses so 30+ concurrent readers share one 100k-line parse.
+    tape_compute_lock: std::sync::Mutex<()>,
     /// The computed analysis (slot simulation + per-strategy scores)
     /// for one exact tape state. Shared via Arc under RwLock so 30+
     /// concurrent readers never contend or clone thousands of trades.
@@ -2318,6 +2349,9 @@ struct App {
     scale_ctx_compute_lock: std::sync::Mutex<()>,
     /// Bounded cache for repeated `$500/day` capital scale-plan requests.
     scale_plan_cache: std::sync::RwLock<Vec<(u64, Arc<String>)>>,
+    /// Cached 1-click Full Quant Edge Audit scorecard payloads under RwLock + singleflight.
+    edge_audit_cache: std::sync::RwLock<Vec<EdgeAuditCacheEntry>>,
+    edge_audit_compute_lock: std::sync::Mutex<()>,
     /// Small bounded cache for repeated in-memory sandbox backtests over
     /// an unchanged tape + identical source/config hash.
     backtest_cache: std::sync::RwLock<Vec<(u64, Arc<String>)>>,
@@ -2354,6 +2388,7 @@ impl App {
                 connected: false,
             }),
             tape_cache: std::sync::RwLock::new(None),
+            tape_compute_lock: std::sync::Mutex::new(()),
             analysis_cache: std::sync::RwLock::new(None),
             analysis_compute_lock: std::sync::Mutex::new(()),
             analytics_cache: std::sync::RwLock::new(None),
@@ -2367,6 +2402,8 @@ impl App {
             scale_ctx_cache: std::sync::RwLock::new(None),
             scale_ctx_compute_lock: std::sync::Mutex::new(()),
             scale_plan_cache: std::sync::RwLock::new(Vec::new()),
+            edge_audit_cache: std::sync::RwLock::new(Vec::new()),
+            edge_audit_compute_lock: std::sync::Mutex::new(()),
             backtest_cache: std::sync::RwLock::new(Vec::new()),
         }
     }
@@ -2446,6 +2483,15 @@ impl App {
                 newest_fetched_at: None,
             };
         };
+        {
+            let guard = self.tape_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = &*guard {
+                if e.path == path && e.len == len && e.mtime == mtime {
+                    return view(e);
+                }
+            }
+        }
+        let _tape_compute = self.tape_compute_lock.lock().unwrap_or_else(|p| p.into_inner());
         {
             let guard = self.tape_cache.read().unwrap_or_else(|p| p.into_inner());
             if let Some(e) = &*guard {
@@ -3071,6 +3117,87 @@ impl App {
         }
         payload
     }
+
+    /// Cached 1-click Full Quant Edge Audit scorecard (`GET /api/analytics/edge-audit`)
+    /// combining all 12 strategies, OOS tournament, 4-slot lineup, PAV recalibration,
+    /// Kalshi fee & slippage net EV, Monte Carlo DD, and 5-gate readiness.
+    fn edge_audit_shared(&self, dpath: &Path, dataset: &str, slippage_cents: f64) -> Arc<String> {
+        let slippage = if slippage_cents.is_finite() {
+            slippage_cents.clamp(0.0, 5.0)
+        } else {
+            1.0
+        };
+        let slippage_bits = slippage.to_bits();
+        let key = strategies_dir_key(&self.strategies_dir, self.paper_pot);
+        let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
+        {
+            let guard = self.edge_audit_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = guard.iter().find(|e| {
+                e.path == dpath
+                    && e.len == len
+                    && e.mtime == mtime
+                    && e.key == key
+                    && e.dataset == dataset
+                    && e.slippage_bits == slippage_bits
+            }) {
+                return e.json.clone();
+            }
+        }
+        let _compute_guard = self
+            .edge_audit_compute_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        {
+            let guard = self.edge_audit_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = guard.iter().find(|e| {
+                e.path == dpath
+                    && e.len == len
+                    && e.mtime == mtime
+                    && e.key == key
+                    && e.dataset == dataset
+                    && e.slippage_bits == slippage_bits
+            }) {
+                return e.json.clone();
+            }
+        }
+
+        let (_sim, scores, _, _) = self.analysis_shared(dpath);
+        let view = self.tape(dpath);
+        let (strategies, _) = load_strategies_with_errors(&self.strategies_dir);
+        let tour_ctx = self.tournament_ctx_shared(dpath);
+        let tour = tournament::compute_tournament_from_context(&tour_ctx, slippage);
+        let recal = recalibration::recalibration_from_windows(&view.grouped, &strategies, slippage);
+        let scale_ctx = self.scale_ctx_shared(dpath);
+        let scale_req = scaling::ScalePlanRequest {
+            slippage_cents: slippage,
+            ..scaling::ScalePlanRequest::default()
+        };
+        let scale_plan = scaling::compute_scale_plan_from_context(&scale_ctx, &scale_req);
+        let (_, _, portfolio_returns, _, default_pot) = self.analytics_shared(dpath, dataset);
+        let mc = analytics::run_monte_carlo_with_equity(&portfolio_returns, default_pot, 1_000, 42);
+        let report =
+            edge_audit::build_edge_audit_report(dataset, &scores, &tour, &recal, &scale_plan, &mc);
+        let payload = Arc::new(serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()));
+
+        let entry = EdgeAuditCacheEntry {
+            path: dpath.to_path_buf(),
+            len,
+            mtime,
+            key,
+            dataset: dataset.to_string(),
+            slippage_bits,
+            json: payload.clone(),
+        };
+        let mut guard = self.edge_audit_cache.write().unwrap_or_else(|p| p.into_inner());
+        guard.retain(|e| {
+            !(e.path == dpath && (e.len != len || e.mtime != mtime || e.key != key))
+        });
+        if guard.len() >= SLIPPAGE_CACHE_CAP {
+            guard.remove(0);
+        }
+        guard.push(entry);
+        payload
+    }
 }
 
 /// Grow a held parse by the file's appended tail, if the append is
@@ -3191,8 +3318,7 @@ fn collector_health(app: &App) -> serde_json::Value {
 /// the sanitised dataset= value. Responses carry the name so a
 /// capture of fixture figures can never pass as live ones.
 fn dataset_name(query: &str) -> String {
-    if let Some(pos) = query.find("dataset=") {
-        let raw = &query[pos + "dataset=".len()..];
+    if let Some(raw) = query_param(query, "dataset") {
         let name: String = raw
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
@@ -3205,15 +3331,9 @@ fn dataset_name(query: &str) -> String {
 }
 
 fn dataset_path(app: &App, query: &str) -> PathBuf {
-    if let Some(pos) = query.find("dataset=") {
-        let raw = &query[pos + "dataset=".len()..];
-        let name: String = raw
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .collect();
-        if !name.is_empty() && name != "live" {
-            return app.data_dir.join(format!("{name}-snapshots.jsonl"));
-        }
+    let name = dataset_name(query);
+    if name != "live" {
+        return app.data_dir.join(format!("{name}-snapshots.jsonl"));
     }
     app.data_dir.join("snapshots.jsonl")
 }
@@ -3364,7 +3484,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<RawRequest> {
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
-    let mut content_length = 0usize;
+    let mut content_length: Option<usize> = None;
     let mut headers: Vec<(String, String)> = Vec::new();
     loop {
         let line = read_line_by_byte(&mut reader)?;
@@ -3375,11 +3495,31 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<RawRequest> {
             let name = name.trim().to_ascii_lowercase();
             let value = value.trim().to_string();
             if name == "content-length" {
-                content_length = value.parse().unwrap_or(0);
+                let parsed = match value.parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return Some((
+                            "__bad_request__".to_string(),
+                            String::new(),
+                            "invalid Content-Length header".to_string(),
+                            Vec::new(),
+                        ));
+                    }
+                };
+                if content_length.is_some_and(|prev| prev != parsed) {
+                    return Some((
+                        "__bad_request__".to_string(),
+                        String::new(),
+                        "conflicting Content-Length headers".to_string(),
+                        Vec::new(),
+                    ));
+                }
+                content_length = Some(parsed);
             }
             headers.push((name, value));
         }
     }
+    let content_length = content_length.unwrap_or(0);
     if content_length > MAX_BODY_BYTES {
         return Some((
             "__too_large__".to_string(),
@@ -3740,7 +3880,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 "mode": mode_str,
                 "series": active_series(),
                 "sse": true,
-                "capabilities": ["sse", "calibration", "walkforward", "montecarlo", "sandbox", "export", "recalibration", "scale_plan", "tournament", "auto_collector", "live_kalshi", "risk_rails"],
+                "capabilities": ["sse", "calibration", "walkforward", "montecarlo", "sandbox", "export", "recalibration", "scale_plan", "tournament", "edge_audit", "auto_collector", "live_kalshi", "risk_rails"],
             });
             json_response(200, &home.to_string())
         }
@@ -4058,6 +4198,24 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 .map(|v| v.clamp(0.0, 5.0))
                 .unwrap_or(1.0);
             let payload = app.tournament_shared(&dpath, &dataset, slippage);
+            json_response(200, &payload)
+        }
+        ("GET", "/api/analytics/edge-audit") => {
+            let dpath = dataset_path(app, query);
+            let dataset = dataset_name(query);
+            if dataset != "live" && !dpath.exists() {
+                return json_response(
+                    404,
+                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
+                        .to_string(),
+                );
+            }
+            let slippage = query_param(query, "slippage_cents")
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|v| v.is_finite())
+                .map(|v| v.clamp(0.0, 5.0))
+                .unwrap_or(1.0);
+            let payload = app.edge_audit_shared(&dpath, &dataset, slippage);
             json_response(200, &payload)
         }
         ("POST", "/api/analytics/scale-plan") => {
@@ -5285,16 +5443,41 @@ fn main() {
         open::open_in_browser(&url);
     }
     println!("{}", start_banner(&url, &data_dir, updater().cfg.mode, opening));
+    static ACTIVE_HTTP_CONNS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    const MAX_CONCURRENT_HTTP_CONNS: usize = 128;
+
+    struct ConnGuard;
+    impl Drop for ConnGuard {
+        fn drop(&mut self) {
+            ACTIVE_HTTP_CONNS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
+                if ACTIVE_HTTP_CONNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    >= MAX_CONCURRENT_HTTP_CONNS
+                {
+                    ACTIVE_HTTP_CONNS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    let resp = json_response(503, "{\"error\":\"server busy\"}");
+                    let _ = stream.write_all(resp.as_bytes());
+                    continue;
+                }
                 let app = app.clone();
                 let allowed_hosts = allowed_hosts.clone();
                 std::thread::spawn(move || {
+                    let _conn_guard = ConnGuard;
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
                     if let Some((method, path, body, headers)) = read_request(&mut stream) {
                         if method == "__too_large__" {
                             let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\n\r\n{\"error\":\"request body too large\"}";
+                            let _ = stream.write_all(resp.as_bytes());
+                            return;
+                        }
+                        if method == "__bad_request__" {
+                            let resp = json_response(400, &serde_json::json!({ "error": body }).to_string());
                             let _ = stream.write_all(resp.as_bytes());
                             return;
                         }
@@ -6233,8 +6416,8 @@ mod tests {
     fn version_endpoint_names_the_running_build() {
         let (status, v) = body_json(&update_response("GET", "/api/version", "127.0.0.1:8472").unwrap());
         assert_eq!(status, 200);
-        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.8.0")));
-        assert_eq!(v["release_url"], json!("https://github.com/cayleb-james2008/openbell/releases/tag/v0.8.0"));
+        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.9.0")));
+        assert_eq!(v["release_url"], json!("https://github.com/cayleb-james2008/openbell/releases/tag/v0.9.0"));
     }
 
     #[test]
@@ -6244,7 +6427,7 @@ mod tests {
         for key in ["name", "current", "mode", "repo", "platform", "checked_at", "available", "latest", "notes", "release_url", "error", "staged", "can_apply", "dev_build"] {
             assert!(u.get(key).is_some(), "missing {key}: {u}");
         }
-        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!("0.8.0"), json!(false)));
+        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!("0.9.0"), json!(false)));
         assert!(u["checked_at"].is_null(), "nothing is fetched until a check is asked for");
         assert_eq!(u["staged"], Value::Null);
     }
@@ -6277,7 +6460,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let app = App::new(dir.clone(), dir.clone(), 100.0, 60);
         let (_, home) = body_json(&handle(&app, "GET", "/api/home"));
-        assert_eq!(home["version"], json!("0.8.0"));
+        assert_eq!(home["version"], json!("0.9.0"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

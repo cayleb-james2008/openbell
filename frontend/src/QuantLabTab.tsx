@@ -3,11 +3,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Dices, RefreshCw, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
+import {
+  Badge,
+  Button,
+  StatusPill,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui";
 import { CalibrationReliabilityChart, MonteCarloFanChart, ProvenanceTag } from "@/Charts";
+import { EdgeAuditPanel } from "@/EdgeAuditPanel";
 import { ScalePlannerPanel } from "@/ScalePlannerPanel";
 import { RecalibrationPanel } from "@/RecalibrationPanel";
 import { TournamentPanel } from "@/TournamentPanel";
@@ -35,6 +43,7 @@ function fmtRatio(v: number | null): string {
 }
 
 export type QuantSectionId =
+  | "audit"
   | "scale"
   | "scorecard"
   | "tournament"
@@ -54,6 +63,7 @@ export function QuantLabTab({
   search,
   focusSection,
   reseedSignal,
+  auditSignal,
   onClearFocus,
 }: {
   dataset: Dataset;
@@ -64,6 +74,7 @@ export function QuantLabTab({
   search: string;
   focusSection?: QuantSectionId | null;
   reseedSignal?: number;
+  auditSignal?: number;
   onClearFocus?: () => void;
 }) {
   const [calibration, setCalibration] = useState<CalibrationData | null>(null);
@@ -74,6 +85,7 @@ export function QuantLabTab({
   const [runningMc, setRunningMc] = useState(false);
   const [wfScope, setWfScope] = useState<"all" | "portfolio" | "strategies">("all");
 
+  const auditRef = useRef<HTMLDivElement>(null);
   const scaleRef = useRef<HTMLDivElement>(null);
   const scorecardRef = useRef<HTMLDivElement>(null);
   const tournamentRef = useRef<HTMLDivElement>(null);
@@ -117,7 +129,7 @@ export function QuantLabTab({
         setSeedInput(String(res.seed));
         if (notify) {
           toast.success(
-            `Simulated ${res.paths.toLocaleString()} bootstrap paths (seed ${res.seed}) · P50 ${money(res.terminal.p50)}.`,
+            `Simulated ${res.paths.toLocaleString()} bootstrap paths (seed ${res.seed}), P50 ${money(res.terminal.p50)}.`,
           );
         }
       } finally {
@@ -133,8 +145,10 @@ export function QuantLabTab({
 
   const scrollToSection = useCallback((sec: QuantSectionId) => {
     const node =
-      sec === "scale"
-        ? scaleRef.current
+      sec === "audit"
+        ? auditRef.current
+        : sec === "scale"
+          ? scaleRef.current
         : sec === "scorecard"
           ? scorecardRef.current
           : sec === "tournament"
@@ -189,10 +203,11 @@ export function QuantLabTab({
 
   return (
     <section id="quant-lab" aria-label="Quant Lab statistical diagnostics" className="space-y-4">
-      {/* Compact in-tab section jump pills (keeps 4 clean top tabs) */}
+      {/* Compact in-tab section jump pills */}
       <div className="flex flex-wrap items-center gap-1.5" role="navigation" aria-label="Quant Lab sections">
         {(
           [
+            ["audit", "Edge Audit"],
             ["scale", "$500/Day Scale Planner"],
             ["scorecard", "5-Gate Scorecard"],
             ["tournament", "Tournament"],
@@ -214,6 +229,17 @@ export function QuantLabTab({
           </button>
         ))}
       </div>
+
+      {/* 1-Click Full Quant Edge Audit Scorecard */}
+      <EdgeAuditPanel
+        dataset={dataset}
+        home={home}
+        strategies={strategies}
+        markets={markets}
+        slots={slots}
+        auditSignal={auditSignal}
+        panelRef={auditRef}
+      />
 
       {/* $500/Day Paper Capital Scale Planner, 180-Day Trajectory & 5-Gate Readiness Scorecard */}
       <ScalePlannerPanel
@@ -261,20 +287,20 @@ export function QuantLabTab({
                 <h3 className="text-sm font-semibold text-ink">Calibration Reliability</h3>
                 <ProvenanceTag kind="tape" />
               </div>
-              <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-ink-2">
-                <PillStatus className="border-r-0 pr-0">
-                  <PillIndicator variant={eceBadge.variant} />
-                  {eceBadge.label}
-                </PillStatus>
-              </Pill>
+              <StatusPill
+                tone={eceBadge.variant === "error" ? "error" : eceBadge.variant}
+                className="min-h-6 px-2 py-0.5 text-xs text-ink-2"
+              >
+                {eceBadge.label}
+              </StatusPill>
             </div>
             <p className="mt-1 text-xs text-ink-2">
               Implied YES probability vs realized settlement rate with 95% Wilson bounds.
             </p>
 
             {/* Brier, ECE, Sample KPIs */}
-            <dl className="mt-3 grid grid-cols-3 gap-2">
-              <div className="rounded-lg border border-hairline bg-board p-2.5">
+            <dl className="mt-3 grid grid-cols-3 divide-x divide-hairline border-y border-hairline">
+              <div className="p-2.5">
                 <dt className="text-xs text-ink-3">Brier Score</dt>
                 <dd id="quant-brier" className="mono mt-0.5 text-sm font-semibold text-ink">
                   {calibration?.brierScore !== null && calibration?.brierScore !== undefined
@@ -282,7 +308,7 @@ export function QuantLabTab({
                     : "-"}
                 </dd>
               </div>
-              <div className="rounded-lg border border-hairline bg-board p-2.5">
+              <div className="p-2.5">
                 <dt className="text-xs text-ink-3">ECE</dt>
                 <dd id="quant-ece" className="mono mt-0.5 text-sm font-semibold text-ink">
                   {calibration?.ece !== null && calibration?.ece !== undefined
@@ -290,7 +316,7 @@ export function QuantLabTab({
                     : "-"}
                 </dd>
               </div>
-              <div className="rounded-lg border border-hairline bg-board p-2.5">
+              <div className="p-2.5">
                 <dt className="text-xs text-ink-3">Settled Tape</dt>
                 <dd className="mono mt-0.5 text-sm font-semibold text-ink">
                   {calibration ? calibration.totalWindows.toLocaleString() : "-"}
@@ -377,26 +403,26 @@ export function QuantLabTab({
             </p>
 
             {/* Terminal & Drawdown Exceedance Readouts */}
-            <dl className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
-              <div className="rounded-lg border border-hairline bg-board p-2.5">
+            <dl className="mt-3 grid grid-cols-2 divide-y divide-hairline border-y border-hairline sm:grid-cols-4 sm:divide-x sm:divide-y-0">
+              <div className="p-2.5">
                 <dt className="text-xs text-ink-3">P50 Median</dt>
                 <dd id="mc-p50" className="mono mt-0.5 text-sm font-semibold text-info-foreground">
                   {mc ? money(mc.terminal.p50) : "-"}
                 </dd>
               </div>
-              <div className="rounded-lg border border-hairline bg-board p-2.5">
+              <div className="p-2.5">
                 <dt className="text-xs text-ink-3">P5 / P95</dt>
                 <dd className="mono mt-0.5 text-xs font-semibold text-ink">
                   {mc ? `${money(mc.terminal.p5)} / ${money(mc.terminal.p95)}` : "-"}
                 </dd>
               </div>
-              <div className="rounded-lg border border-hairline bg-board p-2.5">
+              <div className="p-2.5">
                 <dt className="text-xs text-ink-3">P(DD &ge; 10%)</dt>
                 <dd className="mono mt-0.5 text-sm font-semibold text-warning-foreground">
                   {mc ? `${(mc.ddProb10 * 100).toFixed(1)}%` : "-"}
                 </dd>
               </div>
-              <div className="rounded-lg border border-hairline bg-board p-2.5">
+              <div className="p-2.5">
                 <dt className="text-xs text-ink-3">P(DD &ge; 25%)</dt>
                 <dd className="mono mt-0.5 text-sm font-semibold text-destructive-foreground">
                   {mc ? `${(mc.ddProb25 * 100).toFixed(1)}%` : "-"}
@@ -414,7 +440,7 @@ export function QuantLabTab({
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-2.5 text-xs text-ink-3">
-            <span>Seed {mc?.seed ?? seed} · {mc ? `${mc.elapsedMs}ms` : "pending"}</span>
+            <span>Seed {mc?.seed ?? seed} ({mc ? `${mc.elapsedMs}ms` : "pending"})</span>
             <span className="mono">
               {mc?.source === "server" ? "Server Bootstrap Engine" : "Seeded client fallback"}
             </span>

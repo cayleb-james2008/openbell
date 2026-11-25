@@ -3,10 +3,17 @@
 // Strictly paper-only; zero user-facing internal engine jargon.
 import { type RefObject, useCallback, useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Grid3X3, RefreshCw, Sparkles, Trophy } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
+import {
+  Badge,
+  Button,
+  StatusPill,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui";
 import { CorrelationMatrixChart, ProvenanceTag, RegimeHeatmapChart } from "@/Charts";
 import {
   type Dataset,
@@ -142,13 +149,13 @@ export function TournamentPanel({
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex flex-wrap items-center gap-2">
               <Sparkles className="size-3.5 text-info-foreground" aria-hidden />
-              <h4 className="text-xs font-semibold uppercase tracking-wide text-ink">
+              <h4 className="text-xs font-semibold text-ink">
                 Optimal Uncorrelated 4-Slot Lineup (|r| &le; {(data?.optimalLineup.maxCorrelationLimit ?? 0.65).toFixed(2)})
               </h4>
             </div>
-            <Pill
+            <StatusPill
               id="tournament-lineup-pill"
-              variant="outline"
+              tone={data && !data.optimalLineup.isFallback ? "success" : "warning"}
               className={
                 "min-h-6 px-2.5 py-0.5 text-xs " +
                 (data && !data.optimalLineup.isFallback
@@ -156,11 +163,8 @@ export function TournamentPanel({
                   : "text-warning-foreground")
               }
             >
-              <PillStatus className="border-r-0 pr-0">
-                <PillIndicator variant={data && !data.optimalLineup.isFallback ? "success" : "warning"} />
-                {data ? `${data.optimalLineup.strategies.length}/4 slots qualified` : "Evaluating…"}
-              </PillStatus>
-            </Pill>
+              {data ? `${data.optimalLineup.strategies.length}/4 slots qualified` : "Evaluating…"}
+            </StatusPill>
           </div>
 
           {data?.optimalLineup.isFallback && (
@@ -174,18 +178,18 @@ export function TournamentPanel({
           )}
 
           {lineupRows.length > 0 && (
-            <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
+            <div className="mt-3 grid grid-cols-1 divide-y divide-hairline rounded-lg border border-hairline bg-surface sm:grid-cols-2 sm:divide-x lg:grid-cols-4 lg:divide-y-0">
               {lineupRows.map((row, idx) =>
                 row ? (
                   <div
                     key={row.strategy}
                     data-lineup-slot={idx + 1}
-                    className="rounded-lg border border-blue/40 bg-surface p-3"
+                    className="p-3"
                   >
                     <div className="flex items-center justify-between gap-2">
                       <span className="mono text-xs font-semibold text-info-foreground">Slot #{idx + 1}</span>
-                      <Badge variant="outline" className="mono text-xs uppercase">
-                        {row.side}
+                      <Badge variant="outline" className="mono text-xs">
+                        {row.side.toUpperCase()}
                       </Badge>
                     </div>
                     <p className="mt-1 truncate text-xs font-semibold text-ink">{row.strategy}</p>
@@ -252,8 +256,8 @@ export function TournamentPanel({
                       </div>
                     </TableCell>
                     <TableCell className="m-right">
-                      <Badge variant="outline" className="mono text-xs uppercase">
-                        {row.side}
+                      <Badge variant="outline" className="mono text-xs">
+                        {row.side.toUpperCase()}
                       </Badge>
                     </TableCell>
                     <TableCell
@@ -357,7 +361,7 @@ export function TournamentPanel({
           )}
 
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-2.5 text-xs text-ink-3">
-            <span>Blue = positive r · Red = inverse r</span>
+            <span>Blue = positive r, Red = inverse r</span>
             <span className="mono">{data?.correlation.strategies.length ?? 0} strategies compared</span>
           </div>
         </div>
@@ -392,7 +396,7 @@ export function TournamentPanel({
           )}
 
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-2.5 text-xs text-ink-3">
-            <span>Green = positive net edge · Red = fee/edge drag</span>
+            <span>Green = positive net edge, Red = fee/edge drag</span>
             <span className="mono">Wilson 95% CI on hover</span>
           </div>
         </div>
