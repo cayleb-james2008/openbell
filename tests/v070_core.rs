@@ -278,14 +278,14 @@ fn v070_tournament_and_collector_100k_ticks_30_concurrent_under_300ms_p95() {
     assert_eq!(t1["windows_settled_total"], 2_000);
     assert_eq!(t1["windows_settled_oos"], 800);
     let rankings = t1["rankings"].as_array().unwrap();
-    assert_eq!(rankings.len(), 12);
+    assert_eq!(rankings.len(), 16);
     let corr_strats = t1["correlation_matrix"]["strategies"].as_array().unwrap();
     let corr_mat = t1["correlation_matrix"]["matrix"].as_array().unwrap();
-    assert_eq!(corr_strats.len(), 12);
-    assert_eq!(corr_mat.len(), 12);
-    for i in 0..12 {
+    assert_eq!(corr_strats.len(), 16);
+    assert_eq!(corr_mat.len(), 16);
+    for i in 0..16 {
         assert!((corr_mat[i][i].as_f64().unwrap() - 1.0).abs() < 1e-6);
-        for j in 0..12 {
+        for j in 0..16 {
             assert_eq!(corr_mat[i][j], corr_mat[j][i], "matrix must be symmetric at ({i},{j})");
         }
     }

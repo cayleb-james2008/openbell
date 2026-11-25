@@ -1,0 +1,43 @@
+// Paper research shape: spot-lead momentum YES.
+// Mid-to-late (120s to 480s remaining) maker/limit YES continuation in
+// 62c-84c when book overround stays tight (<= 3c).
+// Scored strictly on paper by the shadow scorer — this file places nothing.
+
+pub fn name() {
+    "spot-lead-momentum-yes"
+}
+
+pub fn side() {
+    "yes"
+}
+
+pub fn describe() {
+    "Mid-to-late YES continuation limit (62c-84c, overround <=3c) with 2m-8m left."
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    if secs_to_close > 480 || secs_to_close < 120 {
+        return false;
+    }
+    if yes_ask < 0.62 || yes_ask > 0.84 || no_ask < 0.16 || no_ask > 0.41 {
+        return false;
+    }
+    let spread = yes_ask + no_ask - 1.0;
+    if spread < -0.001 || spread > 0.035 {
+        return false;
+    }
+    let yc = yes_ask * 100.0;
+    let nc = no_ask * 100.0;
+    (yc - yc.round()).abs() < 0.000001 && (nc - nc.round()).abs() < 0.000001
+}
+
+pub fn entry_quote(yes_ask, no_ask, secs_to_close) {
+    if allow_entry(yes_ask, no_ask, secs_to_close) {
+        let spread = yes_ask + no_ask - 1.0;
+        let base_c = (yes_ask * 100.0).round();
+        let q = if spread >= 0.019 { base_c - 1.0 } else { base_c };
+        Some(q / 100.0)
+    } else {
+        None
+    }
+}

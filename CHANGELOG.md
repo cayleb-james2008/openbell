@@ -4,6 +4,16 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.10.0 - 2026-11-25
+
+- **Autonomous Edge & Capital Allocator (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**
+  - Integrated 4 new post-only maker, momentum, and fade strategies (`maker_late_theta_no.rn`, `maker_spread_capture.rn`, `spot_lead_momentum_yes.rn`, `tail_overreaction_fade.rn`) expanding the built-in library to **16 strategies**.
+  - Added `GET /api/allocator` and `POST /api/allocator/plan` with zero-lookahead causal In-Sample (`close_epoch < split_epoch`) selection -> held-out OOS replay (`causal_is_to_oos`), `1/4` Kalshi maker fees (`0.0175 * p * (1 - p)` with whole-cent order fee rounding `ceil(rate * C * p * (1 - p) * 100) / 100`), pairwise correlation pruning (`|r| <= 0.65`), Fractional-Kelly (`quarter_kelly` / `half_kelly` / `equal_winners`) heat caps, automatic 0% quarantine of negative/thin/correlated shapes, `$500/day` Go/No-Go verdict & blockers, and 1-click order-ticket staging behind fail-closed Hard Risk Rails (`live_armed: false` on boot).
+  - Added `post_only` maker limit support (`KalshiOrderRequest::maker_limit`, `POST /api/live/order`, Live Order Ticket `Post-Only ON` toggle) and the `#openbell-brand-mark` Gaussian bell SVG mark in the header, plus a zero-bloat custom SVG `AllocatorComparisonChart` in `frontend/src/Charts.tsx`.
+- **Runtime Speed, Gzip + ETag/304 & Binary Diet (`Cargo.toml`, `frontend/vite.config.ts`, `src/main.rs`):**
+  - Added `[profile.release]` (`lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`, `opt-level = 3`), pre-compressed `assets/index.html.gz` (`Accept-Encoding: gzip`), strong SHA-256 `ETag` + `304 Not Modified`, `Vary: Accept-Encoding`, and security headers (`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`).
+  - Replaced per-connection thread spawning with a bounded 32-worker HTTP pool (`set_nodelay(true)`), chunked buffered request header parsing (`read_request`), zero-copy `seam_of_bytes` + streaming `parse_tape_bytes`, and pre-serialized JSON caches (`desk_json_shared`, `allocator_shared`).
+
 ## 0.9.0 - 2026-11-25
 
 - **Institutional Desktop Quant Workbench (`frontend/src/App.tsx`, `frontend/src/components/ui.tsx`, `frontend/src/EdgeAuditPanel.tsx` -> slimmed `assets/index.html`):**

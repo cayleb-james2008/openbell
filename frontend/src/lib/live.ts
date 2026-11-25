@@ -104,6 +104,7 @@ export type LiveOrderPayload = {
   side: "yes" | "no";
   count: number;
   price_cents: number;
+  post_only?: boolean;
   client_order_id?: string;
 };
 
@@ -355,13 +356,15 @@ export function evaluateOrderRails(
   count: number,
   priceCents: number,
   action: "buy" | "sell" = "buy",
+  postOnly = false,
 ): RailEvaluation {
   const cleanTicker = ticker.trim().toUpperCase();
   const c = Number.isFinite(count) ? Math.floor(count) : 0;
   const p = Number.isFinite(priceCents) ? Math.round(priceCents) : 0;
   const wholeCentValid = Number.isInteger(priceCents) && p >= 1 && p <= 99;
   const orderNotionalDollars = c > 0 && p >= 1 && p <= 99 ? Number(((c * p) / 100).toFixed(2)) : 0;
-  const estFeeDollars = c > 0 && p >= 1 && p <= 99 ? Number(kalshiFeeDollars(c, p / 100).toFixed(2)) : 0;
+  const estFeeDollars =
+    c > 0 && p >= 1 && p <= 99 ? Number(kalshiFeeDollars(c, p / 100, postOnly).toFixed(2)) : 0;
 
   const r = status.rails;
   const prefixes = r.allowedTickerPrefix

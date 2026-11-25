@@ -457,6 +457,9 @@ export function LiveDeskWorkspace({
   markets,
   prefillTicker,
   prefillPriceCents,
+  prefillSide,
+  prefillCount,
+  prefillPostOnly,
   busy,
   onSubmitOrder,
   onCancelOrder,
@@ -467,6 +470,9 @@ export function LiveDeskWorkspace({
   markets: Market[];
   prefillTicker?: string | null;
   prefillPriceCents?: number | null;
+  prefillSide?: "yes" | "no" | null;
+  prefillCount?: number | null;
+  prefillPostOnly?: boolean | null;
   busy: boolean;
   onSubmitOrder: (payload: LiveOrderPayload) => Promise<void>;
   onCancelOrder: (orderId: string) => Promise<void>;
@@ -485,6 +491,7 @@ export function LiveDeskWorkspace({
   const [side, setSide] = useState<"yes" | "no">("yes");
   const [countInput, setCountInput] = useState("5");
   const [priceInput, setPriceInput] = useState("55");
+  const [postOnly, setPostOnly] = useState<boolean>(true);
   const [subTab, setSubTab] = useState<"orders" | "positions" | "fills">("orders");
   const [submitting, setSubmitting] = useState(false);
 
@@ -498,11 +505,25 @@ export function LiveDeskWorkspace({
     }
   }, [prefillPriceCents]);
 
+  useEffect(() => {
+    if (prefillSide === "yes" || prefillSide === "no") setSide(prefillSide);
+  }, [prefillSide]);
+
+  useEffect(() => {
+    if (isNum(prefillCount) && prefillCount >= 1) {
+      setCountInput(String(Math.floor(prefillCount)));
+    }
+  }, [prefillCount]);
+
+  useEffect(() => {
+    if (typeof prefillPostOnly === "boolean") setPostOnly(prefillPostOnly);
+  }, [prefillPostOnly]);
+
   const parsedCount = Number(countInput);
   const parsedPrice = Number(priceInput);
   const railEval = useMemo(
-    () => evaluateOrderRails(status, ticker, parsedCount, parsedPrice, action),
-    [status, ticker, parsedCount, parsedPrice, action],
+    () => evaluateOrderRails(status, ticker, parsedCount, parsedPrice, action, postOnly),
+    [status, ticker, parsedCount, parsedPrice, action, postOnly],
   );
 
   const tickerSuggestions = useMemo(() => {
@@ -529,6 +550,7 @@ export function LiveDeskWorkspace({
         side,
         count: Math.floor(parsedCount),
         price_cents: Math.round(parsedPrice),
+        post_only: postOnly ? true : undefined,
         client_order_id: `ob-${Date.now()}`,
       });
     } finally {
@@ -673,6 +695,32 @@ export function LiveDeskWorkspace({
             </div>
           </div>
 
+          {/* Post-Only Maker Toggle */}
+          <div className="flex items-center justify-between gap-2 rounded-lg border border-hairline bg-board/60 px-3 py-2 text-xs">
+            <div>
+              <div className="font-medium text-ink">Post-Only Maker Order</div>
+              <div className="text-ink-3">1.75% maker fee schedule (4x lower than 7% taker)</div>
+            </div>
+            <button
+              id="live-ticket-post-only"
+              type="button"
+              aria-pressed={postOnly}
+              onClick={() => setPostOnly((v) => !v)}
+              className={
+                "inline-flex min-h-11 shrink-0 cursor-pointer items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8 " +
+                (postOnly
+                  ? "border-blue bg-blue-soft text-info-foreground"
+                  : "border-hairline bg-surface text-ink-2 hover:text-ink")
+              }
+            >
+              <span
+                aria-hidden="true"
+                className={"size-2 rounded-full " + (postOnly ? "bg-blue" : "bg-ink-3")}
+              />
+              <span>{postOnly ? "Post-Only ON" : "Standard"}</span>
+            </button>
+          </div>
+
           {/* Notional & Fee Preview */}
           <dl className="grid grid-cols-2 divide-x divide-hairline border-y border-hairline py-2 text-xs">
             <div className="pr-3">
@@ -680,7 +728,7 @@ export function LiveDeskWorkspace({
               <dd className="mono mt-0.5 font-semibold text-ink">{money(railEval.orderNotionalDollars)}</dd>
             </div>
             <div className="pl-3">
-              <dt className="text-ink-3">Est. Kalshi Fee</dt>
+              <dt className="text-ink-3">Est. Kalshi Fee ({postOnly ? "1.75% maker" : "7% taker"})</dt>
               <dd className="mono mt-0.5 font-semibold text-ink">{money(railEval.estFeeDollars)}</dd>
             </div>
           </dl>

@@ -302,7 +302,7 @@ export async function fetchEdgeAudit(
     funnel: [
       {
         id: "tournament",
-        title: "12 Strategies OOS Tournament",
+        title: `${tour.rankings.length} Strategies OOS Tournament`,
         passed: positiveCount > 0 && oosTotal >= 30,
         metric: top?.oosNetExpectancyCents !== null && top?.oosNetExpectancyCents !== undefined ? `${top.oosNetExpectancyCents.toFixed(2)}c/ct` : "n/a",
         detail: `${positiveCount}/${tour.rankings.length} positive OOS across ${oosTotal} OOS windows`,

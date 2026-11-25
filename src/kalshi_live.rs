@@ -731,6 +731,8 @@ pub struct KalshiOrderRequest {
     pub yes_price: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_price: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_only: Option<bool>,
 }
 
 impl KalshiOrderRequest {
@@ -788,7 +790,22 @@ impl KalshiOrderRequest {
             order_type: "limit".to_string(),
             yes_price,
             no_price,
+            post_only: None,
         })
+    }
+
+    /// Construct a validated whole-cent post-only maker limit order request (`post_only: Some(true)`).
+    pub fn maker_limit(
+        ticker: &str,
+        action: &str,
+        side: &str,
+        count: u32,
+        price_cents: u8,
+        client_order_id: Option<String>,
+    ) -> Result<Self, String> {
+        let mut req = Self::limit(ticker, action, side, count, price_cents, client_order_id)?;
+        req.post_only = Some(true);
+        Ok(req)
     }
 }
 
@@ -1623,5 +1640,34 @@ pub(crate) mod tests {
         assert!(report.errors.is_empty());
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn maker_limit_serializes_post_only_true_and_limit_omits_it() {
+        let taker_req =
+            KalshiOrderRequest::limit("KXBTC15M-TEST", "buy", "yes", 5, 62, Some("cid-1".into()))
+                .unwrap();
+        assert_eq!(taker_req.post_only, None);
+        let taker_json = serde_json::to_string(&taker_req).unwrap();
+        assert!(
+            !taker_json.contains("post_only"),
+            "legacy limit() must omit post_only: {taker_json}"
+        );
+
+        let maker_req = KalshiOrderRequest::maker_limit(
+            "KXBTC15M-TEST",
+            "buy",
+            "no",
+            4,
+            74,
+            Some("cid-2".into()),
+        )
+        .unwrap();
+        assert_eq!(maker_req.post_only, Some(true));
+        let maker_json = serde_json::to_string(&maker_req).unwrap();
+        assert!(
+            maker_json.contains("\"post_only\":true"),
+            "maker_limit() must serialize post_only:true: {maker_json}"
+        );
     }
 }

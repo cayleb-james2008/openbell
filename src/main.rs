@@ -8,6 +8,7 @@
 //! capital scaling engine, and out-of-sample strategy tournament.
 
 mod analytics;
+mod auto_allocator;
 mod edge_audit;
 mod kalshi_live;
 mod open;
@@ -20,12 +21,31 @@ mod update;
 use serde_json::json;
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::io::{BufReader, Read, Write};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
+
+const INDEX_HTML: &str = include_str!("../assets/index.html");
+const INDEX_HTML_GZ: &[u8] = include_bytes!("../assets/index.html.gz");
+
+fn index_etag() -> &'static str {
+    static ETAG: LazyLock<String> = LazyLock::new(|| {
+        let digest = Sha256::digest(INDEX_HTML.as_bytes());
+        let mut hex = String::with_capacity(66);
+        hex.push('"');
+        for b in digest {
+            use std::fmt::Write as _;
+            let _ = write!(&mut hex, "{b:02x}");
+        }
+        hex.push('"');
+        hex
+    });
+    ETAG.as_str()
+}
 
 const SERIES: [&str; 5] = ["KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M", "KXDOGE15M"];
 const API_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
@@ -733,16 +753,20 @@ fn append_tape(path: &Path, body: &str) -> std::io::Result<()> {
 /// total, exactly like any malformed line; it never hides its
 /// neighbours. Returns (snapshots, lines in the file).
 fn parse_tape_bytes(bytes: &[u8]) -> (Vec<Snapshot>, usize) {
-    let mut lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
-    if lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
+    let trimmed = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    if trimmed.is_empty() {
+        return (Vec::new(), 0);
     }
-    let snaps = lines
-        .iter()
-        .filter_map(|l| std::str::from_utf8(l).ok())
-        .filter_map(|l| serde_json::from_str::<Snapshot>(l).ok())
-        .collect();
-    (snaps, lines.len())
+    let est = (trimmed.len() / 200).max(16);
+    let mut snaps = Vec::with_capacity(est);
+    let mut total_lines = 0usize;
+    for line in trimmed.split(|&b| b == b'\n') {
+        total_lines += 1;
+        if let Ok(s) = serde_json::from_slice::<Snapshot>(line) {
+            snaps.push(s);
+        }
+    }
+    (snaps, total_lines)
 }
 
 // ---------------------------------------------------------------------------
@@ -2198,13 +2222,15 @@ struct TapeView {
     conflicting_settlements: usize,
     newest_fetched_at: Option<i64>,
 }
-/// (offset of the last line, its text) for a text whose first byte
-/// sits at `base` in the file.
-fn seam_of(text: &str, base: u64) -> (u64, String) {
-    let t = text.strip_suffix('\n').unwrap_or(text);
-    match t.rfind('\n') {
-        Some(i) => (base + i as u64 + 1, t[i + 1..].to_string()),
-        None => (base, t.to_string()),
+/// Byte-level seam finder avoiding full-buffer UTF-8 conversion on large tapes.
+fn seam_of_bytes(bytes: &[u8], base: u64) -> (u64, String) {
+    let t = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    match t.iter().rposition(|&b| b == b'\n') {
+        Some(i) => (
+            base + i as u64 + 1,
+            String::from_utf8_lossy(&t[i + 1..]).to_string(),
+        ),
+        None => (base, String::from_utf8_lossy(t).to_string()),
     }
 }
 
@@ -2295,6 +2321,26 @@ struct EdgeAuditCacheEntry {
     json: Arc<String>,
 }
 
+struct DeskJsonCacheEntry {
+    path: PathBuf,
+    len: u64,
+    mtime: u64,
+    key: u64,
+    dataset: String,
+    strategies_json: Arc<String>,
+    slots_json: Arc<String>,
+    equity_json: Arc<String>,
+}
+
+struct AllocatorCacheEntry {
+    path: PathBuf,
+    len: u64,
+    mtime: u64,
+    key: u64,
+    req_hash: u64,
+    json: Arc<String>,
+}
+
 const BACKTEST_CACHE_CAP: usize = 16;
 const SCALE_PLAN_CACHE_CAP: usize = 32;
 const SLIPPAGE_CACHE_CAP: usize = 16;
@@ -2355,6 +2401,12 @@ struct App {
     /// Cached 1-click Full Quant Edge Audit scorecard payloads under RwLock + singleflight.
     edge_audit_cache: std::sync::RwLock<Vec<EdgeAuditCacheEntry>>,
     edge_audit_compute_lock: std::sync::Mutex<()>,
+    /// Pre-serialized `/api/strategies`, `/api/slots`, and `/api/equity` JSON strings
+    /// cached under `(tape, strategy-dir, dataset)` so concurrent readers pay 0 serialization.
+    desk_json_cache: std::sync::RwLock<Vec<DeskJsonCacheEntry>>,
+    desk_json_compute_lock: std::sync::Mutex<()>,
+    /// Bounded cache for `GET /api/allocator` and `POST /api/allocator/plan` responses.
+    allocator_cache: std::sync::RwLock<Vec<AllocatorCacheEntry>>,
     /// Small bounded cache for repeated in-memory sandbox backtests over
     /// an unchanged tape + identical source/config hash.
     backtest_cache: std::sync::RwLock<Vec<(u64, Arc<String>)>>,
@@ -2407,6 +2459,9 @@ impl App {
             scale_plan_cache: std::sync::RwLock::new(Vec::new()),
             edge_audit_cache: std::sync::RwLock::new(Vec::new()),
             edge_audit_compute_lock: std::sync::Mutex::new(()),
+            desk_json_cache: std::sync::RwLock::new(Vec::new()),
+            desk_json_compute_lock: std::sync::Mutex::new(()),
+            allocator_cache: std::sync::RwLock::new(Vec::new()),
             backtest_cache: std::sync::RwLock::new(Vec::new()),
         }
     }
@@ -2551,7 +2606,7 @@ impl App {
         }
         let bytes = std::fs::read(path).unwrap_or_default();
         let (snaps, total_lines) = parse_tape_bytes(&bytes);
-        let (seam_offset, seam_line) = seam_of(&String::from_utf8_lossy(&bytes), 0);
+        let (seam_offset, seam_line) = seam_of_bytes(&bytes, 0);
         let ends_newline = bytes.last().is_none_or(|b| *b == b'\n');
         let mut markets = std::collections::HashSet::new();
         let mut results_by_ticker = std::collections::HashMap::new();
@@ -3223,6 +3278,163 @@ impl App {
         guard.push(entry);
         payload
     }
+
+    /// Cached pre-serialized `/api/strategies`, `/api/slots`, and `/api/equity` JSON strings
+    /// keyed on `(path, len, mtime, strategy_key, dataset)` so 30+ concurrent readers
+    /// skip all `serde_json::to_value` allocations.
+    fn desk_json_shared(&self, dpath: &Path, dataset: &str) -> (Arc<String>, Arc<String>, Arc<String>) {
+        let key = strategies_dir_key(&self.strategies_dir, self.paper_pot);
+        let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
+        {
+            let guard = self.desk_json_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = guard.iter().find(|e| {
+                e.path == dpath && e.len == len && e.mtime == mtime && e.key == key && e.dataset == dataset
+            }) {
+                return (e.strategies_json.clone(), e.slots_json.clone(), e.equity_json.clone());
+            }
+        }
+        let _compute_guard = self.desk_json_compute_lock.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let guard = self.desk_json_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = guard.iter().find(|e| {
+                e.path == dpath && e.len == len && e.mtime == mtime && e.key == key && e.dataset == dataset
+            }) {
+                return (e.strategies_json.clone(), e.slots_json.clone(), e.equity_json.clone());
+            }
+        }
+
+        let (sim, scores_arc, lib_errors, strategy_names) = self.analysis_shared(dpath);
+
+        let mut reports: Vec<ScoreReport> = (*scores_arc).clone();
+        for report in &mut reports {
+            report.verdict = dataset_verdict(&report.verdict, dataset);
+        }
+        let strategies_json = Arc::new(serde_json::to_string(&reports).unwrap_or_else(|_| "[]".to_string()));
+
+        let mut slots_body = serde_json::to_value(sim.as_ref()).unwrap_or_else(|_| json!({}));
+        slots_body["stage_target"] = serde_json::to_value(stage_progress(&sim)).unwrap_or_else(|_| json!({}));
+        let total = sim.trades.len();
+        let shown: Vec<&Trade> = sim.trades.iter().skip(total.saturating_sub(5000)).collect();
+        slots_body["trades"] = serde_json::to_value(&shown).unwrap_or_else(|_| json!([]));
+        slots_body["trades_truncated"] = json!(total > 5000);
+        let lib_err_val = json!(lib_errors
+            .iter()
+            .map(|(file, error)| json!({ "file": file, "error": error }))
+            .collect::<Vec<_>>());
+        slots_body["library_errors"] = lib_err_val.clone();
+        slots_body["dataset"] = json!(dataset);
+        let slots_json = Arc::new(slots_body.to_string());
+
+        let (pot, per) = equity_curves(&sim);
+        let mut series: Vec<serde_json::Value> = strategy_names
+            .iter()
+            .map(|name| {
+                let points = per
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, pts)| pts.clone())
+                    .unwrap_or_default();
+                json!({ "strategy": name, "points": points })
+            })
+            .collect();
+        series.sort_by(|a, b| a["strategy"].as_str().cmp(&b["strategy"].as_str()));
+        let equity_body = json!({
+            "paper_pot_start": sim.paper_pot_start,
+            "pot": pot,
+            "series": series,
+            "library_errors": lib_err_val,
+            "dataset": dataset,
+        });
+        let equity_json = Arc::new(equity_body.to_string());
+
+        let entry = DeskJsonCacheEntry {
+            path: dpath.to_path_buf(),
+            len,
+            mtime,
+            key,
+            dataset: dataset.to_string(),
+            strategies_json: strategies_json.clone(),
+            slots_json: slots_json.clone(),
+            equity_json: equity_json.clone(),
+        };
+        let mut guard = self.desk_json_cache.write().unwrap_or_else(|p| p.into_inner());
+        guard.retain(|e| !(e.path == dpath && (e.len != len || e.mtime != mtime || e.key != key)));
+        if guard.len() >= SLIPPAGE_CACHE_CAP {
+            guard.remove(0);
+        }
+        guard.push(entry);
+        (strategies_json, slots_json, equity_json)
+    }
+
+    /// Cached Autonomous Edge Allocator JSON payload keyed on tape, strategy dir,
+    /// request parameters, and current Hard Risk Rails state.
+    fn allocator_shared(
+        &self,
+        dpath: &Path,
+        dataset: &str,
+        req: &auto_allocator::AutoAllocatorRequest,
+    ) -> Arc<String> {
+        use std::hash::{Hash, Hasher};
+        let san = req.sanitized();
+        let (live_armed, killed, rails) = {
+            let st = self.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+            (st.rails.live_armed, st.rails.killed, st.rails.rails.clone())
+        };
+        let key = strategies_dir_key(&self.strategies_dir, self.paper_pot);
+        let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
+
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        dataset.hash(&mut h);
+        san.sizing_mode.hash(&mut h);
+        san.execution_mode.hash(&mut h);
+        san.maker_fill_rate.to_bits().hash(&mut h);
+        san.min_oos_trades.hash(&mut h);
+        san.max_slot_risk_pct.to_bits().hash(&mut h);
+        san.max_total_heat_pct.to_bits().hash(&mut h);
+        san.slippage_cents.to_bits().hash(&mut h);
+        san.starting_bankroll.to_bits().hash(&mut h);
+        live_armed.hash(&mut h);
+        killed.hash(&mut h);
+        rails.max_order_contracts.hash(&mut h);
+        rails.max_order_dollars.to_bits().hash(&mut h);
+        rails.max_daily_loss_dollars.to_bits().hash(&mut h);
+        rails.max_open_exposure_dollars.to_bits().hash(&mut h);
+        rails.allowed_ticker_prefix.hash(&mut h);
+        let req_hash = h.finish();
+
+        {
+            let guard = self.allocator_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = guard.iter().find(|e| {
+                e.path == dpath
+                    && e.len == len
+                    && e.mtime == mtime
+                    && e.key == key
+                    && e.req_hash == req_hash
+            }) {
+                return e.json.clone();
+            }
+        }
+
+        let ctx = self.tournament_ctx_shared(dpath);
+        let rep =
+            auto_allocator::compute_auto_allocator_report(&ctx, &san, &rails, live_armed, killed);
+        let json = Arc::new(serde_json::to_string(&rep).unwrap_or_else(|_| "{}".into()));
+
+        let mut guard = self.allocator_cache.write().unwrap_or_else(|p| p.into_inner());
+        guard.retain(|e| !(e.path == dpath && (e.len != len || e.mtime != mtime || e.key != key)));
+        if guard.len() >= SLIPPAGE_CACHE_CAP {
+            guard.remove(0);
+        }
+        guard.push(AllocatorCacheEntry {
+            path: dpath.to_path_buf(),
+            len,
+            mtime,
+            key,
+            req_hash,
+            json: json.clone(),
+        });
+        json
+    }
 }
 
 /// Grow a held parse by the file's appended tail, if the append is
@@ -3285,7 +3497,7 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
     e.latest_json = build_latest_markets_json(&e.grouped);
     Arc::make_mut(&mut e.snaps).extend(new_snaps);
     if !tail_buf.is_empty() {
-        let (off, line) = seam_of(&String::from_utf8_lossy(&tail_buf), e.len);
+        let (off, line) = seam_of_bytes(&tail_buf, e.len);
         e.seam_offset = off;
         e.seam_line = line;
         e.ends_newline = tail_buf.last() == Some(&b'\n');
@@ -3377,18 +3589,92 @@ fn dataset_verdict(verdict: &str, dataset: &str) -> String {
     verdict.to_string()
 }
 
+const SEC_HEADERS: &str = "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n";
+
 fn json_response(status: u16, body: &str) -> String {
     format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{SEC_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
 
 fn html_response(body: &str) -> String {
     format!(
-        "HTTP/1.1 200\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{SEC_HEADERS}ETag: {}\r\nVary: Accept-Encoding\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        index_etag(),
         body.len()
     )
+}
+
+fn accepts_gzip(headers: &[(String, String)]) -> bool {
+    let raw = headers
+        .iter()
+        .find(|(n, _)| n == "accept-encoding")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    for part in raw.split(',') {
+        let mut pieces = part.trim().split(';');
+        let enc = pieces.next().unwrap_or("").trim().to_ascii_lowercase();
+        if enc == "gzip" {
+            let zero_q = pieces.any(|p| {
+                p.trim()
+                    .strip_prefix("q=")
+                    .and_then(|q| q.trim().parse::<f64>().ok())
+                    .is_some_and(|v| v <= 0.0)
+            });
+            if !zero_q {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn etag_matches(headers: &[(String, String)], etag: &str) -> bool {
+    let raw = headers
+        .iter()
+        .find(|(n, _)| n == "if-none-match")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    if raw.is_empty() {
+        return false;
+    }
+    raw.split(',').any(|tok| {
+        let t = tok.trim();
+        t == "*" || t == etag || t.strip_prefix("W/").is_some_and(|w| w.trim() == etag)
+    })
+}
+
+fn serve_index_bytes(method: &str, headers: &[(String, String)]) -> Vec<u8> {
+    let etag = index_etag();
+    if etag_matches(headers, etag) {
+        return format!(
+            "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nVary: Accept-Encoding\r\nCache-Control: no-cache\r\n{SEC_HEADERS}Connection: close\r\n\r\n"
+        )
+        .into_bytes();
+    }
+    let is_head = method == "HEAD";
+    let use_gzip = accepts_gzip(headers);
+    let body: &[u8] = if use_gzip {
+        INDEX_HTML_GZ
+    } else {
+        INDEX_HTML.as_bytes()
+    };
+    let enc_hdr = if use_gzip {
+        "Content-Encoding: gzip\r\n"
+    } else {
+        ""
+    };
+    let hdr = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{enc_hdr}Vary: Accept-Encoding\r\nETag: {etag}\r\nCache-Control: no-cache\r\n{SEC_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut out = Vec::with_capacity(hdr.len() + if is_head { 0 } else { body.len() });
+    out.extend_from_slice(hdr.as_bytes());
+    if !is_head {
+        out.extend_from_slice(body);
+    }
+    out
 }
 
 /// Declared-body cap. Anything larger is refused without being
@@ -3484,41 +3770,45 @@ fn refuse_live_request(
 
 type RawRequest = (String, String, String, Vec<(String, String)>);
 fn read_request(stream: &mut std::net::TcpStream) -> Option<RawRequest> {
+    const MAX_HEADER_BYTES: usize = 32_768;
     // One deadline for the whole request: a per-read timeout alone
     // is defeated by a client dripping a byte just under it.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let mut reader = BufReader::new(stream.try_clone().ok()?);
-    // Header lines are read byte by byte so the deadline is checked
-    // for EVERY byte: a read_line would wait inside one line while
-    // a drip feeds it a byte per per-read timeout.
-    let read_line_by_byte =
-        |reader: &mut BufReader<std::net::TcpStream>| -> Option<String> {
-            let mut line = String::new();
-            loop {
-                if std::time::Instant::now() >= deadline {
-                    return None;
-                }
-                let mut b = [0u8; 1];
-                let n = reader.read(&mut b).ok()?;
-                if n == 0 {
-                    return if line.is_empty() { None } else { Some(line) };
-                }
-                line.push(b[0] as char);
-                if b[0] == b'\n' || line.len() > 16384 {
-                    return Some(line);
-                }
-            }
-        };
-    let request_line = read_line_by_byte(&mut reader)?;
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let hdr_end = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+        if buf.len() > MAX_HEADER_BYTES {
+            return Some((
+                "__bad_request__".to_string(),
+                String::new(),
+                "HTTP headers too large".to_string(),
+                Vec::new(),
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+
+    let hdr_str = String::from_utf8_lossy(&buf[..hdr_end]);
+    let mut lines = hdr_str.split("\r\n");
+    let request_line = lines.next()?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
     let mut content_length: Option<usize> = None;
     let mut headers: Vec<(String, String)> = Vec::new();
-    loop {
-        let line = read_line_by_byte(&mut reader)?;
-        if line == "\r\n" || line.is_empty() {
-            break;
+    for line in lines {
+        if line.is_empty() {
+            continue;
         }
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim().to_ascii_lowercase();
@@ -3557,17 +3847,23 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<RawRequest> {
             Vec::new(),
         ));
     }
+    let body_start = hdr_end + 4;
     let mut body: Vec<u8> = Vec::with_capacity(content_length);
-    if content_length > 0 {
-        let mut chunk = [0u8; 65536];
+    let already = &buf[body_start..];
+    if !already.is_empty() {
+        let take = already.len().min(content_length);
+        body.extend_from_slice(&already[..take]);
+    }
+    if body.len() < content_length {
+        let mut rbuf = [0u8; 65536];
         while body.len() < content_length {
             if std::time::Instant::now() >= deadline {
                 return None;
             }
-            let want = (content_length - body.len()).min(chunk.len());
-            match reader.read(&mut chunk[..want]) {
+            let want = (content_length - body.len()).min(rbuf.len());
+            match stream.read(&mut rbuf[..want]) {
                 Ok(0) => return None,
-                Ok(n) => body.extend_from_slice(&chunk[..n]),
+                Ok(n) => body.extend_from_slice(&rbuf[..n]),
                 Err(_) => return None,
             }
         }
@@ -3610,7 +3906,7 @@ fn query_param(query: &str, key: &str) -> Option<String> {
 
 fn text_download_response(content_type: &str, filename: &str, body: &str) -> String {
     format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Disposition: attachment; filename=\"{filename}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Disposition: attachment; filename=\"{filename}\"\r\n{SEC_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
@@ -3917,7 +4213,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
         None => (path, ""),
     };
     match (method, route) {
-        ("GET", "/") => html_response(include_str!("../assets/index.html")),
+        ("GET", "/") => html_response(INDEX_HTML),
         ("GET", "/api/home") => {
             let (sim, _, lib_errors, _) = app.analysis_shared(&app.data_dir.join("snapshots.jsonl"));
             let live_snap = {
@@ -3944,7 +4240,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 "mode": mode_str,
                 "series": active_series(),
                 "sse": true,
-                "capabilities": ["sse", "calibration", "walkforward", "montecarlo", "sandbox", "export", "recalibration", "scale_plan", "tournament", "edge_audit", "auto_collector", "live_kalshi", "risk_rails"],
+                "capabilities": ["sse", "calibration", "walkforward", "montecarlo", "sandbox", "export", "recalibration", "scale_plan", "tournament", "edge_audit", "auto_allocator", "auto_collector", "live_kalshi", "risk_rails"],
             });
             json_response(200, &home.to_string())
         }
@@ -4088,65 +4384,24 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
-            let (_, reports_arc, _, _) = app.analysis_shared(&dpath);
-            let mut reports: Vec<ScoreReport> = (*reports_arc).clone();
-            for report in &mut reports {
-                report.verdict = dataset_verdict(&report.verdict, &dataset);
-            }
-            json_response(200, &serde_json::to_string(&reports).unwrap())
+            let (strategies_json, _, _) = app.desk_json_shared(&dpath, &dataset);
+            json_response(200, &strategies_json)
         }
         ("GET", "/api/slots") => {
             let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
-            let (sim, _, lib_errors, _) = app.analysis_shared(&dpath);
-            let mut body = serde_json::to_value(sim.as_ref()).unwrap();
-            body["stage_target"] = serde_json::to_value(stage_progress(&sim)).unwrap();
-            let total = sim.trades.len();
-            let shown: Vec<&Trade> =
-                sim.trades.iter().skip(total.saturating_sub(5000)).collect();
-            body["trades"] = serde_json::to_value(&shown).unwrap();
-            body["trades_truncated"] = serde_json::json!(total > 5000);
-            body["library_errors"] = serde_json::json!(
-                lib_errors
-                    .iter()
-                    .map(|(file, error)| serde_json::json!({ "file": file, "error": error }))
-                    .collect::<Vec<_>>()
-            );
-            body["dataset"] = serde_json::json!(dataset);
-            json_response(200, &body.to_string())
+            let (_, slots_json, _) = app.desk_json_shared(&dpath, &dataset);
+            json_response(200, &slots_json)
         }
         ("GET", "/api/equity") => {
             let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
-            let (sim, _, lib_errors, strategy_names) = app.analysis_shared(&dpath);
-            let (pot, per) = equity_curves(&sim);
-            let mut series: Vec<serde_json::Value> = strategy_names
-                .iter()
-                .map(|name| {
-                    let points = per
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .map(|(_, pts)| pts.clone())
-                        .unwrap_or_default();
-                    serde_json::json!({ "strategy": name, "points": points })
-                })
-                .collect();
-            series.sort_by(|a, b| a["strategy"].as_str().cmp(&b["strategy"].as_str()));
-            let body = serde_json::json!({
-                "paper_pot_start": sim.paper_pot_start,
-                "pot": pot,
-                "series": series,
-                "library_errors": lib_errors
-                    .iter()
-                    .map(|(file, error)| serde_json::json!({ "file": file, "error": error }))
-                    .collect::<Vec<_>>(),
-                "dataset": dataset,
-            });
-            json_response(200, &body.to_string())
+            let (_, _, equity_json) = app.desk_json_shared(&dpath, &dataset);
+            json_response(200, &equity_json)
         }
         ("GET", "/api/report") => {
             let report = daily_report(app);
@@ -4203,6 +4458,57 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 .map(|v| v.clamp(0.0, 5.0))
                 .unwrap_or(1.0);
             let payload = app.recalibration_shared(&dpath, &dataset, slippage);
+            json_response(200, &payload)
+        }
+        ("GET", "/api/allocator") => {
+            let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let payload =
+                app.allocator_shared(&dpath, &dataset, &auto_allocator::AutoAllocatorRequest::default());
+            json_response(200, &payload)
+        }
+        ("POST", "/api/allocator/plan") => {
+            let parsed: serde_json::Value = if body.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                match serde_json::from_str::<serde_json::Value>(body) {
+                    Ok(v) if v.is_object() => v,
+                    Ok(_) => {
+                        return json_response(
+                            400,
+                            "{\"error\":\"Allocator request body must be a JSON object\"}",
+                        );
+                    }
+                    Err(e) => {
+                        return json_response(
+                            400,
+                            &serde_json::json!({ "error": format!("invalid JSON body: {e}") })
+                                .to_string(),
+                        );
+                    }
+                }
+            };
+            let (dataset, dpath) = match resolve_dataset_checked(
+                app,
+                query,
+                parsed.get("dataset").and_then(|v| v.as_str()),
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let req: auto_allocator::AutoAllocatorRequest = match serde_json::from_value(parsed) {
+                Ok(r) => r,
+                Err(e) => {
+                    return json_response(
+                        400,
+                        &serde_json::json!({ "error": format!("invalid allocator parameters: {e}") })
+                            .to_string(),
+                    );
+                }
+            };
+            let payload = app.allocator_shared(&dpath, &dataset, &req);
             json_response(200, &payload)
         }
         ("GET", "/api/analytics/tournament") => {
@@ -4951,6 +5257,16 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     );
                 }
             };
+            let post_only = match parsed.get("post_only") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(_) => {
+                    return json_response(
+                        400,
+                        "{\"ok\":false,\"error\":\"post_only must be a boolean\"}",
+                    );
+                }
+            };
             let intent: risk_rails::LiveOrderIntent = match serde_json::from_value(parsed) {
                 Ok(i) => i,
                 Err(e) => {
@@ -4966,7 +5282,28 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 (st.rails.authorize_order(&intent), st.config.clone())
             };
             let (kalshi_req, check) = match auth_res {
-                Ok(ok) => ok,
+                Ok((base_req, check)) => {
+                    if post_only {
+                        match kalshi_live::KalshiOrderRequest::maker_limit(
+                            &intent.ticker,
+                            &intent.action,
+                            &intent.side,
+                            intent.count,
+                            intent.price_cents,
+                            Some(base_req.client_order_id),
+                        ) {
+                            Ok(maker_req) => (maker_req, check),
+                            Err(e) => {
+                                return json_response(
+                                    400,
+                                    &serde_json::json!({ "ok": false, "error": e }).to_string(),
+                                );
+                            }
+                        }
+                    } else {
+                        (base_req, check)
+                    }
+                }
                 Err(check) => {
                     return json_response(
                         403,
@@ -5174,18 +5511,22 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
 const DEFAULT_PORT: u16 = 8472;
 const DEFAULT_PORT_SPAN: u16 = 20;
 
-/// The strategy library built into the binary, so a first run has all twelve paper shapes without a checkout.
-const BUILT_IN_STRATEGIES: [(&str, &str); 12] = [
+/// The strategy library built into the binary, so a first run has all sixteen paper shapes without a checkout.
+const BUILT_IN_STRATEGIES: [(&str, &str); 16] = [
     ("bid_ask_imbalance.rn", include_str!("../strategies/bid_ask_imbalance.rn")),
     ("favourite_floor.rn", include_str!("../strategies/favourite_floor.rn")),
     ("favourite_late.rn", include_str!("../strategies/favourite_late.rn")),
     ("late_convergence_cap.rn", include_str!("../strategies/late_convergence_cap.rn")),
     ("longshot_late.rn", include_str!("../strategies/longshot_late.rn")),
+    ("maker_late_theta_no.rn", include_str!("../strategies/maker_late_theta_no.rn")),
+    ("maker_spread_capture.rn", include_str!("../strategies/maker_spread_capture.rn")),
     ("mean_reversion_fade.rn", include_str!("../strategies/mean_reversion_fade.rn")),
     ("mid_window_momentum.rn", include_str!("../strategies/mid_window_momentum.rn")),
     ("no_favourite.rn", include_str!("../strategies/no_favourite.rn")),
     ("opening_range_break.rn", include_str!("../strategies/opening_range_break.rn")),
+    ("spot_lead_momentum_yes.rn", include_str!("../strategies/spot_lead_momentum_yes.rn")),
     ("spread_compression.rn", include_str!("../strategies/spread_compression.rn")),
+    ("tail_overreaction_fade.rn", include_str!("../strategies/tail_overreaction_fade.rn")),
     ("time_decay_harvest.rn", include_str!("../strategies/time_decay_harvest.rn")),
     ("volatility_squeeze.rn", include_str!("../strategies/volatility_squeeze.rn")),
 ];
@@ -5456,12 +5797,88 @@ fn main() {
     static ACTIVE_HTTP_CONNS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
     const MAX_CONCURRENT_HTTP_CONNS: usize = 128;
+    const HTTP_POOL_WORKERS: usize = 32;
 
     struct ConnGuard;
     impl Drop for ConnGuard {
         fn drop(&mut self) {
             ACTIVE_HTTP_CONNS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    let queue: Arc<(Mutex<VecDeque<std::net::TcpStream>>, Condvar)> =
+        Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+    for _ in 0..HTTP_POOL_WORKERS {
+        let queue = queue.clone();
+        let app = app.clone();
+        let allowed_hosts = allowed_hosts.clone();
+        std::thread::spawn(move || loop {
+            let mut stream = {
+                let (lock, cv) = &*queue;
+                let mut q = lock.lock().unwrap_or_else(|p| p.into_inner());
+                while q.is_empty() {
+                    q = cv.wait(q).unwrap_or_else(|p| p.into_inner());
+                }
+                q.pop_front().unwrap()
+            };
+            let conn_guard = ConnGuard;
+            let _ = stream.set_nodelay(true);
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+            if let Some((method, path, body, headers)) = read_request(&mut stream) {
+                if method == "__too_large__" {
+                    let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"request body too large\"}";
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                    continue;
+                }
+                if method == "__bad_request__" {
+                    let resp = json_response(400, &serde_json::json!({ "error": body }).to_string());
+                    let _ = stream.write_all(resp.as_bytes());
+                    continue;
+                }
+                let host = headers
+                    .iter()
+                    .find(|(n, _)| n == "host")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("");
+                if let Some((status, message)) =
+                    refuse_request(&method, &headers, body.len(), &allowed_hosts)
+                {
+                    let response =
+                        json_response(status, &serde_json::json!({ "error": message }).to_string());
+                    let _ = stream.write_all(response.as_bytes());
+                    continue;
+                }
+                let route = path.split_once('?').map(|(r, _)| r).unwrap_or(&path);
+                if route == "/api/live" || route.starts_with("/api/live/") {
+                    if let Some((status, message)) = refuse_live_request(&method, host, &headers) {
+                        let response = json_response(
+                            status,
+                            &serde_json::json!({ "error": message }).to_string(),
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        continue;
+                    }
+                }
+                if method == "GET" && route == "/api/tape/stream" {
+                    let sse_app = app.clone();
+                    std::thread::spawn(move || {
+                        let _sse_guard = conn_guard;
+                        serve_sse_stream(&mut stream, &sse_app);
+                    });
+                    continue;
+                }
+                let _ = &conn_guard;
+                if matches!(method.as_str(), "GET" | "HEAD") && route == "/" {
+                    let bytes = serve_index_bytes(&method, &headers);
+                    let _ = stream.write_all(&bytes);
+                    continue;
+                }
+                let response = update_response(&method, &path, host)
+                    .unwrap_or_else(|| handle_with_body(&app, &method, &path, &body));
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
     }
 
     for stream in listener.incoming() {
@@ -5475,45 +5892,9 @@ fn main() {
                     let _ = stream.write_all(resp.as_bytes());
                     continue;
                 }
-                let app = app.clone();
-                let allowed_hosts = allowed_hosts.clone();
-                std::thread::spawn(move || {
-                    let _conn_guard = ConnGuard;
-                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
-                    if let Some((method, path, body, headers)) = read_request(&mut stream) {
-                        if method == "__too_large__" {
-                            let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\n\r\n{\"error\":\"request body too large\"}";
-                            let _ = stream.write_all(resp.as_bytes());
-                            return;
-                        }
-                        if method == "__bad_request__" {
-                            let resp = json_response(400, &serde_json::json!({ "error": body }).to_string());
-                            let _ = stream.write_all(resp.as_bytes());
-                            return;
-                        }
-                        let host = headers.iter().find(|(n, _)| n == "host").map(|(_, v)| v.as_str()).unwrap_or("");
-                        if let Some((status, message)) = refuse_request(&method, &headers, body.len(), &allowed_hosts) {
-                            let response = json_response(status, &serde_json::json!({ "error": message }).to_string());
-                            let _ = stream.write_all(response.as_bytes());
-                            return;
-                        }
-                        let route = path.split_once('?').map(|(r, _)| r).unwrap_or(&path);
-                        if route == "/api/live" || route.starts_with("/api/live/") {
-                            if let Some((status, message)) = refuse_live_request(&method, host, &headers) {
-                                let response = json_response(status, &serde_json::json!({ "error": message }).to_string());
-                                let _ = stream.write_all(response.as_bytes());
-                                return;
-                            }
-                        }
-                        if method == "GET" && route == "/api/tape/stream" {
-                            serve_sse_stream(&mut stream, &app);
-                            return;
-                        }
-                        let response = update_response(&method, &path, host)
-                            .unwrap_or_else(|| handle_with_body(&app, &method, &path, &body));
-                        let _ = stream.write_all(response.as_bytes());
-                    }
-                });
+                let (lock, cv) = &*queue;
+                lock.lock().unwrap_or_else(|p| p.into_inner()).push_back(stream);
+                cv.notify_one();
             }
             Err(_) => continue,
         }
@@ -6426,8 +6807,8 @@ mod tests {
     fn version_endpoint_names_the_running_build() {
         let (status, v) = body_json(&update_response("GET", "/api/version", "127.0.0.1:8472").unwrap());
         assert_eq!(status, 200);
-        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!("0.9.0")));
-        assert_eq!(v["release_url"], json!("https://github.com/cayleb-james2008/openbell/releases/tag/v0.9.0"));
+        assert_eq!((v["name"].clone(), v["version"].clone()), (json!("openbell-rs"), json!(env!("CARGO_PKG_VERSION"))));
+        assert_eq!(v["release_url"], json!(format!("https://github.com/cayleb-james2008/openbell/releases/tag/v{}", env!("CARGO_PKG_VERSION"))));
     }
 
     #[test]
@@ -6437,7 +6818,7 @@ mod tests {
         for key in ["name", "current", "mode", "repo", "platform", "checked_at", "available", "latest", "notes", "release_url", "error", "staged", "can_apply", "dev_build"] {
             assert!(u.get(key).is_some(), "missing {key}: {u}");
         }
-        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!("0.9.0"), json!(false)));
+        assert_eq!((u["name"].clone(), u["current"].clone(), u["available"].clone()), (json!("openbell-rs"), json!(env!("CARGO_PKG_VERSION")), json!(false)));
         assert!(u["checked_at"].is_null(), "nothing is fetched until a check is asked for");
         assert_eq!(u["staged"], Value::Null);
     }
@@ -6470,7 +6851,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let app = App::new(dir.clone(), dir.clone(), 100.0, 60);
         let (_, home) = body_json(&handle(&app, "GET", "/api/home"));
-        assert_eq!(home["version"], json!("0.9.0"));
+        assert_eq!(home["version"], json!(env!("CARGO_PKG_VERSION")));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6573,7 +6954,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ob-seed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         seed_strategy_library(&dir).unwrap();
-        assert_eq!(load_strategies(&dir).len(), 12, "all twelve shapes load from the seeded folder");
+        assert_eq!(load_strategies(&dir).len(), 16, "all sixteen shapes load from the seeded folder");
         std::fs::write(dir.join("favourite_late.rn"), "pub fn name() { \"mine\" }\n").unwrap();
         seed_strategy_library(&dir).unwrap();
         assert!(std::fs::read_to_string(dir.join("favourite_late.rn")).unwrap().contains("mine"), "an existing folder is left alone");

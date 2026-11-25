@@ -143,6 +143,9 @@ export function App() {
   const [editorInitStrategy, setEditorInitStrategy] = useState<string | null>(null);
   const [ticketTicker, setTicketTicker] = useState<string | null>(null);
   const [ticketPriceCents, setTicketPriceCents] = useState<number | null>(null);
+  const [ticketSide, setTicketSide] = useState<"yes" | "no" | null>(null);
+  const [ticketCount, setTicketCount] = useState<number | null>(null);
+  const [ticketPostOnly, setTicketPostOnly] = useState<boolean | null>(null);
 
   const searchRef = useRef<HTMLInputElement>(null);
   const { reads, stream, load: reload } = useDesk(dataset);
@@ -449,7 +452,7 @@ export function App() {
       id: "strategies",
       label: "Strategies",
       shortLabel: "Strategies",
-      meta: `${strategies.length || 12}`,
+      meta: `${strategies.length || 16}`,
       icon: ListChecks,
     },
     {
@@ -496,7 +499,25 @@ export function App() {
           {/* Left: Brand + Fail-Closed Live State Badge */}
           <div className="flex items-center gap-2.5">
             <span className="inline-flex items-center gap-2 text-base font-semibold tracking-tight text-ink">
-              <span aria-hidden className="inline-block size-2 rounded-full bg-dot-green" />
+              <svg
+                id="openbell-brand-mark"
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 64 64"
+                fill="none"
+                className="size-5 shrink-0 text-ink"
+                role="img"
+                aria-label="OpenBell Gaussian bell mark"
+              >
+                <path
+                  stroke="currentColor"
+                  strokeWidth="4.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M10 42C18 42 22.6 28.1 24.6 22.8C25.6 20.2 29 10 32 10C35 10 38.4 20.2 39.4 22.8C41.4 28.1 46 42 54 42"
+                />
+                <path stroke="currentColor" strokeWidth="4.5" strokeLinecap="round" d="M8 42H56" />
+                <circle cx="32" cy="50.5" r="5" fill="#1562fc" />
+              </svg>
               <span>OpenBell</span>
             </span>
             <span className="mono hidden text-xs text-ink-3 sm:inline">v{versionText}</span>
@@ -566,7 +587,7 @@ export function App() {
               variant="default"
               size="sm"
               onClick={handleRunEdgeAudit}
-              title="Run 1-click Full Quant Edge Audit across all 12 strategies"
+              title={`Run 1-click Full Quant Edge Audit across all ${strategies.length || 16} strategies`}
             >
               <Gauge className="size-3.5" strokeWidth={1.5} aria-hidden />
               <span>Edge Audit</span>
@@ -870,8 +891,18 @@ export function App() {
               equityRead={reads?.equity}
               homeRead={reads?.home}
               reportRead={reads?.report}
+              marketsRead={reads?.markets}
               liveBundle={liveBundle}
               onOpenOrderTicket={() => setTicketDrawerOpen(true)}
+              onStageOrder={(draft) => {
+                setTicketTicker(draft.ticker);
+                setTicketSide(draft.side);
+                setTicketCount(draft.count);
+                setTicketPriceCents(draft.priceCents);
+                setTicketPostOnly(draft.postOnly);
+                setTicketDrawerOpen(true);
+              }}
+              onOpenFullAudit={handleRunEdgeAudit}
               onOpenSettings={() => setSettingsOpen(true)}
               dataset={dataset}
               search={search}
@@ -912,6 +943,9 @@ export function App() {
                 markets={markets}
                 prefillTicker={ticketTicker}
                 prefillPriceCents={ticketPriceCents}
+                prefillSide={ticketSide}
+                prefillCount={ticketCount}
+                prefillPostOnly={ticketPostOnly}
                 busy={liveBusy}
                 onSubmitOrder={handleSubmitLiveOrder}
                 onCancelOrder={handleCancelLiveOrder}
@@ -923,7 +957,7 @@ export function App() {
 
           <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-3 pb-4 text-xs text-ink-3">
             <span>
-              OpenBell v{versionText}: Kalshi 15m Quant &amp; Execution Workbench (Hard Risk Rails Enforced)
+              OpenBell v{versionText}: Autonomous Kalshi Edge &amp; Auto-Allocator, Maker Post-Only, Hard Risk Rails
             </span>
             <span>
               {liveStatus.liveArmed
@@ -975,6 +1009,9 @@ export function App() {
                 markets={markets}
                 prefillTicker={ticketTicker}
                 prefillPriceCents={ticketPriceCents}
+                prefillSide={ticketSide}
+                prefillCount={ticketCount}
+                prefillPostOnly={ticketPostOnly}
                 busy={liveBusy}
                 onSubmitOrder={handleSubmitLiveOrder}
                 onCancelOrder={handleCancelLiveOrder}

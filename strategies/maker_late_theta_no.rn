@@ -1,0 +1,43 @@
+// Paper research shape: maker late theta NO.
+// Late-window (90s to 300s remaining) resting maker NO limit in the 68c-86c
+// zone with orderly spread (<= 4c) and zero extreme tail exposure (> 86c).
+// Scored strictly on paper by the shadow scorer — this file places nothing.
+
+pub fn name() {
+    "maker-late-theta-no"
+}
+
+pub fn side() {
+    "no"
+}
+
+pub fn describe() {
+    "Post-only late-window NO maker limit (68c-86c, spread <=4c, zero tail >86c) with 90s-5m left."
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    if secs_to_close > 300 || secs_to_close < 90 {
+        return false;
+    }
+    if no_ask < 0.68 || no_ask > 0.86 || yes_ask < 0.14 || yes_ask > 0.36 {
+        return false;
+    }
+    let spread = yes_ask + no_ask - 1.0;
+    if spread < -0.001 || spread > 0.045 {
+        return false;
+    }
+    let nc = no_ask * 100.0;
+    let yc = yes_ask * 100.0;
+    (nc - nc.round()).abs() < 0.000001 && (yc - yc.round()).abs() < 0.000001
+}
+
+pub fn entry_quote(yes_ask, no_ask, secs_to_close) {
+    if allow_entry(yes_ask, no_ask, secs_to_close) {
+        let spread = yes_ask + no_ask - 1.0;
+        let base_c = (no_ask * 100.0).round();
+        let q = if spread >= 0.019 { base_c - 1.0 } else { base_c };
+        Some(q / 100.0)
+    } else {
+        None
+    }
+}

@@ -1711,9 +1711,9 @@ mod tests {
     }
 
     #[test]
-    fn scale_100k_ticks_all_12_strategies_and_clean_json_no_rune_jargon() {
+    fn scale_100k_ticks_all_16_strategies_and_clean_json_no_rune_jargon() {
         let strategies = load_strategies(Path::new("strategies"));
-        assert_eq!(strategies.len(), 12);
+        assert_eq!(strategies.len(), 16);
 
         // Reuse one deserialized Snapshot template (forward-compatible with any optional
         // fields added to Snapshot) so test fixture construction doesn't burn CPU on 100k JSON parses.
@@ -1776,8 +1776,8 @@ mod tests {
         );
 
         assert_eq!(rep.windows_settled_total, 2_000);
-        assert_eq!(rep.rankings.len(), 12);
-        assert_eq!(rep.correlation_matrix.strategies.len(), 12);
+        assert_eq!(rep.rankings.len(), 16);
+        assert_eq!(rep.correlation_matrix.strategies.len(), 16);
         assert_eq!(rep.regime_heatmap_oos.cells.len(), 20);
         assert_eq!(
             rep.regime_heatmap_oos.total_entries_in_grid + rep.regime_heatmap_oos.excluded_below_10c,

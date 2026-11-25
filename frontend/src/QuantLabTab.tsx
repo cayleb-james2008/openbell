@@ -211,7 +211,7 @@ export function QuantLabTab({
             ["scale", "$500/Day Scale Planner"],
             ["scorecard", "5-Gate Scorecard"],
             ["tournament", "Tournament"],
-            ["correlation", "12×12 Corr"],
+            ["correlation", `${strategies.length || 16}×${strategies.length || 16} Corr`],
             ["regime", "Regime Map"],
             ["recalibration", "Isotonic PAV"],
             ["calibration", "Calibration"],

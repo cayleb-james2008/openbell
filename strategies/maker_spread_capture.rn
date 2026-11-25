@@ -1,0 +1,50 @@
+// Paper research shape: maker spread capture.
+// Post-only YES maker bid inside tight-spread balanced/leaning books
+// (45c-72c YES ask, 30c-58c NO ask, >= 3c spread capture with <= 6c book width)
+// during 2 to 10 minutes remaining, quoting the favorable rounded mid.
+// Scored strictly on paper by the shadow scorer — this file places nothing.
+
+pub fn name() {
+    "maker-spread-capture"
+}
+
+pub fn side() {
+    "yes"
+}
+
+pub fn describe() {
+    "Post-only YES maker bid inside tight-spread balanced/leaning books (>=3c spread capture, 45c-72c, 2m-10m left)."
+}
+
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) {
+    if secs_to_close > 600 || secs_to_close < 120 {
+        return false;
+    }
+    if yes_ask < 0.45 || yes_ask > 0.72 || no_ask < 0.30 || no_ask > 0.58 {
+        return false;
+    }
+    let spread = yes_ask + no_ask - 1.0;
+    if spread < 0.029 || spread > 0.065 {
+        return false;
+    }
+    let yc = yes_ask * 100.0;
+    let nc = no_ask * 100.0;
+    (yc - yc.round()).abs() < 0.000001 && (nc - nc.round()).abs() < 0.000001
+}
+
+pub fn entry_quote(yes_ask, no_ask, secs_to_close) {
+    if allow_entry(yes_ask, no_ask, secs_to_close) {
+        let yes_bid = 1.0 - no_ask;
+        let mid_c = ((yes_ask + yes_bid) * 50.0).floor();
+        let q = if mid_c < 1.0 {
+            1.0
+        } else if mid_c > 99.0 {
+            99.0
+        } else {
+            mid_c
+        };
+        Some(q / 100.0)
+    } else {
+        None
+    }
+}

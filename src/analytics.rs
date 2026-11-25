@@ -1774,14 +1774,14 @@ impl CompiledSandboxStrategy {
 
     /// Scan one settled window for the first whole-cent entry quote in `0.01..=0.99`.
     /// Returns `(Option<entry_price>, ticks_scanned)`.
-    fn scan_window(&mut self, snaps: &[Snapshot]) -> (Option<f64>, usize) {
+    fn scan_window(&mut self, snaps: &[Snapshot], known_close: Option<i64>) -> (Option<f64>, usize) {
         if !self.budget_open() {
             return (None, 0);
         }
         let t0 = Instant::now();
         let is_yes = self.side == "yes";
         let mut last_close_str: Option<&str> = None;
-        let mut last_close_epoch: Option<i64> = None;
+        let mut last_close_epoch: Option<i64> = known_close;
         let mut scanned = 0usize;
         let mut entry = None;
 
@@ -1794,7 +1794,9 @@ impl CompiledSandboxStrategy {
             if !is_valid_whole_cent(price) {
                 continue;
             }
-            let close_epoch = if last_close_str == Some(snap.close_time.as_str()) {
+            let close_epoch = if let Some(c) = known_close {
+                Some(c)
+            } else if last_close_str == Some(snap.close_time.as_str()) {
                 last_close_epoch
             } else {
                 let parsed = parse_iso_z(&snap.close_time);
@@ -1997,7 +1999,7 @@ pub fn validate_and_backtest_rune_source_with_config(
         };
         settled += 1;
 
-        let (entry_opt, scanned) = strat.scan_window(snaps);
+        let (entry_opt, scanned) = strat.scan_window(snaps, Some(close_epoch));
         ticks_scanned += scanned;
         let Some(price) = entry_opt else {
             continue;
@@ -2701,14 +2703,14 @@ mod tests {
             assert_eq!(normalize_whole_cent(bad), None);
         }
 
-        // Verify all 12 strategies in `strategies/` compile, pass paper-only checks,
+        // Verify all 16 strategies in `strategies/` compile, pass paper-only checks,
         // never emit invalid quotes on boundary fuzz grids, and fire distinctly
         // across synthetic market regimes.
         let strategies = load_strategies(Path::new("strategies"));
         assert_eq!(
             strategies.len(),
-            12,
-            "expected all 12 Rune strategies in strategies/, got {}",
+            16,
+            "expected all 16 strategies in strategies/, got {}",
             strategies.len()
         );
 
@@ -2718,11 +2720,15 @@ mod tests {
             "favourite-late",
             "late-convergence-cap",
             "longshot-late",
+            "maker-late-theta-no",
+            "maker-spread-capture",
             "mean-reversion-fade",
             "mid-window-momentum",
             "no-favourite",
             "opening-range-break",
+            "spot-lead-momentum-yes",
             "spread-compression",
+            "tail-overreaction-fade",
             "time-decay-harvest",
             "volatility-squeeze",
         ];
@@ -2736,17 +2742,18 @@ mod tests {
             .filter(|p| p.extension().is_some_and(|x| x == "rn"))
             .collect();
         rn_files.sort();
-        assert_eq!(rn_files.len(), 12);
+        assert_eq!(rn_files.len(), 16);
 
         // Multi-regime synthetic windows spanning opening, mid, late, YES-dominant,
         // NO-dominant, tight-spread, near-50/50 squeeze, and overextended spikes.
         let regime_windows: Vec<(f64, f64, i64, &str)> = vec![
             (0.70, 0.32, 720, "yes"), // opening range break
-            (0.80, 0.22, 480, "no"),  // mean reversion fade + mid/favourite-floor
+            (0.80, 0.22, 480, "no"),  // mean reversion fade + tail-overreaction-fade + mid/favourite-floor
             (0.51, 0.50, 360, "yes"), // volatility squeeze + no-favourite
-            (0.68, 0.34, 420, "yes"), // mid-window momentum + spread compression
+            (0.68, 0.34, 420, "yes"), // mid-window momentum + spread compression + spot-lead-momentum-yes
             (0.78, 0.24, 180, "yes"), // late convergence cap + bid-ask imbalance + favourite-late + longshot-late
-            (0.24, 0.78, 180, "no"),  // time decay harvest + no-favourite
+            (0.24, 0.78, 180, "no"),  // time decay harvest + maker-late-theta-no + no-favourite
+            (0.58, 0.45, 300, "yes"), // maker-spread-capture (3c spread inside balanced/leaning book)
             (0.4567, 0.5633, 240, "yes"), // fractional-cent poison: MUST never trade!
             (0.004, 0.996, 240, "yes"),   // sub-cent poison: MUST never trade!
             (1.00, 0.00, 240, "yes"),     // boundary poison: MUST never trade!
@@ -2782,12 +2789,16 @@ mod tests {
             );
         }
 
-        let new_seven = [
+        let new_eleven = [
             "bid_ask_imbalance.rn",
             "late_convergence_cap.rn",
+            "maker_late_theta_no.rn",
+            "maker_spread_capture.rn",
             "mean_reversion_fade.rn",
             "opening_range_break.rn",
+            "spot_lead_momentum_yes.rn",
             "spread_compression.rn",
+            "tail_overreaction_fade.rn",
             "time_decay_harvest.rn",
             "volatility_squeeze.rn",
         ];
@@ -2808,7 +2819,7 @@ mod tests {
                 "strategy {fname} failed validation: {:?}",
                 bt.validation.errors
             );
-            // Every strategy in the 12-strategy library MUST trade at least 1
+            // Every strategy in the 16-strategy library MUST trade at least 1
             // legitimate window in our multi-regime tape and NEVER trade a poison window.
             assert!(
                 bt.trades_total >= 1,
@@ -2821,16 +2832,16 @@ mod tests {
                     t.entry_price
                 );
                 assert!(
-                    !t.ticker.ends_with("06")
-                        && !t.ticker.ends_with("07")
-                        && !t.ticker.ends_with("08"),
+                    !t.ticker.ends_with("07")
+                        && !t.ticker.ends_with("08")
+                        && !t.ticker.ends_with("09"),
                     "{fname} traded a poisoned non-whole-cent window {}",
                     t.ticker
                 );
             }
 
-            // For all 7 new strategies, also verify `entry_quote` directly on boundary fuzz values.
-            if new_seven.contains(&fname.as_str()) {
+            // For all 11 extended strategies, also verify `entry_quote` directly on boundary fuzz values.
+            if new_eleven.contains(&fname.as_str()) {
                 let (mut compiled, _) = CompiledSandboxStrategy::compile(&src).unwrap();
                 for &(ya, na, secs) in &[
                     (0.0, 1.0, 240),
@@ -2863,14 +2874,14 @@ mod tests {
             }
         }
 
-        // End-to-end desk calibration & walk-forward over all 12 strategies + SlotSimulation.
+        // End-to-end desk calibration & walk-forward over all 16 strategies + SlotSimulation.
         let all_snaps: Vec<Snapshot> = windows_map.values().flatten().cloned().collect();
         let sim = simulate_slots(&strategies, &all_snaps, 100.0);
         let cal = calibration_from_windows(&windows_map, &strategies);
         assert_eq!(cal.windows_settled, regime_windows.len());
-        assert_eq!(cal.by_strategy.len(), 12);
+        assert_eq!(cal.by_strategy.len(), 16);
         let wf = walk_forward_from_desk(&windows_map, &strategies, &sim);
-        assert_eq!(wf.strategies.len(), 12);
+        assert_eq!(wf.strategies.len(), 16);
         assert!(
             (wf.portfolio.full_sample.end_equity_dollars - sim.paper_equity_dollars).abs() < 1e-6
         );

@@ -2,6 +2,7 @@
 // and the result is ONE html file (js, css and fonts inline) at ../assets/index.html, which the Rust binary embeds.
 import fs from "node:fs";
 import path from "node:path";
+import zlib from "node:zlib";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
@@ -52,7 +53,9 @@ function singleFile(): Plugin {
       html = html.replace(/\.transition\{[^}]*\}/g, "");
       const out = path.resolve(root, "../assets/index.html");
       fs.writeFileSync(out, html);
-      console.log(`single file: ${out} (${(html.length / 1024).toFixed(0)} kB)`);
+      const gz = zlib.gzipSync(Buffer.from(html, "utf8"), { level: 9 });
+      fs.writeFileSync(out + ".gz", gz);
+      console.log(`single file: ${out} (${(html.length / 1024).toFixed(0)} kB raw, ${(gz.length / 1024).toFixed(0)} kB gzip)`);
     },
   };
 }

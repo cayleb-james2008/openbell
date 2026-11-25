@@ -152,7 +152,47 @@ fn edge_audit_endpoint_and_security_hardening_work_end_to_end() {
     assert_eq!(v["verdict"], "NO_GO", "fixture tape must never emit GO");
     assert_eq!(v["funnel"].as_array().unwrap().len(), 5);
     assert_eq!(v["readiness"]["gates"].as_array().unwrap().len(), 5);
-    assert_eq!(v["strategies_total"].as_u64().unwrap(), 12);
+    assert_eq!(v["strategies_total"].as_u64().unwrap(), 16);
+
+    // 1b. Verify gzip compression, strong ETag / 304 Not Modified, Vary, and security headers on `/`.
+    {
+        let mut sg = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        sg.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        sg.write_all(
+            format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        let mut raw_bytes = Vec::new();
+        sg.read_to_end(&mut raw_bytes).unwrap();
+        let split = raw_bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let hdr = String::from_utf8_lossy(&raw_bytes[..split]).to_string();
+        let gz_body = &raw_bytes[split + 4..];
+        assert!(hdr.starts_with("HTTP/1.1 200"));
+        assert!(hdr.to_ascii_lowercase().contains("content-encoding: gzip"));
+        assert!(hdr.to_ascii_lowercase().contains("vary: accept-encoding"));
+        assert!(hdr.to_ascii_lowercase().contains("x-content-type-options: nosniff"));
+        assert!(hdr.to_ascii_lowercase().contains("x-frame-options: deny"));
+        assert!(hdr.to_ascii_lowercase().contains("referrer-policy: no-referrer"));
+        assert!(gz_body.len() < 600_000, "gzipped index must be slim, got {}", gz_body.len());
+
+        let etag_line = hdr
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("etag:"))
+            .expect("ETag header present");
+        let etag_val = etag_line.split_once(':').unwrap().1.trim();
+
+        let mut s304 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s304.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s304.write_all(
+            format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nIf-None-Match: {etag_val}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        let mut raw_304 = String::new();
+        s304.read_to_string(&mut raw_304).unwrap();
+        assert!(raw_304.starts_with("HTTP/1.1 304"), "expected 304 Not Modified, got {raw_304}");
+    }
 
     // 2. Security: `notdataset=fixture` must NOT match `dataset=fixture`.
     let (st_sub, body_sub) = http_req(port, "GET", "/api/markets?notdataset=fixture", "");

@@ -18,10 +18,12 @@ import {
   type TrackerBlock,
 } from "@/components/ui";
 import { EquityDrawdownChart, ProvenanceTag, validPoints } from "@/Charts";
+import { AutoAllocatorPanel, type StagedOrderDraft } from "@/AutoAllocatorPanel";
 import {
   type Dataset,
   type Equity,
   type Home,
+  type Market,
   type Read,
   type Report,
   type Slot,
@@ -56,8 +58,11 @@ export function SlotsTab({
   equityRead,
   homeRead,
   reportRead,
+  marketsRead,
   liveBundle,
   onOpenOrderTicket,
+  onStageOrder,
+  onOpenFullAudit,
   onOpenSettings,
   dataset,
   search,
@@ -67,8 +72,11 @@ export function SlotsTab({
   equityRead?: Read<Equity>;
   homeRead?: Read<Home>;
   reportRead?: Read<Report>;
+  marketsRead?: Read<Market[]>;
   liveBundle: LiveDeskBundle;
   onOpenOrderTicket: () => void;
+  onStageOrder?: (draft: StagedOrderDraft) => void;
+  onOpenFullAudit?: () => void;
   onOpenSettings: () => void;
   dataset: Dataset;
   search: string;
@@ -78,6 +86,10 @@ export function SlotsTab({
   const slots = slotsRead?.ok ? slotsRead.v : null;
   const equity = equityRead?.ok ? equityRead.v : null;
   const home = homeRead?.ok ? homeRead.v : null;
+  const markets = useMemo(
+    () => (marketsRead?.ok ? marketsRead.v.filter((m): m is Market => !!m && typeof m === "object") : []),
+    [marketsRead],
+  );
   const reportText = reportRead?.ok ? reportRead.v.report : "";
 
   const potPoints = useMemo(() => validPoints(equity?.pot), [equity]);
@@ -189,7 +201,27 @@ export function SlotsTab({
   };
 
   return (
-    <section id="slots-card" aria-label="Slot compounding desk and audit trail" className="space-y-4">
+    <section id="slots-card" aria-label="Autonomous edge allocator and baseline slot ledger" className="space-y-4">
+      <AutoAllocatorPanel
+        dataset={dataset}
+        slots={slots}
+        markets={markets}
+        liveArmed={liveBundle.status.liveArmed}
+        search={search}
+        onStageOrder={onStageOrder}
+        onOpenFullAudit={onOpenFullAudit}
+      />
+
+      <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+        <div className="flex items-center gap-2">
+          <h3 className="text-sm font-semibold text-ink">Legacy 1/N Equal-Split Baseline Comparison Ledger</h3>
+          <ProvenanceTag kind="paper" />
+        </div>
+        <span className="text-xs text-ink-3">
+          Equal-weight taker baseline kept for side-by-side comparison against the Autonomous Edge Allocator above.
+        </span>
+      </div>
+
       {/* Equity Curve + Drawdown Underwater Subplot & Stint Attribution */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
         <div className="rounded-[10px] border border-hairline bg-surface p-4 lg:col-span-7">

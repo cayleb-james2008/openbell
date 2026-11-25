@@ -99,7 +99,7 @@ export function EdgeAuditPanel({
             )}
           </div>
           <p className="text-sm text-ink-2">
-            One-click evaluation from all 12 strategies through OOS tournament, 4-slot decorrelation, PAV calibration, Kalshi fees, and Monte Carlo drawdown.
+            One-click evaluation from all {strategies.length || 16} strategies through OOS tournament, 4-slot decorrelation, PAV calibration, Kalshi fees, and Monte Carlo drawdown.
           </p>
         </div>
 
