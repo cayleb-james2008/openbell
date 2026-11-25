@@ -3,13 +3,21 @@
 // with Cult UI Expandable Rune source, and Interactive Rune Sandbox Editor + Backtester.
 import { useEffect, useMemo, useState } from "react";
 import { Drawer } from "vaul";
-import { ChevronDown, Code2, Play, X } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
-import { Tracker, type TrackerBlockProps } from "@/components/Tracker/Tracker";
-import { Expandable, ExpandableContent, ExpandableTrigger } from "@/components/ui/expandable";
+import { Code2, Play, X } from "lucide-react";
+import {
+  Badge,
+  Button,
+  Disclosure,
+  StatusPill,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+  TrackerBar,
+  type TrackerBlock,
+} from "@/components/ui";
 import { StrategyEquityChart, TremorSpark, validPoints, type Point } from "@/Charts";
 import { RuneSandbox } from "@/RuneSandbox";
 import { useWide } from "@/lib/media";
@@ -39,55 +47,43 @@ function VerdictPill({ verdict }: { verdict: unknown }) {
   const c = classifyVerdict(verdict);
   if (c.kind === "proven_forward") {
     return (
-      <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-success-foreground">
-        <PillStatus className="border-r-0 pr-0">
-          <PillIndicator variant="success" />
-          Proven
-        </PillStatus>
-      </Pill>
+      <StatusPill tone="success" className="min-h-6 px-2 py-0.5 text-xs text-success-foreground">
+        Proven
+      </StatusPill>
     );
   }
   if (c.kind === "proven_example") {
     return (
-      <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-warning-foreground">
-        <PillStatus className="border-r-0 pr-0">
-          <PillIndicator variant="warning" />
-          Example pass
-        </PillStatus>
-      </Pill>
+      <StatusPill tone="warning" className="min-h-6 px-2 py-0.5 text-xs text-warning-foreground">
+        Example pass
+      </StatusPill>
     );
   }
   if (c.kind === "rejected") {
     return (
-      <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-destructive-foreground">
-        <PillStatus className="border-r-0 pr-0">
-          <PillIndicator variant="error" />
-          Rejected
-        </PillStatus>
-      </Pill>
+      <StatusPill tone="error" className="min-h-6 px-2 py-0.5 text-xs text-destructive-foreground">
+        Rejected
+      </StatusPill>
     );
   }
   return (
-    <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-ink-2">
-      <PillStatus className="border-r-0 pr-0">
-        <PillIndicator variant="info" />
-        Testing
-      </PillStatus>
-    </Pill>
+    <StatusPill tone="info" className="min-h-6 px-2 py-0.5 text-xs text-ink-2">
+      Testing
+    </StatusPill>
   );
 }
 
 function EvidenceTracker({ traded, minWindows }: { traded: number; minWindows: number }) {
   const target = minWindows > 0 ? minWindows : 100;
   const filled = Math.min(10, Math.round((traded / target) * 10));
-  const data: TrackerBlockProps[] = Array.from({ length: 10 }, (_, idx) => ({
+  const data: TrackerBlock[] = Array.from({ length: 10 }, (_, idx) => ({
     color: idx < filled ? (traded >= target ? "bg-dot-green" : "bg-blue") : "bg-track",
     tooltip: `${traded} / ${target} traded windows`,
   }));
   return (
     <div className="flex min-w-28 items-center gap-2">
       <div className="w-20 shrink-0">
-        <Tracker data={data} />
+        <TrackerBar data={data} />
       </div>
       <span className="mono text-xs text-ink-2">
         {traded}/{target}
@@ -190,8 +186,8 @@ function StrategyInspector({
                   </Button>
                 </div>
 
-                <dl className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
-                  <div className="rounded-lg border border-hairline bg-board p-3">
+                <dl className="grid grid-cols-2 divide-y divide-hairline rounded-lg border border-hairline sm:grid-cols-4 sm:divide-x sm:divide-y-0">
+                  <div className="p-3">
                     <dt className="text-xs text-ink-3">Paper Net P&amp;L</dt>
                     <dd
                       className={
@@ -202,19 +198,19 @@ function StrategyInspector({
                       {pnl !== null ? moneySigned(pnl) : "$0.00"}
                     </dd>
                   </div>
-                  <div className="rounded-lg border border-hairline bg-board p-3">
+                  <div className="p-3">
                     <dt className="text-xs text-ink-3">Mean / Contract</dt>
                     <dd className="mono mt-1 text-sm font-semibold text-ink">
                       {signedCents(strategy.mean_cents_per_contract)}
                     </dd>
                   </div>
-                  <div className="rounded-lg border border-hairline bg-board p-3">
+                  <div className="p-3">
                     <dt className="text-xs text-ink-3">Windows Traded</dt>
                     <dd className="mono mt-1 text-sm font-semibold text-ink">
                       {traded} / {minW}
                     </dd>
                   </div>
-                  <div className="rounded-lg border border-hairline bg-board p-3">
+                  <div className="p-3">
                     <dt className="text-xs text-ink-3">Half Split</dt>
                     <dd className="mono mt-1 text-xs font-medium text-ink">
                       {signedCents(strategy.first_half_cents)} / {signedCents(strategy.second_half_cents)}
@@ -223,10 +219,10 @@ function StrategyInspector({
                 </dl>
 
                 {/* Cumulative paper equity curve */}
-                <div className="rounded-lg border border-hairline bg-board/50 p-3.5">
+                <div className="border-t border-hairline pt-4">
                   <div className="mb-2 flex items-center justify-between text-xs">
                     <span className="font-semibold text-ink">Cumulative Paper P&amp;L Curve</span>
-                    <span className="mono text-ink-3">Paper sim · Fee-adjusted</span>
+                    <span className="mono text-ink-3">Paper sim, fee-adjusted</span>
                   </div>
                   <StrategyEquityChart
                     points={points}
@@ -235,52 +231,50 @@ function StrategyInspector({
                   />
                 </div>
 
-                {/* Cult UI Expandable: strategy script source */}
-                <div className="rounded-lg border border-hairline bg-board/50 px-3.5 py-2.5">
-                  <Expandable expandDirection="vertical" expandBehavior="push" className="w-full">
-                    <ExpandableTrigger className="flex min-h-11 w-full cursor-pointer items-center justify-between gap-2 text-left text-xs font-semibold text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring">
-                      <span className="inline-flex items-center gap-2">
-                        <Code2 className="size-4 text-ink-2" aria-hidden />
+                {/* Disclosure: strategy script source */}
+                <div className="border-t border-hairline pt-3">
+                  <Disclosure
+                    label={
+                      <span className="inline-flex items-center gap-2 text-xs font-semibold">
+                        <Code2 className="size-4 text-ink-2" strokeWidth={1.5} aria-hidden />
                         <span>Strategy script source {source?.file ? `(${source.file})` : ""}</span>
                       </span>
-                      <ChevronDown className="size-4 text-ink-2" aria-hidden />
-                    </ExpandableTrigger>
-                    <ExpandableContent preset="fade">
-                      {source ? (
-                        <pre className="mono mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded-md border border-hairline bg-surface p-3 text-xs text-ink">
-                          {source.source}
-                        </pre>
-                      ) : sourceErr ? (
-                        <p className="mt-2 text-xs text-ink-2">Strategy source unavailable ({sourceErr}).</p>
-                      ) : (
-                        <p className="mt-2 text-xs text-ink-3">Loading strategy script…</p>
-                      )}
-                    </ExpandableContent>
-                  </Expandable>
+                    }
+                  >
+                    {source ? (
+                      <pre className="mono overflow-x-auto whitespace-pre-wrap break-words rounded-md border border-hairline bg-board p-3 text-xs text-ink">
+                        {source.source}
+                      </pre>
+                    ) : sourceErr ? (
+                      <p className="text-xs text-ink-2">Strategy source unavailable ({sourceErr}).</p>
+                    ) : (
+                      <p className="text-xs text-ink-3">Loading strategy script…</p>
+                    )}
+                  </Disclosure>
                 </div>
 
                 {/* Paper trade ledger */}
-                <div>
+                <div className="border-t border-hairline pt-4">
                   <div className="mb-2 flex items-center justify-between gap-2">
-                    <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-3">
+                    <h3 className="text-xs font-semibold text-ink-2">
                       Paper Trade Ledger ({trades.length}
                       {tradesTruncated ? "+" : ""})
                     </h3>
                     <span className="text-xs text-ink-3">Most recent 40 shown</span>
                   </div>
                   {trades.length === 0 ? (
-                    <p className="rounded-lg border border-hairline bg-board/40 px-4 py-3 text-xs text-ink-2">
+                    <p className="py-2 text-xs text-ink-2">
                       No paper trades for this strategy yet.
                     </p>
                   ) : (
-                    <ul className="divide-y divide-hairline rounded-lg border border-hairline bg-board/40">
+                    <ul className="divide-y divide-hairline border-t border-hairline">
                       {[...trades].reverse().slice(0, 40).map((t, idx) => (
-                        <li key={idx} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 font-mono text-xs">
+                        <li key={idx} className="flex flex-wrap items-center justify-between gap-2 py-2 font-mono text-xs">
                           <span className="text-ink-2">
                             {dayLabel(t.close_epoch)} {timeUtcLabel(t.close_epoch)}
                           </span>
                           <span className="text-ink">
-                            Slot {t.slot} · {t.contracts}x @ {Math.round((t.price || 0) * 100)}c
+                            Slot {t.slot} | {t.contracts}x @ {Math.round((t.price || 0) * 100)}c
                           </span>
                           <span className={t.pnl_dollars >= 0 ? "font-medium text-success-foreground" : "font-medium text-destructive-foreground"}>
                             {moneySigned(t.pnl_dollars)}

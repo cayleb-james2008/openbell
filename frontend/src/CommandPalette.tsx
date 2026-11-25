@@ -1,6 +1,6 @@
-// Global Command Palette (Cmd+K / Ctrl+K) built on Radix Dialog + cmdk.
-// Jumps directly to any live 15m market ticker, Rune strategy, active slot, Quant Lab panel, or paper-only action.
-import * as Dialog from "@radix-ui/react-dialog";
+// Global Command Palette (Cmd+K / Ctrl+K) built on native accessible modal + cmdk.
+// Jumps directly to any live 15m market ticker, strategy, active slot, Quant Lab panel, or paper-only action.
+import { useEffect } from "react";
 import { Command } from "cmdk";
 import {
   Activity,
@@ -21,8 +21,7 @@ import {
   Trophy,
   X,
 } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
-import { Kbd } from "@/components/ui/kbd";
+import { Badge, Kbd } from "@/components/ui";
 import type { QuantSectionId } from "@/QuantLabTab";
 import {
   type Market,
@@ -37,7 +36,7 @@ import {
   seriesShort,
 } from "@/lib/desk";
 
-export type DeskTabId = "tape" | "strategies" | "slots" | "quant";
+export type DeskTabId = "tape" | "strategies" | "slots" | "quant" | "live";
 
 export function CommandPalette({
   open,
@@ -81,30 +80,43 @@ export function CommandPalette({
     fn();
   };
 
-  return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-ink/35" />
-        <Dialog.Content
-          id="command-palette"
-          data-command-palette
-          className="fixed top-[10vh] left-1/2 z-50 w-[calc(100%-24px)] max-w-[640px] -translate-x-1/2 overflow-hidden rounded-[12px] border border-hairline bg-surface text-ink shadow-(--elev-lift) outline-none"
-        >
-          <Dialog.Title className="sr-only">OpenBell Command Palette</Dialog.Title>
-          <Dialog.Description className="sr-only">
-            Jump to any 15-minute market ticker, strategy, slot, Quant Lab panel, live order ticket, or desk action.
-          </Dialog.Description>
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onOpenChange(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onOpenChange]);
 
-          <Command label="OpenBell Command Palette" className="flex flex-col">
-            <div className="flex items-center gap-2 border-b border-hairline px-3.5 py-2.5 focus-within:ring-2 focus-within:ring-inset focus-within:ring-ring">
-              <Search className="size-4 shrink-0 text-ink-3" aria-hidden />
-              <Command.Input
-                id="cmdk-input"
-                data-cmdk-input
-                aria-label="Search tickers, strategies, slots, or Quant Lab"
-                placeholder="Jump to ticker, strategy, slot, or Quant Lab…"
-                className="min-h-11 flex-1 bg-transparent text-sm text-ink placeholder:text-ink-3 outline-none focus-visible:outline-none sm:min-h-8"
-              />
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh]">
+      <div
+        aria-hidden="true"
+        className="fixed inset-0 bg-ink/35"
+        onClick={() => onOpenChange(false)}
+      />
+      <div
+        id="command-palette"
+        data-command-palette
+        role="dialog"
+        aria-modal="true"
+        aria-label="OpenBell Command Palette"
+        className="relative z-10 w-[calc(100%-24px)] max-w-[640px] overflow-hidden rounded-[12px] border border-hairline bg-surface text-ink shadow-(--elev-lift) outline-none"
+      >
+        <Command label="OpenBell Command Palette" className="flex flex-col">
+          <div className="flex items-center gap-2 border-b border-hairline px-3.5 py-2.5 focus-within:ring-2 focus-within:ring-inset focus-within:ring-ring">
+            <Search className="size-4 shrink-0 text-ink-3" aria-hidden />
+            <Command.Input
+              id="cmdk-input"
+              data-cmdk-input
+              autoFocus
+              aria-label="Search tickers, strategies, slots, or Quant Lab"
+              placeholder="Jump to ticker, strategy, slot, or Quant Lab…"
+              className="min-h-11 flex-1 bg-transparent text-sm text-ink placeholder:text-ink-3 outline-none focus-visible:outline-none sm:min-h-8"
+            />
               <button
                 type="button"
                 aria-label="Close command palette"
@@ -122,8 +134,30 @@ export function CommandPalette({
 
               <Command.Group
                 heading="Workbench Views"
-                className="mb-2 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-ink-3"
+                className="mb-2 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:text-ink-2"
               >
+                <Command.Item
+                  value="Live and Risk Rails Kalshi account orders positions"
+                  onSelect={() => closeAnd(() => onSelectTab("live"))}
+                  className="flex min-h-11 cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-2 text-sm text-ink outline-none data-[selected=true]:bg-blue-soft sm:min-h-9"
+                >
+                  <span className="flex items-center gap-2">
+                    <ShieldCheck className="size-4 text-ink-2" strokeWidth={1.5} aria-hidden />
+                    <span>Live &amp; Rails</span>
+                  </span>
+                  <Kbd>5</Kbd>
+                </Command.Item>
+                <Command.Item
+                  value="Full Quant Edge Audit 1-Click Scorecard Go No-Go"
+                  onSelect={() => closeAnd(() => onJumpQuantSection("audit"))}
+                  className="flex min-h-11 cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-2 text-sm text-ink outline-none data-[selected=true]:bg-blue-soft sm:min-h-9"
+                >
+                  <span className="flex items-center gap-2">
+                    <ShieldCheck className="size-4 text-info-foreground" strokeWidth={1.5} aria-hidden />
+                    <span>Full Quant Edge Audit (Go / No-Go)</span>
+                  </span>
+                  <span className="mono text-xs text-info-foreground">1-Click</span>
+                </Command.Item>
                 <Command.Item
                   value="Live 15m Tape markets quotes"
                   onSelect={() => closeAnd(() => onSelectTab("tape"))}
@@ -282,7 +316,7 @@ export function CommandPalette({
 
               <Command.Group
                 heading="Desk & Live Kalshi Actions"
-                className="mb-2 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-ink-3"
+                className="mb-2 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:text-ink-2"
               >
                 <Command.Item
                   value="Open Live Kalshi Order Ticket Positions Orders Fills"
@@ -366,7 +400,7 @@ export function CommandPalette({
               {strategies.length > 0 && (
                 <Command.Group
                   heading={`Strategies (${strategies.length})`}
-                  className="mb-2 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-ink-3"
+                  className="mb-2 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:text-ink-2"
                 >
                   {strategies.map((s, idx) => {
                     const name = cleanStr(s.strategy, `strategy-${idx}`);
@@ -394,7 +428,7 @@ export function CommandPalette({
               {slots.length > 0 && (
                 <Command.Group
                   heading={`Active Slots (${slots.length})`}
-                  className="mb-2 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-ink-3"
+                  className="mb-2 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:text-ink-2"
                 >
                   {slots.map((s, idx) => {
                     const name = cleanStr(s.strategy, "unnamed");
@@ -410,7 +444,7 @@ export function CommandPalette({
                           {name}
                         </span>
                         <span className="mono shrink-0 text-xs text-ink-2">
-                          {s.strikes ?? 0}/3 · {moneySigned(s.stint_pnl_dollars ?? s.paper_pnl_dollars)}
+                          {s.strikes ?? 0}/3 {moneySigned(s.stint_pnl_dollars ?? s.paper_pnl_dollars)}
                         </span>
                       </Command.Item>
                     );
@@ -421,7 +455,7 @@ export function CommandPalette({
               {markets.length > 0 && (
                 <Command.Group
                   heading={`15m Markets (${Math.min(25, markets.length)} shown)`}
-                  className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-ink-3"
+                  className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:text-ink-2"
                 >
                   {markets.slice(0, 25).map((m, idx) => {
                     const ticker = cleanStr(m.ticker, `market-${idx}`);
@@ -460,8 +494,7 @@ export function CommandPalette({
               </span>
             </div>
           </Command>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+      </div>
+    </div>
   );
 }

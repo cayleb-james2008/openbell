@@ -254,16 +254,38 @@ fn short_url(url: &str) -> String {
     url[..end].to_string()
 }
 
-/// Deletes its file on drop, so every way out of a download leaves nothing behind.
-struct TempFile(PathBuf);
+/// Deletes its private directory on drop, so every way out of a download leaves nothing behind.
+struct TempDownloadDir(PathBuf);
 
-impl Drop for TempFile {
+impl Drop for TempDownloadDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
 static DOWNLOAD_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Create a private `0700` temporary directory for one download (CWE-59 symlink-safe).
+fn create_private_download_dir() -> Result<TempDownloadDir, String> {
+    let base = std::env::temp_dir();
+    for _ in 0..32 {
+        let seq = DOWNLOAD_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = base.join(format!("openbell-dl-{}-{seq}", std::process::id()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+                }
+                return Ok(TempDownloadDir(dir));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("could not create download temp dir: {e}")),
+        }
+    }
+    Err("could not allocate unique download temp directory".to_string())
+}
 
 /// The next URL of a redirect. Absolute http(s) locations and root-relative
 /// paths are followed; anything else is not.
@@ -287,11 +309,8 @@ fn resolve_location(cur: &str, loc: &str) -> Result<String, String> {
 /// content by hash afterwards, not by where it came from.
 fn http_get(url: &str, max: u64, github_only: bool) -> Result<Vec<u8>, String> {
     let loopback_http = url.starts_with("http://");
-    let body = TempFile(std::env::temp_dir().join(format!(
-        "openbell-dl-{}-{}",
-        std::process::id(),
-        DOWNLOAD_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    )));
+    let dl_dir = create_private_download_dir()?;
+    let body_path = dl_dir.0.join("payload");
     let mut cur = url.to_string();
     for _hop in 0..=MAX_REDIRECTS {
         let allowed = if cur.starts_with("http://") { loopback_http && url_allowed(&cur) } else { url_allowed(&cur) };
@@ -304,7 +323,7 @@ fn http_get(url: &str, max: u64, github_only: bool) -> Result<Vec<u8>, String> {
             .args(["-sS", "--proto", "=https,http", "--max-redirs", "0", "--max-time", "300", "--max-filesize"])
             .arg(max.to_string())
             .args(["-A", "openbell-updater", "-H", "Accept: application/vnd.github+json, application/octet-stream", "-o"])
-            .arg(&body.0)
+            .arg(&body_path)
             .args(["-w", "%{http_code} %{redirect_url}"])
             .arg(&cur)
             .stdin(std::process::Stdio::null())
@@ -335,7 +354,7 @@ fn http_get(url: &str, max: u64, github_only: bool) -> Result<Vec<u8>, String> {
         if !(200..300).contains(&status) {
             return Err(format!("{} answered HTTP {status}", short_url(&cur)));
         }
-        let bytes = std::fs::read(&body.0).map_err(|_| "the download could not be read back".to_string())?;
+        let bytes = std::fs::read(&body_path).map_err(|_| "the download could not be read back".to_string())?;
         if bytes.len() as u64 > max {
             return Err(format!("download is larger than the {max} byte limit"));
         }

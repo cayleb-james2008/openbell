@@ -3,8 +3,7 @@
 // with 95% Wilson error bars, 1,000-path Monte Carlo percentile fan, and Tremor sparklines.
 import { useEffect, useId, useRef, useState } from "react";
 import { motion, useReducedMotion } from "motion/react";
-import { SparkAreaChart } from "@/components/SparkChart/SparkChart";
-import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
+import { StatusPill } from "@/components/ui";
 import {
   type Market,
   cents,
@@ -55,31 +54,44 @@ export function TremorSpark({
   points,
   start,
   label,
-  className = "h-8 w-24",
+  className = "h-7 w-24",
 }: {
   points: Point[];
   start: number;
   label: string;
   className?: string;
 }) {
+  const gradId = useId().replace(/:/g, "");
   const pts = validPoints(points);
   const s0 = isNum(start) ? start : 0;
   if (pts.length < 2) {
     return <span className="font-mono text-xs text-ink-3">no trades</span>;
   }
-  const data = pts.map(([t, v], idx) => ({ idx, t, value: Number(v.toFixed(2)) }));
+  const vals = pts.map((p) => p[1]);
+  const lo = Math.min(...vals);
+  const hi = Math.max(...vals);
+  const span = Math.max(1e-9, hi - lo);
+  const W = 96;
+  const H = 28;
+  const pad = 2;
+  const X = (i: number) => pad + (i / Math.max(1, pts.length - 1)) * (W - pad * 2);
+  const Y = (v: number) => H - pad - ((v - lo) / span) * (H - pad * 2);
+  const lineD = pts.map((p, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(" ");
+  const areaD = `${lineD} L${X(pts.length - 1).toFixed(1)},${H - pad} L${X(0).toFixed(1)},${H - pad} Z`;
   const up = pts[pts.length - 1][1] >= s0;
+  const stroke = up ? "var(--dot-blue)" : "var(--dot-red)";
   return (
     <div aria-label={label} className="inline-flex items-center">
-      <SparkAreaChart
-        data={data}
-        index="idx"
-        categories={["value"]}
-        colors={[up ? "blue" : "pink"]}
-        autoMinValue
-        fill="gradient"
-        className={className}
-      />
+      <svg viewBox={`0 0 ${W} ${H}`} className={className} aria-hidden="true">
+        <defs>
+          <linearGradient id={`sp-${gradId}`} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={stroke} stopOpacity="0.22" />
+            <stop offset="100%" stopColor={stroke} stopOpacity="0.02" />
+          </linearGradient>
+        </defs>
+        <path d={areaD} fill={`url(#sp-${gradId})`} />
+        <path d={lineD} fill="none" stroke={stroke} strokeWidth={1.6} strokeLinejoin="round" strokeLinecap="round" />
+      </svg>
     </div>
   );
 }
@@ -126,7 +138,7 @@ export function HeroEquityChart({
               ? `Live tape recording (${snapshots.toLocaleString()} snapshots across ${openMarkets} open 15m markets)`
               : "Awaiting first settled paper window"}
           </span>
-          <span className="font-mono text-ink-3">Start {money(s0)} · Stage 1 {moneyWhole(target)}</span>
+          <span className="font-mono text-ink-3">Start {money(s0)} / Stage 1 {moneyWhole(target)}</span>
         </div>
         <svg
           role="img"
@@ -203,7 +215,7 @@ export function HeroEquityChart({
           </span>
         </div>
         <span className="font-mono text-ink-3">
-          {pts.length} paper checkpoints · Start {moneyWhole(s0)}
+          {pts.length} paper checkpoints (Start {moneyWhole(s0)})
         </span>
       </div>
       <svg
@@ -639,10 +651,10 @@ export function MarketHistoryChart({
     );
   }
 
-  const H = height;
+  const H = Math.max(180, height);
   const priceTop = 14;
-  const priceBot = 132;
-  const spreadTop = 150;
+  const priceBot = Math.round(H * 0.60);
+  const spreadTop = priceBot + 18;
   const spreadBot = H - 24;
 
   const x0 = series[0].t;
@@ -1503,28 +1515,22 @@ export function ProbBar({ yesProb }: { yesProb: number | null }) {
 export function ProvenanceTag({ kind }: { kind: "venue" | "tape" | "paper" }) {
   if (kind === "venue") {
     return (
-      <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-info-foreground">
-        <PillStatus className="border-r-0 pr-0">
-          <PillIndicator variant="info" />
-          venue
-        </PillStatus>
-      </Pill>
+      <StatusPill tone="info" className="min-h-6 px-2 py-0.5 text-info-foreground">
+        venue
+      </StatusPill>
     );
   }
   if (kind === "paper") {
     return (
-      <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-warning-foreground">
-        <PillStatus className="border-r-0 pr-0">
-          <PillIndicator variant="warning" />
-          paper
-        </PillStatus>
-      </Pill>
+      <StatusPill tone="warning" className="min-h-6 px-2 py-0.5 text-warning-foreground">
+        paper
+      </StatusPill>
     );
   }
   return (
-    <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-ink-2">
+    <StatusPill tone="neutral" className="min-h-6 px-2 py-0.5 text-ink-2">
       tape
-    </Pill>
+    </StatusPill>
   );
 }
 
@@ -1793,7 +1799,7 @@ export function RegimeHeatmapChart({
         {activeCell && activeCell.n > 0 ? (
           <>
             <span className="font-semibold text-ink">
-              {activeCell.priceBucket} · {activeCell.timeBucket} (n={activeCell.n})
+              {activeCell.priceBucket} {activeCell.timeBucket} (n={activeCell.n})
             </span>
             <div className="flex flex-wrap items-center gap-3">
               <span className="text-ink-2">
@@ -1970,7 +1976,7 @@ export function RegimeHeatmapChart({
                         style={{ fill: "var(--ink-2)" }}
                       >
                         {cell.n > 0
-                          ? `n=${cell.n}${cell.winRatePct !== null ? ` · ${Math.round(cell.winRatePct)}%` : ""}`
+                          ? `n=${cell.n}${cell.winRatePct !== null ? ` (${Math.round(cell.winRatePct)}%)` : ""}`
                           : "no trades"}
                       </text>
                     </g>

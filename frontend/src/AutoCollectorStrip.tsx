@@ -1,7 +1,7 @@
 // Public Read-Only Auto-Collector Schedule Control Strip (Off / 60s / 180s) + 200-Window Readiness Gate Progress Bar.
 // Rendered both inside Live 15m Tape and synchronized inside the Settings Vaul sheet. Strictly public GET only.
 import { AlertTriangle, Clock, ShieldCheck } from "lucide-react";
-import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
+import { StatusPill } from "@/components/ui";
 import type { CollectorScheduleStatus } from "@/lib/desk";
 
 type CadenceChoice = "off" | "60" | "180";
@@ -36,9 +36,9 @@ export function AutoCollectorStrip({
       ? "success"
       : "info";
   const badgeText = status?.rateLimited
-    ? `429 backoff · ${status.backoffSecs || status.effectiveIntervalSecs}s`
+    ? `429 backoff ${status.backoffSecs || status.effectiveIntervalSecs}s`
     : status?.enabled
-      ? `Auto · ${status.intervalSecs}s`
+      ? `Auto ${status.intervalSecs}s`
       : "Auto-collect off";
 
   const choices: readonly [CadenceChoice, string, boolean, number][] = [
@@ -58,12 +58,9 @@ export function AutoCollectorStrip({
             <Clock className="size-3.5 text-info-foreground" aria-hidden />
             <span className="text-xs font-semibold text-ink">Auto-Collector Schedule</span>
           </div>
-          <Pill variant="outline" className="min-h-6 px-2 py-0.5 text-xs text-ink-2">
-            <PillStatus className="border-r-0 pr-0">
-              <PillIndicator variant={badgeTone} />
-              <span className="mono">{badgeText}</span>
-            </PillStatus>
-          </Pill>
+          <StatusPill tone={badgeTone}>
+            <span className="mono">{badgeText}</span>
+          </StatusPill>
         </div>
 
         <div className="grid grid-cols-3 gap-1.5" role="group" aria-label="Auto-collector cadence">
@@ -150,12 +147,9 @@ export function AutoCollectorStrip({
           ))}
         </div>
 
-        <Pill id="auto-collector-status-pill" variant="outline" className="min-h-7 px-2.5 py-0.5 text-xs text-ink-2">
-          <PillStatus className="border-r-0 pr-0">
-            <PillIndicator variant={badgeTone} />
-            <span className="mono">{badgeText}</span>
-          </PillStatus>
-        </Pill>
+        <StatusPill id="auto-collector-status-pill" tone={badgeTone}>
+          <span className="mono">{badgeText}</span>
+        </StatusPill>
 
         {status?.rateLimited && (
           <span className="inline-flex items-center gap-1 font-mono text-xs text-warning-foreground">

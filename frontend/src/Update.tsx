@@ -1,8 +1,7 @@
 // The update strip and the version line. The server checks GitHub in the background; this page asks what it knows.
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { Button } from "@/components/ui/button";
-import { Expandable, ExpandableContent, ExpandableTrigger } from "@/components/ui/expandable";
+import { Button, Disclosure } from "@/components/ui";
 import { getJson, isNum } from "@/lib/desk";
 
 type Snap = {
@@ -217,14 +216,9 @@ type U = UpdatesHandle;
 
 function ErrorDetails({ raw }: { raw: string }) {
   return (
-    <Expandable expandDirection="vertical" expandBehavior="push" className="w-full">
-      <ExpandableTrigger className="min-h-11 cursor-pointer rounded-md px-1 text-sm text-ink-2 underline outline-none hover:text-ink active:bg-track focus-visible:ring-2 focus-visible:ring-ring">
-        Details
-      </ExpandableTrigger>
-      <ExpandableContent preset="fade">
-        <pre className="mt-1 whitespace-pre-wrap break-words rounded-md border border-hairline bg-board p-2.5 font-mono text-xs text-ink-2">{raw}</pre>
-      </ExpandableContent>
-    </Expandable>
+    <Disclosure label={<span className="underline">Details</span>}>
+      <pre className="mt-1 whitespace-pre-wrap break-words rounded-md border border-hairline bg-board p-2.5 font-mono text-xs text-ink-2">{raw}</pre>
+    </Disclosure>
   );
 }
 
@@ -276,7 +270,14 @@ export function UpdateStrip({ u }: { u: U }) {
               </span>
             )}
             {!u.staged && releaseUrl && (
-              <Button variant="outline" className="min-h-11" render={<a href={releaseUrl} target="_blank" rel="noopener" />}>What&apos;s new</Button>
+              <a
+                href={releaseUrl}
+                target="_blank"
+                rel="noopener"
+                className="inline-flex min-h-11 items-center justify-center rounded-md border border-hairline bg-surface px-3.5 text-sm font-medium text-ink hover:bg-board focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9"
+              >
+                What&apos;s new
+              </a>
             )}
             {!u.staged && <Button variant="ghost" className="min-h-11" disabled={busy} onClick={u.dismiss}>Dismiss</Button>}
           </div>

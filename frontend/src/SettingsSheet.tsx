@@ -1,9 +1,7 @@
 // Settings Vaul Sheet — the ONLY place Light/Dark Appearance lives (#67), plus Collector cadence, Updates, and Provenance legend.
 import { Drawer } from "vaul";
 import { Moon, RefreshCw, Sun, X } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { SegmentedControl, SegmentedControlItem } from "@/components/ui/segmented-control";
-import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
+import { Button, StatusPill } from "@/components/ui";
 import { useWide } from "@/lib/media";
 import { type CollectorScheduleStatus, type Home, ageWords, isNum } from "@/lib/desk";
 import type { LiveConfigPayload, LiveStatus } from "@/lib/live";
@@ -93,24 +91,35 @@ export function SettingsSheet({
                   </p>
                 </div>
               </div>
-              <SegmentedControl id="themeBtn" aria-label="Appearance" className="w-full">
+              <div
+                id="themeBtn"
+                role="group"
+                aria-label="Appearance"
+                className="grid w-full grid-cols-2 gap-1.5 rounded-lg border border-hairline bg-board p-1"
+              >
                 {(["light", "dark"] as const).map((t) => (
-                  <SegmentedControlItem
+                  <button
                     key={t}
-                    className="!h-11 flex-1 gap-2 !text-ink"
+                    type="button"
                     aria-pressed={theme === t}
                     data-checked={theme === t ? "" : undefined}
                     onClick={() => onThemeChange(t)}
+                    className={
+                      "inline-flex min-h-11 flex-1 cursor-pointer items-center justify-center gap-2 rounded-md border px-3 text-sm font-medium outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring " +
+                      (theme === t
+                        ? "border-hairline bg-surface text-ink shadow-xs"
+                        : "border-transparent bg-transparent text-ink-2 hover:text-ink")
+                    }
                   >
                     {t === "light" ? (
-                      <Sun className="size-4" strokeWidth={1.75} aria-hidden />
+                      <Sun className="size-4" strokeWidth={1.5} aria-hidden />
                     ) : (
-                      <Moon className="size-4" strokeWidth={1.75} aria-hidden />
+                      <Moon className="size-4" strokeWidth={1.5} aria-hidden />
                     )}
                     <span>{t === "light" ? "Light" : "Dark"}</span>
-                  </SegmentedControlItem>
+                  </button>
                 ))}
-              </SegmentedControl>
+              </div>
             </section>
 
             {/* Kalshi v2 API Credentials & Hard Risk Rails */}
@@ -201,40 +210,34 @@ export function SettingsSheet({
               <h3 id="settings-legend-heading" className="text-sm font-semibold text-ink">
                 How to read this
               </h3>
-              <dl className="grid gap-3 text-xs">
+              <dl className="grid gap-3 text-sm">
                 <div className="flex items-start gap-2.5">
                   <dt className="shrink-0">
-                    <Pill variant="outline" className="text-info-foreground">
-                      <PillStatus className="border-r-0 pr-0">
-                        <PillIndicator variant="info" />
-                        venue
-                      </PillStatus>
-                    </Pill>
+                    <StatusPill tone="info" className="text-info-foreground">
+                      venue
+                    </StatusPill>
                   </dt>
-                  <dd className="text-ink-2">Public market quotes and settlement results fetched directly from Kalshi.</dd>
+                  <dd className="text-xs text-ink-2">Public market quotes and settlement results fetched directly from Kalshi.</dd>
                 </div>
                 <div className="flex items-start gap-2.5">
                   <dt className="shrink-0">
-                    <Pill variant="outline" className="text-ink-2">tape</Pill>
+                    <StatusPill tone="neutral">tape</StatusPill>
                   </dt>
-                  <dd className="text-ink-2">Append-only snapshots recorded locally on disk by OpenBell&apos;s collector.</dd>
+                  <dd className="text-xs text-ink-2">Append-only snapshots recorded locally on disk by OpenBell&apos;s collector.</dd>
                 </div>
                 <div className="flex items-start gap-2.5">
                   <dt className="shrink-0">
-                    <Pill variant="outline" className="text-warning-foreground">
-                      <PillStatus className="border-r-0 pr-0">
-                        <PillIndicator variant="warning" />
-                        paper
-                      </PillStatus>
-                    </Pill>
+                    <StatusPill tone="warning" className="text-warning-foreground">
+                      paper
+                    </StatusPill>
                   </dt>
-                  <dd className="text-ink-2">
+                  <dd className="text-xs text-ink-2">
                     Shadow compounding simulation scored over collected tape alongside live Kalshi v2 order routing.
                   </dd>
                 </div>
               </dl>
               <p className="text-xs text-ink-3">
-                Anything not obtained reads unavailable, with the reason. Press <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">⌘K</kbd> for quick jump, <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">/</kbd> to filter, <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">1</kbd>–<kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">4</kbd> for tabs, and <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">j</kbd>/<kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">k</kbd> to step strategies.
+                Anything not obtained reads unavailable, with the reason. Press <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">⌘K</kbd> for quick jump, <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">/</kbd> to filter, <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">1</kbd>–<kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">5</kbd> for views, and <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">j</kbd>/<kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">k</kbd> to step strategies.
               </p>
             </section>
           </div>

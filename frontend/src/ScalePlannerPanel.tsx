@@ -3,9 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { CheckCircle2, Gauge, RefreshCw, ShieldAlert, TrendingUp, XCircle } from "lucide-react";
 import { toast } from "sonner";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Pill, PillIndicator, PillStatus } from "@/components/kibo-ui/pill";
+import { Badge, Button, StatusPill } from "@/components/ui";
 import { CompoundingTrajectoryChart, ProvenanceTag } from "@/Charts";
 import {
   type Dataset,
@@ -121,19 +119,16 @@ export function ScalePlannerPanel({
             <h3 className="text-sm font-semibold text-ink">$500/Day Paper Capital Scale Planner</h3>
             <ProvenanceTag kind="paper" />
             {plan && (
-              <Pill
+              <StatusPill
                 id="scale-mode-pill"
-                variant="outline"
+                tone={plan.modeLabel === "Empirical Tape" ? "info" : "warning"}
                 className={
                   "min-h-6 px-2 py-0.5 text-xs " +
                   (plan.modeLabel === "Empirical Tape" ? "text-info-foreground" : "text-warning-foreground")
                 }
               >
-                <PillStatus className="border-r-0 pr-0">
-                  <PillIndicator variant={plan.modeLabel === "Empirical Tape" ? "info" : "warning"} />
-                  {plan.modeLabel}
-                </PillStatus>
-              </Pill>
+                {plan.modeLabel}
+              </StatusPill>
             )}
           </div>
           <p className="mt-0.5 text-xs text-ink-2">
@@ -231,10 +226,10 @@ export function ScalePlannerPanel({
             onChange={(e) => setSeriesCount(e.target.value)}
             className="mono min-h-11 rounded-md border border-hairline bg-board px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9"
           >
-            <option value="1">1 · BTC only</option>
-            <option value="2">2 · BTC + ETH</option>
-            <option value="3">3 · BTC–SOL</option>
-            <option value="4">4 · All 4 series</option>
+            <option value="1">1 (BTC only)</option>
+            <option value="2">2 (BTC + ETH)</option>
+            <option value="3">3 (BTC to SOL)</option>
+            <option value="4">4 (All 4 series)</option>
           </select>
         </div>
 
@@ -289,8 +284,8 @@ export function ScalePlannerPanel({
         {/* Left: Capital Sizing, Liquidity Ceiling & 180-Day Trajectory Chart */}
         <div className="space-y-3 lg:col-span-7">
           {/* Required Bankroll & Empirical Daily Run-Rate */}
-          <dl className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-            <div className="rounded-lg border border-hairline bg-board p-2.5">
+          <dl className="grid grid-cols-2 divide-y divide-hairline border-y border-hairline sm:grid-cols-4 sm:divide-x sm:divide-y-0">
+            <div className="p-2.5">
               <dt className="text-xs text-ink-3">Empirical Daily</dt>
               <dd className="mono mt-0.5 text-sm font-semibold text-ink">
                 {plan ? `${moneySigned(plan.currentEmpiricalDailyDollars)}/d` : "-"}
@@ -300,7 +295,7 @@ export function ScalePlannerPanel({
               </span>
             </div>
 
-            <div className="rounded-lg border border-hairline bg-board p-2.5">
+            <div className="p-2.5">
               <dt className="text-xs text-ink-3">Equal Slots Pot</dt>
               <dd id="scale-req-equal" className="mono mt-0.5 text-sm font-semibold text-ink">
                 {plan
@@ -314,7 +309,7 @@ export function ScalePlannerPanel({
               </span>
             </div>
 
-            <div className="rounded-lg border border-hairline bg-board p-2.5">
+            <div className="p-2.5">
               <dt className="text-xs text-ink-3">Quarter-Kelly</dt>
               <dd className="mono mt-0.5 text-sm font-semibold text-ink">
                 {plan
@@ -326,7 +321,7 @@ export function ScalePlannerPanel({
               <span className="mono text-xs text-ink-3">0.25x Kelly</span>
             </div>
 
-            <div className="rounded-lg border border-hairline bg-board p-2.5">
+            <div className="p-2.5">
               <dt className="text-xs text-ink-3">Half-Kelly</dt>
               <dd className="mono mt-0.5 text-sm font-semibold text-ink">
                 {plan
@@ -341,7 +336,7 @@ export function ScalePlannerPanel({
 
           {/* Liquidity Ceiling bar */}
           {plan && (
-            <div className="rounded-lg border border-hairline bg-board/60 p-3">
+            <div className="border-b border-hairline pb-3">
               <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                 <span className="inline-flex items-center gap-1.5 font-medium text-ink">
                   <Gauge className="size-3.5 text-ink-2" aria-hidden />
@@ -374,7 +369,7 @@ export function ScalePlannerPanel({
           )}
 
           {/* 180-Day Compounding Trajectory SVG */}
-          <div className="rounded-lg border border-hairline bg-board/40 p-3">
+          <div className="pt-1">
             <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
               <div className="flex flex-wrap items-center gap-2">
                 <h4 className="text-xs font-semibold text-ink">180-Day Compounding Trajectory (1,000 Paths)</h4>
@@ -442,35 +437,32 @@ export function ScalePlannerPanel({
           ref={scorecardRef}
           id="readiness-scorecard"
           data-readiness-scorecard
-          className="flex flex-col justify-between gap-3 rounded-lg border border-hairline bg-board/40 p-3.5 lg:col-span-5"
+          className="flex flex-col justify-between gap-3 border-t border-hairline pt-4 lg:col-span-5 lg:border-t-0 lg:border-l lg:pl-4 lg:pt-0"
         >
           <div>
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h4 className="text-sm font-semibold text-ink">5-Gate Readiness Scorecard</h4>
-              <Pill
+              <StatusPill
                 id="readiness-verdict-pill"
-                variant="outline"
+                tone={isReadyForReview ? "success" : "warning"}
                 className={
                   "min-h-6 px-2.5 py-0.5 text-xs font-medium " +
                   (isReadyForReview ? "text-success-foreground" : "text-warning-foreground")
                 }
               >
-                <PillStatus className="border-r-0 pr-0">
-                  <PillIndicator variant={isReadyForReview ? "success" : "warning"} />
-                  {isReadyForReview ? "Ready for Owner Review" : "Paper Research Only"}
-                </PillStatus>
-              </Pill>
+                {isReadyForReview ? "Ready for Owner Review" : "Paper Research Only"}
+              </StatusPill>
             </div>
             <p className="mt-1 text-xs text-ink-2">
               {gatesPassed} of {gatesTotal} mechanical gates passed on OOS tape.
             </p>
 
-            <ul className="mt-3 space-y-2">
+            <ul className="mt-3 divide-y divide-hairline border-t border-hairline">
               {(plan?.readinessGates.gates || []).map((g) => (
                 <li
                   key={g.id}
                   data-readiness-gate={g.id}
-                  className="rounded-lg border border-hairline bg-surface p-2.5 text-xs"
+                  className="py-2.5 text-xs"
                 >
                   <div className="flex items-center justify-between gap-2">
                     <span className="inline-flex items-center gap-1.5 font-medium text-ink">
@@ -501,7 +493,7 @@ export function ScalePlannerPanel({
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-2.5 text-xs text-ink-3">
-            <span>Quant scaling engine · hard risk rails enforced on live orders</span>
+            <span>Quant scaling engine, hard risk rails enforced on live orders</span>
             <span className="mono">
               {plan?.source === "server" ? "Server Scale Engine" : "Client scale fallback"}
             </span>
