@@ -20,6 +20,7 @@ import {
 import { AllocatorComparisonChart, ProvenanceTag } from "@/Charts";
 import {
   type Dataset,
+  type Home,
   type Market,
   type Slots,
   money,
@@ -33,6 +34,12 @@ import {
   DEFAULT_ALLOCATOR_REQUEST,
   fetchAllocatorReport,
 } from "@/lib/allocator";
+import {
+  type LiveOrderPreflightResult,
+  type LiveStatus,
+  defaultLiveStatus,
+  preflightLiveOrder,
+} from "@/lib/live";
 
 const SIZING_LABELS: Record<AllocatorSizingMode, string> = {
   quarter_kelly: "Quarter-Kelly",
@@ -68,6 +75,8 @@ export function AutoAllocatorPanel({
   slots,
   markets,
   liveArmed,
+  liveStatus,
+  home = null,
   search,
   onStageOrder,
   onOpenFullAudit,
@@ -76,6 +85,8 @@ export function AutoAllocatorPanel({
   slots: Slots | null;
   markets: Market[];
   liveArmed: boolean;
+  liveStatus?: LiveStatus;
+  home?: Home | null;
   search: string;
   onStageOrder?: (draft: StagedOrderDraft) => void;
   onOpenFullAudit?: () => void;
@@ -86,15 +97,33 @@ export function AutoAllocatorPanel({
   const [sizingMode, setSizingMode] = useState<AllocatorSizingMode>(
     DEFAULT_ALLOCATOR_REQUEST.sizing_mode,
   );
+  const [requireStressResilience, setRequireStressResilience] = useState<boolean>(
+    DEFAULT_ALLOCATOR_REQUEST.require_stress_resilience,
+  );
   const [report, setReport] = useState<AutoAllocatorReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [quarantineOpen, setQuarantineOpen] = useState(false);
+  const [preflightBusy, setPreflightBusy] = useState<string | null>(null);
+  const [preflightState, setPreflightState] = useState<{
+    strategy: string;
+    result: LiveOrderPreflightResult;
+  } | null>(null);
+
+  const effectiveLiveStatus = useMemo(
+    () => liveStatus ?? defaultLiveStatus("client"),
+    [liveStatus],
+  );
 
   const buildRequest = useCallback(
-    (exec: AllocatorExecutionMode, sizing: AllocatorSizingMode): AutoAllocatorRequest => ({
+    (
+      exec: AllocatorExecutionMode,
+      sizing: AllocatorSizingMode,
+      stressGuard: boolean,
+    ): AutoAllocatorRequest => ({
       ...DEFAULT_ALLOCATOR_REQUEST,
       execution_mode: exec,
       sizing_mode: sizing,
+      require_stress_resilience: stressGuard,
     }),
     [],
   );
@@ -110,10 +139,19 @@ export function AutoAllocatorPanel({
   }, [dataset, slots, markets]);
 
   const recalculate = useCallback(
-    async (exec: AllocatorExecutionMode, sizing: AllocatorSizingMode, notify = false) => {
+    async (
+      exec: AllocatorExecutionMode,
+      sizing: AllocatorSizingMode,
+      stressGuard: boolean,
+      notify = false,
+    ) => {
       setLoading(true);
       try {
-        const next = await fetchAllocatorReport(dataset, buildRequest(exec, sizing), { slots, markets });
+        const next = await fetchAllocatorReport(
+          dataset,
+          buildRequest(exec, sizing, stressGuard),
+          { slots, markets },
+        );
         setReport(next);
         if (notify) {
           toast.success(
@@ -133,12 +171,18 @@ export function AutoAllocatorPanel({
 
   const handleExecChange = (nextExec: AllocatorExecutionMode) => {
     setExecutionMode(nextExec);
-    void recalculate(nextExec, sizingMode, false);
+    void recalculate(nextExec, sizingMode, requireStressResilience, false);
   };
 
   const handleSizingChange = (nextSizing: AllocatorSizingMode) => {
     setSizingMode(nextSizing);
-    void recalculate(executionMode, nextSizing, false);
+    void recalculate(executionMode, nextSizing, requireStressResilience, false);
+  };
+
+  const handleStressToggle = () => {
+    const next = !requireStressResilience;
+    setRequireStressResilience(next);
+    void recalculate(executionMode, sizingMode, next, false);
   };
 
   const q = search.trim().toLowerCase();
@@ -177,6 +221,43 @@ export function AutoAllocatorPanel({
     const open = markets.find((m) => m && (!m.result || m.result === ""));
     return open?.ticker || markets[0]?.ticker || "KXBTC15M-DEMO";
   }, [markets]);
+
+  const runPreflightForWinner = useCallback(
+    async (w: AutoAllocatorReport["active_winners"][number]) => {
+      const intent = intentByStrategy.get(w.strategy);
+      const limitCents =
+        intent?.max_limit_cents ??
+        Math.min(99, Math.max(1, Math.round(w.oos_avg_entry_price * 100)));
+      const targetCts = Math.max(1, w.rail_clamped_contracts || 1);
+      const postOnly = intent?.post_only ?? report?.execution_mode === "maker";
+      setPreflightBusy(w.strategy);
+      try {
+        const res = await preflightLiveOrder(
+          {
+            ticker: activeOpenTicker,
+            action: "buy",
+            side: w.side === "no" ? "no" : "yes",
+            count: targetCts,
+            price_cents: limitCents,
+            post_only: postOnly,
+          },
+          effectiveLiveStatus,
+          home,
+        );
+        setPreflightState({ strategy: w.strategy, result: res });
+        if (res.allowed) {
+          toast.success(
+            `Dry-run preflight passed for ${w.strategy}: ${res.count} cts @ ${res.priceCents}c ($${res.orderNotionalDollars.toFixed(2)} notional).`,
+          );
+        } else {
+          toast.warning(`Rail check blocked ${w.strategy}: ${res.railViolations[0] ?? "blocked"}`);
+        }
+      } finally {
+        setPreflightBusy(null);
+      }
+    },
+    [activeOpenTicker, effectiveLiveStatus, home, intentByStrategy, report?.execution_mode],
+  );
 
   const activeExec = (report?.execution_mode === "taker" ? "taker" : "maker") as AllocatorExecutionMode;
   const activeSizing = (
@@ -312,6 +393,32 @@ export function AutoAllocatorPanel({
         </div>
 
         <div className="flex flex-wrap items-center gap-2 self-end">
+          <button
+            id="allocator-stress-toggle"
+            type="button"
+            aria-pressed={requireStressResilience}
+            onClick={handleStressToggle}
+            className={
+              "min-h-11 cursor-pointer rounded-md border px-2.5 text-xs font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8 " +
+              (requireStressResilience
+                ? "border-dot-green/50 bg-pill-active-bg text-pill-active-fg"
+                : "border-hairline bg-surface text-ink-2 hover:text-ink")
+            }
+          >
+            {requireStressResilience ? "Stress Guard: ON (+1c & WF)" : "Stress Guard: OFF"}
+          </button>
+          {filteredWinners.length > 0 && (
+            <Button
+              id="allocator-preflight-top-btn"
+              variant="outline"
+              size="sm"
+              disabled={preflightBusy !== null}
+              onClick={() => void runPreflightForWinner(filteredWinners[0])}
+            >
+              <ShieldCheck className="size-3.5" aria-hidden />
+              <span>{preflightBusy === filteredWinners[0].strategy ? "Checking Rails…" : "Preflight Top"}</span>
+            </Button>
+          )}
           {onOpenFullAudit && (
             <Button
               variant="outline"
@@ -327,7 +434,7 @@ export function AutoAllocatorPanel({
             variant="default"
             size="sm"
             disabled={loading}
-            onClick={() => void recalculate(executionMode, sizingMode, true)}
+            onClick={() => void recalculate(executionMode, sizingMode, requireStressResilience, true)}
           >
             <RefreshCw className={`size-3.5 ${loading ? "animate-spin" : ""}`} aria-hidden />
             <span>{loading ? "Running Pipeline…" : "Run Discovery & Allocate"}</span>
@@ -389,8 +496,8 @@ export function AutoAllocatorPanel({
         </div>
       </div>
 
-      {/* $500/Day Blockers Banner */}
-      {daily && daily.blockers.length > 0 && (
+      {/* $500/Day Blockers & Adverse-Fill Stress Banner */}
+      {daily && (daily.blockers.length > 0 || daily.projected_daily_net_dollars > 0) && (
         <div
           id="allocator-daily-blockers"
           className="mt-3 rounded-[10px] border border-hairline bg-board/50 px-3.5 py-2.5 text-xs"
@@ -399,17 +506,91 @@ export function AutoAllocatorPanel({
             <span className="font-semibold text-ink">
               $500/Day Capital Readiness Blockers ({daily.blockers.length})
             </span>
-            {daily.required_bankroll_dollars !== null && (
+            <div className="flex flex-wrap items-center gap-3">
               <span className="mono text-ink-2">
-                Est. Bankroll for $500/day: {money(daily.required_bankroll_dollars)}
+                Stress +1c: {money(daily.projected_daily_stress_1c_dollars)}/d | +2c: {money(daily.projected_daily_stress_2c_dollars)}/d
               </span>
-            )}
+              {daily.required_bankroll_dollars !== null && (
+                <span className="mono text-ink-2">
+                  Est. Bankroll for $500/day: {money(daily.required_bankroll_dollars)}
+                </span>
+              )}
+            </div>
           </div>
-          <ul className="mt-1 space-y-0.5 text-ink-2">
-            {daily.blockers.slice(0, 3).map((b, i) => (
-              <li key={i}>• {b}</li>
-            ))}
-          </ul>
+          {daily.blockers.length > 0 && (
+            <ul className="mt-1 space-y-0.5 text-ink-2">
+              {daily.blockers.slice(0, 3).map((b, i) => (
+                <li key={i}>• {b}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {/* 1-Click Guarded Order Preflight & Rail Headroom Preview */}
+      {preflightState && (
+        <div
+          id="allocator-preflight-card"
+          role="region"
+          aria-label="Guarded order preflight preview"
+          className="mt-3 rounded-[10px] border border-hairline bg-board/70 px-3.5 py-3 text-xs"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <StatusPill tone={preflightState.result.allowed ? "success" : "error"}>
+                {preflightState.result.allowed ? "Preflight Rails OK (dry_run)" : "Blocked by Hard Rails"}
+              </StatusPill>
+              <span className="font-semibold text-ink">{preflightState.strategy}</span>
+              <span className="mono text-ink-2">
+                {preflightState.result.ticker} ({preflightState.result.side.toUpperCase()})
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {onStageOrder && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    onStageOrder({
+                      ticker: preflightState.result.ticker,
+                      side: preflightState.result.side,
+                      count: preflightState.result.count,
+                      priceCents: preflightState.result.priceCents,
+                      postOnly: preflightState.result.postOnly,
+                    })
+                  }
+                >
+                  Open in Ticket
+                </Button>
+              )}
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setPreflightState(null)}
+              >
+                Dismiss
+              </Button>
+            </div>
+          </div>
+          <div className="mono mt-2 grid grid-cols-1 gap-2 border-t border-hairline pt-2 text-ink-2 sm:grid-cols-4">
+            <div>
+              Size: <span className="text-ink">{preflightState.result.count} / {effectiveLiveStatus.rails.maxOrderContracts} cts</span> @ {preflightState.result.priceCents}c ({preflightState.result.postOnly ? "post_only" : "taker"})
+            </div>
+            <div>
+              Notional: <span className="text-ink">{money(preflightState.result.orderNotionalDollars)} / {money(effectiveLiveStatus.rails.maxOrderDollars)}</span>
+            </div>
+            <div>
+              Est. Fee: <span className="text-ink">{money(preflightState.result.estFeeDollars)}</span> ({preflightState.result.source})
+            </div>
+            <div>
+              Exp. Headroom: <span className="text-ink">{money(preflightState.result.projectedExposureDollars)} / {money(effectiveLiveStatus.rails.maxOpenExposureDollars)}</span>
+            </div>
+          </div>
+          {preflightState.result.railViolations.length > 0 && (
+            <p className="mt-1.5 text-destructive-foreground">
+              Rail violation: {preflightState.result.railViolations.join("; ")}
+            </p>
+          )}
         </div>
       )}
 
@@ -470,6 +651,7 @@ export function AutoAllocatorPanel({
                 <TableHead>Side</TableHead>
                 <TableHead className="text-right">OOS Trades / WR</TableHead>
                 <TableHead className="text-right">IS / OOS EV</TableHead>
+                <TableHead className="text-right">WF Folds / +1c</TableHead>
                 <TableHead className="text-right">Maker vs Taker</TableHead>
                 <TableHead className="text-right">Full Kelly</TableHead>
                 <TableHead className="text-right">Alloc % / $</TableHead>
@@ -500,6 +682,13 @@ export function AutoAllocatorPanel({
                       {fmtCents(w.oos_net_expectancy_cents)}
                     </TableCell>
                     <TableCell className="mono text-right text-xs text-ink-2">
+                      <span>{w.stress.folds_positive}/{w.stress.folds_total}</span>
+                      {" / "}
+                      <span className={w.stress.extra_slippage_1c_cents > 0 ? "text-success-foreground" : "text-destructive-foreground"}>
+                        {fmtCents(w.stress.extra_slippage_1c_cents)}
+                      </span>
+                    </TableCell>
+                    <TableCell className="mono text-right text-xs text-ink-2">
                       {w.maker_fee_cents.toFixed(2)}c vs {w.taker_fee_cents.toFixed(2)}c
                     </TableCell>
                     <TableCell className="mono text-right text-xs text-ink-2">
@@ -509,7 +698,7 @@ export function AutoAllocatorPanel({
                       {fmtPct(w.allocated_pct)} ({money(w.allocated_dollars)})
                     </TableCell>
                     <TableCell className="m-right text-right text-xs">
-                      <div className="inline-flex items-center justify-end gap-2">
+                      <div className="inline-flex flex-wrap items-center justify-end gap-1.5">
                         <div className="inline-flex flex-col items-end gap-0.5">
                           <span className="mono font-medium text-ink">
                             {w.rail_clamped_contracts} cts @ {limitCents}c
@@ -518,6 +707,14 @@ export function AutoAllocatorPanel({
                             {(intent?.post_only ?? activeExec === "maker") ? "post_only" : "taker"} ({intent?.rail_ready ? "rail ready" : "disarmed"})
                           </span>
                         </div>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={preflightBusy !== null}
+                          onClick={() => void runPreflightForWinner(w)}
+                        >
+                          Preflight
+                        </Button>
                         {onStageOrder && (
                           <Button
                             variant="outline"

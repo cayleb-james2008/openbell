@@ -15,6 +15,17 @@ export type AutoAllocatorRequest = {
   max_total_heat_pct: number;
   slippage_cents: number;
   starting_bankroll: number;
+  require_stress_resilience: boolean;
+};
+
+export type StressProfile = {
+  extra_slippage_0c_cents: number;
+  extra_slippage_1c_cents: number;
+  extra_slippage_2c_cents: number;
+  folds_positive: number;
+  folds_total: number;
+  worst_fold_expectancy_cents: number | null;
+  stress_resilient: boolean;
 };
 
 export type AllocatedWinner = {
@@ -34,6 +45,7 @@ export type AllocatedWinner = {
   rail_clamped_contracts: number;
   max_abs_corr: number | null;
   status: string;
+  stress: StressProfile;
 };
 
 export type QuarantinedStrategy = {
@@ -80,6 +92,8 @@ export type DailyTargetVerdict = {
   target_daily_profit_dollars: number;
   verdict: "GO_500_DAY" | "NO_GO_PAPER" | string;
   projected_daily_net_dollars: number;
+  projected_daily_stress_1c_dollars: number;
+  projected_daily_stress_2c_dollars: number;
   required_bankroll_dollars: number | null;
   portfolio_net_expectancy_cents: number | null;
   blockers: string[];
@@ -93,6 +107,7 @@ export type AutoAllocatorReport = {
   max_slot_risk_pct: number;
   max_total_heat_pct: number;
   starting_bankroll: number;
+  require_stress_resilience: boolean;
   windows_settled_total: number;
   windows_settled_oos: number;
   live_armed: boolean;
@@ -116,6 +131,7 @@ export const DEFAULT_ALLOCATOR_REQUEST: AutoAllocatorRequest = {
   max_total_heat_pct: 40,
   slippage_cents: 0.5,
   starting_bankroll: 100,
+  require_stress_resilience: true,
 };
 
 const MUTATION_HEADERS: HeadersInit = {
@@ -160,6 +176,7 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
     max_slot_risk_pct: finiteOr(o.max_slot_risk_pct, 15),
     max_total_heat_pct: finiteOr(o.max_total_heat_pct, 40),
     starting_bankroll: startEq,
+    require_stress_resilience: typeof o.require_stress_resilience === "boolean" ? o.require_stress_resilience : true,
     windows_settled_total: Math.max(0, Math.round(finiteOr(o.windows_settled_total, 0))),
     windows_settled_oos: Math.max(0, Math.round(finiteOr(o.windows_settled_oos, 0))),
     live_armed: Boolean(o.live_armed),
@@ -167,24 +184,37 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
     cash_reserve_pct: finiteOr(o.cash_reserve_pct, 100),
     active_winners: winnersRaw
       .filter((w): w is Record<string, unknown> => !!w && typeof w === "object")
-      .map((w) => ({
-        strategy: strOr(w.strategy, "unnamed"),
-        side: strOr(w.side, "yes"),
-        execution_mode: strOr(w.execution_mode, "maker"),
-        is_net_expectancy_cents: finiteOpt(w.is_net_expectancy_cents),
-        oos_trades: Math.max(0, Math.round(finiteOr(w.oos_trades, 0))),
-        oos_win_rate: finiteOr(w.oos_win_rate, 0),
-        oos_avg_entry_price: finiteOr(w.oos_avg_entry_price, 0.5),
-        taker_fee_cents: finiteOr(w.taker_fee_cents, 0),
-        maker_fee_cents: finiteOr(w.maker_fee_cents, 0),
-        oos_net_expectancy_cents: finiteOr(w.oos_net_expectancy_cents, 0),
-        full_kelly_pct: finiteOr(w.full_kelly_pct, 0),
-        allocated_pct: finiteOr(w.allocated_pct, 0),
-        allocated_dollars: finiteOr(w.allocated_dollars, 0),
-        rail_clamped_contracts: Math.max(0, Math.round(finiteOr(w.rail_clamped_contracts, 0))),
-        max_abs_corr: finiteOpt(w.max_abs_corr),
-        status: strOr(w.status, "ACTIVE_WINNER"),
-      })),
+      .map((w) => {
+        const exp = finiteOr(w.oos_net_expectancy_cents, 0);
+        const stRaw = (w.stress && typeof w.stress === "object" ? w.stress : {}) as Record<string, unknown>;
+        return {
+          strategy: strOr(w.strategy, "unnamed"),
+          side: strOr(w.side, "yes"),
+          execution_mode: strOr(w.execution_mode, "maker"),
+          is_net_expectancy_cents: finiteOpt(w.is_net_expectancy_cents),
+          oos_trades: Math.max(0, Math.round(finiteOr(w.oos_trades, 0))),
+          oos_win_rate: finiteOr(w.oos_win_rate, 0),
+          oos_avg_entry_price: finiteOr(w.oos_avg_entry_price, 0.5),
+          taker_fee_cents: finiteOr(w.taker_fee_cents, 0),
+          maker_fee_cents: finiteOr(w.maker_fee_cents, 0),
+          oos_net_expectancy_cents: exp,
+          full_kelly_pct: finiteOr(w.full_kelly_pct, 0),
+          allocated_pct: finiteOr(w.allocated_pct, 0),
+          allocated_dollars: finiteOr(w.allocated_dollars, 0),
+          rail_clamped_contracts: Math.max(0, Math.round(finiteOr(w.rail_clamped_contracts, 0))),
+          max_abs_corr: finiteOpt(w.max_abs_corr),
+          status: strOr(w.status, "ACTIVE_WINNER"),
+          stress: {
+            extra_slippage_0c_cents: finiteOr(stRaw.extra_slippage_0c_cents, exp),
+            extra_slippage_1c_cents: finiteOr(stRaw.extra_slippage_1c_cents, exp - 1),
+            extra_slippage_2c_cents: finiteOr(stRaw.extra_slippage_2c_cents, exp - 2),
+            folds_positive: Math.max(0, Math.round(finiteOr(stRaw.folds_positive, 1))),
+            folds_total: Math.max(1, Math.round(finiteOr(stRaw.folds_total, 1))),
+            worst_fold_expectancy_cents: finiteOpt(stRaw.worst_fold_expectancy_cents),
+            stress_resilient: typeof stRaw.stress_resilient === "boolean" ? stRaw.stress_resilient : exp - 1 > 0,
+          },
+        };
+      }),
     quarantined: quarantinedRaw
       .filter((q): q is Record<string, unknown> => !!q && typeof q === "object")
       .map((q) => ({
@@ -230,6 +260,8 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
       target_daily_profit_dollars: finiteOr(dtRaw.target_daily_profit_dollars, 500),
       verdict: strOr(dtRaw.verdict, "NO_GO_PAPER"),
       projected_daily_net_dollars: finiteOr(dtRaw.projected_daily_net_dollars, 0),
+      projected_daily_stress_1c_dollars: finiteOr(dtRaw.projected_daily_stress_1c_dollars, 0),
+      projected_daily_stress_2c_dollars: finiteOr(dtRaw.projected_daily_stress_2c_dollars, 0),
       required_bankroll_dollars: finiteOpt(dtRaw.required_bankroll_dollars),
       portfolio_net_expectancy_cents: finiteOpt(dtRaw.portfolio_net_expectancy_cents),
       blockers: Array.isArray(dtRaw.blockers)
@@ -284,6 +316,8 @@ export function computeClientFallbackReport(
         target_daily_profit_dollars: 500,
         verdict: "NO_GO_PAPER",
         projected_daily_net_dollars: 0,
+        projected_daily_stress_1c_dollars: 0,
+        projected_daily_stress_2c_dollars: 0,
         required_bankroll_dollars: null,
         portfolio_net_expectancy_cents: null,
         blockers: ["No settled paper trades loaded yet; 100% cash reserve enforced."],
@@ -395,6 +429,15 @@ export function computeClientFallbackReport(
       rail_clamped_contracts: 0,
       max_abs_corr: null,
       status: "ACTIVE_WINNER",
+      stress: {
+        extra_slippage_0c_cents: Number(meanNetCents.toFixed(2)),
+        extra_slippage_1c_cents: Number((meanNetCents - 1).toFixed(2)),
+        extra_slippage_2c_cents: Number((meanNetCents - 2).toFixed(2)),
+        folds_positive: meanNetCents > 0 ? 1 : 0,
+        folds_total: 1,
+        worst_fold_expectancy_cents: Number(meanNetCents.toFixed(2)),
+        stress_resilient: meanNetCents - 1 > 0,
+      },
     });
   }
 
@@ -498,6 +541,8 @@ export function computeClientFallbackReport(
       target_daily_profit_dollars: 500,
       verdict: "NO_GO_PAPER",
       projected_daily_net_dollars: 0,
+      projected_daily_stress_1c_dollars: 0,
+      projected_daily_stress_2c_dollars: 0,
       required_bankroll_dollars: null,
       portfolio_net_expectancy_cents: rawWinners.length > 0 ? rawWinners[0].oos_net_expectancy_cents : null,
       blockers: ["Live routing is disarmed (live_armed=false)", "Offline preview mode"],

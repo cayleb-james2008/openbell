@@ -170,9 +170,17 @@ fn depth_size(v: &serde_json::Value, keys: &[&str]) -> f64 {
     0.0
 }
 
+#[cfg(test)]
 fn median_observed_book_depth(snaps: &[Snapshot]) -> Option<f64> {
-    let mut depths: Vec<f64> = snaps
-        .iter()
+    median_observed_book_depth_iter(snaps.iter())
+}
+
+fn median_observed_book_depth_grouped(grouped: &BTreeMap<String, Vec<Snapshot>>) -> Option<f64> {
+    median_observed_book_depth_iter(grouped.values().flatten())
+}
+
+fn median_observed_book_depth_iter<'a, I: Iterator<Item = &'a Snapshot>>(iter: I) -> Option<f64> {
+    let mut depths: Vec<f64> = iter
         .flat_map(|s| [s.yes_bid_size, s.no_bid_size])
         .filter(|d| d.is_finite() && *d > 0.0)
         .collect();
@@ -363,13 +371,24 @@ fn existing_settled_keys(path: &Path) -> std::collections::HashSet<(String, Stri
         }
     }
     let mut keys = std::collections::HashSet::new();
-    let Ok(bytes) = std::fs::read(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return keys;
     };
-    let (snaps, _) = parse_tape_bytes(&bytes);
-    for s in snaps {
-        if !s.result.is_empty() {
-            keys.insert((s.ticker, s.status, s.result));
+    use std::io::BufRead as _;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut line = Vec::with_capacity(512);
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let raw = line.strip_suffix(b"\n").unwrap_or(&line);
+                if let Ok(s) = serde_json::from_slice::<Snapshot>(raw) {
+                    if !s.result.is_empty() {
+                        keys.insert((s.ticker, s.status, s.result));
+                    }
+                }
+            }
         }
     }
     if let Some((len, mtime)) = stat {
@@ -1317,6 +1336,7 @@ fn window_facts_scan(snaps: &[Snapshot]) -> WindowFacts {
 
 /// Group snapshots into market windows keyed by ticker, each window's
 /// snapshots in fetch order.
+#[cfg(test)]
 fn group_windows(snapshots: &[Snapshot]) -> BTreeMap<String, Vec<Snapshot>> {
     let mut windows: BTreeMap<String, Vec<Snapshot>> = BTreeMap::new();
     for snap in snapshots {
@@ -2152,28 +2172,22 @@ struct TapeEntry {
     path: PathBuf,
     len: u64,
     mtime: u64,
-    /// Shared: every surface reads the same parse, and a cache hit
-    /// must not clone a quarter-million snapshots per request.
-    snaps: Arc<Vec<Snapshot>>,
-    /// The same snapshots grouped into market windows (each in
-    /// fetch order) — the analysis's working shape. Grouping a
-    /// quarter-million snapshots per recompute cost seconds; here
-    /// it is built once per parse and folded incrementally over
-    /// appends, like everything else in this entry.
+    /// Snapshots grouped into market windows (each in fetch order) —
+    /// built once via streaming BufReader (zero duplicate flat Vec<Snapshot>)
+    /// and folded incrementally over appends.
     grouped: Arc<BTreeMap<String, Vec<Snapshot>>>,
     /// Pre-serialized `/api/markets` JSON body built once per parse/append
     /// from the latest snapshot of each grouped ticker, sorted by close_time.
     latest_json: Arc<String>,
+    /// Total valid parsed snapshots in `grouped`.
+    snaps_count: usize,
+    /// Timestamp (`fetched_at`) of the newest parsed snapshot in append order.
+    newest_fetched_at: Option<i64>,
     /// Every line in the file, parseable or not — the health block's
     /// dropped-line count is total minus parsed, so both numbers
     /// must come from the same read.
     total_lines: usize,
-    /// Collector-health aggregates over the parsed tape, folded in
-    /// as the tape is parsed (and folded incrementally over the
-    /// tail on append): the distinct markets, and each market's set
-    /// of non-empty results — settled windows and conflicting
-    /// settlements both derive from these. Computing them per
-    /// request instead made every surface pay a full-tape scan.
+    /// Collector-health aggregates over the parsed tape.
     markets: std::collections::HashSet<String>,
     results_by_ticker: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// Byte offset at which the last line starts, and its raw text:
@@ -2192,6 +2206,22 @@ fn build_latest_markets_json(grouped: &BTreeMap<String, Vec<Snapshot>>) -> Arc<S
     Arc::new(serde_json::to_string(&latest).unwrap_or_else(|_| "[]".to_string()))
 }
 
+/// Fold health aggregates from one parsed snapshot.
+#[inline]
+fn fold_one_health(
+    s: &Snapshot,
+    markets: &mut std::collections::HashSet<String>,
+    results_by_ticker: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+) {
+    markets.insert(s.ticker.clone());
+    if !s.result.is_empty() {
+        results_by_ticker
+            .entry(s.ticker.clone())
+            .or_default()
+            .insert(s.result.clone());
+    }
+}
+
 /// The seam an append must continue, plus the health aggregates:
 /// see TapeEntry.
 fn fold_health(
@@ -2200,22 +2230,16 @@ fn fold_health(
     results_by_ticker: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
 ) {
     for s in snaps {
-        markets.insert(s.ticker.clone());
-        if !s.result.is_empty() {
-            results_by_ticker
-                .entry(s.ticker.clone())
-                .or_default()
-                .insert(s.result.clone());
-        }
+        fold_one_health(s, markets, results_by_ticker);
     }
 }
 
 /// One consistent read of a tape's current state: the parsed
 /// snapshots plus everything the health block states about them.
 struct TapeView {
-    snaps: Arc<Vec<Snapshot>>,
     grouped: Arc<BTreeMap<String, Vec<Snapshot>>>,
     latest_json: Arc<String>,
+    snaps_count: usize,
     total_lines: usize,
     markets: usize,
     settled_windows: usize,
@@ -2534,9 +2558,9 @@ impl App {
     fn tape(&self, path: &Path) -> TapeView {
         fn view(e: &TapeEntry) -> TapeView {
             TapeView {
-                snaps: e.snaps.clone(),
                 grouped: e.grouped.clone(),
                 latest_json: e.latest_json.clone(),
+                snaps_count: e.snaps_count,
                 total_lines: e.total_lines,
                 markets: e.markets.len(),
                 settled_windows: e.results_by_ticker.len(),
@@ -2545,7 +2569,7 @@ impl App {
                     .values()
                     .filter(|r| r.len() > 1)
                     .count(),
-                newest_fetched_at: e.snaps.last().map(|s| s.fetched_at),
+                newest_fetched_at: e.newest_fetched_at,
             }
         }
         let Some((len, mtime)) = is_confined_regular_file(&self.data_dir, path)
@@ -2553,9 +2577,9 @@ impl App {
             .flatten()
         else {
             return TapeView {
-                snaps: Arc::new(Vec::new()),
                 grouped: Arc::new(BTreeMap::new()),
                 latest_json: Arc::new("[]".to_string()),
+                snaps_count: 0,
                 total_lines: 0,
                 markets: 0,
                 settled_windows: 0,
@@ -2604,22 +2628,60 @@ impl App {
             // Seam check failed: the file was replaced, not appended
             // to. Fall through to a full parse of the current bytes.
         }
-        let bytes = std::fs::read(path).unwrap_or_default();
-        let (snaps, total_lines) = parse_tape_bytes(&bytes);
-        let (seam_offset, seam_line) = seam_of_bytes(&bytes, 0);
-        let ends_newline = bytes.last().is_none_or(|b| *b == b'\n');
+
+        let mut grouped_map: BTreeMap<String, Vec<Snapshot>> = BTreeMap::new();
         let mut markets = std::collections::HashSet::new();
         let mut results_by_ticker = std::collections::HashMap::new();
-        fold_health(&snaps, &mut markets, &mut results_by_ticker);
-        let grouped = Arc::new(group_windows(&snaps));
+        let mut total_lines = 0usize;
+        let mut snaps_count = 0usize;
+        let mut newest_fetched_at: Option<i64> = None;
+        let mut seam_offset = 0u64;
+        let mut seam_bytes = Vec::with_capacity(512);
+        let mut ends_newline = true;
+
+        if let Ok(file) = std::fs::File::open(path) {
+            use std::io::BufRead as _;
+            let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+            let mut line = Vec::with_capacity(512);
+            let mut offset = 0u64;
+            loop {
+                line.clear();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        total_lines += 1;
+                        let has_nl = line.last() == Some(&b'\n');
+                        ends_newline = has_nl;
+                        let raw = if has_nl { &line[..line.len() - 1] } else { &line[..] };
+                        seam_offset = offset;
+                        seam_bytes.clear();
+                        seam_bytes.extend_from_slice(raw);
+                        offset += n as u64;
+                        if let Ok(s) = serde_json::from_slice::<Snapshot>(raw) {
+                            snaps_count += 1;
+                            newest_fetched_at = Some(s.fetched_at);
+                            fold_one_health(&s, &mut markets, &mut results_by_ticker);
+                            grouped_map.entry(s.ticker.clone()).or_default().push(s);
+                        }
+                    }
+                }
+            }
+        }
+        let seam_line = String::from_utf8_lossy(&seam_bytes).into_owned();
+        for snaps in grouped_map.values_mut() {
+            snaps.sort_by_key(|s| s.fetched_at);
+            snaps.shrink_to_fit();
+        }
+        let grouped = Arc::new(grouped_map);
         let latest_json = build_latest_markets_json(&grouped);
         let entry = TapeEntry {
             path: path.to_path_buf(),
             len,
             mtime,
-            snaps: Arc::new(snaps),
             grouped,
             latest_json,
+            snaps_count,
+            newest_fetched_at,
             total_lines,
             markets,
             results_by_ticker,
@@ -2630,11 +2692,6 @@ impl App {
         let out = view(&entry);
         *self.tape_cache.write().unwrap_or_else(|p| p.into_inner()) = Some(entry);
         out
-    }
-
-    #[allow(dead_code)]
-    fn snapshots_cached(&self, path: &Path) -> Arc<Vec<Snapshot>> {
-        self.tape(path).snaps
     }
 
     /// The slot simulation, per-strategy scores, and library load errors over one
@@ -3097,7 +3154,7 @@ impl App {
             "settled_windows": view.settled_windows,
             "readiness_target_windows": READINESS_TARGET_WINDOWS,
             "readiness_progress_pct": progress_pct,
-            "snapshots_on_disk": view.snaps.len(),
+            "snapshots_on_disk": view.snaps_count,
             "markets_seen": view.markets,
             "series": active_series(),
             "mode": "public_readonly_get",
@@ -3133,7 +3190,7 @@ impl App {
         let (sim, _, _, _) = self.analysis_shared(dpath);
         let view = self.tape(dpath);
         let (strategies, _) = load_strategies_with_errors(&self.strategies_dir);
-        let median_depth = median_observed_book_depth(&view.snaps);
+        let median_depth = median_observed_book_depth_grouped(&view.grouped);
         let ctx = Arc::new(scaling::build_scale_tape_context(
             &view.grouped,
             &strategies,
@@ -3393,6 +3450,7 @@ impl App {
         san.max_total_heat_pct.to_bits().hash(&mut h);
         san.slippage_cents.to_bits().hash(&mut h);
         san.starting_bankroll.to_bits().hash(&mut h);
+        san.require_stress_resilience.hash(&mut h);
         live_armed.hash(&mut h);
         killed.hash(&mut h);
         rails.max_order_contracts.hash(&mut h);
@@ -3478,9 +3536,13 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
     // in place when this entry is the only holder (the common
     // case), and every fold touches only the new snapshots.
     fold_health(&new_snaps, &mut e.markets, &mut e.results_by_ticker);
+    e.snaps_count += new_snaps.len();
+    if let Some(last) = new_snaps.last() {
+        e.newest_fetched_at = Some(last.fetched_at);
+    }
     {
         let grouped = Arc::make_mut(&mut e.grouped);
-        for s in &new_snaps {
+        for s in new_snaps {
             let w = grouped.entry(s.ticker.clone()).or_default();
             // Appends arrive in fetch order, so the window stays
             // sorted; an out-of-order tail re-sorts its window
@@ -3488,14 +3550,13 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
             let out_of_order = w
                 .last()
                 .is_some_and(|last| s.fetched_at < last.fetched_at);
-            w.push(s.clone());
+            w.push(s);
             if out_of_order {
                 w.sort_by_key(|x| x.fetched_at);
             }
         }
     }
     e.latest_json = build_latest_markets_json(&e.grouped);
-    Arc::make_mut(&mut e.snaps).extend(new_snaps);
     if !tail_buf.is_empty() {
         let (off, line) = seam_of_bytes(&tail_buf, e.len);
         e.seam_offset = off;
@@ -3532,9 +3593,9 @@ fn collector_health(app: &App) -> serde_json::Value {
         ((view.settled_windows as f64 / READINESS_TARGET_WINDOWS as f64) * 100.0).min(100.0);
     let progress_pct = (progress_pct * 10.0).round() / 10.0;
     serde_json::json!({
-        "snapshots_on_disk": view.snaps.len(),
+        "snapshots_on_disk": view.snaps_count,
         "lines_on_disk": view.total_lines,
-        "dropped_lines": view.total_lines.saturating_sub(view.snaps.len()),
+        "dropped_lines": view.total_lines.saturating_sub(view.snaps_count),
         "markets_seen": view.markets,
         "settled_windows": view.settled_windows,
         "conflicting_settlements": view.conflicting_settlements,
@@ -3645,13 +3706,17 @@ fn etag_matches(headers: &[(String, String)], etag: &str) -> bool {
     })
 }
 
-fn serve_index_bytes(method: &str, headers: &[(String, String)]) -> Vec<u8> {
+fn write_index_response<W: std::io::Write>(
+    stream: &mut W,
+    method: &str,
+    headers: &[(String, String)],
+) -> std::io::Result<()> {
     let etag = index_etag();
     if etag_matches(headers, etag) {
-        return format!(
+        let hdr = format!(
             "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nVary: Accept-Encoding\r\nCache-Control: no-cache\r\n{SEC_HEADERS}Connection: close\r\n\r\n"
-        )
-        .into_bytes();
+        );
+        return stream.write_all(hdr.as_bytes());
     }
     let is_head = method == "HEAD";
     let use_gzip = accepts_gzip(headers);
@@ -3669,12 +3734,11 @@ fn serve_index_bytes(method: &str, headers: &[(String, String)]) -> Vec<u8> {
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{enc_hdr}Vary: Accept-Encoding\r\nETag: {etag}\r\nCache-Control: no-cache\r\n{SEC_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    let mut out = Vec::with_capacity(hdr.len() + if is_head { 0 } else { body.len() });
-    out.extend_from_slice(hdr.as_bytes());
+    stream.write_all(hdr.as_bytes())?;
     if !is_head {
-        out.extend_from_slice(body);
+        stream.write_all(body)?;
     }
-    out
+    Ok(())
 }
 
 /// Declared-body cap. Anything larger is refused without being
@@ -5870,8 +5934,7 @@ fn main() {
                 }
                 let _ = &conn_guard;
                 if matches!(method.as_str(), "GET" | "HEAD") && route == "/" {
-                    let bytes = serve_index_bytes(&method, &headers);
-                    let _ = stream.write_all(&bytes);
+                    let _ = write_index_response(&mut stream, &method, &headers);
                     continue;
                 }
                 let response = update_response(&method, &path, host)
@@ -6513,15 +6576,15 @@ mod tests {
         std::fs::write(&tape, format!("{}\n{}\nnot json\n", line("A", 100), line("B", 110)))
             .unwrap();
         let view = app.tape(&tape);
-        assert_eq!((view.snaps.len(), view.total_lines), (2, 3), "garbage line counted, not parsed");
+        assert_eq!((view.snaps_count, view.total_lines), (2, 3), "garbage line counted, not parsed");
         // Append-only growth: the held parse extends by the tail.
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new().append(true).open(&tape).unwrap();
         writeln!(f, "{}", line("C", 120)).unwrap();
         drop(f);
         let view = app.tape(&tape);
-        assert_eq!((view.snaps.len(), view.total_lines), (3, 4));
-        assert_eq!(view.snaps[2].ticker, "C");
+        assert_eq!((view.snaps_count, view.total_lines), (3, 4));
+        assert!(view.grouped.contains_key("C"));
         // Wholesale replacement with different content (longer, and
         // the seam line differs): the seam check must refuse the
         // incremental path and the new content must be what is read.
@@ -6532,13 +6595,13 @@ mod tests {
         }
         std::fs::write(&tape, &replacement).unwrap();
         let view = app.tape(&tape);
-        assert_eq!((view.snaps.len(), view.total_lines), (6, 6));
-        assert!(view.snaps.iter().all(|s| s.ticker == "ZZ"));
+        assert_eq!((view.snaps_count, view.total_lines), (6, 6));
+        assert!(view.grouped.keys().all(|k| k == "ZZ"));
         // A shorter replacement parses whole too.
         std::fs::write(&tape, format!("{}\n", line("Q", 300))).unwrap();
         let view = app.tape(&tape);
-        assert_eq!((view.snaps.len(), view.total_lines), (1, 1));
-        assert_eq!(view.snaps[0].ticker, "Q");
+        assert_eq!((view.snaps_count, view.total_lines), (1, 1));
+        assert!(view.grouped.contains_key("Q"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6563,7 +6626,7 @@ mod tests {
         std::fs::write(&tape, &bytes).unwrap();
         let view = app.tape(&tape);
         assert_eq!(
-            (view.snaps.len(), view.total_lines),
+            (view.snaps_count, view.total_lines),
             (2, 3),
             "the invalid line is dropped and counted; its neighbours still parse"
         );
@@ -6575,8 +6638,8 @@ mod tests {
         writeln!(f, "{}", line("C", 120)).unwrap();
         drop(f);
         let view = app.tape(&tape);
-        assert_eq!((view.snaps.len(), view.total_lines), (3, 5));
-        assert_eq!(view.snaps[2].ticker, "C");
+        assert_eq!((view.snaps_count, view.total_lines), (3, 5));
+        assert!(view.grouped.contains_key("C"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6593,11 +6656,11 @@ mod tests {
         // A crash left a torn last line with no newline.
         std::fs::write(&tape, format!("{}\n{{\"ticker\":\"TO", line("A", 100))).unwrap();
         let view = app.tape(&tape);
-        assert_eq!((view.snaps.len(), view.total_lines), (1, 2));
+        assert_eq!((view.snaps_count, view.total_lines), (1, 2));
         // The next pass lands after the torn line.
         append_tape(&tape, &format!("{}\n{}\n", line("B", 110), line("C", 120))).unwrap();
         let view = app.tape(&tape);
-        let tickers: Vec<&str> = view.snaps.iter().map(|s| s.ticker.as_str()).collect();
+        let tickers: Vec<&str> = view.grouped.keys().map(|s| s.as_str()).collect();
         assert_eq!(tickers, ["A", "B", "C"], "the pass must not be lost inside the torn line");
         assert_eq!(view.total_lines, 4, "the torn fragment is its own counted line");
         std::fs::remove_dir_all(&dir).ok();

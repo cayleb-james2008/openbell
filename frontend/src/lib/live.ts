@@ -105,7 +105,23 @@ export type LiveOrderPayload = {
   count: number;
   price_cents: number;
   post_only?: boolean;
+  dry_run?: boolean;
   client_order_id?: string;
+};
+
+export type LiveOrderPreflightResult = {
+  allowed: boolean;
+  dryRun: boolean;
+  ticker: string;
+  side: "yes" | "no";
+  count: number;
+  priceCents: number;
+  postOnly: boolean;
+  orderNotionalDollars: number;
+  projectedExposureDollars: number;
+  estFeeDollars: number;
+  railViolations: string[];
+  source: "server" | "client";
 };
 
 export type RailCheckItem = {
@@ -538,6 +554,112 @@ export async function disarmLiveTrading(home: Home | null): Promise<LiveStatus> 
   });
   if (!r.ok) throw new Error(await parseErrorMessage(r, `Disarm answered ${r.status}`));
   return normalizeLiveStatus(await r.json(), "server");
+}
+
+export async function preflightLiveOrder(
+  payload: LiveOrderPayload,
+  status: LiveStatus,
+  home: Home | null,
+): Promise<LiveOrderPreflightResult> {
+  const count = Math.max(1, Math.round(payload.count));
+  const priceCents = Math.min(99, Math.max(1, Math.round(payload.price_cents)));
+  const postOnly = Boolean(payload.post_only);
+  const estFeeDollars = kalshiFeeDollars(count, priceCents / 100, postOnly);
+  const fallbackEval = evaluateOrderRails(status, payload.ticker, count, priceCents, payload.action, postOnly);
+
+  if (!supportsV080(home, "live_kalshi") && !supportsV080(home, "risk_rails")) {
+    return {
+      allowed: fallbackEval.allPassed,
+      dryRun: true,
+      ticker: payload.ticker,
+      side: payload.side,
+      count,
+      priceCents,
+      postOnly,
+      orderNotionalDollars: fallbackEval.orderNotionalDollars,
+      projectedExposureDollars: Number((status.openExposureDollars + fallbackEval.orderNotionalDollars).toFixed(2)),
+      estFeeDollars,
+      railViolations: fallbackEval.checks.filter((c) => !c.passed).map((c) => `${c.label}: ${c.detail}`),
+      source: "client",
+    };
+  }
+
+  try {
+    const r = await fetch("/api/live/order", {
+      method: "POST",
+      headers: MUTATION_HEADERS,
+      body: JSON.stringify({
+        ticker: payload.ticker,
+        action: payload.action,
+        side: payload.side,
+        count,
+        price_cents: priceCents,
+        post_only: postOnly,
+        dry_run: true,
+      }),
+    });
+    const body = (await r.json().catch(() => ({}))) as {
+      ok?: boolean;
+      error?: string;
+      rail_violations?: string[];
+      order_notional_dollars?: number;
+      projected_exposure_dollars?: number;
+      risk_check?: {
+        allowed?: boolean;
+        order_notional_dollars?: number;
+        projected_exposure_dollars?: number;
+        rail_violations?: string[];
+      };
+    };
+    const rc = body.risk_check;
+    const notional = isNum(rc?.order_notional_dollars)
+      ? rc.order_notional_dollars
+      : isNum(body.order_notional_dollars)
+        ? body.order_notional_dollars
+        : fallbackEval.orderNotionalDollars;
+    const projected = isNum(rc?.projected_exposure_dollars)
+      ? rc.projected_exposure_dollars
+      : isNum(body.projected_exposure_dollars)
+        ? body.projected_exposure_dollars
+        : Number((status.openExposureDollars + notional).toFixed(2));
+    const violations = Array.isArray(rc?.rail_violations)
+      ? rc.rail_violations
+      : Array.isArray(body.rail_violations)
+        ? body.rail_violations
+        : r.ok
+          ? []
+          : [body.error || `Preflight rejected (${r.status})`];
+
+    return {
+      allowed: r.ok && Boolean(body.ok ?? true) && violations.length === 0,
+      dryRun: true,
+      ticker: payload.ticker,
+      side: payload.side,
+      count,
+      priceCents,
+      postOnly,
+      orderNotionalDollars: notional,
+      projectedExposureDollars: projected,
+      estFeeDollars,
+      railViolations: violations,
+      source: "server",
+    };
+  } catch {
+    return {
+      allowed: fallbackEval.allPassed,
+      dryRun: true,
+      ticker: payload.ticker,
+      side: payload.side,
+      count,
+      priceCents,
+      postOnly,
+      orderNotionalDollars: fallbackEval.orderNotionalDollars,
+      projectedExposureDollars: Number((status.openExposureDollars + fallbackEval.orderNotionalDollars).toFixed(2)),
+      estFeeDollars,
+      railViolations: fallbackEval.checks.filter((c) => !c.passed).map((c) => `${c.label}: ${c.detail}`),
+      source: "client",
+    };
+  }
 }
 
 export async function submitLiveOrder(

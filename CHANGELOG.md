@@ -4,6 +4,15 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.11.0 - 2026-11-25
+
+- **Rolling Walk-Forward Stress Guard & 1-Click Dry-Run Preflight (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/live.ts`):**
+  - Added chronological 3-fold walk-forward stability and `+0c / +1c / +2c` adverse-fill slippage stress (`StressProfile`) to the causal Autonomous Edge Allocator (`require_stress_resilience`, default `true`), automatically quarantining brittle 1-fold flukes and sub-1c noise edges while reporting portfolio `+1c` / `+2c` stress daily projections.
+  - Added 1-click **Preflight** (`POST /api/live/order` with `dry_run: true`) and **Rail Headroom Preview** directly inside `AutoAllocatorPanel`, surfacing server-verified order notional, Kalshi fee, and exposure headroom before staging into the Order Ticket while keeping `live_armed: false` on boot.
+- **Peak RSS (`VmHWM`) Streaming Tape Diet & Chart Render Optimization (`src/main.rs`, `frontend/src/Charts.tsx`, `frontend/vite.config.ts`):**
+  - Replaced full-file tape reads and duplicate flat snapshot buffers in `App::tape` and `existing_settled_keys` with streaming 64 KB `BufReader::read_until`, folding collector health inline and shrinking per-window `Vec<Snapshot>` allocations.
+  - Memoized `AllocatorComparisonChart` geometry/paths with `useMemo` to eliminate hover re-render overhead.
+
 ## 0.10.0 - 2026-11-25
 
 - **Autonomous Edge & Capital Allocator (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**
