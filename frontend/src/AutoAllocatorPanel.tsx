@@ -4,7 +4,7 @@
 // $500/day Go/No-Go verdict, custom zero-bloat SVG equity comparison, and 1-click ticket staging
 // gated behind fail-closed Hard Risk Rails (live_armed: false on boot).
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ChevronDown, RefreshCw, ShieldAlert, ShieldCheck, ShieldOff, SlidersHorizontal, TrendingUp } from "lucide-react";
+import { CheckCircle2, ChevronDown, Download, RefreshCw, ShieldAlert, ShieldCheck, ShieldOff, SlidersHorizontal, TrendingUp } from "lucide-react";
 import { toast } from "sonner";
 import {
   Badge,
@@ -31,6 +31,7 @@ import {
   type AllocatorSizingMode,
   type AutoAllocatorReport,
   type AutoAllocatorRequest,
+  type StrategyPresetCandidate,
   DEFAULT_ALLOCATOR_REQUEST,
   fetchAllocatorReport,
 } from "@/lib/allocator";
@@ -60,6 +61,12 @@ function fmtCents(v: number | null | undefined): string {
 function fmtPct(v: number | null | undefined, digits = 1): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return "0.0%";
   return `${v.toFixed(digits)}%`;
+}
+
+function fmtBreachPct(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(v) || v <= 0) return "0.0%";
+  if (v < 0.05) return "<0.1%";
+  return `${v.toFixed(1)}%`;
 }
 
 export type StagedOrderDraft = {
@@ -201,6 +208,46 @@ export function AutoAllocatorPanel({
     setEnableRegimeThrottle(next);
     void recalculate(executionMode, sizingMode, requireStressResilience, next, false);
   };
+
+  const applySafePreset = useCallback(
+    async (preset: StrategyPresetCandidate) => {
+      setExecutionMode(preset.config.execution_mode);
+      setSizingMode(preset.config.sizing_mode);
+      setRequireStressResilience(preset.config.require_stress_resilience);
+      setEnableRegimeThrottle(preset.config.enable_regime_throttle);
+      setLoading(true);
+      try {
+        const next = await fetchAllocatorReport(dataset, preset.config, { slots, markets });
+        setReport(next);
+        toast.success(
+          `Applied ${preset.label} to synthetic paper forward-test (live_armed stays false): ${next.active_winners.length} winner${next.active_winners.length === 1 ? "" : "s"}, P50 ${money(next.bootstrap_stress.p50_end_equity)}.`,
+        );
+      } finally {
+        setLoading(false);
+      }
+    },
+    [dataset, slots, markets],
+  );
+
+  const exportAuditJson = useCallback(() => {
+    if (!report) return;
+    const payload = {
+      exported_at: new Date().toISOString(),
+      dataset,
+      live_armed_preserved: false,
+      report,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `openbell-allocator-audit-${dataset}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    toast.success(`Exported allocator audit JSON for ${dataset}.`);
+  }, [dataset, report]);
 
   const q = search.trim().toLowerCase();
 
@@ -527,6 +574,17 @@ export function AutoAllocatorPanel({
               <span>Full Quant Audit</span>
             </Button>
           )}
+          {report && (
+            <Button
+              id="allocator-export-audit-btn"
+              variant="outline"
+              size="sm"
+              onClick={exportAuditJson}
+            >
+              <Download className="size-3.5" aria-hidden />
+              <span>Export Audit JSON</span>
+            </Button>
+          )}
           <Button
             id="allocator-recalculate-btn"
             variant="default"
@@ -828,8 +886,8 @@ export function AutoAllocatorPanel({
                     : "text-destructive-foreground")
                 }
               >
-                {fmtPct(report.bootstrap_stress.daily_rail_breach_prob_pct, 1)}{" "}
-                <span className="text-ink-2">({fmtPct(report.bootstrap_stress.stress_1c_daily_rail_breach_prob_pct, 1)} @ +1c)</span>
+                {fmtBreachPct(report.bootstrap_stress.daily_rail_breach_prob_pct)}{" "}
+                <span className="text-ink-2">({fmtBreachPct(report.bootstrap_stress.stress_1c_daily_rail_breach_prob_pct)} @ +1c)</span>
               </div>
             </div>
             <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
@@ -845,6 +903,127 @@ export function AutoAllocatorPanel({
             trajectory={report.bootstrap_stress.trajectory}
             startingBankroll={report.starting_bankroll}
           />
+        </div>
+      )}
+
+      {/* Zero-Config Strategy Preset Leaderboard & 1-Click Safe Paper Forward-Test */}
+      {report && report.preset_leaderboard.length > 0 && (
+        <div
+          id="allocator-preset-leaderboard"
+          className="mt-3.5 space-y-2.5 rounded-[10px] border border-hairline bg-board/50 p-3.5"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-semibold text-ink">
+                Zero-Config Strategy Leaderboard
+              </span>
+              {report.top_safe_preset ? (
+                <StatusPill id="allocator-top-safe-pill" tone="success">
+                  Top Safe: {report.preset_leaderboard.find((p) => p.is_top_safe)?.label ?? report.top_safe_preset}
+                </StatusPill>
+              ) : (
+                <StatusPill id="allocator-top-safe-pill" tone="warning">
+                  0 Presets Clear 0% Rail-Breach Gate
+                </StatusPill>
+              )}
+              <Badge variant="outline" className="mono text-xs text-ink-2">
+                Hard Gate: 0.0% Rail Breach (OOS &amp; +1c) · live_armed=false
+              </Badge>
+            </div>
+            <div className="flex items-center gap-2">
+              {report.preset_leaderboard.find((p) => p.is_top_safe) && (
+                <Button
+                  id="allocator-apply-top-safe-btn"
+                  variant="default"
+                  size="sm"
+                  disabled={loading}
+                  onClick={() => {
+                    const top = report.preset_leaderboard.find((p) => p.is_top_safe);
+                    if (top) void applySafePreset(top);
+                  }}
+                >
+                  <CheckCircle2 className="size-3.5" aria-hidden />
+                  <span>Apply Top Safe -&gt; Paper Forward-Test</span>
+                </Button>
+              )}
+              <Button
+                id="allocator-leaderboard-export-btn"
+                variant="outline"
+                size="sm"
+                onClick={exportAuditJson}
+              >
+                <Download className="size-3.5" aria-hidden />
+                <span>Audit JSON</span>
+              </Button>
+            </div>
+          </div>
+
+          <div className="overflow-x-auto rounded-lg border border-hairline bg-surface">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Preset</TableHead>
+                  <TableHead className="text-right">Winners / EV</TableHead>
+                  <TableHead className="text-right">30d P50 (+1c)</TableHead>
+                  <TableHead className="text-right">P95 DD (+1c)</TableHead>
+                  <TableHead className="text-right">Rail Breach</TableHead>
+                  <TableHead className="text-right">Score</TableHead>
+                  <TableHead className="text-right">Paper Test</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {report.preset_leaderboard.map((preset) => (
+                  <TableRow key={preset.id} className={preset.is_top_safe ? "bg-board/40" : ""}>
+                    <TableCell>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-semibold text-ink">{preset.label}</span>
+                        {preset.is_top_safe && (
+                          <StatusPill tone="success">TOP SAFE</StatusPill>
+                        )}
+                      </div>
+                      <div className="text-xs text-ink-3">{preset.subtitle}</div>
+                    </TableCell>
+                    <TableCell className="mono text-right">
+                      {preset.active_winners_count}w / {fmtCents(preset.net_expectancy_cents)}
+                    </TableCell>
+                    <TableCell className="mono text-right text-info-foreground">
+                      {money(preset.bootstrap_p50_equity)}{" "}
+                      <span className="text-ink-3">({money(preset.stress_1c_p50_equity)})</span>
+                    </TableCell>
+                    <TableCell className="mono text-right text-warning-foreground">
+                      {fmtPct(preset.bootstrap_p95_max_dd_pct, 1)}{" "}
+                      <span className="text-ink-3">({fmtPct(preset.stress_1c_p95_max_dd_pct, 1)})</span>
+                    </TableCell>
+                    <TableCell className="mono text-right">
+                      <span
+                        className={
+                          preset.safe_gate_passed
+                            ? "font-semibold text-success-foreground"
+                            : "font-semibold text-destructive-foreground"
+                        }
+                      >
+                        {fmtBreachPct(preset.daily_rail_breach_prob_pct)} / {fmtBreachPct(preset.stress_1c_daily_rail_breach_prob_pct)}
+                      </span>
+                    </TableCell>
+                    <TableCell className="mono text-right text-ink">
+                      {preset.risk_adjusted_score.toFixed(1)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <Button
+                        id={`allocator-apply-preset-${preset.id}`}
+                        variant={preset.is_top_safe ? "default" : "outline"}
+                        size="sm"
+                        disabled={loading}
+                        onClick={() => void applySafePreset(preset)}
+                      >
+                        <span>Apply Paper</span>
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
         </div>
       )}
 

@@ -322,7 +322,7 @@ fn scan_window_with_vm(
     let mut found: Option<(f64, i64)> = None;
 
     for snap in snaps {
-        let (Some(ya), Some(na)) = (snap.yes_ask, snap.no_ask) else {
+        let (Some(ya), Some(na)) = (snap.yes_ask.get(), snap.no_ask.get()) else {
             continue;
         };
         let price = if is_yes { ya } else { na };
@@ -1339,7 +1339,7 @@ pub fn tournament_from_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{iso_z, load_strategies};
+    use crate::{iso_z, load_strategies, OptPrice};
     use std::path::Path;
 
     fn snap_json(
@@ -1743,11 +1743,11 @@ mod tests {
                 s.event_ticker = ticker.as_str().into();
                 s.series = series.into();
                 s.close_time = close_iso.as_str().into();
-                s.yes_bid = Some((100 - (102 - base_c)) as f64 / 100.0);
-                s.yes_ask = Some(ya);
-                s.no_bid = Some((100 - base_c) as f64 / 100.0);
-                s.no_ask = Some(na);
-                s.last_price = Some(ya);
+                s.yes_bid = OptPrice::from_opt(Some((100 - (102 - base_c)) as f64 / 100.0));
+                s.yes_ask = OptPrice::from_opt(Some(ya));
+                s.no_bid = OptPrice::from_opt(Some((100 - base_c) as f64 / 100.0));
+                s.no_ask = OptPrice::from_opt(Some(na));
+                s.last_price = OptPrice::from_opt(Some(ya));
                 snaps.push(s);
             }
             let mut st = settled_tpl.clone();

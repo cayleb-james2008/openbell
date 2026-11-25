@@ -100,6 +100,27 @@ export type BootstrapStressSummary = {
   summary: string;
 };
 
+export type StrategyPresetCandidate = {
+  id: string;
+  label: string;
+  subtitle: string;
+  config: AutoAllocatorRequest;
+  active_winners_count: number;
+  net_expectancy_cents: number | null;
+  oos_net_pnl_dollars: number;
+  oos_max_dd_pct: number;
+  bootstrap_p50_equity: number;
+  bootstrap_p95_max_dd_pct: number;
+  stress_1c_p50_equity: number;
+  stress_1c_p95_max_dd_pct: number;
+  daily_rail_breach_prob_pct: number;
+  stress_1c_daily_rail_breach_prob_pct: number;
+  risk_adjusted_score: number;
+  safe_gate_passed: boolean;
+  is_top_safe: boolean;
+  note: string;
+};
+
 export type RegimeEdgeBucket = {
   regime: string;
   trades: number;
@@ -221,6 +242,8 @@ export type AutoAllocatorReport = {
   edge_screener: EdgeScreenerRow[];
   best_basket: BestBasketPlan;
   bootstrap_stress: BootstrapStressSummary;
+  preset_leaderboard: StrategyPresetCandidate[];
+  top_safe_preset: string | null;
   comparison: AllocatorComparison;
   planned_intents: PlannedAllocatorIntent[];
   daily_target: DailyTargetVerdict;
@@ -276,6 +299,7 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
   const basketLegsRaw = Array.isArray(basketRaw.legs) ? basketRaw.legs : [];
   const bsRaw = (o.bootstrap_stress && typeof o.bootstrap_stress === "object" ? o.bootstrap_stress : {}) as Record<string, unknown>;
   const bsTrajRaw = Array.isArray(bsRaw.trajectory) ? bsRaw.trajectory : [];
+  const presetRaw = Array.isArray(o.preset_leaderboard) ? o.preset_leaderboard : [];
   const intentsRaw = Array.isArray(o.planned_intents) ? o.planned_intents : [];
   const notesRaw = Array.isArray(o.honesty_notes) ? o.honesty_notes : [];
   const compRaw = (o.comparison && typeof o.comparison === "object" ? o.comparison : {}) as Record<string, unknown>;
@@ -453,6 +477,44 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
         })),
       summary: strOr(bsRaw.summary, "Awaiting OOS causal bootstrap stress simulation."),
     },
+    preset_leaderboard: presetRaw
+      .filter((p): p is Record<string, unknown> => !!p && typeof p === "object")
+      .map((p) => {
+        const cfgRaw = (p.config && typeof p.config === "object" ? p.config : {}) as Record<string, unknown>;
+        return {
+          id: strOr(p.id, "preset"),
+          label: strOr(p.label, "Preset"),
+          subtitle: strOr(p.subtitle, ""),
+          config: {
+            sizing_mode: (strOr(cfgRaw.sizing_mode, "quarter_kelly") as AllocatorSizingMode),
+            execution_mode: (strOr(cfgRaw.execution_mode, "maker") as AllocatorExecutionMode),
+            maker_fill_rate: finiteOr(cfgRaw.maker_fill_rate, 0.75),
+            min_oos_trades: Math.max(1, Math.round(finiteOr(cfgRaw.min_oos_trades, 30))),
+            max_slot_risk_pct: finiteOr(cfgRaw.max_slot_risk_pct, 15),
+            max_total_heat_pct: finiteOr(cfgRaw.max_total_heat_pct, 60),
+            slippage_cents: finiteOr(cfgRaw.slippage_cents, 0.5),
+            starting_bankroll: finiteOr(cfgRaw.starting_bankroll, startEq),
+            require_stress_resilience: typeof cfgRaw.require_stress_resilience === "boolean" ? cfgRaw.require_stress_resilience : true,
+            enable_regime_throttle: typeof cfgRaw.enable_regime_throttle === "boolean" ? cfgRaw.enable_regime_throttle : true,
+            min_fill_rate_pct: finiteOr(cfgRaw.min_fill_rate_pct, 50),
+          },
+          active_winners_count: Math.max(0, Math.round(finiteOr(p.active_winners_count, 0))),
+          net_expectancy_cents: finiteOpt(p.net_expectancy_cents),
+          oos_net_pnl_dollars: finiteOr(p.oos_net_pnl_dollars, 0),
+          oos_max_dd_pct: finiteOr(p.oos_max_dd_pct, 0),
+          bootstrap_p50_equity: finiteOr(p.bootstrap_p50_equity, startEq),
+          bootstrap_p95_max_dd_pct: finiteOr(p.bootstrap_p95_max_dd_pct, 0),
+          stress_1c_p50_equity: finiteOr(p.stress_1c_p50_equity, startEq),
+          stress_1c_p95_max_dd_pct: finiteOr(p.stress_1c_p95_max_dd_pct, 0),
+          daily_rail_breach_prob_pct: finiteOr(p.daily_rail_breach_prob_pct, 0),
+          stress_1c_daily_rail_breach_prob_pct: finiteOr(p.stress_1c_daily_rail_breach_prob_pct, 0),
+          risk_adjusted_score: finiteOr(p.risk_adjusted_score, 0),
+          safe_gate_passed: Boolean(p.safe_gate_passed),
+          is_top_safe: Boolean(p.is_top_safe),
+          note: strOr(p.note, ""),
+        };
+      }),
+    top_safe_preset: typeof o.top_safe_preset === "string" && o.top_safe_preset.trim().length > 0 ? o.top_safe_preset : null,
     comparison: {
       selection_basis: strOr(compRaw.selection_basis, "causal_is_to_oos"),
       legacy_equal_taker_end_equity: finiteOr(compRaw.legacy_equal_taker_end_equity, startEq),
@@ -568,6 +630,8 @@ export function computeClientFallbackReport(
         trajectory: [],
         summary: "Awaiting OOS trades for 1,000-trial causal bootstrap simulation.",
       },
+      preset_leaderboard: [],
+      top_safe_preset: null,
       comparison: {
         selection_basis: "causal_is_to_oos",
         legacy_equal_taker_end_equity: startEq,
@@ -865,6 +929,8 @@ export function computeClientFallbackReport(
       trajectory: [],
       summary: "Client fallback preview; run server pipeline for 1,000-trial bootstrap simulation.",
     },
+    preset_leaderboard: [],
+    top_safe_preset: null,
     comparison: {
       selection_basis: isTrades.length > 0 ? "causal_is_to_oos" : "oos_only_no_is_history",
       legacy_equal_taker_end_equity: Number(legacyEq.toFixed(2)),

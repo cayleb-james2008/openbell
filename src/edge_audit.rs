@@ -498,11 +498,11 @@ mod tests {
                 "settled".into()
             },
             result: result.into(),
-            yes_bid: ya.map(|p| (p - 0.02).max(0.01)),
-            yes_ask: ya,
-            no_bid: na.map(|p| (p - 0.02).max(0.01)),
-            no_ask: na,
-            last_price: ya,
+            yes_bid: crate::OptPrice::from_opt(ya.map(|p| (p - 0.02).max(0.01))),
+            yes_ask: crate::OptPrice::from_opt(ya),
+            no_bid: crate::OptPrice::from_opt(na.map(|p| (p - 0.02).max(0.01))),
+            no_ask: crate::OptPrice::from_opt(na),
+            last_price: crate::OptPrice::from_opt(ya),
             yes_bid_size: 150.0,
             no_bid_size: 150.0,
         }

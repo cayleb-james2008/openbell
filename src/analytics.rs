@@ -300,7 +300,7 @@ pub fn compute_calibration(observations: &[CalibrationObservation]) -> Calibrati
 fn representative_window_yes_prob(snaps: &[Snapshot], close_epoch: i64) -> Option<f64> {
     let mut best: Option<(i64, f64)> = None;
     for s in snaps {
-        let (Some(ya), Some(na)) = (s.yes_ask, s.no_ask) else {
+        let (Some(ya), Some(na)) = (s.yes_ask.get(), s.no_ask.get()) else {
             continue;
         };
         if !(0.01..=0.99).contains(&ya) || !(0.01..=0.99).contains(&na) {
@@ -311,7 +311,7 @@ fn representative_window_yes_prob(snaps: &[Snapshot], close_epoch: i64) -> Optio
             continue;
         }
         // Synthetic Kalshi YES mid: avg(yes_ask, yes_bid) where yes_bid = 1 - no_ask
-        let yes_bid = s.yes_bid.filter(|b| (0.0..=1.0).contains(b)).unwrap_or(1.0 - na);
+        let yes_bid = s.yes_bid.get().filter(|b| (0.0..=1.0).contains(b)).unwrap_or(1.0 - na);
         let mid = ((ya + yes_bid) * 0.5).clamp(0.01, 0.99);
         let dist = (secs - 240).abs();
         match best {
@@ -1786,7 +1786,7 @@ impl CompiledSandboxStrategy {
         let mut entry = None;
 
         for snap in snaps {
-            let (Some(ya), Some(na)) = (snap.yes_ask, snap.no_ask) else {
+            let (Some(ya), Some(na)) = (snap.yes_ask.get(), snap.no_ask.get()) else {
                 continue;
             };
             let price = if is_yes { ya } else { na };
@@ -2237,11 +2237,11 @@ mod tests {
                 "settled".into()
             },
             result: result.into(),
-            yes_bid: no_ask.map(|na| ((1.0 - na) * 100.0).round() / 100.0),
-            yes_ask,
-            no_bid: yes_ask.map(|ya| ((1.0 - ya) * 100.0).round() / 100.0),
-            no_ask,
-            last_price: yes_ask,
+            yes_bid: crate::OptPrice::from_opt(no_ask.map(|na| ((1.0 - na) * 100.0).round() / 100.0)),
+            yes_ask: crate::OptPrice::from_opt(yes_ask),
+            no_bid: crate::OptPrice::from_opt(yes_ask.map(|ya| ((1.0 - ya) * 100.0).round() / 100.0)),
+            no_ask: crate::OptPrice::from_opt(no_ask),
+            last_price: crate::OptPrice::from_opt(yes_ask),
             yes_bid_size: 0.0,
             no_bid_size: 0.0,
         }

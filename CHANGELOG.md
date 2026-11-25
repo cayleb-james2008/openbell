@@ -4,6 +4,16 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.16.0 - 2026-11-25
+
+- **Zero-Config Strategy Leaderboard, 1-Click Safe Paper Preset & Audit JSON Export (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**
+  - Added deterministic `StrategyPresetCandidate` leaderboard (`compute_preset_leaderboard`) evaluating 5 calibrated maker/taker + Kelly/equal-weight + edge-floor presets across OOS and `+1c` adverse-fill bootstrap trials (`500` trials per preset) with a hard `daily_rail_breach_prob == 0.0%` gate and net-of-fee risk-adjusted scoring (`top_safe_preset`).
+  - Added the **Zero-Config Strategy Leaderboard** panel in `AutoAllocatorPanel` with 1-click **Apply -> Paper Forward-Test** (strictly keeping `live_armed: false`) and 1-click **Export Audit JSON** download.
+- **Sub-8.0 MB Binary & Sub-36 MB Core RSS Allocation Diet (`Cargo.toml`, `src/main.rs`, `src/analytics.rs`, `src/recalibration.rs`, `src/tournament.rs`):**
+  - Compacted `Snapshot` prices (`OptPrice(u32)` exact-cent/f32 encoding) and top-of-book depths (`f32`), shared a single `rune::Context`/`RuntimeContext` across all 16 strategies, replaced `serde_json::to_value` intermediates in `desk_json_shared` with direct typed serialization, tuned GNU/Linux `mallopt` + `malloc_trim(0)` after heavy tape/analytics passes, and enabled dependency size optimization (`opt-level = "z"` on third-party crates while keeping `openbell-rs`, `serde`, and `serde_json` at `opt-level = 3`), cutting release binary size below `6.5 MB` and core 102k-tick `VmHWM` below `35 MB`.
+- **`#154` Zero-GPU E2E Isolation (`frontend/e2e/fixture.mjs`, `frontend/e2e/lints.sh`):**
+  - Added software-rendering Chromium flags (`--disable-gpu`, `--disable-gpu-compositing`, `--disable-gpu-sandbox`, `--disable-accelerated-2d-canvas`, `--disable-accelerated-video-decode`, `--num-raster-threads=1`) and `LIBGL_ALWAYS_SOFTWARE=1 VK_ICD_FILENAMES=/dev/null`.
+
 ## 0.15.0 - 2026-11-25
 
 - **Causal Bootstrap Monte-Carlo Equity & Drawdown Stress Simulator (`src/auto_allocator.rs`, `frontend/src/Charts.tsx`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**
