@@ -1,7 +1,7 @@
 // Institutional paper quant SVG charts: compounding equity + drawdown underwater subplot,
 // interactive market price + spread history with crosshair tooltip, calibration reliability
 // with 95% Wilson error bars, 1,000-path Monte Carlo percentile fan, and Tremor sparklines.
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { motion, useReducedMotion } from "motion/react";
 import { StatusPill } from "@/components/ui";
 import {
@@ -2032,7 +2032,40 @@ export function AllocatorComparisonChart({
   const [boxRef, cw] = useContainerWidth(180, 640);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
-  if (points.length < 2) {
+  const W = Math.max(180, Math.round(cw));
+  const H = 220;
+  const pad = { l: 56, r: 16, t: 16, b: 28 };
+  const iw = W - pad.l - pad.r;
+  const ih = H - pad.t - pad.b;
+
+  const geom = useMemo(() => {
+    if (points.length < 2) return null;
+    let rawMin = startingBankroll;
+    let rawMax = startingBankroll;
+    for (const pt of points) {
+      if (pt.legacy_equity < rawMin) rawMin = pt.legacy_equity;
+      if (pt.allocator_equity < rawMin) rawMin = pt.allocator_equity;
+      if (pt.legacy_equity > rawMax) rawMax = pt.legacy_equity;
+      if (pt.allocator_equity > rawMax) rawMax = pt.allocator_equity;
+    }
+    const span = Math.max(2, rawMax - rawMin);
+    const minY = rawMin - span * 0.08;
+    const maxY = rawMax + span * 0.08;
+    const ySpan = Math.max(1e-6, maxY - minY);
+    const xAt = (idx: number) => pad.l + (idx / Math.max(1, points.length - 1)) * iw;
+    const yAt = (v: number) => pad.t + ih - ((v - minY) / ySpan) * ih;
+    const allocPath = points
+      .map((pt, i) => `${i === 0 ? "M" : "L"}${xAt(i).toFixed(1)},${yAt(pt.allocator_equity).toFixed(1)}`)
+      .join(" ");
+    const legacyPath = points
+      .map((pt, i) => `${i === 0 ? "M" : "L"}${xAt(i).toFixed(1)},${yAt(pt.legacy_equity).toFixed(1)}`)
+      .join(" ");
+    const yTicks = [minY, (minY + maxY) / 2, maxY];
+    const baseY = yAt(startingBankroll);
+    return { minY, ySpan, allocPath, legacyPath, yTicks, baseY };
+  }, [points, startingBankroll, iw, ih]);
+
+  if (!geom || points.length < 2) {
     return (
       <div ref={boxRef} className="w-full min-w-0">
         <div className="flex h-44 items-center justify-center rounded-md border border-dashed border-hairline bg-surface/60 px-4 text-center text-xs text-ink-2">
@@ -2042,35 +2075,9 @@ export function AllocatorComparisonChart({
     );
   }
 
-  const W = Math.max(180, Math.round(cw));
-  const H = 220;
-  const pad = { l: 56, r: 16, t: 16, b: 28 };
-  const iw = W - pad.l - pad.r;
-  const ih = H - pad.t - pad.b;
-
-  const vals: number[] = [startingBankroll];
-  for (const pt of points) {
-    vals.push(pt.legacy_equity, pt.allocator_equity);
-  }
-  const rawMin = Math.min(...vals);
-  const rawMax = Math.max(...vals);
-  const span = Math.max(2, rawMax - rawMin);
-  const minY = rawMin - span * 0.08;
-  const maxY = rawMax + span * 0.08;
-  const ySpan = Math.max(1e-6, maxY - minY);
-
   const xAt = (idx: number) => pad.l + (idx / Math.max(1, points.length - 1)) * iw;
-  const yAt = (v: number) => pad.t + ih - ((v - minY) / ySpan) * ih;
-
-  const allocPath = points
-    .map((pt, i) => `${i === 0 ? "M" : "L"}${xAt(i).toFixed(1)},${yAt(pt.allocator_equity).toFixed(1)}`)
-    .join(" ");
-  const legacyPath = points
-    .map((pt, i) => `${i === 0 ? "M" : "L"}${xAt(i).toFixed(1)},${yAt(pt.legacy_equity).toFixed(1)}`)
-    .join(" ");
-
-  const yTicks = [minY, (minY + maxY) / 2, maxY];
-  const baseY = yAt(startingBankroll);
+  const yAt = (v: number) => pad.t + ih - ((v - geom.minY) / geom.ySpan) * ih;
+  const { allocPath, legacyPath, yTicks, baseY } = geom;
   const ai = hoverIdx !== null && hoverIdx >= 0 && hoverIdx < points.length ? hoverIdx : points.length - 1;
   const activePt = points[ai];
 

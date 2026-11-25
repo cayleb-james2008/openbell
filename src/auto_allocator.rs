@@ -104,6 +104,9 @@ fn default_slippage_cents() -> f64 {
 fn default_starting_bankroll() -> f64 {
     100.0
 }
+fn default_require_stress_resilience() -> bool {
+    true
+}
 
 /// Request parameters for `GET /api/allocator` and `POST /api/allocator/plan`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +127,8 @@ pub struct AutoAllocatorRequest {
     pub slippage_cents: f64,
     #[serde(default = "default_starting_bankroll")]
     pub starting_bankroll: f64,
+    #[serde(default = "default_require_stress_resilience")]
+    pub require_stress_resilience: bool,
 }
 
 impl Default for AutoAllocatorRequest {
@@ -137,6 +142,7 @@ impl Default for AutoAllocatorRequest {
             max_total_heat_pct: default_max_total_heat_pct(),
             slippage_cents: default_slippage_cents(),
             starting_bankroll: default_starting_bankroll(),
+            require_stress_resilience: default_require_stress_resilience(),
         }
     }
 }
@@ -171,11 +177,24 @@ impl AutoAllocatorRequest {
                 .clamp(0.0, 5.0),
             starting_bankroll: finite_or(self.starting_bankroll, default_starting_bankroll())
                 .clamp(10.0, 10_000_000.0),
+            require_stress_resilience: self.require_stress_resilience,
         }
     }
 }
 
-/// One strategy passing OOS depth, positive-EV, and correlation gates.
+/// Chronological walk-forward fold consistency and `+0c/+1c/+2c` adverse-fill stress profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StressProfile {
+    pub extra_slippage_0c_cents: f64,
+    pub extra_slippage_1c_cents: f64,
+    pub extra_slippage_2c_cents: f64,
+    pub folds_positive: usize,
+    pub folds_total: usize,
+    pub worst_fold_expectancy_cents: Option<f64>,
+    pub stress_resilient: bool,
+}
+
+/// One strategy passing OOS depth, positive-EV, stress, and correlation gates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllocatedWinner {
     pub strategy: String,
@@ -194,6 +213,7 @@ pub struct AllocatedWinner {
     pub rail_clamped_contracts: u32,
     pub max_abs_corr: Option<f64>,
     pub status: String,
+    pub stress: StressProfile,
 }
 
 /// One strategy assigned `0%` weight due to insufficient OOS depth, negative EV, or correlation conflict.
@@ -250,6 +270,8 @@ pub struct DailyTargetVerdict {
     pub target_daily_profit_dollars: f64,
     pub verdict: String,
     pub projected_daily_net_dollars: f64,
+    pub projected_daily_stress_1c_dollars: f64,
+    pub projected_daily_stress_2c_dollars: f64,
     pub required_bankroll_dollars: Option<f64>,
     pub portfolio_net_expectancy_cents: Option<f64>,
     pub blockers: Vec<String>,
@@ -265,6 +287,7 @@ pub struct AutoAllocatorReport {
     pub max_slot_risk_pct: f64,
     pub max_total_heat_pct: f64,
     pub starting_bankroll: f64,
+    pub require_stress_resilience: bool,
     pub windows_settled_total: usize,
     pub windows_settled_oos: usize,
     pub live_armed: bool,
@@ -318,6 +341,7 @@ struct SplitCandidate {
     maker_fee_cents: f64,
     net_expectancy_cents: f64,
     full_kelly_pct: f64,
+    stress: StressProfile,
     returns_by_win: HashMap<(i64, String), f64>,
 }
 
@@ -384,6 +408,7 @@ fn evaluate_split_candidates(
         let mut maker_fee_sum = 0.0f64;
         let mut pnl_1ct_sum = 0.0f64;
         let mut returns_by_win: HashMap<(i64, String), f64> = HashMap::with_capacity(n);
+        let mut ordered_pnls: Vec<(i64, &str, f64)> = Vec::with_capacity(n);
 
         for e in list {
             let p = e.entry_price.clamp(0.01, 0.99);
@@ -403,6 +428,7 @@ fn evaluate_split_candidates(
             maker_fee_sum += mf;
             pnl_1ct_sum += net_pnl;
             returns_by_win.insert((e.close_epoch, e.ticker.clone()), finite_or(ret, 0.0));
+            ordered_pnls.push((e.close_epoch, e.ticker.as_str(), net_pnl * 100.0));
         }
 
         let n_f = n as f64;
@@ -412,6 +438,44 @@ fn evaluate_split_candidates(
         let maker_fee_cents = finite_or((maker_fee_sum / n_f) * 100.0, 0.0);
         let exp_cents = finite_or((pnl_1ct_sum / n_f) * 100.0, 0.0);
         expectancy_by_idx.insert(si, exp_cents);
+
+        // Compute rolling chronological walk-forward folds (up to 3 folds) and +0c/+1c/+2c adverse-fill stress.
+        ordered_pnls.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        let folds_total = if n >= 6 {
+            3
+        } else if n >= 4 {
+            2
+        } else {
+            1
+        };
+        let mut folds_positive = 0usize;
+        let mut worst_fold: Option<f64> = None;
+        for f_idx in 0..folds_total {
+            let start = f_idx * n / folds_total;
+            let end = (f_idx + 1) * n / folds_total;
+            if end > start {
+                let sum: f64 = ordered_pnls[start..end].iter().map(|x| x.2).sum();
+                let fold_ev = finite_or(sum / ((end - start) as f64), 0.0);
+                if fold_ev > 0.0 {
+                    folds_positive += 1;
+                }
+                worst_fold = Some(worst_fold.map_or(fold_ev, |m| m.min(fold_ev)));
+            }
+        }
+        let extra_slippage_0c_cents = exp_cents;
+        let extra_slippage_1c_cents = finite_or(exp_cents - 1.0, -1.0);
+        let extra_slippage_2c_cents = finite_or(exp_cents - 2.0, -2.0);
+        let majority_folds_ok = folds_total < 2 || folds_positive >= folds_total.div_ceil(2);
+        let stress_resilient = extra_slippage_1c_cents > 0.0 && majority_folds_ok;
+        let stress = StressProfile {
+            extra_slippage_0c_cents,
+            extra_slippage_1c_cents,
+            extra_slippage_2c_cents,
+            folds_positive,
+            folds_total,
+            worst_fold_expectancy_cents: worst_fold.and_then(finite_opt),
+            stress_resilient,
+        };
 
         if n < min_trades {
             quarantined.push(QuarantinedStrategy {
@@ -431,6 +495,27 @@ fn evaluate_split_candidates(
                 oos_trades: n,
                 oos_net_expectancy_cents: finite_opt(exp_cents),
                 reason: format!("negative OOS expectancy ({exp_cents:+.2}c/ct)"),
+            });
+            continue;
+        }
+
+        if req.require_stress_resilience && !stress.stress_resilient {
+            let reason = if extra_slippage_1c_cents <= 0.0 {
+                format!(
+                    "fails +1c adverse-fill stress ({extra_slippage_1c_cents:+.2}c/ct at +1c; baseline {exp_cents:+.2}c/ct)"
+                )
+            } else {
+                format!(
+                    "fragile walk-forward stability ({folds_positive}/{folds_total} positive OOS folds; worst fold {:+.2}c/ct)",
+                    worst_fold.unwrap_or(0.0)
+                )
+            };
+            quarantined.push(QuarantinedStrategy {
+                strategy: meta.name.clone(),
+                side: meta.side.clone(),
+                oos_trades: n,
+                oos_net_expectancy_cents: finite_opt(exp_cents),
+                reason,
             });
             continue;
         }
@@ -461,6 +546,7 @@ fn evaluate_split_candidates(
             maker_fee_cents,
             net_expectancy_cents: exp_cents,
             full_kelly_pct,
+            stress,
             returns_by_win,
         });
     }
@@ -707,6 +793,7 @@ pub fn compute_auto_allocator_report(
             rail_clamped_contracts,
             max_abs_corr: oos_sel.max_corrs[i],
             status: "ACTIVE_WINNER".to_string(),
+            stress: cand.stress.clone(),
         });
 
         planned_intents.push(PlannedAllocatorIntent {
@@ -790,6 +877,18 @@ pub fn compute_auto_allocator_report(
         );
     }
 
+    if req.require_stress_resilience {
+        honesty_notes.push(
+            "Walk-Forward Stress Guard active: every winner must hold positive expectancy across >=2/3 chronological OOS folds AND survive +1c adverse-fill slippage."
+                .to_string(),
+        );
+    } else {
+        honesty_notes.push(
+            "Walk-Forward Stress Guard disabled: brittle or sub-1c edge winners may appear; verify +1c/+2c stress sensitivity before scaling."
+                .to_string(),
+        );
+    }
+
     AutoAllocatorReport {
         execution_mode: req.execution_mode,
         sizing_mode: req.sizing_mode,
@@ -798,6 +897,7 @@ pub fn compute_auto_allocator_report(
         max_slot_risk_pct: req.max_slot_risk_pct,
         max_total_heat_pct: req.max_total_heat_pct,
         starting_bankroll: req.starting_bankroll,
+        require_stress_resilience: req.require_stress_resilience,
         windows_settled_total: ctx.windows_settled_total,
         windows_settled_oos: ctx.windows_settled_oos,
         live_armed,
@@ -879,6 +979,36 @@ fn compute_daily_target_verdict(
         0.0,
     );
 
+    let expected_stress_1c_per_dollar: f64 = winners
+        .iter()
+        .map(|w| {
+            let fire_rate = (w.oos_trades as f64 / oos_windows).min(1.0);
+            let alloc_frac = w.allocated_pct / 100.0;
+            let p = w.oos_avg_entry_price.clamp(0.01, 0.99);
+            let ev_dollars_per_ct = w.stress.extra_slippage_1c_cents / 100.0;
+            (alloc_frac / p) * ev_dollars_per_ct * fire_rate * fill_mult
+        })
+        .sum();
+    let projected_daily_stress_1c_dollars = finite_or(
+        req.starting_bankroll * expected_stress_1c_per_dollar * WINDOWS_PER_DAY_15M,
+        0.0,
+    );
+
+    let expected_stress_2c_per_dollar: f64 = winners
+        .iter()
+        .map(|w| {
+            let fire_rate = (w.oos_trades as f64 / oos_windows).min(1.0);
+            let alloc_frac = w.allocated_pct / 100.0;
+            let p = w.oos_avg_entry_price.clamp(0.01, 0.99);
+            let ev_dollars_per_ct = w.stress.extra_slippage_2c_cents / 100.0;
+            (alloc_frac / p) * ev_dollars_per_ct * fire_rate * fill_mult
+        })
+        .sum();
+    let projected_daily_stress_2c_dollars = finite_or(
+        req.starting_bankroll * expected_stress_2c_per_dollar * WINDOWS_PER_DAY_15M,
+        0.0,
+    );
+
     let required_bankroll_dollars = if expected_dollars_per_window_per_dollar_bankroll > 1e-9 {
         let req_bk = TARGET_DAILY_PROFIT_DOLLARS
             / (expected_dollars_per_window_per_dollar_bankroll * WINDOWS_PER_DAY_15M);
@@ -910,6 +1040,8 @@ fn compute_daily_target_verdict(
         target_daily_profit_dollars: TARGET_DAILY_PROFIT_DOLLARS,
         verdict,
         projected_daily_net_dollars,
+        projected_daily_stress_1c_dollars,
+        projected_daily_stress_2c_dollars,
         required_bankroll_dollars,
         portfolio_net_expectancy_cents: weighted_ev_cents,
         blockers,
@@ -1292,6 +1424,7 @@ mod tests {
             max_total_heat_pct: 20.0,
             slippage_cents: 0.5,
             starting_bankroll: 1_000.0,
+            require_stress_resilience: true,
         };
         let qk = compute_auto_allocator_report(&ctx, &qk_req, &rails, false, false);
         assert_eq!(qk.active_winners.len(), 2, "win-corr must be pruned for |r|>0.65");
@@ -1331,5 +1464,111 @@ mod tests {
         );
         assert_eq!(qk.comparison.equity_curve.len(), 20);
         assert!(qk.comparison.fee_savings_dollars > 0.0);
+    }
+
+    #[test]
+    fn walk_forward_stress_guard_quarantines_brittle_and_razor_thin_edges() {
+        let strats = vec![
+            StrategyMeta { name: "steady-edge".into(), side: "yes".into() },
+            StrategyMeta { name: "brittle-one-fold".into(), side: "yes".into() },
+            StrategyMeta { name: "razor-thin".into(), side: "yes".into() },
+        ];
+        // 30 OOS windows (epochs 1000..).
+        // 0) steady-edge: wins 80% uniformly at 55c -> EV ~ +24.6c, 3/3 folds positive.
+        // 1) brittle-one-fold: loses all first 20 trades at 60c, wins all last 10 at 10c ->
+        //    mean EV = (20*(-0.60) + 10*(0.90))/30 - fee ≈ -10c? Let's make it win overall:
+        //    entry 0.30, first 20 windows lose 13 / win 7 (-6c in fold 1&2? Let's be explicit!):
+        //    fold 0 (0..10): 2 wins / 10 @ 0.40 -> -20c/ct
+        //    fold 1 (10..20): 2 wins / 10 @ 0.40 -> -20c/ct
+        //    fold 2 (20..30): 10 wins / 10 @ 0.20 -> +80c/ct
+        //    overall avg EV = (-2 - 2 + 8)/30 - fee ≈ +13.1c/ct (> +1c stress!), yet ONLY 1/3 folds positive!
+        // 2) razor-thin: wins 24/30 (80.0%) at 0.793c + maker_fee(~0.29c) => EV ≈ +0.41c/ct (>0 at 0c, <0 at +1c)!
+        let mut entries = Vec::new();
+        for w in 0..30i64 {
+            let epoch = 10_000 + w * 900;
+            let ticker = format!("KXBTC15M-WF{w:02}");
+
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker: ticker.clone(),
+                series: "KXBTC15M".into(),
+                strategy_idx: 0,
+                strategy: "steady-edge".into(),
+                side: "yes".into(),
+                entry_price: 0.55,
+                secs_to_close: 240,
+                won: w % 5 != 0,
+            });
+
+            let (brittle_price, brittle_won) = if w < 20 {
+                (0.40, w % 5 == 0) // 2/10 wins in fold 0 and fold 1 -> negative fold EV
+            } else {
+                (0.20, true) // 10/10 wins in fold 2 -> spikes overall mean EV > +10c!
+            };
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker: ticker.clone(),
+                series: "KXBTC15M".into(),
+                strategy_idx: 1,
+                strategy: "brittle-one-fold".into(),
+                side: "yes".into(),
+                entry_price: brittle_price,
+                secs_to_close: 240,
+                won: brittle_won,
+            });
+
+            // 24/30 wins (0.80) at price 0.793 -> raw EV = 0.80 - 0.793 - 0.0029 = +0.41c/ct.
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker,
+                series: "KXBTC15M".into(),
+                strategy_idx: 2,
+                strategy: "razor-thin".into(),
+                side: "yes".into(),
+                entry_price: 0.793,
+                secs_to_close: 240,
+                won: w % 5 != 0,
+            });
+        }
+        let ctx = make_ctx(strats, entries, 30, 30, 10_000);
+        let rails = RiskRailsConfig::default();
+
+        let strict = compute_auto_allocator_report(
+            &ctx,
+            &AutoAllocatorRequest {
+                require_stress_resilience: true,
+                ..AutoAllocatorRequest::default()
+            },
+            &rails,
+            false,
+            false,
+        );
+        assert_eq!(strict.active_winners.len(), 1);
+        assert_eq!(strict.active_winners[0].strategy, "steady-edge");
+        assert_eq!(strict.active_winners[0].stress.folds_total, 3);
+        assert_eq!(strict.active_winners[0].stress.folds_positive, 3);
+        assert!(strict.active_winners[0].stress.stress_resilient);
+        assert!(
+            strict.active_winners[0].stress.extra_slippage_1c_cents
+                < strict.active_winners[0].stress.extra_slippage_0c_cents
+        );
+        assert!(
+            strict.active_winners[0].stress.extra_slippage_2c_cents
+                < strict.active_winners[0].stress.extra_slippage_1c_cents
+        );
+        assert!(strict.quarantined.iter().any(|q| q.strategy == "brittle-one-fold" && q.reason.contains("1/3 positive OOS folds")));
+        assert!(strict.quarantined.iter().any(|q| q.strategy == "razor-thin" && q.reason.contains("+1c adverse-fill stress")));
+
+        let relaxed = compute_auto_allocator_report(
+            &ctx,
+            &AutoAllocatorRequest {
+                require_stress_resilience: false,
+                ..AutoAllocatorRequest::default()
+            },
+            &rails,
+            false,
+            false,
+        );
+        assert!(relaxed.active_winners.len() >= 2, "disabling stress guard surfaces brittle/thin strategies");
     }
 }

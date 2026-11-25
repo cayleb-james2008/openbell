@@ -207,6 +207,8 @@ export function SlotsTab({
         slots={slots}
         markets={markets}
         liveArmed={liveBundle.status.liveArmed}
+        liveStatus={liveBundle.status}
+        home={home}
         search={search}
         onStageOrder={onStageOrder}
         onOpenFullAudit={onOpenFullAudit}

@@ -4,7 +4,7 @@
 
 
 A Live Kalshi Connected Trading & Quant Desk for Kalshi's 15-minute markets,
-rebuilt lean in Rust (v0.10.0). OpenBell connects directly to Kalshi Trade API v2 (Demo &
+rebuilt lean in Rust (v0.11.0). OpenBell connects directly to Kalshi Trade API v2 (Demo &
 Production) with RSA-PSS SHA-256 signing under fail-closed Hard Risk Rails and
 an Emergency Kill Switch, alongside a 15-minute public tape collector, 16-strategy
 paper slot simulator, Autonomous Edge & Fractional-Kelly Post-Only Allocator,

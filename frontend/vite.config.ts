@@ -63,6 +63,12 @@ function singleFile(): Plugin {
 export default defineConfig({
   plugins: [runeUsed(), react(), tailwindcss(), singleFile()],
   base: "./",
-  build: { assetsInlineLimit: 100_000_000, cssCodeSplit: false, chunkSizeWarningLimit: 4000, modulePreload: false },
+  build: {
+    target: "es2022",
+    assetsInlineLimit: 100_000_000,
+    cssCodeSplit: false,
+    chunkSizeWarningLimit: 4000,
+    modulePreload: false,
+  },
   server: { fs: { allow: [path.resolve(root, "..")] }, proxy: process.env.API_PORT ? { "/api": { target: `http://127.0.0.1:${process.env.API_PORT}`, changeOrigin: true, headers: { Origin: `http://127.0.0.1:${process.env.API_PORT}` } } } : undefined },
 });
