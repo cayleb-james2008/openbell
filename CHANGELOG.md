@@ -4,6 +4,12 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.15.0 - 2026-11-25
+
+- **Causal Bootstrap Monte-Carlo Equity & Drawdown Stress Simulator (`src/auto_allocator.rs`, `frontend/src/Charts.tsx`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**
+  - Added `BootstrapStressSummary` (`compute_bootstrap_stress_sim`): deterministically resamples strictly causal OOS window returns across `1,000` trials (`30` trading days × `96` windows/day) under both `+0c` baseline and `+1c` adverse-fill stress to report `P5 / P50 / P95` 30-day equity trajectories, `P95` max drawdown, daily Hard-Risk-Rail breach probability (`daily_rail_breach_prob_pct`), and `P(>=$500/day)` probability (`prob_500_day_pct`).
+  - Added interactive zero-bloat custom SVG `BootstrapStressFanChart` inside `AutoAllocatorPanel` plotting the `P5–P95` confidence band, `P50` trajectory, `+1c` stress trajectory, and tail-risk readouts before live arming.
+
 ## 0.14.0 - 2026-11-25
 
 - **Multi-Market Spread / Fee / Edge Quality Screener & 1-Click Basket Preflight (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**

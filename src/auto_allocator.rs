@@ -279,6 +279,39 @@ pub struct BestBasketPlan {
     pub summary: String,
 }
 
+/// Daily percentile checkpoint (`day 0..=30`) from 1,000 causal OOS bootstrap trials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapEquityPoint {
+    pub day: u32,
+    pub p5_equity: f64,
+    pub p50_equity: f64,
+    pub p95_equity: f64,
+    pub stress_1c_p50_equity: f64,
+}
+
+/// 1,000-trial causal bootstrap equity & drawdown stress simulator (`+0c` vs `+1c` adverse fill).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapStressSummary {
+    pub trials: usize,
+    pub horizon_days: u32,
+    pub windows_per_day: usize,
+    pub oos_sample_windows: usize,
+    pub p5_end_equity: f64,
+    pub p50_end_equity: f64,
+    pub p95_end_equity: f64,
+    pub p95_max_drawdown_pct: f64,
+    pub daily_rail_breach_prob_pct: f64,
+    pub prob_500_day_pct: f64,
+    pub stress_1c_p5_end_equity: f64,
+    pub stress_1c_p50_end_equity: f64,
+    pub stress_1c_p95_end_equity: f64,
+    pub stress_1c_p95_max_drawdown_pct: f64,
+    pub stress_1c_daily_rail_breach_prob_pct: f64,
+    pub stress_1c_prob_500_day_pct: f64,
+    pub trajectory: Vec<BootstrapEquityPoint>,
+    pub summary: String,
+}
+
 /// One strategy passing OOS depth, positive-EV, stress, and correlation gates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllocatedWinner {
@@ -394,6 +427,7 @@ pub struct AutoAllocatorReport {
     pub drift_gauge: DriftGauge,
     pub edge_screener: Vec<EdgeScreenerRow>,
     pub best_basket: BestBasketPlan,
+    pub bootstrap_stress: BootstrapStressSummary,
     pub comparison: AllocatorComparison,
     pub planned_intents: Vec<PlannedAllocatorIntent>,
     pub daily_target: DailyTargetVerdict,
@@ -850,7 +884,7 @@ pub fn compute_auto_allocator_report(
         }
     };
 
-    let (comparison, regime_throttle_mult, current_oos_drawdown_pct, throttle_reason) =
+    let (comparison, regime_throttle_mult, current_oos_drawdown_pct, throttle_reason, oos_window_returns) =
         replay_oos_comparison(
             ctx,
             &req,
@@ -979,6 +1013,11 @@ pub fn compute_auto_allocator_report(
         is_maker,
         killed,
     );
+    let bootstrap_stress = compute_bootstrap_stress_sim(
+        &oos_window_returns,
+        req.starting_bankroll,
+        rails.max_daily_loss_dollars,
+    );
 
     // Compute $500/day net expectancy readiness verdict with concrete blockers.
     let daily_target = compute_daily_target_verdict(
@@ -1072,6 +1111,7 @@ pub fn compute_auto_allocator_report(
         drift_gauge,
         edge_screener,
         best_basket,
+        bootstrap_stress,
         comparison,
         planned_intents,
         daily_target,
@@ -1650,7 +1690,7 @@ fn replay_oos_comparison(
     winner_weights_by_idx: &HashMap<usize, f64>,
     is_maker: bool,
     selection_basis: String,
-) -> (AllocatorComparison, f64, f64, String) {
+) -> (AllocatorComparison, f64, f64, String, Vec<(f64, f64)>) {
     let start_eq = req.starting_bankroll;
     let legacy_slot_frac = 1.0 / (ctx.strategies.len().max(1) as f64);
     let taker_slip = req.slippage_cents / 100.0;
@@ -1666,6 +1706,7 @@ fn replay_oos_comparison(
     let mut alloc_current_dd_pct = 0.0f64;
     let mut alloc_fees = 0.0f64;
     let mut recent_returns: Vec<f64> = Vec::with_capacity(16);
+    let mut oos_window_returns: Vec<(f64, f64)> = Vec::with_capacity(oos_by_epoch.len());
 
     let mut curve: Vec<ComparisonPoint> = Vec::with_capacity(oos_by_epoch.len());
 
@@ -1677,6 +1718,7 @@ fn replay_oos_comparison(
             compute_causal_throttle(req.enable_regime_throttle, alloc_current_dd_pct, &recent_returns);
         let mut legacy_epoch_pnl = 0.0f64;
         let mut alloc_epoch_pnl = 0.0f64;
+        let mut alloc_epoch_contracts = 0u32;
         let mut alloc_traded = false;
 
         for e in entries {
@@ -1708,6 +1750,7 @@ fn replay_oos_comparison(
                                 ((prev_alloc * weight * epoch_throttle) / p).floor().max(0.0) as u32;
                             if contracts > 0 {
                                 alloc_traded = true;
+                                alloc_epoch_contracts = alloc_epoch_contracts.saturating_add(contracts);
                                 let order_fee = kalshi_order_fee_dollars(contracts, p, is_maker);
                                 let slip = if is_maker { 0.0 } else { taker_slip };
                                 let pnl = (contracts as f64) * (payoff - p - slip) - order_fee;
@@ -1741,6 +1784,12 @@ fn replay_oos_comparison(
             if alloc_current_dd_pct > alloc_max_dd_pct {
                 alloc_max_dd_pct = alloc_current_dd_pct;
             }
+        }
+        if prev_alloc > 1e-9 && (!winner_weights_by_idx.is_empty()) {
+            let r0 = finite_or((alloc_epoch_pnl / prev_alloc).clamp(-0.95, 5.0), 0.0);
+            let pnl_1c = alloc_epoch_pnl - (alloc_epoch_contracts as f64) * 0.01;
+            let r1 = finite_or((pnl_1c / prev_alloc).clamp(-0.95, 5.0), 0.0);
+            oos_window_returns.push((r0, r1));
         }
         if alloc_traded && prev_alloc > 1e-9 {
             recent_returns.push(finite_or(alloc_epoch_pnl / prev_alloc, 0.0));
@@ -1795,7 +1844,218 @@ fn replay_oos_comparison(
         end_throttle,
         finite_or(alloc_current_dd_pct, 0.0),
         end_reason,
+        oos_window_returns,
     )
+}
+
+#[inline]
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+#[inline]
+fn percentile_sorted(sorted: &[f64], pct: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((pct / 100.0) * ((sorted.len() - 1) as f64)).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+struct BootstrapScenarioOut {
+    p5: Vec<f64>,
+    p50: Vec<f64>,
+    p95: Vec<f64>,
+    p95_max_dd_pct: f64,
+    daily_rail_breach_prob_pct: f64,
+    prob_500_day_pct: f64,
+}
+
+fn run_bootstrap_scenario(
+    returns: &[f64],
+    start_eq: f64,
+    max_daily_loss_dollars: f64,
+    trials: usize,
+    days: usize,
+    windows_per_day: usize,
+    seed: u64,
+) -> BootstrapScenarioOut {
+    let n = returns.len();
+    let mut daily_equities = vec![vec![start_eq; trials]; days + 1];
+    let mut max_dds = Vec::with_capacity(trials);
+    let mut rail_breach_days = 0usize;
+    let mut hit_500_days = 0usize;
+    let mut rng = seed;
+    // Cap deployed dollar stake per window at 4x initial bankroll (or 10x daily loss rail) to model finite 15m book capacity.
+    let stake_cap = (start_eq * 4.0).max(max_daily_loss_dollars * 10.0).max(start_eq);
+
+    for t in 0..trials {
+        let mut eq = start_eq;
+        let mut peak = start_eq;
+        let mut max_dd = 0.0f64;
+        for day_row in daily_equities.iter_mut().skip(1) {
+            let day_start = eq;
+            for _ in 0..windows_per_day {
+                let idx = (splitmix64(&mut rng) as usize) % n;
+                let r = returns[idx];
+                let deployed = eq.min(stake_cap);
+                eq = (eq + deployed * r).max(0.0);
+                if eq > peak {
+                    peak = eq;
+                }
+                if peak > 1e-9 {
+                    let dd = (((peak - eq).max(0.0) / peak) * 100.0).clamp(0.0, 100.0);
+                    if dd > max_dd {
+                        max_dd = dd;
+                    }
+                }
+            }
+            let day_pnl = eq - day_start;
+            if (max_daily_loss_dollars > 0.0 && day_pnl <= -max_daily_loss_dollars)
+                || (day_start > 1e-9 && (-day_pnl / day_start) * 100.0 >= 25.0)
+            {
+                rail_breach_days += 1;
+            }
+            if day_pnl >= TARGET_DAILY_PROFIT_DOLLARS {
+                hit_500_days += 1;
+            }
+            day_row[t] = finite_or(eq, start_eq);
+        }
+        max_dds.push(finite_or(max_dd, 0.0));
+    }
+
+    let mut p5 = Vec::with_capacity(days + 1);
+    let mut p50 = Vec::with_capacity(days + 1);
+    let mut p95 = Vec::with_capacity(days + 1);
+    for row in &mut daily_equities {
+        row.sort_by(|a, b| a.total_cmp(b));
+        p5.push(percentile_sorted(row, 5.0));
+        p50.push(percentile_sorted(row, 50.0));
+        p95.push(percentile_sorted(row, 95.0));
+    }
+    max_dds.sort_by(|a, b| a.total_cmp(b));
+    let total_sim_days = (trials * days).max(1) as f64;
+
+    BootstrapScenarioOut {
+        p5,
+        p50,
+        p95,
+        p95_max_dd_pct: percentile_sorted(&max_dds, 95.0),
+        daily_rail_breach_prob_pct: finite_or((rail_breach_days as f64 / total_sim_days) * 100.0, 0.0),
+        prob_500_day_pct: finite_or((hit_500_days as f64 / total_sim_days) * 100.0, 0.0),
+    }
+}
+
+fn compute_bootstrap_stress_sim(
+    oos_window_returns: &[(f64, f64)],
+    starting_bankroll: f64,
+    max_daily_loss_dollars: f64,
+) -> BootstrapStressSummary {
+    const TRIALS: usize = 1_000;
+    const DAYS: u32 = 30;
+    const WINDOWS_PER_DAY: usize = 96;
+
+    if oos_window_returns.is_empty() {
+        let trajectory = (0..=DAYS)
+            .map(|day| BootstrapEquityPoint {
+                day,
+                p5_equity: starting_bankroll,
+                p50_equity: starting_bankroll,
+                p95_equity: starting_bankroll,
+                stress_1c_p50_equity: starting_bankroll,
+            })
+            .collect();
+        return BootstrapStressSummary {
+            trials: TRIALS,
+            horizon_days: DAYS,
+            windows_per_day: WINDOWS_PER_DAY,
+            oos_sample_windows: 0,
+            p5_end_equity: starting_bankroll,
+            p50_end_equity: starting_bankroll,
+            p95_end_equity: starting_bankroll,
+            p95_max_drawdown_pct: 0.0,
+            daily_rail_breach_prob_pct: 0.0,
+            prob_500_day_pct: 0.0,
+            stress_1c_p5_end_equity: starting_bankroll,
+            stress_1c_p50_end_equity: starting_bankroll,
+            stress_1c_p95_end_equity: starting_bankroll,
+            stress_1c_p95_max_drawdown_pct: 0.0,
+            stress_1c_daily_rail_breach_prob_pct: 0.0,
+            stress_1c_prob_500_day_pct: 0.0,
+            trajectory,
+            summary: "Awaiting OOS trades for 1,000-trial causal bootstrap simulation.".to_string(),
+        };
+    }
+
+    let r0: Vec<f64> = oos_window_returns.iter().map(|&(a, _)| a).collect();
+    let r1: Vec<f64> = oos_window_returns.iter().map(|&(_, b)| b).collect();
+    let base = run_bootstrap_scenario(
+        &r0,
+        starting_bankroll,
+        max_daily_loss_dollars,
+        TRIALS,
+        DAYS as usize,
+        WINDOWS_PER_DAY,
+        0x4F50_454E_4245_4C4C,
+    );
+    let stress = run_bootstrap_scenario(
+        &r1,
+        starting_bankroll,
+        max_daily_loss_dollars,
+        TRIALS,
+        DAYS as usize,
+        WINDOWS_PER_DAY,
+        0x4F50_454E_4245_4C4C,
+    );
+
+    let trajectory: Vec<BootstrapEquityPoint> = (0..=DAYS)
+        .map(|d| {
+            let idx = d as usize;
+            BootstrapEquityPoint {
+                day: d,
+                p5_equity: base.p5[idx],
+                p50_equity: base.p50[idx],
+                p95_equity: base.p95[idx],
+                stress_1c_p50_equity: stress.p50[idx],
+            }
+        })
+        .collect();
+
+    let last = DAYS as usize;
+    let summary = format!(
+        "1,000 causal OOS trials (30d): P50 ${:.2} (${:.2} @ +1c), P95 DD {:.1}% ({:.1}% @ +1c), rail-breach {:.1}%, P(>=$500/d) {:.1}%",
+        base.p50[last],
+        stress.p50[last],
+        base.p95_max_dd_pct,
+        stress.p95_max_dd_pct,
+        base.daily_rail_breach_prob_pct,
+        base.prob_500_day_pct,
+    );
+
+    BootstrapStressSummary {
+        trials: TRIALS,
+        horizon_days: DAYS,
+        windows_per_day: WINDOWS_PER_DAY,
+        oos_sample_windows: oos_window_returns.len(),
+        p5_end_equity: base.p5[last],
+        p50_end_equity: base.p50[last],
+        p95_end_equity: base.p95[last],
+        p95_max_drawdown_pct: base.p95_max_dd_pct,
+        daily_rail_breach_prob_pct: base.daily_rail_breach_prob_pct,
+        prob_500_day_pct: base.prob_500_day_pct,
+        stress_1c_p5_end_equity: stress.p5[last],
+        stress_1c_p50_end_equity: stress.p50[last],
+        stress_1c_p95_end_equity: stress.p95[last],
+        stress_1c_p95_max_drawdown_pct: stress.p95_max_dd_pct,
+        stress_1c_daily_rail_breach_prob_pct: stress.daily_rail_breach_prob_pct,
+        stress_1c_prob_500_day_pct: stress.prob_500_day_pct,
+        trajectory,
+        summary,
+    }
 }
 
 #[cfg(test)]
@@ -2411,5 +2671,52 @@ mod tests {
         let rep_killed = compute_auto_allocator_report(&ctx, &req, &rails, false, true);
         assert!(!rep_killed.best_basket.ready_for_dry_run_preflight);
         assert!(rep_killed.best_basket.legs.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_stress_sim_runs_1000_trials_and_flags_tail_risk_and_1c_degradation() {
+        let strats = vec![StrategyMeta {
+            name: "causal-maker".into(),
+            side: "yes".into(),
+        }];
+        let mut entries = Vec::new();
+        for w in 0..40i64 {
+            entries.push(TournamentEntry {
+                close_epoch: 20_000 + w * 900,
+                ticker: format!("KXBTC15M-BS{w:02}"),
+                series: "KXBTC15M".into(),
+                strategy_idx: 0,
+                strategy: "causal-maker".into(),
+                side: "yes".into(),
+                entry_price: 0.55,
+                secs_to_close: 240,
+                won: w % 4 != 0, // 75% win rate -> positive edge
+            });
+        }
+        let ctx = make_ctx(strats, entries, 40, 20, 20_000 + 20 * 900);
+        let rails = RiskRailsConfig::default();
+        let req = AutoAllocatorRequest {
+            starting_bankroll: 500.0,
+            min_oos_trades: 10,
+            ..AutoAllocatorRequest::default()
+        };
+
+        let rep = compute_auto_allocator_report(&ctx, &req, &rails, false, false);
+        let bs = &rep.bootstrap_stress;
+        assert_eq!(bs.trials, 1_000);
+        assert_eq!(bs.horizon_days, 30);
+        assert_eq!(bs.trajectory.len(), 31);
+        assert!((bs.trajectory[0].p50_equity - 500.0).abs() < 1e-9);
+        assert!(bs.p5_end_equity <= bs.p50_end_equity + 1e-6);
+        assert!(bs.p50_end_equity <= bs.p95_end_equity + 1e-6);
+        assert!(
+            bs.stress_1c_p50_end_equity <= bs.p50_end_equity + 1e-6,
+            "+1c adverse stress ({}) must not beat base +0c ({})",
+            bs.stress_1c_p50_end_equity,
+            bs.p50_end_equity
+        );
+        assert!(bs.p95_max_drawdown_pct >= 0.0 && bs.p95_max_drawdown_pct <= 100.0);
+        assert!(bs.daily_rail_breach_prob_pct >= 0.0 && bs.daily_rail_breach_prob_pct <= 100.0);
+        assert!(bs.prob_500_day_pct >= 0.0 && bs.prob_500_day_pct <= 100.0);
     }
 }
