@@ -240,6 +240,45 @@ pub struct DriftGauge {
     pub summary: String,
 }
 
+/// Strictly causal multi-market spread, fee, fill-headroom, and $500/day edge screener row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeScreenerRow {
+    pub rank: usize,
+    pub strategy: String,
+    pub side: String,
+    pub top_series: String,
+    pub execution_mode: String,
+    pub oos_trades: usize,
+    pub avg_entry_cents: u8,
+    pub maker_fee_cents: f64,
+    pub taker_fee_cents: f64,
+    pub fee_edge_saved_cents: f64,
+    pub oos_net_expectancy_cents: f64,
+    pub breakeven_fill_rate_pct: f64,
+    pub fill_headroom_pct: f64,
+    pub folds_positive: usize,
+    pub folds_total: usize,
+    pub worst_fold_expectancy_cents: Option<f64>,
+    pub daily_dollar_contribution: f64,
+    pub daily_target_share_pct: f64,
+    pub edge_quality_score: f64,
+    pub recommended_contracts: u32,
+    pub basket_eligible: bool,
+    pub verdict: String,
+}
+
+/// Guarded dry-run preflight basket assembled from top causal screener winners (live_armed stays false).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BestBasketPlan {
+    pub legs: Vec<PlannedAllocatorIntent>,
+    pub total_contracts: u32,
+    pub total_allocated_dollars: f64,
+    pub projected_daily_dollars: f64,
+    pub avg_fill_headroom_pct: f64,
+    pub ready_for_dry_run_preflight: bool,
+    pub summary: String,
+}
+
 /// One strategy passing OOS depth, positive-EV, stress, and correlation gates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllocatedWinner {
@@ -353,6 +392,8 @@ pub struct AutoAllocatorReport {
     pub regime_attribution: Vec<RegimeEdgeBucket>,
     pub fill_sensitivity: Vec<FillRateSensitivityPoint>,
     pub drift_gauge: DriftGauge,
+    pub edge_screener: Vec<EdgeScreenerRow>,
+    pub best_basket: BestBasketPlan,
     pub comparison: AllocatorComparison,
     pub planned_intents: Vec<PlannedAllocatorIntent>,
     pub daily_target: DailyTargetVerdict,
@@ -928,6 +969,16 @@ pub fn compute_auto_allocator_report(
 
     let fill_sensitivity = compute_fill_sensitivity(ctx, &req, &active_winners);
     let drift_gauge = compute_drift_gauge(&active_winners, &oos_sel.accepted);
+    let (edge_screener, best_basket) = compute_edge_screener_and_basket(
+        ctx,
+        &req,
+        &oos_by_strat,
+        &active_winners,
+        &oos_sel.quarantined,
+        &planned_intents,
+        is_maker,
+        killed,
+    );
 
     // Compute $500/day net expectancy readiness verdict with concrete blockers.
     let daily_target = compute_daily_target_verdict(
@@ -1019,6 +1070,8 @@ pub fn compute_auto_allocator_report(
         regime_attribution,
         fill_sensitivity,
         drift_gauge,
+        edge_screener,
+        best_basket,
         comparison,
         planned_intents,
         daily_target,
@@ -1118,6 +1171,219 @@ fn compute_drift_gauge(winners: &[AllocatedWinner], accepted: &[SplitCandidate])
             "{label}: paper {paper_ev:+.2}c vs trailing shadow {shadow_ev:+.2}c ({drift:+.2}c drift)"
         ),
     }
+}
+
+fn dominant_series_for_entries(entries: Option<&Vec<&TournamentEntry>>) -> String {
+    let Some(list) = entries else {
+        return "KXBTC15M".to_string();
+    };
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for e in list {
+        *counts.entry(e.series.as_str()).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+        .map(|(s, _)| s.to_string())
+        .unwrap_or_else(|| "KXBTC15M".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_edge_screener_and_basket(
+    ctx: &TournamentTapeContext,
+    req: &AutoAllocatorRequest,
+    oos_by_strat: &[Vec<&TournamentEntry>],
+    winners: &[AllocatedWinner],
+    quarantined: &[QuarantinedStrategy],
+    planned_intents: &[PlannedAllocatorIntent],
+    is_maker: bool,
+    killed: bool,
+) -> (Vec<EdgeScreenerRow>, BestBasketPlan) {
+    let oos_windows = ctx.windows_settled_oos.max(1) as f64;
+    let fill_mult = if is_maker { req.maker_fill_rate } else { 1.0 };
+    let idx_by_name: HashMap<&str, usize> = ctx
+        .strategies
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.as_str(), i))
+        .collect();
+
+    let mut rows: Vec<EdgeScreenerRow> = Vec::with_capacity(winners.len() + quarantined.len().min(6));
+    for w in winners {
+        let strat_idx = idx_by_name.get(w.strategy.as_str()).copied();
+        let top_series = dominant_series_for_entries(strat_idx.and_then(|i| oos_by_strat.get(i)));
+        let avg_entry_cents = ((w.oos_avg_entry_price * 100.0).round() as i64).clamp(1, 99) as u8;
+        let fee_edge_saved_cents = if is_maker {
+            finite_or((w.taker_fee_cents - w.maker_fee_cents).max(0.0), 0.0)
+        } else {
+            0.0
+        };
+        let fill_headroom_pct = finite_or(req.maker_fill_rate * 100.0 - w.breakeven_fill_rate_pct, 0.0);
+        let fire_rate = (w.oos_trades as f64 / oos_windows).min(1.0);
+        let p = w.oos_avg_entry_price.clamp(0.01, 0.99);
+        let alloc_frac = w.allocated_pct / 100.0;
+        let daily_dollar_contribution = finite_or(
+            req.starting_bankroll
+                * (alloc_frac / p)
+                * (w.oos_net_expectancy_cents / 100.0)
+                * fire_rate
+                * fill_mult
+                * WINDOWS_PER_DAY_15M,
+            0.0,
+        );
+        let daily_target_share_pct = finite_or(
+            (daily_dollar_contribution / TARGET_DAILY_PROFIT_DOLLARS * 100.0).max(0.0),
+            0.0,
+        );
+        let fold_ratio = if w.stress.folds_total > 0 {
+            w.stress.folds_positive as f64 / w.stress.folds_total as f64
+        } else {
+            0.0
+        };
+        let ev_score = (w.oos_net_expectancy_cents / 15.0).clamp(0.0, 1.0) * 40.0;
+        let fill_score = (fill_headroom_pct / 60.0).clamp(0.0, 1.0) * 25.0;
+        let fold_score = fold_ratio.clamp(0.0, 1.0) * 25.0;
+        let stress_bonus = if w.stress.stress_resilient { 10.0 } else { 0.0 };
+        let edge_quality_score = finite_or((ev_score + fill_score + fold_score + stress_bonus).clamp(0.0, 100.0), 0.0);
+
+        let basket_eligible = !killed && w.rail_clamped_contracts >= 1 && (!is_maker || fill_headroom_pct >= 0.0);
+        let verdict = if basket_eligible {
+            "BASKET_ELIGIBLE"
+        } else if killed {
+            "KILLED"
+        } else if w.rail_clamped_contracts == 0 {
+            "BELOW_1_CONTRACT"
+        } else {
+            "LOW_FILL_HEADROOM"
+        }
+        .to_string();
+
+        rows.push(EdgeScreenerRow {
+            rank: 0,
+            strategy: w.strategy.clone(),
+            side: w.side.clone(),
+            top_series,
+            execution_mode: w.execution_mode.clone(),
+            oos_trades: w.oos_trades,
+            avg_entry_cents,
+            maker_fee_cents: w.maker_fee_cents,
+            taker_fee_cents: w.taker_fee_cents,
+            fee_edge_saved_cents,
+            oos_net_expectancy_cents: w.oos_net_expectancy_cents,
+            breakeven_fill_rate_pct: w.breakeven_fill_rate_pct,
+            fill_headroom_pct,
+            folds_positive: w.stress.folds_positive,
+            folds_total: w.stress.folds_total,
+            worst_fold_expectancy_cents: w.stress.worst_fold_expectancy_cents,
+            daily_dollar_contribution,
+            daily_target_share_pct,
+            edge_quality_score,
+            recommended_contracts: w.rail_clamped_contracts,
+            basket_eligible,
+            verdict,
+        });
+    }
+
+    let mut q_sorted: Vec<&QuarantinedStrategy> = quarantined.iter().collect();
+    q_sorted.sort_by(|a, b| {
+        let ea = a.oos_net_expectancy_cents.unwrap_or(f64::NEG_INFINITY);
+        let eb = b.oos_net_expectancy_cents.unwrap_or(f64::NEG_INFINITY);
+        eb.total_cmp(&ea).then_with(|| a.strategy.cmp(&b.strategy))
+    });
+    for q in q_sorted.into_iter().take(4) {
+        let strat_idx = idx_by_name.get(q.strategy.as_str()).copied();
+        let entries = strat_idx.and_then(|i| oos_by_strat.get(i));
+        let top_series = dominant_series_for_entries(entries);
+        let avg_p = entries
+            .filter(|e| !e.is_empty())
+            .map(|e| e.iter().map(|t| t.entry_price.clamp(0.01, 0.99)).sum::<f64>() / e.len() as f64)
+            .unwrap_or(0.5);
+        let maker_c = maker_fee(avg_p) * 100.0;
+        let taker_c = fee(avg_p) * 100.0;
+        let ev = q.oos_net_expectancy_cents.unwrap_or(0.0);
+        let be_fill = finite_or((1.0 - (ev / 2.0)).clamp(0.0, 1.0) * 100.0, 100.0);
+        rows.push(EdgeScreenerRow {
+            rank: 0,
+            strategy: q.strategy.clone(),
+            side: q.side.clone(),
+            top_series,
+            execution_mode: req.execution_mode.clone(),
+            oos_trades: q.oos_trades,
+            avg_entry_cents: ((avg_p * 100.0).round() as i64).clamp(1, 99) as u8,
+            maker_fee_cents: maker_c,
+            taker_fee_cents: taker_c,
+            fee_edge_saved_cents: if is_maker { (taker_c - maker_c).max(0.0) } else { 0.0 },
+            oos_net_expectancy_cents: ev,
+            breakeven_fill_rate_pct: be_fill,
+            fill_headroom_pct: finite_or(req.maker_fill_rate * 100.0 - be_fill, -100.0),
+            folds_positive: 0,
+            folds_total: 0,
+            worst_fold_expectancy_cents: None,
+            daily_dollar_contribution: 0.0,
+            daily_target_share_pct: 0.0,
+            edge_quality_score: 0.0,
+            recommended_contracts: 0,
+            basket_eligible: false,
+            verdict: "QUARANTINED".to_string(),
+        });
+    }
+
+    rows.sort_by(|a, b| {
+        b.basket_eligible
+            .cmp(&a.basket_eligible)
+            .then_with(|| b.edge_quality_score.total_cmp(&a.edge_quality_score))
+            .then_with(|| b.daily_dollar_contribution.total_cmp(&a.daily_dollar_contribution))
+            .then_with(|| a.strategy.cmp(&b.strategy))
+    });
+    for (idx, r) in rows.iter_mut().enumerate() {
+        r.rank = idx + 1;
+    }
+
+    let intent_map: HashMap<&str, &PlannedAllocatorIntent> = planned_intents
+        .iter()
+        .map(|it| (it.strategy.as_str(), it))
+        .collect();
+    let mut legs = Vec::new();
+    let mut projected_daily = 0.0f64;
+    let mut headroom_sum = 0.0f64;
+    for r in rows.iter().filter(|r| r.basket_eligible).take(4) {
+        if let Some(intent) = intent_map.get(r.strategy.as_str()) {
+            if intent.target_contracts >= 1 {
+                legs.push((*intent).clone());
+                projected_daily += r.daily_dollar_contribution;
+                headroom_sum += r.fill_headroom_pct;
+            }
+        }
+    }
+    let total_contracts: u32 = legs.iter().map(|l| l.target_contracts).sum();
+    let total_allocated_dollars: f64 = finite_or(legs.iter().map(|l| l.allocated_dollars).sum(), 0.0);
+    let avg_fill_headroom_pct = if !legs.is_empty() {
+        finite_or(headroom_sum / legs.len() as f64, 0.0)
+    } else {
+        0.0
+    };
+    let ready_for_dry_run_preflight = !legs.is_empty() && !killed;
+    let summary = if legs.is_empty() {
+        "No basket-eligible causal winners at current OOS depth and fill gates.".to_string()
+    } else {
+        format!(
+            "{} causal leg(s), {} contract(s) (${total_allocated_dollars:.2} cap), avg +{avg_fill_headroom_pct:.1}pp fill headroom, est. ${projected_daily:.2}/day (dry_run preflight ready)",
+            legs.len(),
+            total_contracts
+        )
+    };
+
+    let basket = BestBasketPlan {
+        legs,
+        total_contracts,
+        total_allocated_dollars,
+        projected_daily_dollars: finite_or(projected_daily, 0.0),
+        avg_fill_headroom_pct,
+        ready_for_dry_run_preflight,
+        summary,
+    };
+
+    (rows, basket)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2068,5 +2334,82 @@ mod tests {
             "blockers={:?}",
             rep.daily_target.blockers
         );
+    }
+
+    #[test]
+    fn edge_screener_and_best_basket_rank_causally_and_respect_rails_and_kill_switch() {
+        let strats = vec![
+            StrategyMeta { name: "eth-maker-ace".into(), side: "yes".into() },
+            StrategyMeta { name: "btc-maker-two".into(), side: "no".into() },
+            StrategyMeta { name: "sol-loser".into(), side: "yes".into() },
+        ];
+        let mut entries = Vec::new();
+        for w in 0..40i64 {
+            let epoch = 10_000 + w * 900;
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker: format!("KXETH15M-E{w:02}"),
+                series: "KXETH15M".into(),
+                strategy_idx: 0,
+                strategy: "eth-maker-ace".into(),
+                side: "yes".into(),
+                entry_price: 0.55,
+                secs_to_close: 240,
+                won: w % 5 != 0, // 80% win
+            });
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker: format!("KXBTC15M-B{w:02}"),
+                series: "KXBTC15M".into(),
+                strategy_idx: 1,
+                strategy: "btc-maker-two".into(),
+                side: "no".into(),
+                entry_price: 0.52,
+                secs_to_close: 240,
+                won: w % 3 != 0, // 67% win, independent from mod 5
+            });
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker: format!("KXSOL15M-S{w:02}"),
+                series: "KXSOL15M".into(),
+                strategy_idx: 2,
+                strategy: "sol-loser".into(),
+                side: "yes".into(),
+                entry_price: 0.78,
+                secs_to_close: 180,
+                won: w % 4 == 0, // 25% win -> quarantined
+            });
+        }
+        let ctx = make_ctx(strats, entries, 40, 20, 10_000 + 20 * 900);
+        let rails = RiskRailsConfig {
+            max_order_contracts: 10,
+            max_order_dollars: 40.0,
+            ..RiskRailsConfig::default()
+        };
+        let req = AutoAllocatorRequest {
+            starting_bankroll: 500.0,
+            min_oos_trades: 10,
+            ..AutoAllocatorRequest::default()
+        };
+
+        let rep = compute_auto_allocator_report(&ctx, &req, &rails, false, false);
+        assert!(!rep.live_armed);
+        assert_eq!(rep.edge_screener.len(), 3);
+        assert_eq!(rep.edge_screener[0].rank, 1);
+        assert_eq!(rep.edge_screener[0].strategy, "eth-maker-ace");
+        assert_eq!(rep.edge_screener[0].top_series, "KXETH15M");
+        assert!(rep.edge_screener[0].basket_eligible);
+        assert!(rep.edge_screener[0].fill_headroom_pct > 0.0);
+        assert_eq!(rep.edge_screener[2].strategy, "sol-loser");
+        assert_eq!(rep.edge_screener[2].verdict, "QUARANTINED");
+        assert!(!rep.edge_screener[2].basket_eligible);
+        assert!(rep.best_basket.ready_for_dry_run_preflight);
+        assert_eq!(rep.best_basket.legs.len(), 2);
+        assert!(rep.best_basket.legs.iter().all(|l| l.target_contracts <= rails.max_order_contracts));
+
+        // Kill switch latched must fail-close best basket preflight readiness.
+        let rep_killed = compute_auto_allocator_report(&ctx, &req, &rails, false, true);
+        assert!(!rep_killed.best_basket.ready_for_dry_run_preflight);
+        assert!(rep_killed.best_basket.legs.is_empty());
     }
 }

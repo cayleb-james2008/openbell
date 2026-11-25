@@ -36,6 +36,41 @@ export type DriftGauge = {
   summary: string;
 };
 
+export type EdgeScreenerRow = {
+  rank: number;
+  strategy: string;
+  side: "yes" | "no" | string;
+  top_series: string;
+  execution_mode: AllocatorExecutionMode | string;
+  oos_trades: number;
+  avg_entry_cents: number;
+  maker_fee_cents: number;
+  taker_fee_cents: number;
+  fee_edge_saved_cents: number;
+  oos_net_expectancy_cents: number;
+  breakeven_fill_rate_pct: number;
+  fill_headroom_pct: number;
+  folds_positive: number;
+  folds_total: number;
+  worst_fold_expectancy_cents: number | null;
+  daily_dollar_contribution: number;
+  daily_target_share_pct: number;
+  edge_quality_score: number;
+  recommended_contracts: number;
+  basket_eligible: boolean;
+  verdict: string;
+};
+
+export type BestBasketPlan = {
+  legs: PlannedAllocatorIntent[];
+  total_contracts: number;
+  total_allocated_dollars: number;
+  projected_daily_dollars: number;
+  avg_fill_headroom_pct: number;
+  ready_for_dry_run_preflight: boolean;
+  summary: string;
+};
+
 export type RegimeEdgeBucket = {
   regime: string;
   trades: number;
@@ -154,6 +189,8 @@ export type AutoAllocatorReport = {
   regime_attribution: RegimeEdgeBucket[];
   fill_sensitivity: FillRateSensitivityPoint[];
   drift_gauge: DriftGauge;
+  edge_screener: EdgeScreenerRow[];
+  best_basket: BestBasketPlan;
   comparison: AllocatorComparison;
   planned_intents: PlannedAllocatorIntent[];
   daily_target: DailyTargetVerdict;
@@ -204,6 +241,9 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
   const regRaw = Array.isArray(o.regime_attribution) ? o.regime_attribution : [];
   const fillRaw = Array.isArray(o.fill_sensitivity) ? o.fill_sensitivity : [];
   const driftRaw = (o.drift_gauge && typeof o.drift_gauge === "object" ? o.drift_gauge : {}) as Record<string, unknown>;
+  const screenerRaw = Array.isArray(o.edge_screener) ? o.edge_screener : [];
+  const basketRaw = (o.best_basket && typeof o.best_basket === "object" ? o.best_basket : {}) as Record<string, unknown>;
+  const basketLegsRaw = Array.isArray(basketRaw.legs) ? basketRaw.legs : [];
   const intentsRaw = Array.isArray(o.planned_intents) ? o.planned_intents : [];
   const notesRaw = Array.isArray(o.honesty_notes) ? o.honesty_notes : [];
   const compRaw = (o.comparison && typeof o.comparison === "object" ? o.comparison : {}) as Record<string, unknown>;
@@ -307,6 +347,52 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
       status: strOr(driftRaw.status, "NO_DATA"),
       summary: strOr(driftRaw.summary, "Awaiting OOS drift readout."),
     },
+    edge_screener: screenerRaw
+      .filter((r): r is Record<string, unknown> => !!r && typeof r === "object")
+      .map((r, i) => ({
+        rank: Math.max(1, Math.round(finiteOr(r.rank, i + 1))),
+        strategy: strOr(r.strategy, "unnamed"),
+        side: strOr(r.side, "yes"),
+        top_series: strOr(r.top_series, "KXBTC15M"),
+        execution_mode: strOr(r.execution_mode, "maker"),
+        oos_trades: Math.max(0, Math.round(finiteOr(r.oos_trades, 0))),
+        avg_entry_cents: Math.min(99, Math.max(1, Math.round(finiteOr(r.avg_entry_cents, 50)))),
+        maker_fee_cents: finiteOr(r.maker_fee_cents, 0),
+        taker_fee_cents: finiteOr(r.taker_fee_cents, 0),
+        fee_edge_saved_cents: finiteOr(r.fee_edge_saved_cents, 0),
+        oos_net_expectancy_cents: finiteOr(r.oos_net_expectancy_cents, 0),
+        breakeven_fill_rate_pct: finiteOr(r.breakeven_fill_rate_pct, 0),
+        fill_headroom_pct: finiteOr(r.fill_headroom_pct, 0),
+        folds_positive: Math.max(0, Math.round(finiteOr(r.folds_positive, 0))),
+        folds_total: Math.max(0, Math.round(finiteOr(r.folds_total, 0))),
+        worst_fold_expectancy_cents: finiteOpt(r.worst_fold_expectancy_cents),
+        daily_dollar_contribution: finiteOr(r.daily_dollar_contribution, 0),
+        daily_target_share_pct: finiteOr(r.daily_target_share_pct, 0),
+        edge_quality_score: finiteOr(r.edge_quality_score, 0),
+        recommended_contracts: Math.max(0, Math.round(finiteOr(r.recommended_contracts, 0))),
+        basket_eligible: Boolean(r.basket_eligible),
+        verdict: strOr(r.verdict, "QUARANTINED"),
+      })),
+    best_basket: {
+      legs: basketLegsRaw
+        .filter((it): it is Record<string, unknown> => !!it && typeof it === "object")
+        .map((it) => ({
+          strategy: strOr(it.strategy, "unnamed"),
+          side: strOr(it.side, "yes"),
+          post_only: Boolean(it.post_only),
+          target_contracts: Math.max(0, Math.round(finiteOr(it.target_contracts, 0))),
+          max_limit_cents: Math.min(99, Math.max(1, Math.round(finiteOr(it.max_limit_cents, 50)))),
+          allocated_dollars: finiteOr(it.allocated_dollars, 0),
+          rail_ready: Boolean(it.rail_ready),
+          note: strOr(it.note, ""),
+        })),
+      total_contracts: Math.max(0, Math.round(finiteOr(basketRaw.total_contracts, 0))),
+      total_allocated_dollars: finiteOr(basketRaw.total_allocated_dollars, 0),
+      projected_daily_dollars: finiteOr(basketRaw.projected_daily_dollars, 0),
+      avg_fill_headroom_pct: finiteOr(basketRaw.avg_fill_headroom_pct, 0),
+      ready_for_dry_run_preflight: Boolean(basketRaw.ready_for_dry_run_preflight),
+      summary: strOr(basketRaw.summary, "No basket-eligible causal winners."),
+    },
     comparison: {
       selection_basis: strOr(compRaw.selection_basis, "causal_is_to_oos"),
       legacy_equal_taker_end_equity: finiteOr(compRaw.legacy_equal_taker_end_equity, startEq),
@@ -391,6 +477,16 @@ export function computeClientFallbackReport(
         drift_cents: null,
         status: "NO_DATA",
         summary: "No settled paper trades loaded yet.",
+      },
+      edge_screener: [],
+      best_basket: {
+        legs: [],
+        total_contracts: 0,
+        total_allocated_dollars: 0,
+        projected_daily_dollars: 0,
+        avg_fill_headroom_pct: 0,
+        ready_for_dry_run_preflight: false,
+        summary: "No basket-eligible causal winners.",
       },
       comparison: {
         selection_basis: "causal_is_to_oos",
@@ -635,6 +731,39 @@ export function computeClientFallbackReport(
       drift_cents: rawWinners.length > 0 ? 0 : null,
       status: rawWinners.length > 0 ? "HEALTHY" : "NO_DATA",
       summary: rawWinners.length > 0 ? "Offline preview drift nominal." : "No active winners.",
+    },
+    edge_screener: rawWinners.map((w, idx) => ({
+      rank: idx + 1,
+      strategy: w.strategy,
+      side: w.side,
+      top_series: "KXBTC15M",
+      execution_mode: w.execution_mode,
+      oos_trades: w.oos_trades,
+      avg_entry_cents: Math.min(99, Math.max(1, Math.round(w.oos_avg_entry_price * 100))),
+      maker_fee_cents: w.maker_fee_cents,
+      taker_fee_cents: w.taker_fee_cents,
+      fee_edge_saved_cents: Math.max(0, w.taker_fee_cents - w.maker_fee_cents),
+      oos_net_expectancy_cents: w.oos_net_expectancy_cents,
+      breakeven_fill_rate_pct: w.breakeven_fill_rate_pct,
+      fill_headroom_pct: Math.max(0, params.maker_fill_rate * 100 - w.breakeven_fill_rate_pct),
+      folds_positive: w.stress.folds_positive,
+      folds_total: w.stress.folds_total,
+      worst_fold_expectancy_cents: w.stress.worst_fold_expectancy_cents,
+      daily_dollar_contribution: 0,
+      daily_target_share_pct: 0,
+      edge_quality_score: Math.min(100, Math.max(0, (w.oos_net_expectancy_cents / 15) * 60)),
+      recommended_contracts: w.rail_clamped_contracts,
+      basket_eligible: w.rail_clamped_contracts >= 1,
+      verdict: w.rail_clamped_contracts >= 1 ? "BASKET_ELIGIBLE" : "BELOW_1_CONTRACT",
+    })),
+    best_basket: {
+      legs: planned_intents.filter((it) => it.target_contracts >= 1).slice(0, 4),
+      total_contracts: planned_intents.slice(0, 4).reduce((s, it) => s + it.target_contracts, 0),
+      total_allocated_dollars: planned_intents.slice(0, 4).reduce((s, it) => s + it.allocated_dollars, 0),
+      projected_daily_dollars: 0,
+      avg_fill_headroom_pct: 0,
+      ready_for_dry_run_preflight: planned_intents.some((it) => it.target_contracts >= 1),
+      summary: "Offline preview basket.",
     },
     comparison: {
       selection_basis: isTrades.length > 0 ? "causal_is_to_oos" : "oos_only_no_is_history",

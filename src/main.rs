@@ -11,6 +11,7 @@ mod analytics;
 mod auto_allocator;
 mod edge_audit;
 mod embedded_chunks;
+mod gzip_inflate;
 mod kalshi_live;
 mod open;
 mod recalibration;
@@ -22,7 +23,6 @@ mod update;
 use serde_json::json;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -30,22 +30,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
-const INDEX_HTML: &str = include_str!("../assets/index.html");
 const INDEX_HTML_GZ: &[u8] = include_bytes!("../assets/index.html.gz");
 
-fn index_etag() -> &'static str {
-    static ETAG: LazyLock<String> = LazyLock::new(|| {
-        let digest = Sha256::digest(INDEX_HTML.as_bytes());
-        let mut hex = String::with_capacity(66);
-        hex.push('"');
-        for b in digest {
-            use std::fmt::Write as _;
-            let _ = write!(&mut hex, "{b:02x}");
-        }
-        hex.push('"');
-        hex
+fn index_html_str() -> &'static str {
+    static INDEX_HTML_RAW: LazyLock<String> = LazyLock::new(|| {
+        let bytes = gzip_inflate::inflate_gzip(INDEX_HTML_GZ).expect("embedded index.html.gz must inflate cleanly");
+        String::from_utf8(bytes).expect("embedded index.html must be UTF-8")
     });
-    ETAG.as_str()
+    INDEX_HTML_RAW.as_str()
+}
+
+#[inline]
+fn index_etag() -> &'static str {
+    embedded_chunks::INDEX_HTML_ETAG
 }
 
 const SERIES: [&str; 5] = ["KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M", "KXDOGE15M"];
@@ -3813,8 +3810,8 @@ fn write_cached_asset<W: std::io::Write>(
     content_type: &str,
     cache_control: &str,
     etag: &str,
-    raw: &[u8],
-    gz: &[u8],
+    bytes: &[u8],
+    is_gzip: bool,
 ) -> std::io::Result<()> {
     if etag_matches(headers, etag) {
         let hdr = format!(
@@ -3823,9 +3820,17 @@ fn write_cached_asset<W: std::io::Write>(
         return stream.write_all(hdr.as_bytes());
     }
     let is_head = method == "HEAD";
-    let use_gzip = gz.len() < raw.len() && accepts_gzip(headers);
-    let body: &[u8] = if use_gzip { gz } else { raw };
-    let enc_hdr = if use_gzip {
+    let send_gzip = is_gzip && accepts_gzip(headers);
+    let owned_raw: Option<Vec<u8>> = if is_gzip && !send_gzip {
+        gzip_inflate::inflate_gzip(bytes)
+    } else {
+        None
+    };
+    let body: &[u8] = match owned_raw.as_deref() {
+        Some(raw) => raw,
+        None => bytes,
+    };
+    let enc_hdr = if send_gzip {
         "Content-Encoding: gzip\r\n"
     } else {
         ""
@@ -3846,16 +3851,29 @@ fn write_index_response<W: std::io::Write>(
     method: &str,
     headers: &[(String, String)],
 ) -> std::io::Result<()> {
-    write_cached_asset(
-        stream,
-        method,
-        headers,
-        "text/html; charset=utf-8",
-        "no-cache",
-        index_etag(),
-        INDEX_HTML.as_bytes(),
-        INDEX_HTML_GZ,
-    )
+    if accepts_gzip(headers) {
+        write_cached_asset(
+            stream,
+            method,
+            headers,
+            "text/html; charset=utf-8",
+            "no-cache",
+            index_etag(),
+            INDEX_HTML_GZ,
+            true,
+        )
+    } else {
+        write_cached_asset(
+            stream,
+            method,
+            headers,
+            "text/html; charset=utf-8",
+            "no-cache",
+            index_etag(),
+            index_html_str().as_bytes(),
+            false,
+        )
+    }
 }
 
 fn write_embedded_chunk<W: std::io::Write>(
@@ -3871,8 +3889,8 @@ fn write_embedded_chunk<W: std::io::Write>(
         chunk.content_type,
         "public, max-age=31536000, immutable",
         chunk.etag,
-        chunk.raw,
-        chunk.gz,
+        chunk.bytes,
+        chunk.is_gzip,
     )
 }
 
@@ -4412,7 +4430,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
         None => (path, ""),
     };
     match (method, route) {
-        ("GET", "/") => html_response(INDEX_HTML),
+        ("GET", "/") => html_response(index_html_str()),
         ("GET", "/api/home") => {
             let (sim, _, lib_errors, _) = app.analysis_shared(&app.data_dir.join("snapshots.jsonl"));
             let live_snap = {
@@ -7372,10 +7390,15 @@ mod tests {
 
     #[test]
     fn embedded_chunks_serve_gzip_etag_304_immutable_and_block_woff2_recompress() {
+        use sha2::{Digest, Sha256};
+        // Verify pure-Rust inflator reproduces assets/index.html byte-for-byte.
+        let disk_html = include_bytes!("../assets/index.html");
+        assert_eq!(index_html_str().as_bytes(), disk_html);
+
         let js_chunk = embedded_chunks::CHUNKS
             .iter()
-            .find(|c| c.name.ends_with(".js") && c.gz.len() < c.raw.len())
-            .expect("at least one embedded js chunk");
+            .find(|c| c.name.ends_with(".js") && c.is_gzip)
+            .expect("at least one embedded gzip js chunk");
         let mut buf = Vec::new();
         let gzip_hdrs = vec![("accept-encoding".to_string(), "gzip, deflate".to_string())];
         write_embedded_chunk(&mut buf, "GET", &gzip_hdrs, js_chunk).unwrap();
@@ -7385,7 +7408,17 @@ mod tests {
         assert!(hdr.contains("Content-Encoding: gzip"));
         assert!(hdr.contains("Cache-Control: public, max-age=31536000, immutable"));
         assert!(hdr.contains(&format!("ETag: {}", js_chunk.etag)));
-        assert_eq!(&buf[split_pos + 4..], js_chunk.gz);
+        assert_eq!(&buf[split_pos + 4..], js_chunk.bytes);
+
+        // Verify non-gzip identity clients receive exact SHA-256 inflated JS.
+        let mut id_buf = Vec::new();
+        write_embedded_chunk(&mut id_buf, "GET", &[], js_chunk).unwrap();
+        let id_split = id_buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let id_hdr = std::str::from_utf8(&id_buf[..id_split]).unwrap();
+        assert!(!id_hdr.contains("Content-Encoding: gzip"));
+        let digest = Sha256::digest(&id_buf[id_split + 4..]);
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(format!("\"{hex}\""), js_chunk.etag);
 
         let mut buf_304 = Vec::new();
         let inm_hdrs = vec![("if-none-match".to_string(), js_chunk.etag.to_string())];
@@ -7401,7 +7434,7 @@ mod tests {
             let f_hdr = std::str::from_utf8(&font_buf[..f_split]).unwrap();
             assert!(!f_hdr.contains("Content-Encoding: gzip"));
             assert!(f_hdr.contains("Content-Type: font/woff2"));
-            assert_eq!(&font_buf[f_split + 4..], font.raw);
+            assert_eq!(&font_buf[f_split + 4..], font.bytes);
         }
     }
 }

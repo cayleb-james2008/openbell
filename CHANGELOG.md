@@ -4,6 +4,14 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.14.0 - 2026-11-25
+
+- **Multi-Market Spread / Fee / Edge Quality Screener & 1-Click Basket Preflight (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**
+  - Added strictly causal `edge_screener` ranking discovered strategies and dominant 15m Kalshi market series (`KXBTC15M`, `KXETH15M`, `KXSOL15M`, `KXXRP15M`) by fee-adjusted maker expectancy, taker-vs-maker fee edge saved, break-even queue fill headroom, walk-forward fold consistency, `$500/day` daily contribution share, and composite quality score.
+  - Added causal `best_basket` assembly and 1-click **Stage Best Basket** dry-run preflight (`POST /api/live/order` with `dry_run: true`) verifying multi-leg Hard Risk Rail compliance before staging into the Order Ticket while keeping `live_armed: false` on boot.
+- **Binary Size & `.rodata` Diet (`Cargo.toml`, `src/gzip_inflate.rs`, `frontend/vite.config.ts`, `src/main.rs`):**
+  - Enabled `lto = "fat"` and `panic = "abort"` in `[profile.release]`, and eliminated ~787 KB of duplicate uncompressed HTML/JS `.rodata` by embedding pre-gzipped assets once (`index.html.gz` + `/chunks/*.js.gz`) with build-time SHA-256 `INDEX_HTML_ETAG` and a verified pure-Rust RFC 1951/1952 `inflate_gzip` fallback for `identity` HTTP clients.
+
 ## 0.13.0 - 2026-11-25
 
 - **Initial-Shell `React.lazy` `/chunks/*` Code-Splitting (`frontend/vite.config.ts`, `src/embedded_chunks.rs`, `src/main.rs`):**
