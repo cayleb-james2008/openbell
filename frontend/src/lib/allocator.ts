@@ -121,6 +121,26 @@ export type StrategyPresetCandidate = {
   note: string;
 };
 
+export type ForwardEnvelopeMonitor = {
+  status: "ON_TRACK" | "DRIFT_DEMOTE" | "NO_DATA" | string;
+  active_preset_id: string | null;
+  active_preset_label: string;
+  envelope_day: number;
+  envelope_p5_equity: number;
+  envelope_p50_equity: number;
+  observed_paper_equity: number;
+  predicted_ev_cents: number | null;
+  observed_forward_ev_cents: number | null;
+  expectancy_drift_cents: number | null;
+  realized_slippage_vs_model_cents: number;
+  daily_rail_breach_prob_pct: number;
+  stress_1c_daily_rail_breach_prob_pct: number;
+  next_safe_preset_id: string | null;
+  next_safe_preset_label: string | null;
+  live_armed: boolean;
+  summary: string;
+};
+
 export type RegimeEdgeBucket = {
   regime: string;
   trades: number;
@@ -244,6 +264,7 @@ export type AutoAllocatorReport = {
   bootstrap_stress: BootstrapStressSummary;
   preset_leaderboard: StrategyPresetCandidate[];
   top_safe_preset: string | null;
+  forward_envelope: ForwardEnvelopeMonitor;
   comparison: AllocatorComparison;
   planned_intents: PlannedAllocatorIntent[];
   daily_target: DailyTargetVerdict;
@@ -300,6 +321,7 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
   const bsRaw = (o.bootstrap_stress && typeof o.bootstrap_stress === "object" ? o.bootstrap_stress : {}) as Record<string, unknown>;
   const bsTrajRaw = Array.isArray(bsRaw.trajectory) ? bsRaw.trajectory : [];
   const presetRaw = Array.isArray(o.preset_leaderboard) ? o.preset_leaderboard : [];
+  const envRaw = (o.forward_envelope && typeof o.forward_envelope === "object" ? o.forward_envelope : {}) as Record<string, unknown>;
   const intentsRaw = Array.isArray(o.planned_intents) ? o.planned_intents : [];
   const notesRaw = Array.isArray(o.honesty_notes) ? o.honesty_notes : [];
   const compRaw = (o.comparison && typeof o.comparison === "object" ? o.comparison : {}) as Record<string, unknown>;
@@ -515,6 +537,25 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
         };
       }),
     top_safe_preset: typeof o.top_safe_preset === "string" && o.top_safe_preset.trim().length > 0 ? o.top_safe_preset : null,
+    forward_envelope: {
+      status: strOr(envRaw.status, "NO_DATA"),
+      active_preset_id: typeof envRaw.active_preset_id === "string" && envRaw.active_preset_id.trim().length > 0 ? envRaw.active_preset_id : null,
+      active_preset_label: strOr(envRaw.active_preset_label, "Custom"),
+      envelope_day: Math.max(1, Math.min(30, Math.round(finiteOr(envRaw.envelope_day, 1)))),
+      envelope_p5_equity: finiteOr(envRaw.envelope_p5_equity, startEq),
+      envelope_p50_equity: finiteOr(envRaw.envelope_p50_equity, startEq),
+      observed_paper_equity: finiteOr(envRaw.observed_paper_equity, startEq),
+      predicted_ev_cents: finiteOpt(envRaw.predicted_ev_cents),
+      observed_forward_ev_cents: finiteOpt(envRaw.observed_forward_ev_cents),
+      expectancy_drift_cents: finiteOpt(envRaw.expectancy_drift_cents),
+      realized_slippage_vs_model_cents: finiteOr(envRaw.realized_slippage_vs_model_cents, 0),
+      daily_rail_breach_prob_pct: finiteOr(envRaw.daily_rail_breach_prob_pct, 0),
+      stress_1c_daily_rail_breach_prob_pct: finiteOr(envRaw.stress_1c_daily_rail_breach_prob_pct, 0),
+      next_safe_preset_id: typeof envRaw.next_safe_preset_id === "string" && envRaw.next_safe_preset_id.trim().length > 0 ? envRaw.next_safe_preset_id : null,
+      next_safe_preset_label: typeof envRaw.next_safe_preset_label === "string" && envRaw.next_safe_preset_label.trim().length > 0 ? envRaw.next_safe_preset_label : null,
+      live_armed: Boolean(envRaw.live_armed),
+      summary: strOr(envRaw.summary, "Awaiting active OOS winners for forward-test envelope tracking."),
+    },
     comparison: {
       selection_basis: strOr(compRaw.selection_basis, "causal_is_to_oos"),
       legacy_equal_taker_end_equity: finiteOr(compRaw.legacy_equal_taker_end_equity, startEq),
@@ -632,6 +673,25 @@ export function computeClientFallbackReport(
       },
       preset_leaderboard: [],
       top_safe_preset: null,
+      forward_envelope: {
+        status: "NO_DATA",
+        active_preset_id: null,
+        active_preset_label: "Paper Preview",
+        envelope_day: 1,
+        envelope_p5_equity: startEq,
+        envelope_p50_equity: startEq,
+        observed_paper_equity: startEq,
+        predicted_ev_cents: null,
+        observed_forward_ev_cents: null,
+        expectancy_drift_cents: null,
+        realized_slippage_vs_model_cents: 0,
+        daily_rail_breach_prob_pct: 0,
+        stress_1c_daily_rail_breach_prob_pct: 0,
+        next_safe_preset_id: null,
+        next_safe_preset_label: null,
+        live_armed: false,
+        summary: "Awaiting OOS winners for paper envelope tracking.",
+      },
       comparison: {
         selection_basis: "causal_is_to_oos",
         legacy_equal_taker_end_equity: startEq,
@@ -931,6 +991,25 @@ export function computeClientFallbackReport(
     },
     preset_leaderboard: [],
     top_safe_preset: null,
+    forward_envelope: {
+      status: rawWinners.length > 0 ? "ON_TRACK" : "NO_DATA",
+      active_preset_id: null,
+      active_preset_label: "Offline Preview",
+      envelope_day: 1,
+      envelope_p5_equity: startEq,
+      envelope_p50_equity: startEq,
+      observed_paper_equity: Number(allocEq.toFixed(2)),
+      predicted_ev_cents: rawWinners.length > 0 ? rawWinners[0].oos_net_expectancy_cents : null,
+      observed_forward_ev_cents: rawWinners.length > 0 ? rawWinners[0].oos_net_expectancy_cents : null,
+      expectancy_drift_cents: rawWinners.length > 0 ? 0 : null,
+      realized_slippage_vs_model_cents: 0,
+      daily_rail_breach_prob_pct: 0,
+      stress_1c_daily_rail_breach_prob_pct: 0,
+      next_safe_preset_id: null,
+      next_safe_preset_label: null,
+      live_armed: false,
+      summary: rawWinners.length > 0 ? "Offline paper envelope nominal." : "No active winners.",
+    },
     comparison: {
       selection_basis: isTrades.length > 0 ? "causal_is_to_oos" : "oos_only_no_is_history",
       legacy_equal_taker_end_equity: Number(legacyEq.toFixed(2)),

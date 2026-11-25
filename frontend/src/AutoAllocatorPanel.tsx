@@ -915,8 +915,26 @@ export function AutoAllocatorPanel({
           <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-semibold text-ink">
-                Zero-Config Strategy Leaderboard
+                Zero-Config Strategy Leaderboard &amp; Envelope Monitor
               </span>
+              {report.forward_envelope && (
+                <StatusPill
+                  id="allocator-envelope-status"
+                  tone={
+                    report.forward_envelope.status === "ON_TRACK"
+                      ? "success"
+                      : report.forward_envelope.status === "DRIFT_DEMOTE"
+                        ? "error"
+                        : "neutral"
+                  }
+                >
+                  {report.forward_envelope.status === "ON_TRACK"
+                    ? "ON TRACK"
+                    : report.forward_envelope.status === "DRIFT_DEMOTE"
+                      ? "DRIFT / DEMOTE"
+                      : "AWAITING DATA"}
+                </StatusPill>
+              )}
               {report.top_safe_preset ? (
                 <StatusPill id="allocator-top-safe-pill" tone="success">
                   Top Safe: {report.preset_leaderboard.find((p) => p.is_top_safe)?.label ?? report.top_safe_preset}
@@ -930,8 +948,26 @@ export function AutoAllocatorPanel({
                 Hard Gate: 0.0% Rail Breach (OOS &amp; +1c) · live_armed=false
               </Badge>
             </div>
-            <div className="flex items-center gap-2">
-              {report.preset_leaderboard.find((p) => p.is_top_safe) && (
+            <div className="flex flex-wrap items-center gap-2">
+              {report.forward_envelope?.next_safe_preset_id && (
+                <Button
+                  id="allocator-rotate-safe-btn"
+                  variant={report.forward_envelope.status === "DRIFT_DEMOTE" ? "default" : "outline"}
+                  size="sm"
+                  disabled={loading}
+                  onClick={() => {
+                    const nextP = report.preset_leaderboard.find(
+                      (p) => p.id === report.forward_envelope.next_safe_preset_id,
+                    );
+                    if (nextP) void applySafePreset(nextP);
+                  }}
+                >
+                  <RefreshCw className="size-3.5" aria-hidden />
+                  <span>Rotate Safe -&gt; {report.forward_envelope.next_safe_preset_label ?? "Next Safe"}</span>
+                </Button>
+              )}
+              {report.preset_leaderboard.find((p) => p.is_top_safe) &&
+                report.forward_envelope?.next_safe_preset_id !== report.top_safe_preset && (
                 <Button
                   id="allocator-apply-top-safe-btn"
                   variant="default"
@@ -957,6 +993,40 @@ export function AutoAllocatorPanel({
               </Button>
             </div>
           </div>
+
+          {report.forward_envelope && (
+            <div
+              id="allocator-forward-envelope"
+              className="grid grid-cols-1 gap-2 rounded-lg border border-hairline bg-surface px-3 py-2 text-xs sm:grid-cols-4"
+            >
+              <div>
+                <div className="text-ink-3">Active Config (Day {report.forward_envelope.envelope_day})</div>
+                <div className="mt-0.5 font-semibold text-ink">{report.forward_envelope.active_preset_label}</div>
+              </div>
+              <div>
+                <div className="text-ink-3">Paper vs P5–P50 Envelope</div>
+                <div className="mono mt-0.5 font-semibold text-ink">
+                  {money(report.forward_envelope.observed_paper_equity)}{" "}
+                  <span className="text-ink-3">
+                    (P5 {money(report.forward_envelope.envelope_p5_equity)} / P50 {money(report.forward_envelope.envelope_p50_equity)})
+                  </span>
+                </div>
+              </div>
+              <div>
+                <div className="text-ink-3">Forward EV / Slippage Drift</div>
+                <div className="mono mt-0.5 font-semibold text-ink">
+                  {fmtCents(report.forward_envelope.observed_forward_ev_cents)}{" "}
+                  <span className="text-ink-3">
+                    (drift {fmtCents(report.forward_envelope.expectancy_drift_cents)})
+                  </span>
+                </div>
+              </div>
+              <div>
+                <div className="text-ink-3">Envelope Verdict</div>
+                <div className="mt-0.5 text-ink-2">{report.forward_envelope.summary}</div>
+              </div>
+            </div>
+          )}
 
           <div className="overflow-x-auto rounded-lg border border-hairline bg-surface">
             <Table>

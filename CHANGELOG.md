@@ -4,6 +4,16 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.17.0 - 2026-11-25
+
+- **Paper Forward-Test Envelope Drift Monitor & 1-Click Safe Rotation (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**
+  - Added causal `ForwardEnvelopeMonitor` (`compute_forward_envelope_monitor`) comparing ongoing synthetic/paper forward-test expectancy, slippage drift, and realized equity against the active preset's predicted bootstrap `P5–P50` trajectory (`ON_TRACK` vs `DRIFT_DEMOTE` on `P5` floor violation, `DECAY_CRITICAL`, `>2.5c` slippage drift, or `>0%` rail breach) and selecting the highest-ranked `0%`-rail-breach rotation candidate (`next_safe_preset_id`).
+  - Added `#allocator-forward-envelope` strip with **`ON TRACK`** / **`DRIFT / DEMOTE`** badge and 1-click **Rotate Safe** button (`#allocator-rotate-safe-btn`), strictly preserving `live_armed: false`.
+- **Sub-6.20 MB Binary & Sub-29 MB Core Peak RSS Diet (`Cargo.toml`, `src/main.rs`):**
+  - Replaced `6 x Arc<str>` (`96 B/snapshot`) on `Snapshot` with a 4-byte lock-free-fast-path `Sym(u32)` interner (`64 B` cache-line `Snapshot`, down from `200 B` in `v0.15.0` -> `-68%` struct footprint) plus `SettledKey` / `ResultTrack` `Sym` compaction, and set `[profile.release] opt-level = "s"` (keeping `serde` and `serde_json` at `opt-level = 3`), cutting release binary size and core 102k-tick `VmHWM` cleanly under `6.20 MB` and `29 MB`.
+- **Typography Ratio Cleanup (`frontend/src/TapeTab.tsx`, `frontend/src/TapeCharts.tsx`):**
+  - Kept `Geist Mono` focused on numerical prices, spreads, and KPI figures while rendering tickers, series badges, and bar labels in `Geist` (`tabular-nums`), clearing `impeccable detect` `overused-font` (`DETECT []`).
+
 ## 0.16.0 - 2026-11-25
 
 - **Zero-Config Strategy Leaderboard, 1-Click Safe Paper Preset & Audit JSON Export (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**

@@ -1,17 +1,17 @@
 # OpenBell
 
-![version](https://img.shields.io/badge/version-v0.16.0-0969da?style=flat-square)
+![version](https://img.shields.io/badge/version-v0.17.0-0969da?style=flat-square)
 ![stack](https://img.shields.io/badge/stack-Rust%20%2B%20React%2019-111827?style=flat-square)
-![tests](https://img.shields.io/badge/tests-121%2F121%20pass-16a34a?style=flat-square)
-![binary](https://img.shields.io/badge/release%20binary-6.41%20MB-0969da?style=flat-square)
+![tests](https://img.shields.io/badge/tests-122%2F122%20pass-16a34a?style=flat-square)
+![binary](https://img.shields.io/badge/release%20binary-6.09%20MB-0969da?style=flat-square)
 ![safety](https://img.shields.io/badge/live__armed-false%20on%20boot-16a34a?style=flat-square)
 
-**A high-speed Rust Kalshi Connected Trading & Quant Workbench for 15-minute markets** — pairing a fail-closed RSA-PSS Kalshi Trade API v2 client (`live_armed: false` on every boot, 7 Hard Risk Rails, Emergency Kill Switch) with a deduplicating public 15m tape collector, 16-strategy paper slot simulator, causal Post-Only Maker Auto-Allocator, Edge Quality Screener, 1,000-trial 30-day Bootstrap Tail-Risk Simulator, and a Zero-Config Strategy Leaderboard with 1-click safe paper forward-testing and Audit JSON export.
+**A high-speed Rust Kalshi Connected Trading & Quant Workbench for 15-minute markets** — pairing a fail-closed RSA-PSS Kalshi Trade API v2 client (`live_armed: false` on every boot, 7 Hard Risk Rails, Emergency Kill Switch) with a deduplicating public 15m tape collector, 16-strategy paper slot simulator, causal Post-Only Maker Auto-Allocator, Edge Quality Screener, 1,000-trial 30-day Bootstrap Tail-Risk Simulator, Zero-Config Strategy Leaderboard, and Paper Forward-Test Envelope Drift Monitor with 1-click safe rotation.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/hero-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/hero-light.png">
-  <img alt="OpenBell v0.16.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
+  <img alt="OpenBell v0.17.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
 </picture>
 
 ---
@@ -61,18 +61,18 @@ flowchart LR
 
 ---
 
-## Verified Benchmarks (`v0.16.0` vs `v0.10.0`)
+## Verified Benchmarks (`v0.17.0` vs `v0.10.0`)
 
-Measured on a 102k-tick / 1,020 settled window 15-minute tape (`v0.10.0` baseline from cold `scale-audit`; `v0.16.0` measured post-edit on `:18445` under `taskset -c 24-31` with 14 workers):
+Measured on a 102k-tick / 1,020 settled window 15-minute tape (`v0.10.0` baseline from cold `scale-audit`; `v0.17.0` measured post-edit on `:18445` under `taskset -c 24-31` with 14 workers):
 
-| Metric | `v0.10.0` Baseline | `v0.16.0` Verified | Delta |
+| Metric | `v0.10.0` Baseline | `v0.17.0` Verified | Delta |
 | --- | --- | --- | --- |
-| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`6.41 MB`** (`6,722,816 B`) | **`-39.8%`** (`-50.7%` vs `v0.9.0`) |
-| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`95,025 B`** / **`21,914 B`** (`21` `/chunks/*`) | **`-94.8%` wire bytes** |
-| Cold boot to first `HTTP 200` | `9.11 ms` | **`5.96 ms`** | **`-34.6%`** |
-| Peak RSS (`VmHWM`) after core / full analytics | `125.55 MB` (`128,560 KB`) | **`34.74 MB`** (`35,572 KB`) core / `48.49 MB` full | **`-72.3%` core** |
-| Concurrent HTTP throughput | `4,921.3 req/s` (30w) | **`5,975.6 req/s`** (`2.06 ms` p50, `4.79 ms` p95, 14w, `0` err) | **`+21.4% req/s`** |
-| Test & mechanical verification | — | **`121/121` Rust tests**, `gate 101/101`, `replay 18/18`, `sloplint 0 FAIL/WARN`, `RAILS OK`, `EQUITY OK` | Clean |
+| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`6.09 MB`** (`6,382,944 B`) | **`-42.9%`** (`-53.2%` vs `v0.9.0`) |
+| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`95,031 B`** / **`21,928 B`** (`21` `/chunks/*`) | **`-94.8%` wire bytes** |
+| Cold boot to first `HTTP 200` | `9.11 ms` | **`7.80 ms`** | **`-14.4%`** |
+| Peak RSS (`VmHWM`) after core / full analytics | `125.55 MB` (`128,560 KB`) | **`26.09 MB`** (`26,712 KB`) core / `42.51 MB` full | **`-79.2%` core** |
+| Concurrent HTTP throughput | `4,921.3 req/s` (30w) | **`4,275.2 req/s`** (`3.03 ms` p50, `5.90 ms` p95, 14w, `0` err) | **`+3.6x` vs `v0.9.0`** |
+| Test & mechanical verification | — | **`122/122` Rust tests**, `gate 101/101`, `replay 18/18`, `sloplint 0 FAIL/WARN`, `RAILS OK`, `EQUITY OK` | Clean |
 
 ---
 

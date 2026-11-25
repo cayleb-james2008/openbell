@@ -422,6 +422,30 @@ pub struct StrategyPresetCandidate {
     pub note: String,
 }
 
+/// Paper forward-test envelope monitor comparing realized OOS expectancy & slippage
+/// against the active preset's predicted bootstrap P5-P50 trajectory and selecting
+/// the next 0%-rail-breach safe rotation preset (`live_armed: false`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardEnvelopeMonitor {
+    pub status: String,
+    pub active_preset_id: Option<String>,
+    pub active_preset_label: String,
+    pub envelope_day: u32,
+    pub envelope_p5_equity: f64,
+    pub envelope_p50_equity: f64,
+    pub observed_paper_equity: f64,
+    pub predicted_ev_cents: Option<f64>,
+    pub observed_forward_ev_cents: Option<f64>,
+    pub expectancy_drift_cents: Option<f64>,
+    pub realized_slippage_vs_model_cents: f64,
+    pub daily_rail_breach_prob_pct: f64,
+    pub stress_1c_daily_rail_breach_prob_pct: f64,
+    pub next_safe_preset_id: Option<String>,
+    pub next_safe_preset_label: Option<String>,
+    pub live_armed: bool,
+    pub summary: String,
+}
+
 /// Complete response payload for `GET /api/allocator` and `POST /api/allocator/plan`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoAllocatorReport {
@@ -453,6 +477,7 @@ pub struct AutoAllocatorReport {
     pub bootstrap_stress: BootstrapStressSummary,
     pub preset_leaderboard: Vec<StrategyPresetCandidate>,
     pub top_safe_preset: Option<String>,
+    pub forward_envelope: ForwardEnvelopeMonitor,
     pub comparison: AllocatorComparison,
     pub planned_intents: Vec<PlannedAllocatorIntent>,
     pub daily_target: DailyTargetVerdict,
@@ -1052,6 +1077,16 @@ pub fn compute_auto_allocator_report(
         &oos_by_epoch,
         is_total_entries,
     );
+    let forward_envelope = compute_forward_envelope_monitor(
+        &req,
+        &active_winners,
+        &drift_gauge,
+        &bootstrap_stress,
+        &comparison,
+        &preset_leaderboard,
+        oos_window_returns.len(),
+        live_armed,
+    );
 
     // Compute $500/day net expectancy readiness verdict with concrete blockers.
     let daily_target = compute_daily_target_verdict(
@@ -1148,6 +1183,7 @@ pub fn compute_auto_allocator_report(
         bootstrap_stress,
         preset_leaderboard,
         top_safe_preset,
+        forward_envelope,
         comparison,
         planned_intents,
         daily_target,
@@ -2383,6 +2419,167 @@ fn compute_preset_leaderboard(
     (rows, top_safe_preset)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn compute_forward_envelope_monitor(
+    req: &AutoAllocatorRequest,
+    winners: &[AllocatedWinner],
+    drift_gauge: &DriftGauge,
+    bootstrap_stress: &BootstrapStressSummary,
+    comparison: &AllocatorComparison,
+    leaderboard: &[StrategyPresetCandidate],
+    oos_windows_count: usize,
+    live_armed: bool,
+) -> ForwardEnvelopeMonitor {
+    let matched_preset = leaderboard.iter().find(|p| {
+        p.config.execution_mode == req.execution_mode
+            && p.config.sizing_mode == req.sizing_mode
+            && (p.config.max_slot_risk_pct - req.max_slot_risk_pct).abs() < 1e-6
+            && (p.config.max_total_heat_pct - req.max_total_heat_pct).abs() < 1e-6
+    });
+    let active_preset_id = matched_preset.map(|p| p.id.clone());
+    let active_preset_label = matched_preset
+        .map(|p| p.label.clone())
+        .unwrap_or_else(|| {
+            format!(
+                "Custom ({} · {:.0}%/{:.0}%)",
+                req.execution_mode, req.max_slot_risk_pct, req.max_total_heat_pct
+            )
+        });
+
+    let exact_day = (oos_windows_count as f64 / 96.0).clamp(0.0, 30.0);
+    let envelope_day = (exact_day.round() as u32).clamp(1, 30);
+    let (envelope_p5_equity, envelope_p50_equity) = if bootstrap_stress.trajectory.len() >= 2 {
+        let max_idx = bootstrap_stress.trajectory.len() - 1;
+        let lo = (exact_day.floor() as usize).min(max_idx);
+        let hi = (exact_day.ceil() as usize).min(max_idx);
+        let t = (exact_day - (lo as f64)).clamp(0.0, 1.0);
+        let a = &bootstrap_stress.trajectory[lo];
+        let b = &bootstrap_stress.trajectory[hi];
+        (
+            a.p5_equity + (b.p5_equity - a.p5_equity) * t,
+            a.p50_equity + (b.p50_equity - a.p50_equity) * t,
+        )
+    } else {
+        (req.starting_bankroll, req.starting_bankroll)
+    };
+    let observed_paper_equity = comparison.auto_allocator_end_equity;
+
+    let total_w: f64 = winners.iter().map(|w| w.allocated_pct).sum();
+    let predicted_ev_cents = if total_w > 1e-9 {
+        finite_opt(
+            winners
+                .iter()
+                .map(|w| w.oos_net_expectancy_cents * (w.allocated_pct / total_w))
+                .sum::<f64>(),
+        )
+    } else if !winners.is_empty() {
+        finite_opt(
+            winners
+                .iter()
+                .map(|w| w.oos_net_expectancy_cents)
+                .sum::<f64>()
+                / (winners.len() as f64),
+        )
+    } else {
+        None
+    };
+
+    let observed_forward_ev_cents = drift_gauge.shadow_expectancy_cents.or(predicted_ev_cents);
+    let expectancy_drift_cents = match (observed_forward_ev_cents, predicted_ev_cents) {
+        (Some(obs), Some(pred)) => finite_opt(obs - pred),
+        _ => drift_gauge.drift_cents,
+    };
+    let realized_slippage_vs_model_cents = expectancy_drift_cents
+        .map(|d| finite_or((-d).max(0.0), 0.0))
+        .unwrap_or(0.0);
+
+    let next_safe = leaderboard
+        .iter()
+        .find(|p| p.safe_gate_passed && active_preset_id.as_ref() != Some(&p.id));
+
+    let has_data = !winners.is_empty() && oos_windows_count > 0;
+    let rail_breached = bootstrap_stress.daily_rail_breach_prob_pct > 0.0
+        || bootstrap_stress.stress_1c_daily_rail_breach_prob_pct > 0.0;
+    let below_p5 = has_data && observed_paper_equity + 1e-6 < envelope_p5_equity;
+    let decay_critical = drift_gauge.status == "DECAY_CRITICAL"
+        || observed_forward_ev_cents.is_some_and(|ev| ev < 0.0)
+        || realized_slippage_vs_model_cents > 2.5;
+
+    let status = if !has_data {
+        if decay_critical {
+            "DRIFT_DEMOTE"
+        } else {
+            "NO_DATA"
+        }
+    } else if rail_breached || below_p5 || decay_critical {
+        "DRIFT_DEMOTE"
+    } else {
+        "ON_TRACK"
+    }
+    .to_string();
+
+    let summary = match status.as_str() {
+        "ON_TRACK" => format!(
+            "ON TRACK (Day {envelope_day} envelope): paper ${observed_paper_equity:.2} >= P5 ${envelope_p5_equity:.2} (P50 ${envelope_p50_equity:.2}), 0.0% daily rail breach."
+        ),
+        "DRIFT_DEMOTE" => {
+            let fmt_b = |v: f64| -> String {
+                if v > 0.0 && v < 0.05 {
+                    "<0.1%".to_string()
+                } else {
+                    format!("{v:.1}%")
+                }
+            };
+            let mut reasons: Vec<String> = Vec::new();
+            if rail_breached {
+                reasons.push(format!(
+                    "rail breach {}/{} @ +1c",
+                    fmt_b(bootstrap_stress.daily_rail_breach_prob_pct),
+                    fmt_b(bootstrap_stress.stress_1c_daily_rail_breach_prob_pct)
+                ));
+            }
+            if below_p5 {
+                reasons.push(format!(
+                    "paper ${observed_paper_equity:.2} < P5 ${envelope_p5_equity:.2}"
+                ));
+            }
+            if decay_critical {
+                reasons.push(format!("slippage/drift {realized_slippage_vs_model_cents:.2}c/ct"));
+            }
+            let rot = next_safe
+                .map(|p| format!(" -> rotate to {}", p.label))
+                .unwrap_or_default();
+            format!(
+                "DRIFT / DEMOTE ({}): {}{rot}",
+                active_preset_label,
+                reasons.join("; ")
+            )
+        }
+        _ => "Awaiting active OOS winners & paper forward-test windows for envelope tracking."
+            .to_string(),
+    };
+
+    ForwardEnvelopeMonitor {
+        status,
+        active_preset_id,
+        active_preset_label,
+        envelope_day,
+        envelope_p5_equity,
+        envelope_p50_equity,
+        observed_paper_equity,
+        predicted_ev_cents,
+        observed_forward_ev_cents,
+        expectancy_drift_cents,
+        realized_slippage_vs_model_cents,
+        daily_rail_breach_prob_pct: bootstrap_stress.daily_rail_breach_prob_pct,
+        stress_1c_daily_rail_breach_prob_pct: bootstrap_stress.stress_1c_daily_rail_breach_prob_pct,
+        next_safe_preset_id: next_safe.map(|p| p.id.clone()),
+        next_safe_preset_label: next_safe.map(|p| p.label.clone()),
+        live_armed,
+        summary,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3122,6 +3319,95 @@ mod tests {
                 assert!(!p.safe_gate_passed);
                 assert!(!p.is_top_safe);
             }
+        }
+    }
+
+    #[test]
+    fn forward_envelope_monitor_detects_drift_and_selects_next_safe_rotation() {
+        let strats = vec![StrategyMeta {
+            name: "decay-maker".into(),
+            side: "yes".into(),
+        }];
+        let mut entries = Vec::new();
+        // IS + first two OOS folds strong (80% WR), trailing OOS tail collapses -> active winner overall, DECAY_CRITICAL trailing!
+        for w in 0..120i64 {
+            let won = if w < 108 { w % 5 != 0 } else { false };
+            entries.push(TournamentEntry {
+                close_epoch: 40_000 + w * 900,
+                ticker: format!("KXBTC15M-FE{w:03}"),
+                series: "KXBTC15M".into(),
+                strategy_idx: 0,
+                strategy: "decay-maker".into(),
+                side: "yes".into(),
+                entry_price: 0.55,
+                secs_to_close: 240,
+                won,
+            });
+        }
+        let ctx = make_ctx(strats, entries, 120, 48, 40_000 + 72 * 900);
+        let rails = RiskRailsConfig {
+            max_daily_loss_dollars: 500.0,
+            ..RiskRailsConfig::default()
+        };
+        let req = AutoAllocatorRequest {
+            starting_bankroll: 500.0,
+            min_oos_trades: 20,
+            require_stress_resilience: false,
+            ..AutoAllocatorRequest::default()
+        };
+        let rep = compute_auto_allocator_report(&ctx, &req, &rails, false, false);
+        assert!(!rep.forward_envelope.live_armed);
+        assert_eq!(rep.forward_envelope.status, "DRIFT_DEMOTE");
+        assert!(rep.forward_envelope.envelope_day >= 1);
+        assert!(rep.forward_envelope.envelope_p5_equity <= rep.forward_envelope.envelope_p50_equity + 1e-6);
+
+        // On healthy monotone positive tape with Conservative Maker QK, monitor reports ON_TRACK.
+        let healthy_strats = vec![StrategyMeta {
+            name: "steady-maker".into(),
+            side: "yes".into(),
+        }];
+        let healthy_entries: Vec<TournamentEntry> = (0..80i64)
+            .map(|w| TournamentEntry {
+                close_epoch: 50_000 + w * 900,
+                ticker: format!("KXBTC15M-OK{w:02}"),
+                series: "KXBTC15M".into(),
+                strategy_idx: 0,
+                strategy: "steady-maker".into(),
+                side: "yes".into(),
+                entry_price: 0.55,
+                secs_to_close: 240,
+                won: w % 4 != 0,
+            })
+            .collect();
+        let h_ctx = make_ctx(healthy_strats, healthy_entries, 80, 32, 50_000 + 48 * 900);
+        let cons_req = AutoAllocatorRequest {
+            execution_mode: "maker".into(),
+            sizing_mode: "quarter_kelly".into(),
+            maker_fill_rate: 0.70,
+            min_oos_trades: 20,
+            max_slot_risk_pct: 2.0,
+            max_total_heat_pct: 10.0,
+            starting_bankroll: 500.0,
+            require_stress_resilience: true,
+            enable_regime_throttle: true,
+            min_fill_rate_pct: 60.0,
+            ..AutoAllocatorRequest::default()
+        };
+        let h_rep = compute_auto_allocator_report(&h_ctx, &cons_req, &rails, false, false);
+        assert_eq!(h_rep.forward_envelope.status, "ON_TRACK");
+        assert_eq!(
+            h_rep.forward_envelope.active_preset_id.as_deref(),
+            Some("conservative_maker_qk")
+        );
+        if let Some(next_id) = &h_rep.forward_envelope.next_safe_preset_id {
+            let next_p = h_rep
+                .preset_leaderboard
+                .iter()
+                .find(|p| &p.id == next_id)
+                .expect("next_safe_preset exists in leaderboard");
+            assert!(next_p.safe_gate_passed);
+            assert_eq!(next_p.daily_rail_breach_prob_pct, 0.0);
+            assert_eq!(next_p.stress_1c_daily_rail_breach_prob_pct, 0.0);
         }
     }
 }
