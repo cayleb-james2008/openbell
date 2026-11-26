@@ -43,6 +43,21 @@ export type DiversificationGuardReport = {
   summary: string;
 };
 
+export type RegimeStabilityStatus = "ALL-REGIME" | "CALM-ONLY" | "VOL-SENSITIVE" | "NO_DATA" | string;
+
+export type RegimeStabilityReport = {
+  status: RegimeStabilityStatus;
+  causal_percentile_pct: number;
+  calm_windows: number;
+  high_vol_windows: number;
+  active_calm_ev_cents: number | null;
+  active_high_vol_ev_cents: number | null;
+  active_calm_stress_1c_ok: boolean;
+  active_high_vol_stress_1c_ok: boolean;
+  all_regime_safe_presets: number;
+  summary: string;
+};
+
 export type SessionBriefingReport = {
   status: "PASS_READY" | "HOLD_PAPER" | "NO_DATA" | string;
   live_armed: boolean;
@@ -58,6 +73,9 @@ export type SessionBriefingReport = {
   daily_loss_headroom_pct: number;
   active_winners_count: number;
   projected_daily_net_dollars: number;
+  regime_stability: RegimeStabilityStatus;
+  calm_expectancy_cents: number | null;
+  high_vol_expectancy_cents: number | null;
   summary: string;
 };
 
@@ -159,6 +177,11 @@ export type StrategyPresetCandidate = {
   risk_adjusted_score: number;
   safe_gate_passed: boolean;
   is_top_safe: boolean;
+  calm_expectancy_cents: number | null;
+  high_vol_expectancy_cents: number | null;
+  calm_stress_1c_survival: boolean;
+  high_vol_stress_1c_survival: boolean;
+  regime_stability: RegimeStabilityStatus;
   note: string;
 };
 
@@ -306,6 +329,7 @@ export type AutoAllocatorReport = {
   bootstrap_stress: BootstrapStressSummary;
   preset_leaderboard: StrategyPresetCandidate[];
   top_safe_preset: string | null;
+  regime_stability: RegimeStabilityReport;
   forward_envelope: ForwardEnvelopeMonitor;
   diversification: DiversificationGuardReport;
   session_briefing: SessionBriefingReport;
@@ -366,6 +390,7 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
   const bsRaw = (o.bootstrap_stress && typeof o.bootstrap_stress === "object" ? o.bootstrap_stress : {}) as Record<string, unknown>;
   const bsTrajRaw = Array.isArray(bsRaw.trajectory) ? bsRaw.trajectory : [];
   const presetRaw = Array.isArray(o.preset_leaderboard) ? o.preset_leaderboard : [];
+  const regStabRaw = (o.regime_stability && typeof o.regime_stability === "object" ? o.regime_stability : {}) as Record<string, unknown>;
   const envRaw = (o.forward_envelope && typeof o.forward_envelope === "object" ? o.forward_envelope : {}) as Record<string, unknown>;
   const divRaw = (o.diversification && typeof o.diversification === "object" ? o.diversification : {}) as Record<string, unknown>;
   const divClustersRaw = Array.isArray(divRaw.clusters) ? divRaw.clusters : [];
@@ -587,10 +612,27 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
           risk_adjusted_score: finiteOr(p.risk_adjusted_score, 0),
           safe_gate_passed: Boolean(p.safe_gate_passed),
           is_top_safe: Boolean(p.is_top_safe),
+          calm_expectancy_cents: finiteOpt(p.calm_expectancy_cents),
+          high_vol_expectancy_cents: finiteOpt(p.high_vol_expectancy_cents),
+          calm_stress_1c_survival: Boolean(p.calm_stress_1c_survival),
+          high_vol_stress_1c_survival: Boolean(p.high_vol_stress_1c_survival),
+          regime_stability: strOr(p.regime_stability, "NO_DATA"),
           note: strOr(p.note, ""),
         };
       }),
     top_safe_preset: typeof o.top_safe_preset === "string" && o.top_safe_preset.trim().length > 0 ? o.top_safe_preset : null,
+    regime_stability: {
+      status: strOr(regStabRaw.status, "NO_DATA"),
+      causal_percentile_pct: finiteOr(regStabRaw.causal_percentile_pct, 60),
+      calm_windows: Math.max(0, Math.round(finiteOr(regStabRaw.calm_windows, 0))),
+      high_vol_windows: Math.max(0, Math.round(finiteOr(regStabRaw.high_vol_windows, 0))),
+      active_calm_ev_cents: finiteOpt(regStabRaw.active_calm_ev_cents),
+      active_high_vol_ev_cents: finiteOpt(regStabRaw.active_high_vol_ev_cents),
+      active_calm_stress_1c_ok: Boolean(regStabRaw.active_calm_stress_1c_ok),
+      active_high_vol_stress_1c_ok: Boolean(regStabRaw.active_high_vol_stress_1c_ok),
+      all_regime_safe_presets: Math.max(0, Math.round(finiteOr(regStabRaw.all_regime_safe_presets, 0))),
+      summary: strOr(regStabRaw.summary, "Awaiting OOS trades for causal regime stability validation."),
+    },
     forward_envelope: {
       status: strOr(envRaw.status, "NO_DATA"),
       active_preset_id: typeof envRaw.active_preset_id === "string" && envRaw.active_preset_id.trim().length > 0 ? envRaw.active_preset_id : null,
@@ -655,6 +697,9 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
       daily_loss_headroom_pct: finiteOr(briefRaw.daily_loss_headroom_pct, 100),
       active_winners_count: Math.max(0, Math.round(finiteOr(briefRaw.active_winners_count, 0))),
       projected_daily_net_dollars: finiteOr(briefRaw.projected_daily_net_dollars, 0),
+      regime_stability: strOr(briefRaw.regime_stability, strOr(regStabRaw.status, "NO_DATA")),
+      calm_expectancy_cents: finiteOpt(briefRaw.calm_expectancy_cents),
+      high_vol_expectancy_cents: finiteOpt(briefRaw.high_vol_expectancy_cents),
       summary: strOr(briefRaw.summary, "Awaiting OOS winners for session briefing attribution."),
     },
     comparison: {
@@ -740,6 +785,27 @@ function makeOfflineDiversification(
   };
 }
 
+function makeOfflineRegimeStability(
+  hasWinners: boolean,
+  expectedEvCents: number | null,
+): RegimeStabilityReport {
+  const status = hasWinners && (expectedEvCents ?? 0) > 1 ? "ALL-REGIME" : hasWinners ? "VOL-SENSITIVE" : "NO_DATA";
+  return {
+    status,
+    causal_percentile_pct: 60,
+    calm_windows: 0,
+    high_vol_windows: 0,
+    active_calm_ev_cents: expectedEvCents,
+    active_high_vol_ev_cents: expectedEvCents,
+    active_calm_stress_1c_ok: (expectedEvCents ?? 0) > 1,
+    active_high_vol_stress_1c_ok: (expectedEvCents ?? 0) > 1,
+    all_regime_safe_presets: 0,
+    summary: hasWinners
+      ? "Offline preview: run server pipeline for causal Calm vs High-Vol / Wide-Spread partitioning."
+      : "No active winners for causal regime stability validation.",
+  };
+}
+
 function makeOfflineSessionBriefing(
   hasWinners: boolean,
   expectedEvCents: number | null,
@@ -747,6 +813,7 @@ function makeOfflineSessionBriefing(
   feeDragCents: number,
   winnersCount: number,
 ): SessionBriefingReport {
+  const reg = hasWinners && (expectedEvCents ?? 0) > 1 ? "ALL-REGIME" : hasWinners ? "VOL-SENSITIVE" : "NO_DATA";
   return {
     status: hasWinners ? "HOLD_PAPER" : "NO_DATA",
     live_armed: false,
@@ -762,6 +829,9 @@ function makeOfflineSessionBriefing(
     daily_loss_headroom_pct: 100,
     active_winners_count: winnersCount,
     projected_daily_net_dollars: 0,
+    regime_stability: reg,
+    calm_expectancy_cents: expectedEvCents,
+    high_vol_expectancy_cents: expectedEvCents,
     summary: hasWinners
       ? "Offline paper preview: slippage/rail attribution requires live server pipeline."
       : "No active winners for session briefing attribution.",
@@ -836,6 +906,7 @@ export function computeClientFallbackReport(
       },
       preset_leaderboard: [],
       top_safe_preset: null,
+      regime_stability: makeOfflineRegimeStability(false, null),
       forward_envelope: {
         status: "NO_DATA",
         active_preset_id: null,
@@ -1156,6 +1227,10 @@ export function computeClientFallbackReport(
     },
     preset_leaderboard: [],
     top_safe_preset: null,
+    regime_stability: makeOfflineRegimeStability(
+      rawWinners.length > 0,
+      rawWinners.length > 0 ? rawWinners[0].oos_net_expectancy_cents : null,
+    ),
     forward_envelope: {
       status: rawWinners.length > 0 ? "ON_TRACK" : "NO_DATA",
       active_preset_id: null,

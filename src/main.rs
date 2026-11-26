@@ -2813,8 +2813,19 @@ struct LiveDeskManager {
     connected: bool,
 }
 
+#[derive(Default)]
+struct LiveHotSnapshot {
+    until: Option<std::time::Instant>,
+    markets_json: Option<Arc<String>>,
+    home_json: Option<Arc<String>>,
+    strategies_json: Option<Arc<String>>,
+    slots_json: Option<Arc<String>>,
+    equity_json: Option<Arc<String>>,
+}
+
 struct App {
     data_dir: PathBuf,
+    live_snapshots_path: PathBuf,
     strategies_dir: PathBuf,
     /// The paper pot the slot simulation splits across slots. A
     /// simulation parameter, stated on every surface that shows it —
@@ -2872,13 +2883,24 @@ struct App {
     /// Small bounded cache for repeated in-memory sandbox backtests over
     /// an unchanged tape + identical source/config hash.
     backtest_cache: std::sync::RwLock<Vec<(u64, Arc<String>)>>,
-    home_cache: std::sync::RwLock<Option<(i64, u64, Arc<String>)>>,
+    home_cache: std::sync::RwLock<Option<HomeCacheEntry>>,
+    live_hot_cache: std::sync::RwLock<LiveHotSnapshot>,
 }
+
+type HomeCacheEntry = (i64, u64, Arc<String>);
+type DeskJsonTriple = (Arc<String>, Arc<String>, Arc<String>);
 
 impl App {
     #[cfg(test)]
     fn new(data_dir: PathBuf, strategies_dir: PathBuf, paper_pot: f64, collect_secs: u64) -> Self {
         Self::new_with_auto_collect(data_dir, strategies_dir, paper_pot, collect_secs, false, collect_secs)
+    }
+
+    #[inline]
+    fn invalidate_live_hot(&self) {
+        if let Ok(mut guard) = self.live_hot_cache.write() {
+            *guard = LiveHotSnapshot::default();
+        }
     }
 
     fn new_with_auto_collect(
@@ -2891,8 +2913,10 @@ impl App {
     ) -> Self {
         let live_cfg = kalshi_live::load_live_config(&data_dir);
         let live_rails = risk_rails::RiskRailsState::load(&data_dir);
+        let live_snapshots_path = data_dir.join("snapshots.jsonl");
         Self {
             data_dir,
+            live_snapshots_path,
             strategies_dir,
             paper_pot,
             collect_secs,
@@ -2927,6 +2951,7 @@ impl App {
             allocator_cache: std::sync::RwLock::new(Vec::new()),
             backtest_cache: std::sync::RwLock::new(Vec::new()),
             home_cache: std::sync::RwLock::new(None),
+            live_hot_cache: std::sync::RwLock::new(LiveHotSnapshot::default()),
         }
     }
 }
@@ -3169,6 +3194,7 @@ impl App {
         trim_heap();
         let grouped = Arc::new(grouped_map);
         let latest_json = build_latest_markets_json(&grouped);
+        results_by_ticker.shrink_to_fit();
         let conflicting_settlements = results_by_ticker
             .values()
             .filter(|r| matches!(r, ResultTrack::Conflict))
@@ -3860,9 +3886,8 @@ impl App {
     }
 
     /// Cached pre-serialized `/api/strategies`, `/api/slots`, and `/api/equity` JSON strings
-    /// keyed on `(path, len, mtime, strategy_key, dataset)` so 30+ concurrent readers
-    /// skip all `serde_json::to_value` allocations.
-    fn desk_json_shared(&self, dpath: &Path, dataset: &str) -> (Arc<String>, Arc<String>, Arc<String>) {
+    /// keyed on `(path, len, mtime, strategy_key, dataset)`.
+    fn desk_json_shared(&self, dpath: &Path, dataset: &str) -> DeskJsonTriple {
         let key = strategies_dir_key(&self.strategies_dir, self.paper_pot);
         let (len, mtime) = tape_stat(dpath).unwrap_or((0, 0));
         {
@@ -4259,23 +4284,6 @@ fn write_all_vectored<W: std::io::Write>(
     Ok(())
 }
 
-fn write_json_bytes<W: std::io::Write>(
-    stream: &mut W,
-    status: u16,
-    body: &[u8],
-) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut hdr_buf = [0u8; 256];
-    let mut cursor = std::io::Cursor::new(&mut hdr_buf[..]);
-    let _ = write!(
-        cursor,
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{SEC_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let hdr_len = cursor.position() as usize;
-    write_all_vectored(stream, &hdr_buf[..hdr_len], body)
-}
-
 fn json_response(status: u16, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{SEC_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -4291,16 +4299,12 @@ fn html_response(body: &str) -> String {
     )
 }
 
-fn accepts_gzip(headers: &[(String, String)]) -> bool {
-    let raw = headers
-        .iter()
-        .find(|(n, _)| n == "accept-encoding")
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("");
+#[inline]
+fn accepts_gzip_header(raw: &str) -> bool {
     for part in raw.split(',') {
         let mut pieces = part.trim().split(';');
-        let enc = pieces.next().unwrap_or("").trim().to_ascii_lowercase();
-        if enc == "gzip" {
+        let enc = pieces.next().unwrap_or("").trim();
+        if enc.eq_ignore_ascii_case("gzip") {
             let zero_q = pieces.any(|p| {
                 p.trim()
                     .strip_prefix("q=")
@@ -4313,6 +4317,15 @@ fn accepts_gzip(headers: &[(String, String)]) -> bool {
         }
     }
     false
+}
+
+fn accepts_gzip(headers: &[(String, String)]) -> bool {
+    let raw = headers
+        .iter()
+        .find(|(n, _)| n == "accept-encoding")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    accepts_gzip_header(raw)
 }
 
 fn etag_matches(headers: &[(String, String)], etag: &str) -> bool {
@@ -4525,7 +4538,7 @@ fn find_crlfcrlf(haystack: &[u8]) -> Option<usize> {
 type RawRequest = (String, String, String, Vec<(String, String)>);
 fn read_request_with_prefix(
     stream: &mut std::net::TcpStream,
-    mut stack_buf: [u8; 4096],
+    stack_buf: &mut [u8; 4096],
     mut stack_len: usize,
 ) -> Option<RawRequest> {
     const MAX_HEADER_BYTES: usize = 32_768;
@@ -5126,18 +5139,21 @@ fn home_json_shared(app: &App) -> Arc<String> {
     body
 }
 
+#[inline]
 fn write_json_bytes_inline<W: std::io::Write>(
     stream: &mut W,
     status: u16,
     body: &[u8],
     set_blocking_on_partial: Option<&std::net::TcpStream>,
+    keep_alive: bool,
 ) -> Option<()> {
     use std::io::{IoSlice, Write as _};
     let mut hdr_buf = [0u8; 256];
     let mut cursor = std::io::Cursor::new(&mut hdr_buf[..]);
+    let conn = if keep_alive { "keep-alive" } else { "close" };
     let _ = write!(
         cursor,
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{SEC_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{SEC_HEADERS}Content-Length: {}\r\nConnection: {conn}\r\n\r\n",
         body.len()
     );
     let hdr_len = cursor.position() as usize;
@@ -5174,11 +5190,25 @@ fn write_json_bytes_inline<W: std::io::Write>(
     Some(())
 }
 
+#[inline]
+fn hot_ttl() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        std::time::Duration::from_millis(0)
+    }
+    #[cfg(not(test))]
+    {
+        std::time::Duration::from_millis(1000)
+    }
+}
+
+#[inline]
 fn try_serve_fast_get(
     stream: &mut std::net::TcpStream,
     app: &App,
     path: &str,
     warm_only: bool,
+    keep_alive: bool,
 ) -> bool {
     let (route, query) = path.split_once('?').unwrap_or((path, ""));
     let sock_ref: Option<&std::net::TcpStream> = if warm_only {
@@ -5186,8 +5216,32 @@ fn try_serve_fast_get(
     } else {
         None
     };
+    let ttl = hot_ttl();
+    let now_inst = if !ttl.is_zero() && !warm_only && query.is_empty() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     match route {
         "/api/version" => {
+            if !keep_alive {
+                static VERSION_HTTP_CLOSE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+                let raw = VERSION_HTTP_CLOSE.get_or_init(|| {
+                    let up = updater();
+                    let body = format!(
+                        "{{\"name\":\"openbell-rs\",\"version\":\"{}\",\"release_url\":\"https://github.com/{}/releases/tag/v{}\"}}",
+                        env!("CARGO_PKG_VERSION"),
+                        up.cfg.repo,
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{SEC_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .into_bytes()
+                });
+                return stream.write_all(raw).is_ok();
+            }
             static VERSION_JSON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
             let body = VERSION_JSON.get_or_init(|| {
                 let up = updater();
@@ -5198,9 +5252,27 @@ fn try_serve_fast_get(
                     env!("CARGO_PKG_VERSION")
                 )
             });
-            write_json_bytes_inline(stream, 200, body.as_bytes(), sock_ref).is_some()
+            write_json_bytes_inline(stream, 200, body.as_bytes(), sock_ref, keep_alive).is_some()
         }
         "/api/home" => {
+            if let Some(now) = now_inst {
+                if let Ok(guard) = app.live_hot_cache.try_read() {
+                    if guard.until.is_some_and(|u| now <= u) {
+                        if let Some(b) = &guard.home_json {
+                            let body = b.clone();
+                            drop(guard);
+                            return write_json_bytes_inline(
+                                stream,
+                                200,
+                                body.as_bytes(),
+                                sock_ref,
+                                keep_alive,
+                            )
+                            .is_some();
+                        }
+                    }
+                }
+            }
             let body = if warm_only {
                 let now = now_unix();
                 let Ok(guard) = app.home_cache.try_read() else {
@@ -5211,11 +5283,39 @@ fn try_serve_fast_get(
                     _ => return false,
                 }
             } else {
-                home_json_shared(app)
+                let b = home_json_shared(app);
+                if let Some(now) = now_inst {
+                    if let Ok(mut guard) = app.live_hot_cache.write() {
+                        if guard.until.is_none_or(|u| now > u) {
+                            *guard = LiveHotSnapshot::default();
+                            guard.until = Some(now + ttl);
+                        }
+                        guard.home_json = Some(b.clone());
+                    }
+                }
+                b
             };
-            write_json_bytes_inline(stream, 200, body.as_bytes(), sock_ref).is_some()
+            write_json_bytes_inline(stream, 200, body.as_bytes(), sock_ref, keep_alive).is_some()
         }
         "/api/markets" => {
+            if let Some(now) = now_inst {
+                if let Ok(guard) = app.live_hot_cache.try_read() {
+                    if guard.until.is_some_and(|u| now <= u) {
+                        if let Some(b) = &guard.markets_json {
+                            let body = b.clone();
+                            drop(guard);
+                            return write_json_bytes_inline(
+                                stream,
+                                200,
+                                body.as_bytes(),
+                                sock_ref,
+                                keep_alive,
+                            )
+                            .is_some();
+                        }
+                    }
+                }
+            }
             if warm_only && query.is_empty() {
                 let Ok(guard) = app.tape_cache.try_read() else {
                     return false;
@@ -5223,16 +5323,22 @@ fn try_serve_fast_get(
                 let Some(e) = &*guard else {
                     return false;
                 };
-                let dpath = app.data_dir.join("snapshots.jsonl");
-                let Some((len, mtime)) = tape_stat(&dpath) else {
+                let Some((len, mtime)) = tape_stat(&app.live_snapshots_path) else {
                     return false;
                 };
-                if e.path != dpath || e.len != len || e.mtime != mtime {
+                if e.path != app.live_snapshots_path || e.len != len || e.mtime != mtime {
                     return false;
                 }
                 let latest = e.latest_json.clone();
                 drop(guard);
-                return write_json_bytes_inline(stream, 200, latest.as_bytes(), sock_ref).is_some();
+                return write_json_bytes_inline(
+                    stream,
+                    200,
+                    latest.as_bytes(),
+                    sock_ref,
+                    keep_alive,
+                )
+                .is_some();
             }
             if warm_only {
                 return false;
@@ -5240,26 +5346,64 @@ fn try_serve_fast_get(
             match resolve_dataset_checked(app, query, None) {
                 Ok((_, dpath)) => {
                     let latest = app.tape_latest_json(&dpath);
-                    let _ = write_json_bytes(stream, 200, latest.as_bytes());
+                    if let Some(now) = now_inst {
+                        if let Ok(mut guard) = app.live_hot_cache.write() {
+                            if guard.until.is_none_or(|u| now > u) {
+                                *guard = LiveHotSnapshot::default();
+                                guard.until = Some(now + ttl);
+                            }
+                            guard.markets_json = Some(latest.clone());
+                        }
+                    }
+                    let _ = write_json_bytes_inline(
+                        stream,
+                        200,
+                        latest.as_bytes(),
+                        None,
+                        keep_alive,
+                    );
                 }
                 Err(resp) => {
                     let _ = stream.write_all(resp.as_bytes());
+                    return false;
                 }
             }
             true
         }
         "/api/strategies" | "/api/slots" | "/api/equity" => {
+            if let Some(now) = now_inst {
+                if let Ok(guard) = app.live_hot_cache.try_read() {
+                    if guard.until.is_some_and(|u| now <= u) {
+                        let hit = match route {
+                            "/api/strategies" => &guard.strategies_json,
+                            "/api/slots" => &guard.slots_json,
+                            _ => &guard.equity_json,
+                        };
+                        if let Some(b) = hit {
+                            let body = b.clone();
+                            drop(guard);
+                            return write_json_bytes_inline(
+                                stream,
+                                200,
+                                body.as_bytes(),
+                                sock_ref,
+                                keep_alive,
+                            )
+                            .is_some();
+                        }
+                    }
+                }
+            }
             if warm_only && query.is_empty() {
                 let Ok(guard) = app.desk_json_cache.try_read() else {
                     return false;
                 };
-                let dpath = app.data_dir.join("snapshots.jsonl");
                 let key = strategies_dir_key(&app.strategies_dir, app.paper_pot);
-                let Some((len, mtime)) = tape_stat(&dpath) else {
+                let Some((len, mtime)) = tape_stat(&app.live_snapshots_path) else {
                     return false;
                 };
                 let Some(e) = guard.iter().find(|e| {
-                    e.path == dpath
+                    e.path == app.live_snapshots_path
                         && e.len == len
                         && e.mtime == mtime
                         && e.key == key
@@ -5273,7 +5417,14 @@ fn try_serve_fast_get(
                     _ => e.equity_json.clone(),
                 };
                 drop(guard);
-                return write_json_bytes_inline(stream, 200, body.as_bytes(), sock_ref).is_some();
+                return write_json_bytes_inline(
+                    stream,
+                    200,
+                    body.as_bytes(),
+                    sock_ref,
+                    keep_alive,
+                )
+                .is_some();
             }
             if warm_only {
                 return false;
@@ -5281,15 +5432,27 @@ fn try_serve_fast_get(
             match resolve_dataset_checked(app, query, None) {
                 Ok((dataset, dpath)) => {
                     let (s_json, sl_json, eq_json) = app.desk_json_shared(&dpath, &dataset);
+                    if let Some(now) = now_inst {
+                        if let Ok(mut guard) = app.live_hot_cache.write() {
+                            if guard.until.is_none_or(|u| now > u) {
+                                *guard = LiveHotSnapshot::default();
+                            }
+                            guard.until = Some(now + ttl);
+                            guard.strategies_json = Some(s_json.clone());
+                            guard.slots_json = Some(sl_json.clone());
+                            guard.equity_json = Some(eq_json.clone());
+                        }
+                    }
                     let body = match route {
                         "/api/strategies" => &s_json,
                         "/api/slots" => &sl_json,
                         _ => &eq_json,
                     };
-                    let _ = write_json_bytes(stream, 200, body.as_bytes());
+                    let _ = write_json_bytes_inline(stream, 200, body.as_bytes(), None, keep_alive);
                 }
                 Err(resp) => {
                     let _ = stream.write_all(resp.as_bytes());
+                    return false;
                 }
             }
             true
@@ -5298,34 +5461,30 @@ fn try_serve_fast_get(
     }
 }
 
+#[inline]
 fn try_handle_inline_get(
     stream: &mut std::net::TcpStream,
     buf: &[u8],
     app: &App,
     allowed_hosts: &[String],
-    warm_only: bool,
-) -> bool {
+    allow_keep_alive: bool,
+) -> Option<bool> {
     if !buf.starts_with(b"GET /api/") {
-        return false;
+        return None;
     }
-    let Some(hdr_end) = find_crlfcrlf(buf) else {
-        return false;
-    };
-    let Ok(hdr_str) = std::str::from_utf8(&buf[..hdr_end]) else {
-        return false;
-    };
+    let hdr_end = find_crlfcrlf(buf)?;
+    let hdr_str = std::str::from_utf8(&buf[..hdr_end]).ok()?;
     let mut lines = hdr_str.split("\r\n");
-    let Some(req_line) = lines.next() else {
-        return false;
-    };
+    let req_line = lines.next()?;
     let mut parts = req_line.split_whitespace();
     let (Some("GET"), Some(path), Some(_ver)) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
+        return None;
     };
     if path.starts_with("/api/live") || path.starts_with("/api/tape/stream") {
-        return false;
+        return None;
     }
     let mut host_ok = false;
+    let mut want_keep_alive = false;
     for l in lines {
         if let Some((n, v)) = l.split_once(':') {
             let tn = n.trim();
@@ -5334,15 +5493,27 @@ fn try_handle_inline_get(
                 host_ok = hn.eq_ignore_ascii_case("localhost")
                     || matches!(hn, "127.0.0.1" | "[::1]")
                     || allowed_hosts.iter().any(|a| a.eq_ignore_ascii_case(hn));
+            } else if tn.eq_ignore_ascii_case("connection") {
+                let tv = v.trim();
+                if tv.eq_ignore_ascii_case("keep-alive") {
+                    want_keep_alive = true;
+                } else if tv.eq_ignore_ascii_case("close") {
+                    want_keep_alive = false;
+                }
             } else if tn.eq_ignore_ascii_case("content-length") {
-                return false;
+                return None;
             }
         }
     }
     if !host_ok {
-        return false;
+        return None;
     }
-    try_serve_fast_get(stream, app, path, warm_only)
+    let keep_alive = allow_keep_alive && want_keep_alive && buf.len() == hdr_end + 4;
+    if try_serve_fast_get(stream, app, path, false, keep_alive) {
+        Some(keep_alive)
+    } else {
+        None
+    }
 }
 
 fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
@@ -6791,6 +6962,9 @@ fn start_background_collector(app: Arc<App>) {
         let updated = app.collector_scheduler.record_pass_result(&res);
         match res {
             Ok(rep) => {
+                if rep.written > 0 {
+                    app.invalidate_live_hot();
+                }
                 if rep.errors.is_empty() {
                     if rep.deduplicated > 0 {
                         println!(
@@ -6834,10 +7008,11 @@ fn trim_heap() {
 
 fn main() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    // SAFETY: M_ARENA_MAX (-8) and M_TRIM_THRESHOLD (-1) bound per-thread arenas and trim freed heap pages promptly.
+    // SAFETY: M_ARENA_MAX (-8), M_TRIM_THRESHOLD (-1), and M_MMAP_THRESHOLD (-3) bound heap arenas and return freed pages promptly.
     unsafe {
-        mallopt(-8, 2);
+        mallopt(-8, 1);
         mallopt(-1, 32 * 1024);
+        mallopt(-3, 32 * 1024);
     }
     if std::env::args().nth(1).as_deref().is_some_and(|a| a == "--version" || a == "-V") {
         println!("openbell-rs {}", env!("CARGO_PKG_VERSION"));
@@ -6850,6 +7025,16 @@ fn main() {
             panic!("PORT is set to '{p}', which is not a valid port — refusing to silently fall back to 8472")
         })
     });
+    let listener = match explicit_port {
+        Some(p) => TcpListener::bind(("127.0.0.1", p))
+            .unwrap_or_else(|e| panic!("PORT {p} is not free ({e}); choose another PORT")),
+        None => bind_free_port(DEFAULT_PORT, |p| TcpListener::bind(("127.0.0.1", p)))
+            .map(|(l, _)| l)
+            .unwrap_or_else(|| {
+                panic!("ports {DEFAULT_PORT} to {} are all busy; set PORT to a free port", DEFAULT_PORT + DEFAULT_PORT_SPAN)
+            }),
+    };
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(DEFAULT_PORT);
     let get_env = |k: &str| std::env::var(k).ok();
     let data_dir = std::env::var("OPENBELL_DATA").map(PathBuf::from).unwrap_or_else(|_| {
         default_data_dir(std::env::consts::OS, &get_env, Path::new("openbell-data").is_dir())
@@ -6899,30 +7084,17 @@ fn main() {
         auto_collect_enabled,
         auto_collect_interval,
     ));
-    start_background_collector(app.clone());
     let allowed_hosts: Vec<String> = std::env::var("OPENBELL_ALLOWED_HOSTS")
         .unwrap_or_default()
         .split(',')
         .map(|h| h.trim().to_ascii_lowercase())
         .filter(|h| !h.is_empty())
         .collect();
-    updater().start_background();
-    let listener = match explicit_port {
-        Some(p) => TcpListener::bind(("127.0.0.1", p))
-            .unwrap_or_else(|e| panic!("PORT {p} is not free ({e}); choose another PORT")),
-        None => bind_free_port(DEFAULT_PORT, |p| TcpListener::bind(("127.0.0.1", p)))
-            .map(|(l, _)| l)
-            .unwrap_or_else(|| {
-                panic!("ports {DEFAULT_PORT} to {} are all busy; set PORT to a free port", DEFAULT_PORT + DEFAULT_PORT_SPAN)
-            }),
-    };
-    let port = listener.local_addr().map(|a| a.port()).unwrap_or(DEFAULT_PORT);
     let url = format!("http://127.0.0.1:{port}");
     let opening = open::wanted(&args, &get_env, std::env::consts::OS);
     if opening {
         open::open_in_browser(&url);
     }
-    println!("{}", start_banner(&url, &data_dir, updater().cfg.mode, opening));
     static ACTIVE_HTTP_CONNS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
     const MAX_CONCURRENT_HTTP_CONNS: usize = 128;
@@ -6938,120 +7110,162 @@ fn main() {
     struct QueuedConn {
         stream: std::net::TcpStream,
         _guard: ConnGuard,
-        buf: [u8; 4096],
-        len: usize,
     }
 
     let queue: Arc<(Mutex<VecDeque<QueuedConn>>, Condvar)> =
         Arc::new((Mutex::new(VecDeque::with_capacity(64)), Condvar::new()));
     let allowed_hosts = Arc::new(allowed_hosts);
+    let worker_stack = 2 * 1024 * 1024;
     for _ in 0..HTTP_POOL_WORKERS {
         let queue = queue.clone();
         let app = app.clone();
         let allowed_hosts = allowed_hosts.clone();
         let _ = std::thread::Builder::new()
-            .stack_size(2 * 1024 * 1024)
-            .spawn(move || loop {
-                let QueuedConn {
-                    mut stream,
-                    _guard: conn_guard,
-                    mut buf,
-                    len,
-                } = {
-                    let (lock, cv) = &*queue;
-                    let mut q = lock.lock().unwrap_or_else(|p| p.into_inner());
-                    while q.is_empty() {
-                        q = cv.wait(q).unwrap_or_else(|p| p.into_inner());
-                    }
-                    q.pop_front().unwrap()
-                };
-                let _ = stream.set_nodelay(true);
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
-                let first_n = if len > 0 {
-                    len
-                } else {
-                    match stream.read(&mut buf) {
-                        Ok(0) | Err(_) => continue,
-                        Ok(n) => n,
-                    }
-                };
-                if try_handle_inline_get(&mut stream, &buf[..first_n], &app, &allowed_hosts, false)
-                {
-                    continue;
-                }
-                if let Some((method, path, body, headers)) =
-                    read_request_with_prefix(&mut stream, buf, first_n)
-                {
-                    if method == "__too_large__" {
-                        let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"request body too large\"}";
-                        let _ = stream.write_all(resp.as_bytes());
-                        let _ = stream.flush();
-                        continue;
-                    }
-                    if method == "__bad_request__" {
-                        let resp = json_response(400, &serde_json::json!({ "error": body }).to_string());
-                        let _ = stream.write_all(resp.as_bytes());
-                        continue;
-                    }
-                    let host = headers
-                        .iter()
-                        .find(|(n, _)| n == "host")
-                        .map(|(_, v)| v.as_str())
-                        .unwrap_or("");
-                    if let Some((status, message)) =
-                        refuse_request(&method, &headers, body.len(), &allowed_hosts)
-                    {
-                        let response =
-                            json_response(status, &serde_json::json!({ "error": message }).to_string());
-                        let _ = stream.write_all(response.as_bytes());
-                        continue;
-                    }
-                    let route = path.split_once('?').map(|(r, _)| r).unwrap_or(&path);
-                    if route == "/api/live" || route.starts_with("/api/live/") {
-                        if let Some((status, message)) = refuse_live_request(&method, host, &headers) {
-                            let response = json_response(
-                                status,
-                                &serde_json::json!({ "error": message }).to_string(),
-                            );
-                            let _ = stream.write_all(response.as_bytes());
-                            continue;
+            .stack_size(worker_stack)
+            .spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let QueuedConn {
+                        mut stream,
+                        _guard: conn_guard,
+                    } = {
+                        let (lock, cv) = &*queue;
+                        let mut q = lock.lock().unwrap_or_else(|p| p.into_inner());
+                        while q.is_empty() {
+                            q = cv.wait(q).unwrap_or_else(|p| p.into_inner());
                         }
-                    }
-                    if method == "GET" && route == "/api/tape/stream" {
-                        let sse_app = app.clone();
-                        std::thread::spawn(move || {
-                            let _sse_guard = conn_guard;
-                            serve_sse_stream(&mut stream, &sse_app);
-                        });
-                        continue;
-                    }
-                    let _ = &conn_guard;
-                    if matches!(method.as_str(), "GET" | "HEAD") && route == "/" {
-                        let _ = write_index_response(&mut stream, &method, &headers);
-                        continue;
-                    }
-                    if matches!(method.as_str(), "GET" | "HEAD") {
-                        if let Some(chunk_name) = route.strip_prefix("/chunks/") {
-                            if !chunk_name.contains('/') && !chunk_name.contains("..") {
-                                if let Some(chunk) = embedded_chunks::lookup(chunk_name) {
-                                    let _ = write_embedded_chunk(&mut stream, &method, &headers, chunk);
-                                    continue;
+                        q.pop_front().unwrap()
+                    };
+                    let _ = stream.set_nodelay(true);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                    let mut in_keep_alive = false;
+                    let mut sse_handed_off = false;
+                    loop {
+                        let first_n = match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        let allow_ka =
+                            ACTIVE_HTTP_CONNS.load(std::sync::atomic::Ordering::Relaxed)
+                                < (HTTP_POOL_WORKERS - 4);
+                        if let Some(keep_alive) = try_handle_inline_get(
+                            &mut stream,
+                            &buf[..first_n],
+                            &app,
+                            &allowed_hosts,
+                            allow_ka,
+                        ) {
+                            if keep_alive {
+                                if !in_keep_alive {
+                                    in_keep_alive = true;
+                                    let _ = stream.set_nodelay(true);
+                                    let _ = stream.set_read_timeout(Some(
+                                        std::time::Duration::from_millis(500),
+                                    ));
+                                }
+                                continue;
+                            }
+                            break;
+                        }
+                        if let Some((method, path, body, headers)) =
+                            read_request_with_prefix(&mut stream, &mut buf, first_n)
+                        {
+                            if method == "__too_large__" {
+                                let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"request body too large\"}";
+                                let _ = stream.write_all(resp.as_bytes());
+                                let _ = stream.flush();
+                                break;
+                            }
+                            if method == "__bad_request__" {
+                                let resp = json_response(
+                                    400,
+                                    &serde_json::json!({ "error": body }).to_string(),
+                                );
+                                let _ = stream.write_all(resp.as_bytes());
+                                break;
+                            }
+                            let host = headers
+                                .iter()
+                                .find(|(n, _)| n == "host")
+                                .map(|(_, v)| v.as_str())
+                                .unwrap_or("");
+                            if let Some((status, message)) =
+                                refuse_request(&method, &headers, body.len(), &allowed_hosts)
+                            {
+                                let response = json_response(
+                                    status,
+                                    &serde_json::json!({ "error": message }).to_string(),
+                                );
+                                let _ = stream.write_all(response.as_bytes());
+                                break;
+                            }
+                            let route = path.split_once('?').map(|(r, _)| r).unwrap_or(&path);
+                            if route == "/api/live" || route.starts_with("/api/live/") {
+                                if let Some((status, message)) =
+                                    refuse_live_request(&method, host, &headers)
+                                {
+                                    let response = json_response(
+                                        status,
+                                        &serde_json::json!({ "error": message }).to_string(),
+                                    );
+                                    let _ = stream.write_all(response.as_bytes());
+                                    break;
                                 }
                             }
-                            let resp = json_response(404, "{\"error\":\"chunk not found\"}");
-                            let _ = stream.write_all(resp.as_bytes());
-                            continue;
+                            if method == "GET" && route == "/api/tape/stream" {
+                                let sse_app = app.clone();
+                                sse_handed_off = true;
+                                std::thread::spawn(move || {
+                                    let _sse_guard = conn_guard;
+                                    serve_sse_stream(&mut stream, &sse_app);
+                                });
+                                break;
+                            }
+                            let _ = &conn_guard;
+                            if matches!(method.as_str(), "GET" | "HEAD") && route == "/" {
+                                let _ = write_index_response(&mut stream, &method, &headers);
+                                break;
+                            }
+                            if matches!(method.as_str(), "GET" | "HEAD") {
+                                if let Some(chunk_name) = route.strip_prefix("/chunks/") {
+                                    if !chunk_name.contains('/') && !chunk_name.contains("..") {
+                                        if let Some(chunk) = embedded_chunks::lookup(chunk_name) {
+                                            let _ = write_embedded_chunk(
+                                                &mut stream,
+                                                &method,
+                                                &headers,
+                                                chunk,
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    let resp =
+                                        json_response(404, "{\"error\":\"chunk not found\"}");
+                                    let _ = stream.write_all(resp.as_bytes());
+                                    break;
+                                }
+                            }
+                            if method == "GET"
+                                && try_serve_fast_get(&mut stream, &app, &path, false, false)
+                            {
+                                break;
+                            }
+                            let response = update_response(&method, &path, host)
+                                .unwrap_or_else(|| handle_with_body(&app, &method, &path, &body));
+                            if method != "GET" && method != "HEAD" {
+                                app.invalidate_live_hot();
+                            }
+                            let _ = stream.write_all(response.as_bytes());
                         }
+                        break;
                     }
-                    if method == "GET" && try_serve_fast_get(&mut stream, &app, &path, false) {
-                        continue;
-                    }
-                    let response = update_response(&method, &path, host)
-                        .unwrap_or_else(|| handle_with_body(&app, &method, &path, &body));
-                    let _ = stream.write_all(response.as_bytes());
+                    let _ = sse_handed_off;
                 }
             });
     }
+    start_background_collector(app.clone());
+    updater().start_background();
+    println!("{}", start_banner(&url, &data_dir, updater().cfg.mode, opening));
 
     for stream in listener.incoming() {
         match stream {
@@ -7068,8 +7282,6 @@ fn main() {
                 lock.lock().unwrap_or_else(|p| p.into_inner()).push_back(QueuedConn {
                     stream,
                     _guard: ConnGuard,
-                    buf: [0u8; 4096],
-                    len: 0,
                 });
                 cv.notify_one();
             }

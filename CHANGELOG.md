@@ -4,6 +4,14 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.20.0 - 2026-11-25
+
+- **Walk-Forward Regime Stability Validator (`src/tournament.rs`, `src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**
+  - Partitioned settled 15m tape windows strictly causally into **Calm** vs **High-Vol / Wide-Spread** regimes using a backward-looking trailing 60th-percentile threshold (`< close_epoch`, zero future lookahead) over pre-settlement quote spread and price range (`compute_window_vol_score` + `classify_causal_epoch_regimes`).
+  - Evaluated per-preset regime net expectancy and `+1c` adverse-fill survival across both regimes (`evaluate_regime_stability`) and surfaced crisp **Regime Stability** badges (`ALL-REGIME` vs `CALM-ONLY` / `VOL-SENSITIVE`) inside the Strategy Leaderboard, `RegimeStabilityReport`, and Session Briefing while preserving `live_armed: false` and the `0.0%` daily rail-breach hard gate.
+- **Persistent HTTP Keep-Alive, Zero-Copy Queue & `<20 MB` RSS Diet (`src/main.rs`):**
+  - Removed 4 KB per-connection buffer copies from `QueuedConn`, added bounded `150 ms` `live_hot_cache` zero-stat fast-paths invalidated on mutations, enabled adaptive HTTP/1.1 keep-alive with load shedding under pool saturation, bound `TcpListener` ahead of worker/background spawns, and tuned glibc `M_ARENA_MAX=1` + `M_MMAP_THRESHOLD=32KB`.
+
 ## 0.19.0 - 2026-11-25
 
 - **1-Click Session Briefing & Slippage Attribution Card (`src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**
