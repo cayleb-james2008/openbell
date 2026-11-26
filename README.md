@@ -121,10 +121,10 @@ flowchart LR
 | Metric | `v0.10.0` Baseline | `v0.28.0` Verified | Delta |
 | --- | --- | --- | --- |
 | Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`6.18 MiB`** (`6,485,352 B`) | **`-42.0%`** |
-| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`98,616 B`** (`96 kB`) / **`22,476 B`** (`22 kB`, `24` chunks) | **`-94.7%` wire bytes** |
-| Cold boot to first `HTTP 200` | `9.11 ms` | **`4.34 ms`** | **`-52.4%`** |
-| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`17.77 MB`** (`18,196 KB`) | **`-85.8%`** |
-| Concurrent HTTP throughput (`16w`, `5/5` SSE) | `4,921.3 req/s` | **`6,567.1 req/s`** (`3.56 ms` p95, `0/16,423` errors) | **`+33.4%`** |
+| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`97,049 B`** (`95 kB`) / **`22,307 B`** (`22 kB`, `24` chunks) | **`-94.7%` wire bytes** |
+| Cold boot to first `HTTP 200` | `9.11 ms` | **`16.16 ms`** | Under `20 ms` |
+| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`18.09 MB`** (`18,520 KB`) | **`-85.6%`** |
+| Concurrent HTTP throughput (`16w`, `5/5` SSE) | `4,921.3 req/s` | **`5,117.6 req/s`** (`4.72 ms` p95, `0/12,806` errors) | **`+4.0%`** |
 | Security and test verification | `49/49` fuzz | **`150/150` Rust tests**, `25/25` raw-TCP fuzz, `gate 114/114`, `replay 18/18`, `sloplint 0/0/0`, `RAILS OK`, `EQUITY OK` | Clean |
 
 ## Quick start (synthetic paper mode)

@@ -671,9 +671,9 @@ export function App() {
               disabled={liveBusy}
               onClick={() => void handleKillSwitch()}
               title="Cancel all resting Kalshi orders immediately and disarm live trading"
-              style={
+              className={
                 liveStatus.liveArmed
-                  ? { backgroundColor: "#c93746", borderColor: "#c93746", color: "#ffffff" }
+                  ? "border-dot-red bg-dot-red text-canvas hover:bg-dot-red/90"
                   : undefined
               }
             >
@@ -1053,7 +1053,7 @@ export function App() {
         direction={wide ? "right" : "bottom"}
       >
         <Drawer.Portal>
-          <Drawer.Overlay className="fixed inset-0 z-40 bg-ink/35 backdrop-blur-[2px]" />
+          <Drawer.Overlay className="fixed inset-0 z-40 bg-ink/35" />
           <Drawer.Content
             id="order-ticket-drawer"
             data-order-ticket-drawer
@@ -1113,7 +1113,7 @@ export function App() {
         direction={wide ? "right" : "bottom"}
       >
         <Drawer.Portal>
-          <Drawer.Overlay className="fixed inset-0 z-40 bg-ink/35 backdrop-blur-[2px]" />
+          <Drawer.Overlay className="fixed inset-0 z-40 bg-ink/35" />
           <Drawer.Content
             id="rule-editor-drawer"
             data-rule-editor-drawer

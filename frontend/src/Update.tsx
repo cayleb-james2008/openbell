@@ -246,8 +246,8 @@ export function UpdateStrip({ u }: { u: U }) {
             {!u.staged && canApplyHere && (
               <span className="mt-0.5 block text-sm text-ink-2">Update now downloads it, checks it, and replaces this app. Restart to start using it.</span>
             )}
-            {applying && <span className="mt-0.5 block text-sm text-ink-2">Downloading and checking...</span>}
-            {restarting && <span className="mt-0.5 block text-sm text-ink-2">Restarting...</span>}
+            {applying && <span className="mt-0.5 block text-sm text-ink-2">Downloading and checking…</span>}
+            {restarting && <span className="mt-0.5 block text-sm text-ink-2">Restarting…</span>}
             {u.raw && <span role="alert" className="mt-1 block text-sm text-unread">{plainUpdateError(u.raw)}</span>}
             {u.returnMsg && <span className="mt-0.5 block text-sm text-ink-2">{u.returnMsg}</span>}
           </p>
@@ -256,11 +256,11 @@ export function UpdateStrip({ u }: { u: U }) {
               <span className="text-sm text-ink-2">To update, open OpenBell on the computer it runs on.</span>
             ) : u.staged ? (
               <Button ref={u.refs.restartRef} variant="default" className="min-h-11" disabled={busy} onClick={u.restart}>
-                {restarting ? "Restarting..." : u.raw ? "Try again" : "Restart now"}
+                {restarting ? "Restarting…" : u.raw ? "Try again" : "Restart now"}
               </Button>
             ) : snap.can_apply ? (
               <Button variant="default" className="min-h-11" disabled={busy} onClick={u.apply}>
-                {applying ? "Downloading and checking..." : u.raw ? "Try again" : "Update now"}
+                {applying ? "Downloading and checking…" : u.raw ? "Try again" : "Update now"}
               </Button>
             ) : (
               <span className="text-sm text-ink-2">

@@ -1110,7 +1110,7 @@ export function AutoAllocatorPanel({
                     : "NO DATA"}
               </StatusPill>
               <Badge variant="outline" className="mono text-xs text-ink-2">
-                live_armed=false · {report.session_briefing.active_winners_count}w
+                live_armed=false ({report.session_briefing.active_winners_count}w)
               </Badge>
               <StatusPill
                 id="allocator-briefing-regime-pill"
@@ -1128,17 +1128,17 @@ export function AutoAllocatorPanel({
                 {report.session_briefing.breakeven_slippage_cents === null
                   ? "n/a"
                   : `${report.session_briefing.breakeven_slippage_cents.toFixed(2)}c`}{" "}
-                · {report.session_briefing.slippage_cushion_status === "NO_DATA"
+                ({report.session_briefing.slippage_cushion_status === "NO_DATA"
                   ? "NO DATA"
-                  : report.session_briefing.slippage_cushion_status}
+                  : report.session_briefing.slippage_cushion_status})
               </StatusPill>
               <StatusPill
                 id="allocator-briefing-ceiling-pill"
                 tone={ceilingTone(report.diversification?.ceiling_status)}
               >
                 Ceiling: {fmtPct(report.diversification?.worst_correlated_cluster_heat_pct ?? 0, 1)} /{" "}
-                {fmtPct(report.diversification?.regime_drawdown_ceiling_pct ?? 0, 1)} ·{" "}
-                {(report.diversification?.ceiling_status ?? "NO_DATA").replaceAll("_", " ")}
+                {fmtPct(report.diversification?.regime_drawdown_ceiling_pct ?? 0, 1)} (
+                {(report.diversification?.ceiling_status ?? "NO_DATA").replaceAll("_", " ")})
               </StatusPill>
             </div>
             <div className="flex flex-wrap items-center gap-2">
@@ -1507,7 +1507,7 @@ export function AutoAllocatorPanel({
                     </StatusPill>
                   </div>
                   <div className="mono mt-0.5 text-ink-2">
-                    Fill {(sc.fill_ratio * 100).toFixed(0)}% · Impact -{sc.impact_drag_cents.toFixed(2)}c · Net{" "}
+                    Fill {(sc.fill_ratio * 100).toFixed(0)}%, Impact -{sc.impact_drag_cents.toFixed(2)}c, Net{" "}
                     {fmtCents(sc.net_ev_after_impact_cents)}
                   </div>
                 </div>
@@ -1679,7 +1679,7 @@ export function AutoAllocatorPanel({
                   }}
                 >
                   <RefreshCw className="size-3.5" aria-hidden />
-                  <span>Rotate Safe -&gt; {report.forward_envelope.next_safe_preset_label ?? "Next Safe"}</span>
+                  <span>Rotate Safe: {report.forward_envelope.next_safe_preset_label ?? "Next Safe"}</span>
                 </Button>
               )}
               {report.preset_leaderboard.find((p) => p.is_top_safe) &&
@@ -1695,7 +1695,7 @@ export function AutoAllocatorPanel({
                   }}
                 >
                   <CheckCircle2 className="size-3.5" aria-hidden />
-                  <span>Apply Top Safe -&gt; Paper Forward-Test</span>
+                  <span>Apply Top Safe to Paper Forward-Test</span>
                 </Button>
               )}
               <Button
@@ -1749,8 +1749,8 @@ export function AutoAllocatorPanel({
                       max |r|{" "}
                       {report.diversification.max_cross_asset_corr === null
                         ? "n/a"
-                        : report.diversification.max_cross_asset_corr.toFixed(2)}{" "}
-                      · cluster cap {fmtPct(report.diversification.cluster_heat_cap_pct, 1)} · regime ceiling{" "}
+                        : report.diversification.max_cross_asset_corr.toFixed(2)},{" "}
+                      cluster cap {fmtPct(report.diversification.cluster_heat_cap_pct, 1)}, regime ceiling{" "}
                       {fmtPct(report.diversification.regime_drawdown_ceiling_pct, 1)} (
                       {report.diversification.hv_regime_mult.toFixed(2)}x HV)
                     </span>
@@ -2071,7 +2071,7 @@ export function AutoAllocatorPanel({
                         </StatusPill>
                       </div>
                     </TableCell>
-                    <TableCell className="mono text-xs uppercase text-ink-2">{w.side}</TableCell>
+                    <TableCell className="mono text-xs text-ink-2">{w.side.toUpperCase()}</TableCell>
                     <TableCell className="mono text-right text-xs text-ink-2">
                       {w.oos_trades} ({(w.oos_win_rate * 100).toFixed(1)}%)
                     </TableCell>
@@ -2153,10 +2153,10 @@ export function AutoAllocatorPanel({
           type="button"
           aria-expanded={quarantineOpen}
           onClick={() => setQuarantineOpen((v) => !v)}
-          className="flex min-h-11 w-full cursor-pointer items-center justify-between gap-2 px-4 py-2.5 text-left text-xs font-medium text-ink hover:bg-board sm:min-h-10"
+          className="flex min-h-11 w-full cursor-pointer items-center justify-between gap-2 whitespace-nowrap px-4 py-2.5 text-left text-xs font-medium text-ink hover:bg-board sm:min-h-10"
         >
-          <span className="flex flex-wrap items-center gap-2">
-            <span className="font-semibold">Quarantined Shapes (0% Weight)</span>
+          <span className="flex items-center gap-2">
+            <span className="font-semibold">Quarantined</span>
             <Badge variant="outline" className="mono text-xs text-destructive-foreground">
               {filteredQuarantined.length} excluded
             </Badge>
@@ -2188,7 +2188,7 @@ export function AutoAllocatorPanel({
                       <TableCell className="m-grow max-w-[220px] break-all font-medium text-ink">
                         {item.strategy}
                       </TableCell>
-                      <TableCell className="mono text-xs uppercase text-ink-2">{item.side}</TableCell>
+                      <TableCell className="mono text-xs text-ink-2">{item.side.toUpperCase()}</TableCell>
                       <TableCell className="mono text-right text-xs text-ink-2">{item.oos_trades}</TableCell>
                       <TableCell
                         className={
