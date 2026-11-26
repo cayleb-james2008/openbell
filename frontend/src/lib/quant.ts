@@ -735,6 +735,7 @@ export function validateRuneSourceClient(source: string): RuneValidationResult {
   const nameFn = extractFnBody(clean, "name");
   const sideFn = extractFnBody(clean, "side");
   const allowFn = extractFnBody(clean, "allow_entry");
+  const evalFn = extractFnBody(clean, "evaluate");
 
   let name = "custom-strategy";
   let side: "yes" | "no" | "unknown" = "unknown";
@@ -755,12 +756,20 @@ export function validateRuneSourceClient(source: string): RuneValidationResult {
     else side = sm[1].toLowerCase() as "yes" | "no";
   }
 
-  if (!allowFn) {
+  if (!allowFn && !evalFn) {
     diagnostics.push({
       level: "error",
-      message: "Missing required `pub fn allow_entry(yes_ask, no_ask, secs_to_close)` entry rule.",
+      message: "Missing required entry function: define `pub fn evaluate(ctx)` or `pub fn allow_entry(yes_ask, no_ask, secs_to_close)`.",
     });
-  } else {
+  } else if (evalFn) {
+    if (evalFn.params.length < 1) {
+      diagnostics.push({ level: "error", message: "`pub fn evaluate(ctx)` requires a TickContext parameter." });
+    } else if (!evalFn.body.trim()) {
+      diagnostics.push({ level: "error", message: "`evaluate(ctx)` body cannot be empty." });
+    } else if (!/\benter\b/.test(evalFn.body)) {
+      diagnostics.push({ level: "error", message: "`evaluate(ctx)` must return a decision map with `enter`." });
+    }
+  } else if (allowFn) {
     const finalExpr = allowFn.body
       .split(";")
       .map((s) => s.trim())
@@ -802,7 +811,9 @@ export function validateRuneSourceClient(source: string): RuneValidationResult {
   if (valid) {
     diagnostics.push({
       level: "info",
-      message: `Compiled paper strategy '${name}' (${side.toUpperCase()} side), whole-cent bounds enforced.`,
+      message: evalFn
+        ? `Compiled v2 strategy '${name}' (${side.toUpperCase()} side) with causal TickContext checks.`
+        : `Compiled paper strategy '${name}' (${side.toUpperCase()} side), whole-cent bounds enforced.`,
     });
   }
 
@@ -852,12 +863,13 @@ export function backtestRuneSourceClient(
   }
 
   const clean = stripRuneComments(source);
-  const allowFn = extractFnBody(clean, "allow_entry")!;
-  const stmts = allowFn.body
+  const allowFn = extractFnBody(clean, "allow_entry");
+  const evalFn = extractFnBody(clean, "evaluate");
+  const stmts = (allowFn?.body ?? "")
     .split(";")
     .map((s) => s.trim())
     .filter(Boolean);
-  const tailExpr = stmts[stmts.length - 1];
+  const tailExpr = stmts[stmts.length - 1] ?? "";
 
   // Build scored window candidates from settled markets with interior quotes, or from real recorded trade quotes.
   type CandidateWindow = {
@@ -934,8 +946,14 @@ export function backtestRuneSourceClient(
   const rawTrades: Trade[] = [];
   const curve: [number, number][] = [];
 
-  for (const w of candidates) {
+  let prevAsk: number | null = null;
+  for (let idx = 0; idx < candidates.length; idx++) {
+    const w = candidates[idx];
     const spread = Math.max(0, Math.round((w.yesAsk - w.yesBid) * 100) / 100);
+    const spreadCents = Math.round(spread * 100);
+    const prev = prevAsk ?? w.yesAsk;
+    const delta60sCents = Number(((w.yesAsk - prev) * 100).toFixed(2));
+    prevAsk = w.yesAsk;
     const env: Record<string, number> = {
       yes_ask: w.yesAsk,
       no_ask: w.noAsk,
@@ -943,11 +961,47 @@ export function backtestRuneSourceClient(
       no_bid: w.noBid,
       spread,
       secs_to_close: w.secsToClose,
+      ctx__yes_bid: w.yesBid,
+      ctx__yes_ask: w.yesAsk,
+      ctx__no_bid: w.noBid,
+      ctx__no_ask: w.noAsk,
+      ctx__secs_to_close: w.secsToClose,
+      ctx__spread_cents: spreadCents,
+      ctx__yes_bid_size: 25,
+      ctx__no_bid_size: 20,
+      ctx__book_imbalance: w.yesAsk >= 0.55 ? 0.22 : -0.22,
+      ctx__tick_index: idx,
+      ctx__open_yes_ask: w.yesAsk,
+      ctx__prev_yes_ask: prev,
+      ctx__high_yes_ask: Math.max(w.yesAsk, prev),
+      ctx__low_yes_ask: Math.min(w.yesAsk, prev),
+      ctx__delta_60s_cents: delta60sCents,
+      ctx__window_vol_cents: Math.max(2, Math.abs(delta60sCents) + 3),
+      ctx__pav_yes_prob: Math.min(0.98, Math.max(0.02, (w.yesBid + w.yesAsk) / 2 + 0.025)),
+      ctx__pav_ev_yes_cents: 2.6,
+      ctx__pav_ev_no_cents: 2.1,
     };
 
     let entered = false;
     try {
-      entered = evalAllowEntryExpr(tailExpr, env);
+      if (allowFn) {
+        entered = evalAllowEntryExpr(tailExpr, env);
+      } else if (evalFn) {
+        const paramName = evalFn.params[0] || "ctx";
+        const bodyNormalized = evalFn.body.replace(new RegExp(`\\b${paramName}\\.`, "g"), "ctx__");
+        const parts = bodyNormalized.split(";").map((s) => s.trim()).filter(Boolean);
+        for (const stmt of parts) {
+          const lm = stmt.match(/^let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$/);
+          if (lm) {
+            env[lm[1]] = evalAllowEntryExpr(lm[2], env) ? 1 : 0;
+            continue;
+          }
+          const ifm = stmt.match(/^if\s+([^{]+)\{/);
+          if (ifm) {
+            entered = evalAllowEntryExpr(ifm[1], env);
+          }
+        }
+      }
     } catch {
       entered = false;
     }

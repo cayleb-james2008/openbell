@@ -925,6 +925,7 @@ export function App() {
                 dataset={dataset}
                 search={search}
                 onRetry={() => void reload()}
+                onLibraryMutated={() => void reload()}
                 isActiveTab={tab === "strategies"}
                 jumpStrategy={jumpStrategy}
                 sandboxSignal={sandboxSignal}
@@ -1138,6 +1139,7 @@ export function App() {
                   home={home}
                   dataset={dataset}
                   initialStrategyName={editorInitStrategy}
+                  onLibraryMutated={() => void reload()}
                   onClose={() => setEditorDrawerOpen(false)}
                 />
               </Suspense>
