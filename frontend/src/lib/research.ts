@@ -136,6 +136,8 @@ export type SynthCandidate = {
   maxCorrWithLibrary: number;
   survivedFdr: boolean;
   passedDsr: boolean;
+  passedCorrCap: boolean;
+  passedAllGates: boolean;
   causalCanaryPassed: boolean;
   rejectionReason: string | null;
   description: string;
@@ -336,6 +338,11 @@ function normalizeCandidate(raw: unknown, idx: number, fallbackMode: SynthExecut
   const isWinRatePct =
     isWinRateRaw !== null ? isWinRateRaw : isWinRateFrac !== null ? (isWinRateFrac <= 1 ? isWinRateFrac * 100 : isWinRateFrac) : 0;
 
+  const maxCorrWithLibrary = Number((pickNum(o, ["max_corr_with_library", "max_abs_corr", "library_corr"]) ?? 0).toFixed(2));
+  const passedCorrCap = o.passed_corr_cap === undefined ? maxCorrWithLibrary <= 0.65 : Boolean(o.passed_corr_cap);
+  const passedAllGates =
+    o.passed_all_gates === undefined ? survivedFdr && passedDsr && passedCorrCap : Boolean(o.passed_all_gates);
+
   return {
     id: cleanStr(o.id, `${name}-${idx + 1}`),
     name,
@@ -353,9 +360,11 @@ function normalizeCandidate(raw: unknown, idx: number, fallbackMode: SynthExecut
     deflatedSharpe: Number(dsr.toFixed(2)),
     pValue: Number(pVal.toFixed(4)),
     bhAdjustedPValue: Number(bhPVal.toFixed(4)),
-    maxCorrWithLibrary: Number((pickNum(o, ["max_corr_with_library", "max_abs_corr", "library_corr"]) ?? 0).toFixed(2)),
+    maxCorrWithLibrary,
     survivedFdr,
     passedDsr,
+    passedCorrCap,
+    passedAllGates,
     causalCanaryPassed: o.causal_canary_passed === undefined ? true : Boolean(o.causal_canary_passed),
     rejectionReason: typeof o.rejection_reason === "string" && o.rejection_reason.trim() ? o.rejection_reason.trim() : null,
     description: cleanStr(o.description, "Walk-forward synthesized v2 candidate"),
@@ -589,11 +598,13 @@ export function synthesizeStrategiesClient(
     const bhRaw = Math.min(1, (b.pValue * mCount) / (rankIdx + 1));
     const bhAdjustedPValue = Number(bhRaw.toFixed(4));
     const survivedFdr = bhAdjustedPValue <= req.fdr_alpha && b.oosNetExpectancyCents > 0;
-    const passedDsr = b.deflatedSharpe > 0 && b.maxCorrWithLibrary <= 0.65;
+    const passedDsr = b.deflatedSharpe > 0;
+    const passedCorrCap = b.maxCorrWithLibrary <= 0.65;
+    const passedAllGates = survivedFdr && passedDsr && passedCorrCap;
     let rejectionReason: string | null = null;
     if (b.oosNetExpectancyCents <= 0) rejectionReason = "Negative OOS expectancy";
     else if (!survivedFdr) rejectionReason = `BH adj p ${bhAdjustedPValue.toFixed(4)} > alpha ${req.fdr_alpha.toFixed(2)}`;
-    else if (b.maxCorrWithLibrary > 0.65) rejectionReason = `Library corr ${b.maxCorrWithLibrary.toFixed(2)} > 0.65`;
+    else if (!passedCorrCap) rejectionReason = `Library corr ${b.maxCorrWithLibrary.toFixed(2)} > 0.65`;
     else if (!passedDsr) rejectionReason = "Deflated Sharpe <= 0";
 
     return {
@@ -616,6 +627,8 @@ export function synthesizeStrategiesClient(
       maxCorrWithLibrary: b.maxCorrWithLibrary,
       survivedFdr,
       passedDsr,
+      passedCorrCap,
+      passedAllGates,
       causalCanaryPassed: true,
       rejectionReason,
       description: b.description,
@@ -635,7 +648,7 @@ export function synthesizeStrategiesClient(
     };
   });
 
-  const survivorCount = candidates.filter((c) => c.survivedFdr && c.passedDsr).length;
+  const survivorCount = candidates.filter((c) => c.passedAllGates).length;
 
   return {
     family: req.family,
@@ -700,7 +713,7 @@ export async function synthesizeStrategies(
 
     const survivorCount =
       pickNum(raw, ["survivor_count", "survivors_count"]) ??
-      candidates.filter((c) => c.survivedFdr && c.passedDsr).length;
+      candidates.filter((c) => c.passedAllGates).length;
 
     return {
       family: (cleanStr(raw.family, req.family) as StrategyFamily) || req.family,

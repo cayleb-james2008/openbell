@@ -80,13 +80,13 @@ export function StrategySynthesizerPanel({
       const hit = result.candidates.find((c) => c.id === selectedId);
       if (hit) return hit;
     }
-    return result.candidates.find((c) => c.survivedFdr && c.passedDsr) ?? result.candidates[0];
+    return result.candidates.find((c) => c.passedAllGates) ?? result.candidates[0];
   }, [result, selectedId]);
 
   const visibleCandidates = useMemo(() => {
     if (!result) return [];
     if (!survivorsOnly) return result.candidates;
-    return result.candidates.filter((c) => c.survivedFdr && c.passedDsr);
+    return result.candidates.filter((c) => c.passedAllGates);
   }, [result, survivorsOnly]);
 
   const handleSynthesize = async () => {
@@ -113,7 +113,7 @@ export function StrategySynthesizerPanel({
         { markets, slots, strategies },
       );
       setResult(res);
-      const top = res.candidates.find((c) => c.survivedFdr && c.passedDsr) ?? res.candidates[0] ?? null;
+      const top = res.candidates.find((c) => c.passedAllGates) ?? res.candidates[0] ?? null;
       setSelectedId(top ? top.id : null);
       toast.success(
         `Evaluated ${res.candidatesEvaluated} candidates: ${res.survivorCount} survivor${res.survivorCount === 1 ? "" : "s"} passed BH-FDR and DSR.`,
@@ -359,7 +359,7 @@ export function StrategySynthesizerPanel({
                 </TableHeader>
                 <TableBody>
                   {visibleCandidates.map((c) => {
-                    const passed = c.survivedFdr && c.passedDsr;
+                    const passed = c.passedAllGates;
                     const isSelected = selectedCandidate?.id === c.id;
                     return (
                       <TableRow

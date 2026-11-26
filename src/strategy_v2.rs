@@ -962,6 +962,17 @@ pub fn save_strategy_atomic(
     requested_name_or_file: Option<&str>,
     source: &str,
 ) -> Result<SaveStrategyResult, CrudError> {
+    save_strategy_atomic_with_overwrite(strategies_dir, requested_name_or_file, source, true)
+}
+
+/// Atomically validate and save a strategy `.rn` file inside `strategies_dir`,
+/// honoring `overwrite` and resolving existing hyphen/underscore library stems.
+pub fn save_strategy_atomic_with_overwrite(
+    strategies_dir: &Path,
+    requested_name_or_file: Option<&str>,
+    source: &str,
+    overwrite: bool,
+) -> Result<SaveStrategyResult, CrudError> {
     let validated = validate_strategy_source_full(source)
         .map_err(|(errs, _)| CrudError::BadRequest(errs))?;
 
@@ -973,8 +984,16 @@ pub fn save_strategy_atomic(
     };
     let stem = validate_strategy_slug(&stem_raw)
         .map_err(|e| CrudError::BadRequest(vec![e]))?;
-    let file_name = format!("{stem}.rn");
-    let dest_path = canon_dir.join(&file_name);
+    let mut file_name = format!("{stem}.rn");
+    let mut dest_path = canon_dir.join(&file_name);
+    if std::fs::symlink_metadata(&dest_path).is_err() {
+        let alt_name = format!("{}.rn", stem.replace('-', "_"));
+        let alt_path = canon_dir.join(&alt_name);
+        if std::fs::symlink_metadata(&alt_path).is_ok() {
+            file_name = alt_name;
+            dest_path = alt_path;
+        }
+    }
 
     // Check symlink confinement on target if it already exists.
     if let Ok(meta) = std::fs::symlink_metadata(&dest_path) {
@@ -989,6 +1008,11 @@ pub fn save_strategy_atomic(
         if !canon_dest.starts_with(&canon_dir) || canon_dest.parent() != Some(canon_dir.as_path()) {
             return Err(CrudError::Forbidden(format!(
                 "target path escapes strategies_dir: {file_name}"
+            )));
+        }
+        if !overwrite {
+            return Err(CrudError::Conflict(format!(
+                "strategy file {file_name} already exists; use Save to overwrite"
             )));
         }
     }

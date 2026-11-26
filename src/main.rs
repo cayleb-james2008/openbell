@@ -6497,7 +6497,21 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     }
                 },
             };
-            match strategy_v2::save_strategy_atomic(&app.strategies_dir, requested, source) {
+            let overwrite = match parsed.get("overwrite") {
+                None | Some(serde_json::Value::Null) => true,
+                Some(v) => match v.as_bool() {
+                    Some(b) => b,
+                    None => {
+                        return json_ok_err_response(400, "overwrite must be a boolean");
+                    }
+                },
+            };
+            match strategy_v2::save_strategy_atomic_with_overwrite(
+                &app.strategies_dir,
+                requested,
+                source,
+                overwrite,
+            ) {
                 Ok(saved) => {
                     invalidate_strategies_dir_caches();
                     app.invalidate_live_hot();
