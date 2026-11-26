@@ -196,6 +196,21 @@ async function open(w, h, theme = 'light', extra = {}) {
   p.on('pageerror', e => errs.push(`${w}-${theme}: pageerror ${e.message}`))
   p.on('console', m => { if (m.type() === 'error' && !p.__allow.test(m.text())) errs.push(`${w}-${theme}: ${m.text().slice(0, 140)} @ ${m.location().url}`) })
   await p.route('**/api/collect', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"snapshots_written":5}' }))
+  await p.route(/\/api\/orderbook(\/.*|\?.*)?$/, async r => {
+    try {
+      const res = await r.fetch()
+      if (res.status() !== 404) return r.fulfill({ response: res })
+    } catch {}
+    const u = new URL(r.request().url())
+    if (u.pathname.endsWith('/stream-status')) {
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ws_connected: false, mode: 'offline', subscribed_tickers: [], active_books: 0, stale_books: 0, last_error: null, delta_count: 0, resync_count: 0 }) })
+    }
+    if (u.pathname.endsWith('/subscribe')) {
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: false, subscribed_tickers: [] }) })
+    }
+    const ticker = u.searchParams.get('ticker') || ''
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: false, ticker, yes_bids: [], no_bids: [], yes_asks: [], no_asks: [], best_yes_bid: null, best_yes_ask: null, spread_cents: null, mid_cents: null, vwap_10: null, last_seq: 0, updated_ms: 0, source: 'empty', stale: false }) })
+  })
   return { ctx, p }
 }
 
@@ -1188,10 +1203,109 @@ for (const m of measures) {
   })
   await p.route('**/api/tape/stream', r => {
     hits.add('sse')
+    const obEvent = JSON.stringify({
+      ok: true,
+      ticker: 'KXBTC15M-MOCK',
+      yes_bids: [
+        { price_cents: 54, qty: 12, cumulative_qty: 12 },
+        { price_cents: 52, qty: 20, cumulative_qty: 32 },
+        { price_cents: 49, qty: 40, cumulative_qty: 72 },
+      ],
+      no_bids: [
+        { price_cents: 44, qty: 10, cumulative_qty: 10 },
+        { price_cents: 42, qty: 15, cumulative_qty: 25 },
+      ],
+      yes_asks: [
+        { price_cents: 56, qty: 10, cumulative_qty: 10 },
+        { price_cents: 58, qty: 15, cumulative_qty: 25 },
+        { price_cents: 61, qty: 30, cumulative_qty: 55 },
+      ],
+      no_asks: [
+        { price_cents: 46, qty: 12, cumulative_qty: 12 },
+        { price_cents: 48, qty: 20, cumulative_qty: 32 },
+      ],
+      best_yes_bid: 54,
+      best_yes_ask: 56,
+      spread_cents: 2,
+      mid_cents: 55.0,
+      vwap_10: 56.0,
+      last_seq: 42,
+      updated_ms: 1700000900000,
+      source: 'ws',
+      stale: false,
+    })
     return r.fulfill({
       status: 200,
       headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
-      body: 'event: tape\ndata: {"snapshots_written":1}\n\nevent: runner\ndata: {"kind":"quote_posted","slot_id":1,"strategy":"late-favourite-edge","ticker":"KXBTC15M-MOCK"}\n\n',
+      body: `event: tape\ndata: {"snapshots_written":1}\n\nevent: runner\ndata: {"kind":"quote_posted","slot_id":1,"strategy":"late-favourite-edge","ticker":"KXBTC15M-MOCK"}\n\nevent: orderbook\ndata: ${obEvent}\n\n`,
+    })
+  })
+  await p.route(/\/api\/orderbook\/stream-status(\?.*)?$/, r => {
+    hits.add('orderbook-stream-status')
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ws_connected: true,
+        mode: 'ws',
+        subscribed_tickers: ['KXBTC15M-MOCK'],
+        active_books: 1,
+        stale_books: 0,
+        last_error: null,
+        delta_count: 14,
+        resync_count: 1,
+      }),
+    })
+  })
+  await p.route(/\/api\/orderbook\/subscribe(\?.*)?$/, r => {
+    checkCsrf(r)
+    hits.add('orderbook-subscribe')
+    const b = JSON.parse(r.request().postData() || '{}')
+    const tickers = Array.isArray(b.tickers) ? b.tickers : b.ticker ? [b.ticker] : ['KXBTC15M-MOCK']
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, subscribed_tickers: tickers }),
+    })
+  })
+  await p.route(/\/api\/orderbook(\?.*)?$/, r => {
+    hits.add('orderbook')
+    const u = new URL(r.request().url())
+    const ticker = (u.searchParams.get('ticker') || 'KXBTC15M-MOCK').toUpperCase()
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        ticker,
+        yes_bids: [
+          { price_cents: 54, qty: 12, cumulative_qty: 12 },
+          { price_cents: 52, qty: 20, cumulative_qty: 32 },
+          { price_cents: 49, qty: 40, cumulative_qty: 72 },
+        ],
+        no_bids: [
+          { price_cents: 44, qty: 10, cumulative_qty: 10 },
+          { price_cents: 42, qty: 15, cumulative_qty: 25 },
+        ],
+        yes_asks: [
+          { price_cents: 56, qty: 10, cumulative_qty: 10 },
+          { price_cents: 58, qty: 15, cumulative_qty: 25 },
+          { price_cents: 61, qty: 30, cumulative_qty: 55 },
+        ],
+        no_asks: [
+          { price_cents: 46, qty: 12, cumulative_qty: 12 },
+          { price_cents: 48, qty: 20, cumulative_qty: 32 },
+        ],
+        best_yes_bid: 54,
+        best_yes_ask: 56,
+        spread_cents: 2,
+        mid_cents: 55.0,
+        vwap_10: 56.0,
+        last_seq: 42,
+        updated_ms: 1700000900000,
+        source: 'ws',
+        stale: false,
+      }),
     })
   })
   await p.route('**/api/analytics/calibration*', r => {
@@ -1297,6 +1411,20 @@ for (const m of measures) {
   await p.locator('#runner-confirm-live-btn').click(); await p.waitForTimeout(300)
   const runnerLiveActive = (await p.locator('#runner-mode-badge').innerText()).includes('Live Auto')
   await p.locator('#live-ticket-ticker').fill('KXBTC15M-MOCK')
+  await p.waitForTimeout(200)
+  const obBarsCount = await p.locator('#live-trading-workspace [data-orderbook-ladder] [data-depth-bar]').count()
+  const obSpreadTxt = (await p.locator('#live-trading-workspace [data-orderbook-spread]').innerText()).trim()
+  const obStatusTxt = (await p.locator('#live-trading-workspace [data-orderbook-status]').innerText()).trim()
+  await p.locator('#live-ticket-count').fill('5')
+  await p.waitForTimeout(80)
+  const vwap5Txt = await p.locator('#live-trading-workspace [data-orderbook-vwap]').innerText()
+  await p.locator('#live-ticket-count').fill('25')
+  await p.waitForTimeout(80)
+  const vwap25Txt = await p.locator('#live-trading-workspace [data-orderbook-vwap]').innerText()
+  const ticketVwap25Txt = await p.locator('#live-ticket-vwap-impact').innerText()
+  await p.locator('#live-trading-workspace [data-orderbook-level][data-price-cents="54"]').click()
+  await p.waitForTimeout(80)
+  const clickedPriceVal = await p.locator('#live-ticket-price').inputValue()
   await p.locator('#live-ticket-count').fill('5')
   await p.locator('#live-ticket-price').fill('55')
   await p.waitForTimeout(100)
@@ -1311,6 +1439,18 @@ for (const m of measures) {
       runnerLockedBeforeArm && runnerShadowActive && runnerLiveActive && runnerHaltedAfterKill,
     `locked=${runnerLockedBeforeArm} shadow=${runnerShadowActive} live=${runnerLiveActive} halt=${runnerHaltedAfterKill}`)
   await p.locator('#tab-tape').click(); await p.waitForTimeout(200)
+  await p.locator('#markets-card button[data-market-row]').first().click(); await p.waitForTimeout(350)
+  const drawerObOk =
+    (await p.locator('[data-market-drawer] [data-orderbook-ladder]').isVisible()) &&
+    (await p.locator('[data-market-drawer] [data-orderbook-ladder] [data-depth-bar]').count()) >= 4 &&
+    (await p.locator('[data-market-drawer] [data-orderbook-spread]').innerText()).trim() === '2c'
+  await p.keyboard.press('Escape'); await p.waitForTimeout(350)
+  ok('L2 Orderbook DOM ladder renders depth bars, spread badge, live VWAP book-walk updates on qty change, click-to-fill price & Market Inspector auto-subscribe',
+    ['orderbook', 'orderbook-stream-status', 'orderbook-subscribe'].every(k => hits.has(k)) &&
+      obBarsCount >= 6 && obSpreadTxt === '2c' && obStatusTxt.includes('WS Live') &&
+      vwap5Txt.includes('56.00c') && vwap25Txt.includes('57.20c') && vwap25Txt.includes('+1.20c') &&
+      ticketVwap25Txt.includes('57.20c') && clickedPriceVal === '54' && drawerObOk,
+    `bars=${obBarsCount} spread=${obSpreadTxt} status=${obStatusTxt} vwap5=${vwap5Txt} vwap25=${vwap25Txt} clicked=${clickedPriceVal} drawer=${drawerObOk}`)
 
   await p.locator('#auto-collector-strip [data-collector-mode="60"]').click(); await p.waitForTimeout(250)
   const schedUpdated = (await p.locator('#auto-collector-status-pill').innerText()).includes('Auto') &&
