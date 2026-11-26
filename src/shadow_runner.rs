@@ -124,6 +124,16 @@ fn default_bankroll() -> f64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedSlotPause {
+    slot_id: usize,
+    paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pause_reason: Option<String>,
+    #[serde(default)]
+    peak_realized_pnl_dollars: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedRunnerState {
     #[serde(default)]
     mode: String,
@@ -135,6 +145,8 @@ struct PersistedRunnerState {
     bankroll_dollars: f64,
     #[serde(default)]
     slots: Vec<RunnerSlotConfig>,
+    #[serde(default)]
+    slot_states: Vec<PersistedSlotPause>,
 }
 
 fn default_tick_interval() -> u64 {
@@ -330,6 +342,10 @@ struct RunnerState {
     queue_wait_sum_secs: f64,
     queue_wait_count: u64,
     live_poll_last: Option<Instant>,
+    quarantine_state: crate::execution_audit::QuarantineStateFile,
+    recent_fill_tickers: HashMap<String, i64>,
+    last_markout_sample_ts: HashMap<String, i64>,
+    audit_dirty: bool,
 }
 
 struct PendingLiveOrderIntent {
@@ -466,6 +482,16 @@ impl RunnerState {
             cancel_before_close_secs: self.cancel_before_close_secs,
             bankroll_dollars: self.bankroll_dollars,
             slots: self.slots.iter().map(|s| s.cfg.clone()).collect(),
+            slot_states: self
+                .slots
+                .iter()
+                .map(|s| PersistedSlotPause {
+                    slot_id: s.cfg.slot_id,
+                    paused: s.paused,
+                    pause_reason: s.pause_reason.clone(),
+                    peak_realized_pnl_dollars: s.peak_realized_pnl_dollars,
+                })
+                .collect(),
         };
         write_atomic_json(&state_path(&self.data_dir), &persisted)
     }
@@ -615,6 +641,11 @@ impl RunnerState {
             slot.fills = slot.fills.saturating_add(1);
         }
         self.mark_slot_ticker(q.slot_id, &q.ticker);
+        self.recent_fill_tickers
+            .entry(q.ticker.clone())
+            .and_modify(|prev| *prev = (*prev).max(filled_at))
+            .or_insert(filled_at);
+        self.audit_dirty = true;
         self.filled_positions.push(FilledPosition {
             order_id: q.order_id.clone(),
             slot_id: q.slot_id,
@@ -695,6 +726,11 @@ impl RunnerState {
             slot.fills = slot.fills.saturating_add(1);
         }
         self.mark_slot_ticker(q.slot_id, &q.ticker);
+        self.recent_fill_tickers
+            .entry(q.ticker.clone())
+            .and_modify(|prev| *prev = (*prev).max(filled_at))
+            .or_insert(filled_at);
+        self.audit_dirty = true;
         self.filled_positions.push(FilledPosition {
             order_id: q.order_id.clone(),
             slot_id: q.slot_id,
@@ -861,6 +897,7 @@ impl RunnerState {
                     live_order_id: None,
                 };
                 self.append_and_publish(pause_ev, "slot_auto_paused");
+                let _ = self.persist_state();
             }
         }
     }
@@ -965,7 +1002,7 @@ impl ShadowRunner {
             .ok()
             .and_then(|raw| serde_json::from_str::<PersistedRunnerState>(&raw).ok());
 
-        let (mode, tick_interval_ms, cancel_before_close_secs, bankroll_dollars, slot_cfgs) =
+        let (mode, tick_interval_ms, cancel_before_close_secs, bankroll_dollars, slot_cfgs, persisted_slot_states) =
             match disk_state {
                 Some(s) => {
                     // Safety invariant: NEVER boot in "live_auto", even if runner_state.json was edited.
@@ -991,6 +1028,11 @@ impl ShadowRunner {
                         .tick_interval_ms
                         .clamp(MIN_TICK_INTERVAL_MS, MAX_TICK_INTERVAL_MS);
                     let clamped_cancel = s.cancel_before_close_secs.min(MAX_CANCEL_BEFORE_CLOSE_SECS);
+                    let slot_states_map: HashMap<usize, PersistedSlotPause> = s
+                        .slot_states
+                        .iter()
+                        .map(|ps| (ps.slot_id, ps.clone()))
+                        .collect();
                     // Sanitize on disk immediately if persisted mode was "live_auto" or invalid.
                     if s.mode != safe_mode.persisted_str() {
                         let sanitized = PersistedRunnerState {
@@ -999,6 +1041,7 @@ impl ShadowRunner {
                             cancel_before_close_secs: clamped_cancel,
                             bankroll_dollars: bankroll,
                             slots: valid_slots.clone(),
+                            slot_states: s.slot_states.clone(),
                         };
                         let _ = write_atomic_json(&state_path(data_dir), &sanitized);
                     }
@@ -1008,6 +1051,7 @@ impl ShadowRunner {
                         clamped_cancel,
                         bankroll,
                         valid_slots,
+                        slot_states_map,
                     )
                 }
                 None => (
@@ -1020,6 +1064,7 @@ impl ShadowRunner {
                         DEFAULT_BANKROLL_DOLLARS
                     },
                     Vec::new(),
+                    HashMap::new(),
                 ),
             };
 
@@ -1034,6 +1079,7 @@ impl ShadowRunner {
         let mut queue_wait_sum_secs = 0.0;
         let mut queue_wait_count = 0u64;
         let mut slot_stats: HashMap<usize, (u64, u64, f64, f64)> = HashMap::new();
+        let mut ledger_paused: HashMap<usize, String> = HashMap::new();
         let mut settled_or_filled_slot_tickers: HashMap<String, HashSet<usize>> = HashMap::new();
         let mut terminal_order_ids: HashSet<String> = HashSet::new();
         let mut terminal_order_queue: VecDeque<String> = VecDeque::new();
@@ -1099,6 +1145,13 @@ impl ShadowRunner {
                         }
                     }
                 }
+                "SlotPaused" => {
+                    if let Some(ref r) = ev.reason {
+                        ledger_paused.insert(ev.slot_id, r.clone());
+                    } else {
+                        ledger_paused.insert(ev.slot_id, "auto-paused".to_string());
+                    }
+                }
                 _ => {}
             }
         }
@@ -1114,17 +1167,35 @@ impl ShadowRunner {
                     .get(&cfg.slot_id)
                     .copied()
                     .unwrap_or((0, 0, 0.0, 0.0));
+                let (paused, pause_reason, persisted_peak) =
+                    if let Some(ps) = persisted_slot_states.get(&cfg.slot_id) {
+                        (
+                            ps.paused,
+                            ps.pause_reason.clone(),
+                            ps.peak_realized_pnl_dollars.max(peak),
+                        )
+                    } else if persisted_slot_states.is_empty() {
+                        if let Some(reason) = ledger_paused.get(&cfg.slot_id) {
+                            (true, Some(reason.clone()), peak)
+                        } else {
+                            (false, None, peak)
+                        }
+                    } else {
+                        (false, None, peak)
+                    };
                 SlotRuntime {
                     cfg,
-                    paused: false,
-                    pause_reason: None,
+                    paused,
+                    pause_reason,
                     quotes_posted: qp,
                     fills: fl,
                     realized_pnl_dollars: pnl,
-                    peak_realized_pnl_dollars: peak,
+                    peak_realized_pnl_dollars: persisted_peak,
                 }
             })
             .collect();
+
+        let quarantine_state = crate::execution_audit::load_quarantine_state(data_dir);
 
         Self {
             state: Mutex::new(RunnerState {
@@ -1154,6 +1225,10 @@ impl ShadowRunner {
                 queue_wait_sum_secs,
                 queue_wait_count,
                 live_poll_last: None,
+                quarantine_state,
+                recent_fill_tickers: HashMap::new(),
+                last_markout_sample_ts: HashMap::new(),
+                audit_dirty: false,
             }),
             cv: Condvar::new(),
             halted: AtomicBool::new(false),
@@ -1247,6 +1322,175 @@ impl ShadowRunner {
         drop(st);
         self.cv.notify_all();
         Ok(snap)
+    }
+
+    #[allow(dead_code)]
+    pub fn quarantine_state(&self) -> crate::execution_audit::QuarantineStateFile {
+        let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        st.quarantine_state.clone()
+    }
+
+    pub fn set_quarantine_state(&self, qs: crate::execution_audit::QuarantineStateFile) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        st.quarantine_state = qs;
+        let q_strats: HashSet<String> = st
+            .quarantine_state
+            .strategies
+            .iter()
+            .filter(|(_, e)| e.status == "quarantined" || e.throttle_mult <= 0.0)
+            .map(|(k, _)| k.clone())
+            .collect();
+        if !q_strats.is_empty() {
+            let now = now_unix();
+            let existing = std::mem::take(&mut st.open_quotes);
+            let mut kept = Vec::with_capacity(existing.len());
+            let mut canceled = Vec::new();
+            for rq in existing {
+                if rq.order.mode == "shadow"
+                    && (q_strats.contains(&rq.order.strategy)
+                        || q_strats.contains(&rq.order.strategy.replace('-', "_"))
+                        || q_strats.contains(&rq.order.strategy.replace('_', "-")))
+                {
+                    canceled.push(rq.order);
+                } else {
+                    kept.push(rq);
+                }
+            }
+            st.open_quotes = kept;
+            for q in canceled {
+                st.emit_quote_canceled(&q, now, "strategy_quarantined");
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_from_allocator(
+        &self,
+        report: &crate::auto_allocator::AutoAllocatorReport,
+        rails: &risk_rails::RiskRailsConfig,
+        quarantine: &crate::execution_audit::QuarantineStateFile,
+        bankroll_override: Option<f64>,
+        execution_mode_override: Option<&str>,
+        live_armed: bool,
+        killed: bool,
+    ) -> Result<(Vec<RunnerSlotConfig>, Vec<String>, RunnerStatusResponse), String> {
+        let mut excluded_quarantined: Vec<String> = Vec::new();
+        for q in &report.quarantined {
+            if !excluded_quarantined.contains(&q.strategy) {
+                excluded_quarantined.push(q.strategy.clone());
+            }
+        }
+        let mut series_by_strat: HashMap<&str, &str> = HashMap::new();
+        for row in &report.edge_screener {
+            if !row.top_series.is_empty() {
+                series_by_strat.insert(row.strategy.as_str(), row.top_series.as_str());
+            }
+        }
+
+        let exec_override = execution_mode_override
+            .map(|m| m.trim().to_ascii_lowercase())
+            .filter(|m| m == "maker" || m == "taker");
+
+        let mut slots_out: Vec<RunnerSlotConfig> = Vec::new();
+        let mut next_slot_id = 1usize;
+        for w in &report.active_winners {
+            if slots_out.len() >= MAX_RUNNER_SLOTS {
+                break;
+            }
+            if quarantine.is_quarantined(&w.strategy) || w.execution_status == "quarantined" {
+                if !excluded_quarantined.contains(&w.strategy) {
+                    excluded_quarantined.push(w.strategy.clone());
+                }
+                continue;
+            }
+            let mult = quarantine.throttle_mult(&w.strategy);
+            if mult <= 0.0 {
+                if !excluded_quarantined.contains(&w.strategy) {
+                    excluded_quarantined.push(w.strategy.clone());
+                }
+                continue;
+            }
+            let rail_cap = rails.max_order_contracts.clamp(1, 10_000);
+            let raw_contracts = w.rail_clamped_contracts.min(rail_cap);
+            if raw_contracts == 0 {
+                continue;
+            }
+            let max_contracts = if mult < 1.0 {
+                ((raw_contracts as f64) * mult).floor().max(1.0) as u32
+            } else {
+                raw_contracts
+            }
+            .min(rail_cap)
+            .clamp(1, 10_000);
+
+            let series = match series_by_strat.get(w.strategy.as_str()) {
+                Some(s) if !s.is_empty() => vec![(*s).to_string()],
+                _ => Vec::new(),
+            };
+            let exec_mode = exec_override
+                .clone()
+                .unwrap_or_else(|| {
+                    if w.execution_mode == "taker" {
+                        "taker".to_string()
+                    } else {
+                        "maker".to_string()
+                    }
+                });
+            let auto_pause_drawdown = (rails.max_daily_loss_dollars
+                * (w.allocated_pct / 100.0).max(0.1))
+            .clamp(5.0, rails.max_daily_loss_dollars.max(5.0));
+
+            let slot = normalize_slot(&RunnerSlotConfig {
+                slot_id: next_slot_id,
+                strategy: w.strategy.clone(),
+                series,
+                max_contracts,
+                execution_mode: exec_mode,
+                auto_pause_drawdown_dollars: auto_pause_drawdown,
+                enabled: true,
+            })?;
+            slots_out.push(slot);
+            next_slot_id += 1;
+        }
+
+        let bankroll = bankroll_override
+            .filter(|b| b.is_finite() && *b > 0.0 && *b <= 10_000_000.0)
+            .unwrap_or_else(|| {
+                if report.starting_bankroll.is_finite()
+                    && report.starting_bankroll > 0.0
+                    && report.starting_bankroll <= 10_000_000.0
+                {
+                    report.starting_bankroll
+                } else {
+                    DEFAULT_BANKROLL_DOLLARS
+                }
+            });
+
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        // Safety invariant: sync_from_allocator NEVER sets RunnerMode::LiveAuto.
+        if st.mode == RunnerMode::LiveAuto {
+            st.mode = RunnerMode::Stopped;
+        }
+        st.bankroll_dollars = bankroll;
+        st.quarantine_state = quarantine.clone();
+        st.slots = slots_out
+            .iter()
+            .cloned()
+            .map(|cfg| SlotRuntime {
+                cfg,
+                paused: false,
+                pause_reason: None,
+                quotes_posted: 0,
+                fills: 0,
+                realized_pnl_dollars: 0.0,
+                peak_realized_pnl_dollars: 0.0,
+            })
+            .collect();
+        st.persist_state()?;
+        let snap = st.status_snapshot(live_armed, killed);
+        drop(st);
+        self.cv.notify_all();
+        Ok((slots_out, excluded_quarantined, snap))
     }
 
     pub fn start(
@@ -2369,6 +2613,88 @@ impl ShadowRunner {
                 }
             }
         }
+
+        // Sample markout midpoints for recent fills and refresh execution quarantine state.
+        let (data_dir, need_audit) = {
+            let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let wall_now = now_unix();
+            let mut to_sample: Vec<(String, f64)> = Vec::new();
+            let mut expired: Vec<String> = Vec::new();
+            for (t, fts) in &st.recent_fill_tickers {
+                if wall_now - *fts > 180 {
+                    expired.push(t.clone());
+                    continue;
+                }
+                if st.last_markout_sample_ts.get(t).copied().unwrap_or(0) >= wall_now {
+                    continue;
+                }
+                if let Some(ob) = ob_snapshots.get(t) {
+                    if !ob.stale && !ob.needs_resync && ob.source != "empty" {
+                        if let Some(mid) = ob.mid_cents.filter(|m| m.is_finite()) {
+                            to_sample.push((t.clone(), mid));
+                            continue;
+                        }
+                    }
+                }
+                if let Some(snaps) = tape.grouped.get(t.as_str()) {
+                    if let Some(last) = snaps.last() {
+                        if last.result.is_empty() {
+                            if let (Some(yb), Some(ya)) = (last.yes_bid.get(), last.yes_ask.get()) {
+                                to_sample.push((t.clone(), (yb + ya) * 50.0));
+                            }
+                        }
+                    }
+                }
+            }
+            for t in expired {
+                st.recent_fill_tickers.remove(&t);
+            }
+            let sampled = !to_sample.is_empty();
+            for (t, mid) in to_sample {
+                st.last_markout_sample_ts.insert(t.clone(), wall_now);
+                crate::execution_audit::append_markout_sample(
+                    &st.data_dir,
+                    &crate::execution_audit::MarkoutSampleRecord {
+                        ts_ms: wall_now * 1000,
+                        ticker: t,
+                        yes_mid_cents: mid,
+                    },
+                );
+            }
+            let dirty = st.audit_dirty || sampled;
+            st.audit_dirty = false;
+            (st.data_dir.clone(), dirty)
+        };
+
+        if need_audit {
+            let mut tape_mids: HashMap<String, Vec<crate::execution_audit::MidpointObs>> =
+                HashMap::new();
+            let mut tape_settle: HashMap<String, String> = HashMap::new();
+            for (t, snaps) in tape.grouped.iter() {
+                for s in snaps {
+                    let res = s.result.as_str().trim().to_ascii_lowercase();
+                    if res == "yes" || res == "no" {
+                        tape_settle.insert(t.clone(), res);
+                    } else if let (Some(yb), Some(ya)) = (s.yes_bid.get(), s.yes_ask.get()) {
+                        tape_mids
+                            .entry(t.clone())
+                            .or_default()
+                            .push(crate::execution_audit::MidpointObs {
+                                ts_secs: s.fetched_at as f64,
+                                yes_mid_cents: (yb + ya) * 50.0,
+                            });
+                    }
+                }
+            }
+            let health = crate::execution_audit::evaluate_execution_health(
+                &data_dir,
+                Some(&app.orderbook),
+                Some(&tape_mids),
+                Some(&tape_settle),
+                true,
+            );
+            self.set_quarantine_state(health.quarantine_state);
+        }
     }
 }
 
@@ -2530,6 +2856,16 @@ fn evaluate_slots_for_market(
             let s = &st.slots[idx];
             (s.cfg.strategy.clone(), s.cfg.execution_mode.clone())
         };
+        let q_mult = st.quarantine_state.throttle_mult(&strat_name);
+        if q_mult <= 0.0 {
+            continue;
+        }
+        let eff_max_contracts = if q_mult < 1.0 {
+            ((max_contracts as f64) * q_mult).floor().max(1.0) as u32
+        } else {
+            max_contracts
+        };
+        let eff_slot_budget = slot_budget * q_mult;
 
         let Some(strat) = cached_strats.find(&strat_name) else {
             continue;
@@ -2567,7 +2903,7 @@ fn evaluate_slots_for_market(
                     &app.orderbook,
                     ticker,
                     &entry_side,
-                    max_contracts,
+                    eff_max_contracts,
                     side_bid_c,
                     side_ask_c,
                     quote_cents,
@@ -2582,13 +2918,13 @@ fn evaluate_slots_for_market(
                 } else {
                     quote_cents
                 };
-                (lc, max_contracts, lc as f64, 0.0)
+                (lc, eff_max_contracts, lc as f64, 0.0)
             };
         if !(1..=99).contains(&limit_cents) || eff_contracts == 0 {
             continue;
         }
 
-        let affordable = (slot_budget / (limit_cents as f64 / 100.0)).floor() as u32;
+        let affordable = (eff_slot_budget / (limit_cents as f64 / 100.0)).floor() as u32;
         let contracts = eff_contracts.min(affordable);
         if contracts == 0 {
             continue;
