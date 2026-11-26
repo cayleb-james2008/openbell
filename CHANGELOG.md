@@ -4,6 +4,13 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.26.0 - 2026-11-26
+
+- Added a live Kalshi Trade API v2 L2 Orderbook store, RFC 6455 WebSocket depth client with RSA-PSS handshake signing, exponential-backoff REST L2 poller, sequence-gap resync detection, and exact book-walk VWAP/slippage sizing in `src/orderbook.rs` and `src/kalshi_live.rs` with zero new external Cargo dependencies.
+- Wired L2 book-walk execution and queue-ahead estimation into `src/shadow_runner.rs` and `src/auto_allocator.rs` (falling back to quote midpoint metrics cleanly when depth is missing or stale), alongside `/api/orderbook`, `/api/orderbook/stream-status`, CSRF-guarded `POST /api/orderbook/subscribe`, throttled `event: orderbook` SSE frames, and `"orderbook_l2": true` in `/api/home`, keeping `live_armed: false` on boot.
+- Built `frontend/src/lib/orderbook.ts` and `frontend/src/OrderbookLadder.tsx` mounted inside `TapeTab.tsx` (Market Inspector auto-subscribe + live stream) and `LiveTradingPanel.tsx` (clickable bid/ask rows populating `#live-ticket-price` and live VWAP impact preview).
+- Added `docs/screenshots/orderbook-ladder-{light,dark}.png`, updated version parity to `0.26.0`, and verified post-final-edit: `clippy` 0 warnings, `x86_64-pc-windows-msvc` check ok, `136/136` Rust tests, `gate 104/104`, `replay 18/18`, `SLOP 0/0/0`, `RAILS OK`, `EQUITY OK`, `6.03 MiB` (`6,325,600 B`) release binary, `7.72 ms` boot, `18.26 MB` RSS, `3,265.1 req/s` (`7.84 ms` p95, `0/8,167` errors), `5/5` SSE, and `25/25` fuzz.
+
 ## 0.25.0 - 2026-11-26
 
 - Added a continuous tick-driven Paper/Shadow Orderbook Matching Engine and fail-closed automated multi-slot Strategy Runner in `src/shadow_runner.rs` (`ShadowRunner`), wired into `src/main.rs` via `/api/runner/{status,config,start,stop,ledger}`, `event: runner` SSE frames, and atomic `runner.emergency_halt()` inside `POST /api/live/kill-switch` before `cancel_all_orders()`.
