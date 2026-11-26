@@ -468,12 +468,16 @@ export function VenueReconciliationPanel({
   const utcDayLoss = reconcile.source === "server" ? reconcile.utcDayLossDollars : status.dailyRealizedLossDollars;
   const openExposure = reconcile.source === "server" ? reconcile.openExposureDollars : status.openExposureDollars;
   const totalFees = useMemo(
-    () => reconcile.executions.reduce((sum, ex) => sum + ex.feeDollars, 0),
-    [reconcile.executions],
+    () =>
+      reconcile.utcDayFeesDollars ??
+      reconcile.executions.reduce((sum, ex) => sum + ex.feeDollars, 0),
+    [reconcile.utcDayFeesDollars, reconcile.executions],
   );
   const totalRealizedPnl = useMemo(
-    () => reconcile.executions.reduce((sum, ex) => sum + ex.realizedPnlDollars, 0),
-    [reconcile.executions],
+    () =>
+      reconcile.utcDayRealizedPnlDollars ??
+      reconcile.executions.reduce((sum, ex) => sum + ex.realizedPnlDollars, 0),
+    [reconcile.utcDayRealizedPnlDollars, reconcile.executions],
   );
 
   return (

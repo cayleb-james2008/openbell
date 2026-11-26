@@ -108,6 +108,8 @@ export type LiveReconcileResponse = {
   lastSyncEpoch: number | null;
   syncStale: boolean;
   utcDayLossDollars: number;
+  utcDayFeesDollars: number | null;
+  utcDayRealizedPnlDollars: number | null;
   openExposureDollars: number;
   executions: ReconcileExecution[];
   discrepancies: ReconcileDiscrepancy[];
@@ -282,6 +284,8 @@ export function defaultLiveReconcile(source: "server" | "client" = "client"): Li
     lastSyncEpoch: null,
     syncStale: false,
     utcDayLossDollars: 0,
+    utcDayFeesDollars: null,
+    utcDayRealizedPnlDollars: null,
     openExposureDollars: 0,
     executions: [],
     discrepancies: [],
@@ -304,7 +308,7 @@ function normalizeReconcileExecutions(raw: unknown): ReconcileExecution[] {
         ts: Math.max(0, Math.round(pickNum(x, ["ts", "epoch", "created_epoch"]) ?? 0)),
         orderId: cleanStr(x.order_id, ""),
         clientOrderId: cleanStr(x.client_order_id, ""),
-        tradeId: cleanStr(x.trade_id ?? x.fill_id ?? x.id, `exec-${idx}`),
+        tradeId: cleanStr(x.trade_id ?? x.venue_id ?? x.fill_id ?? x.id, `exec-${idx}`),
         ticker: cleanStr(x.ticker ?? x.market_ticker, "unknown"),
         side,
         action,
@@ -343,6 +347,8 @@ export function normalizeLiveReconcile(
     syncStale: Boolean(o.sync_stale ?? o.venue_sync_stale ?? false),
     utcDayLossDollars:
       pickNum(o, ["utc_day_loss_dollars", "daily_realized_loss_dollars", "daily_loss_dollars"]) ?? 0,
+    utcDayFeesDollars: pickNum(o, ["utc_day_fees_dollars"]),
+    utcDayRealizedPnlDollars: pickNum(o, ["utc_day_realized_pnl_dollars"]),
     openExposureDollars: pickNum(o, ["open_exposure_dollars"]) ?? 0,
     executions: normalizeReconcileExecutions(o.executions),
     discrepancies: normalizeReconcileDiscrepancies(o.discrepancies),

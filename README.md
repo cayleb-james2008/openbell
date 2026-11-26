@@ -1,17 +1,17 @@
 # OpenBell
 
-![version](https://img.shields.io/badge/version-v0.29.0-0969da?style=flat-square)
+![version](https://img.shields.io/badge/version-v0.30.0-0969da?style=flat-square)
 ![stack](https://img.shields.io/badge/stack-Rust%20%2B%20React%2019-111827?style=flat-square)
-![tests](https://img.shields.io/badge/tests-152%2F152%20pass-16a34a?style=flat-square)
-![binary](https://img.shields.io/badge/release%20binary-6.24%20MiB-0969da?style=flat-square)
+![tests](https://img.shields.io/badge/tests-157%2F157%20pass-16a34a?style=flat-square)
+![binary](https://img.shields.io/badge/release%20binary-6.30%20MiB-0969da?style=flat-square)
 ![safety](https://img.shields.io/badge/live__armed-false%20on%20boot-16a34a?style=flat-square)
 
-OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction markets. It includes a Kalshi Trade API v2 client (`live_armed: false` on every boot, seven hard risk rails, and an emergency kill switch), a live WebSocket and REST L2 orderbook stream (`OrderbookStore` auto-subscription up to 32 active markets, trade channel ingestion, bounded snapshot history, book-walk VWAP sizing, and DOM depth ladder), a tick-driven shadow orderbook runner (decoupled resting-quote management, direct L2 touch/cross/trade matching, idempotent settlement logging, and restart clamping), a causal Strategy Runtime v2 with confined script library CRUD and a walk-forward BH-FDR edge synthesizer, a deduplicating public 15-minute tape collector, and a post-only maker allocator.
+OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction markets. It includes a Kalshi Trade API v2 client (`live_armed: false` on every boot, seven hard risk rails, persistent `0600` runtime state, closed-loop fill/settlement reconciliation, an emergency kill switch, and explicit kill latch reset), a live WebSocket and REST L2 orderbook stream (`OrderbookStore` auto-subscription up to 32 active markets, trade channel ingestion, bounded snapshot history, book-walk VWAP sizing, and DOM depth ladder), a tick-driven shadow orderbook runner (decoupled resting-quote management, direct L2 touch/cross/trade matching, idempotent settlement logging, fail-closed stale-sync gating, and restart clamping), a causal Strategy Runtime v2 with confined script library CRUD and a walk-forward BH-FDR edge synthesizer, a deduplicating public 15-minute tape collector, and a post-only maker allocator.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/hero-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/hero-light.png">
-  <img alt="OpenBell v0.29.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
+  <img alt="OpenBell v0.30.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
 </picture>
 
 ## Feature gallery
@@ -111,6 +111,18 @@ OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction marke
       </picture>
     </td>
   </tr>
+  <tr>
+    <td colspan="2" valign="top">
+      <strong>Venue Reconciliation and Persistent Risk Rails (<code>v0.30.0</code>)</strong><br>
+      <sub>Reconciles Kalshi v2 fills, settlements, and open exposure into an idempotent <code>live_executions.jsonl</code> ledger, persists UTC-day realized loss and kill latches in <code>risk_rails_runtime.json</code> across restarts, blocks stale live auto-routing fail-closed, and adds explicit kill latch unlatching while keeping <code>live_armed: false</code>.</sub>
+      <br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/reconcile-rails-dark.png">
+        <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/reconcile-rails-light.png">
+        <img alt="OpenBell v0.30.0 Venue Reconciliation and Persistent Risk Rails" src="docs/screenshots/reconcile-rails-light.png">
+      </picture>
+    </td>
+  </tr>
 </table>
 
 ## Causal execution and fail-closed risk pipeline
@@ -128,16 +140,16 @@ flowchart LR
   R -- "confirm_arm = true" --> K["Kalshi Trade API v2 (RSA-PSS SHA-256)"]
 ```
 
-## Verified baseline (`v0.29.0`)
+## Verified baseline (`v0.30.0`)
 
-| Metric | `v0.10.0` Baseline | `v0.29.0` Verified | Delta |
+| Metric | `v0.10.0` Baseline | `v0.30.0` Verified | Delta |
 | --- | --- | --- | --- |
-| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`6.24 MiB`** (`6,538,600 B`) | **`-41.5%`** |
-| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`99,079 B`** (`97 kB`) / **`22,748 B`** (`22 kB`, `24` chunks) | **`-94.6%` wire bytes** |
-| Cold boot to first `HTTP 200` | `9.11 ms` | **`4.91 ms`** | Under `20 ms` |
-| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`18.91 MB`** (`19,368 KB`) | **`-84.9%`** |
-| Concurrent HTTP throughput (`16w`, `5/5` SSE) | `4,921.3 req/s` | **`4,935.8 req/s`** (`4.69 ms` p95, `0/12,355` errors) | **`+0.3%`** |
-| Security and test verification | `49/49` fuzz | **`152/152` Rust tests**, `25/25` raw-TCP fuzz, `gate 116/116`, `replay 18/18`, `sloplint 0/0/0`, `RAILS OK`, `EQUITY OK` | Clean |
+| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`6.30 MiB`** (`6,604,136 B`) | **`-40.9%`** |
+| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`99,599 B`** (`97 kB`) / **`22,822 B`** (`22 kB`, `24` chunks) | **`-94.6%` wire bytes** |
+| Cold boot to first `HTTP 200` | `9.11 ms` | **`17.02 ms`** | Under `20 ms` |
+| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`19.45 MB`** (`19,916 KB`) | **`-84.5%`** |
+| Concurrent HTTP throughput (`16w`, `5/5` SSE) | `4,921.3 req/s` | **`3,902.3 req/s`** (`6.34 ms` p95, `0/9,762` errors) | Under `10 ms` p95 |
+| Security and test verification | `49/49` fuzz | **`157/157` Rust tests**, `25/25` raw-TCP fuzz, `gate 121/121`, `replay 18/18`, `sloplint 0/0/0`, `RAILS OK`, `EQUITY OK` | Clean |
 
 ## Quick start (synthetic paper mode)
 
@@ -156,7 +168,7 @@ Open `http://127.0.0.1:18440/?dataset=fixture` to inspect the 15-minute fixture 
 
 ### Fail-closed hard risk rails and live Kalshi v2 (`src/risk_rails.rs`, `src/kalshi_live.rs`)
 
-Every launch and restart boots with `live_armed: false`. Routing an order requires configured Kalshi v2 API credentials stored with `0600` permissions inside `OPENBELL_DATA`, explicit `confirm_arm: true` over loopback with `X-OpenBell-CSRF: 1`, and passing all seven hard risk rails (`max_order_contracts`, `max_order_dollars`, `max_daily_loss_dollars`, `max_open_exposure_dollars`, `allowed_ticker_prefix`, whole-cent `1..=99` price check, and kill-switch clear). Posting to `POST /api/live/kill-switch` disarms `live_armed`, latches `killed: true`, and runs `cancel_all_orders()`.
+Every launch and restart boots with `live_armed: false`. Routing an order requires configured Kalshi v2 API credentials stored with `0600` permissions inside `OPENBELL_DATA`, explicit `confirm_arm: true` over loopback with `X-OpenBell-CSRF: 1`, and passing all seven hard risk rails (`max_order_contracts`, `max_order_dollars`, `max_daily_loss_dollars`, `max_open_exposure_dollars`, `allowed_ticker_prefix`, whole-cent `1..=99` price check, and kill-switch clear). Risk runtime state (`killed`, `kill_reason`, UTC-day realized loss, open exposure, and `last_venue_sync_epoch`) persists atomically with `0600` permissions in `risk_rails_runtime.json`, while `GET/POST /api/live/reconcile` syncs fills and settlements into `live_executions.jsonl`. Posting to `POST /api/live/kill-switch` disarms `live_armed`, latches `killed: true`, and runs `cancel_all_orders()`, and clearing the latch requires an explicit `POST /api/live/reset-kill` (`confirm_reset_kill: true`), which leaves `live_armed: false`.
 
 HTTP requests enforce Host-header loopback confinement (`403` on non-loopback hosts), `Content-Type: application/json` (`415`), prompt raw-TCP `413 Payload Too Large` responses before allocation, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, strong SHA-256 `ETag` `304` handling, and CWE-22/CWE-59 symlink and path confinement on strategy library mutations (`POST /api/strategies/save`, `DELETE /api/strategies/{name}`, `POST /api/research/synthesize`).
 
