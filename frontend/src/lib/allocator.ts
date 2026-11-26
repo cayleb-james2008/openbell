@@ -1050,7 +1050,12 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
     },
     execution_health:
       o.execution_health && typeof o.execution_health === "object"
-        ? normalizeExecutionHealth(o.execution_health, "server")
+        ? normalizeExecutionHealth(
+            Array.isArray((o.execution_health as Record<string, unknown>).strategies)
+              ? o.execution_health
+              : { ok: true, strategies: [], overall: o.execution_health },
+            "server",
+          )
         : null,
     honesty_notes: notesRaw.filter((n): n is string => typeof n === "string" && n.trim().length > 0),
     source: "server",

@@ -674,7 +674,7 @@ export function ShadowRunnerPanel({
       setOverrideBusy(strategy);
       setOverrideError(null);
       try {
-        const nextHealth = await overrideQuarantine(strategy, action, "1");
+        const nextHealth = await overrideQuarantine(strategy, action, "1", undefined, dataset);
         setExecutionHealth(nextHealth);
         toast.success(
           action === "quarantine"
@@ -690,7 +690,7 @@ export function ShadowRunnerPanel({
         setOverrideBusy(null);
       }
     },
-    [overrideBusy, refreshAll],
+    [overrideBusy, refreshAll, dataset],
   );
 
   return (

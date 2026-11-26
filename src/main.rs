@@ -5664,6 +5664,7 @@ fn home_json_body(app: &App) -> String {
             "strategy_v2",
             "synthesizer",
             "live_reconcile",
+            "execution_health",
         ],
     };
     serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string())

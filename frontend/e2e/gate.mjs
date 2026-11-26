@@ -978,7 +978,7 @@ for (const m of measures) {
   await p.route('**/api/home', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.30.0'
+    j.version = '0.31.0'
     j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan', 'tournament', 'auto_collector', 'live_kalshi', 'risk_rails', 'edge_audit', 'shadow_runner', 'strategy_v2', 'strategy_crud', 'synthesizer']
     j.collector = {
       ...j.collector,
@@ -2147,7 +2147,7 @@ for (const m of measures) {
   await p.route('**/api/home*', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.30.0'
+    j.version = '0.31.0'
     j.capabilities = ['sse', 'sandbox', 'live_kalshi', 'risk_rails', 'shadow_runner', 'strategy_v2', 'strategy_crud', 'synthesizer']
     return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
   })
@@ -2326,7 +2326,7 @@ for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light'
   await p.route('**/api/home*', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.30.0'
+    j.version = '0.31.0'
     j.capabilities = ['sse', 'live_kalshi', 'risk_rails', 'shadow_runner', 'live_reconcile']
     return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
   })
@@ -2507,6 +2507,70 @@ for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light'
         { slot_id: 1, strategy: 'late-favourite-edge', series: ['KXBTC15M'], max_contracts: 12, execution_mode: 'maker', auto_pause_drawdown_dollars: 25, enabled: true },
       ],
       skipped_quarantined: ['spread-squeeze-no'],
+    }),
+  }))
+  await p.unroute(/\/api\/analytics\/execution-health(\?.*)?$/)
+  await p.route('**/api/analytics/execution-health*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ok: true,
+      strategies: [
+        {
+          strategy: 'late-favourite-edge',
+          status: 'active',
+          throttle_mult: 1.0,
+          reason: 'Positive +30s markout and fill rate within expected bounds',
+          rolling_fills: 18,
+          markout_10s_cents: 0.65,
+          markout_30s_cents: 1.42,
+          markout_60s_cents: 1.88,
+          settlement_markout_cents: 2.35,
+          predicted_prob: 0.78,
+          realized_win_rate: 0.778,
+          assumed_fill_rate_pct: 75.0,
+          realized_fill_rate_pct: 72.0,
+          expected_slippage_cents: 0.5,
+          realized_slippage_cents: 0.42,
+          rolling_net_pnl_dollars: 5.4,
+        },
+        {
+          strategy: 'mid-band-reversion',
+          status: 'throttled',
+          throttle_mult: 0.5,
+          reason: 'Realized fill rate below assumed maker target',
+          rolling_fills: 14,
+          markout_10s_cents: 0.12,
+          markout_30s_cents: -0.35,
+          markout_60s_cents: -0.48,
+          settlement_markout_cents: -0.2,
+          predicted_prob: 0.64,
+          realized_win_rate: 0.571,
+          assumed_fill_rate_pct: 70.0,
+          realized_fill_rate_pct: 52.0,
+          expected_slippage_cents: 0.5,
+          realized_slippage_cents: 0.95,
+          rolling_net_pnl_dollars: -0.45,
+        },
+        {
+          strategy: 'spread-squeeze-no',
+          status: 'quarantined',
+          throttle_mult: 0.0,
+          reason: 'Adverse +30s markout (-1.65c) and negative rolling net PnL',
+          rolling_fills: 12,
+          markout_10s_cents: -0.9,
+          markout_30s_cents: -1.65,
+          markout_60s_cents: -2.1,
+          settlement_markout_cents: -2.4,
+          predicted_prob: 0.58,
+          realized_win_rate: 0.417,
+          assumed_fill_rate_pct: 65.0,
+          realized_fill_rate_pct: 38.0,
+          expected_slippage_cents: 0.5,
+          realized_slippage_cents: 1.45,
+          rolling_net_pnl_dollars: -3.15,
+        },
+      ],
     }),
   }))
 

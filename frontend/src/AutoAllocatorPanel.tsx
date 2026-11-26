@@ -435,16 +435,16 @@ export function AutoAllocatorPanel({
     setSyncBusy(true);
     setSyncError(null);
     try {
-      const res = await syncAllocatorToRunner(
-        "1",
-        buildRequest(
+      const res = await syncAllocatorToRunner("1", {
+        ...buildRequest(
           executionMode,
           sizingMode,
           requireStressResilience,
           enableRegimeThrottle,
           enableDiversificationGuard,
         ),
-      );
+        dataset,
+      });
       setSyncResult(res);
       toast.success(
         `Synced ${res.synced_slots.length} slot${res.synced_slots.length === 1 ? "" : "s"} to Runner (live_armed: false, mode: ${res.mode}).`,
@@ -464,6 +464,7 @@ export function AutoAllocatorPanel({
     requireStressResilience,
     enableRegimeThrottle,
     enableDiversificationGuard,
+    dataset,
   ]);
 
   const q = search.trim().toLowerCase();

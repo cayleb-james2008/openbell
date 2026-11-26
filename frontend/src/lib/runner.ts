@@ -1032,7 +1032,7 @@ function normalizeHealthStrategy(raw: unknown, idx: number): ExecutionHealthStra
     predicted_prob: finiteOrNull(o.predicted_prob),
     realized_win_rate: finiteOrNull(o.realized_win_rate),
     assumed_fill_rate_pct: finiteOrNull(o.assumed_fill_rate_pct),
-    realized_fill_rate_pct: finiteOrNull(o.realized_fill_rate_pct),
+    realized_fill_rate_pct: pickNum(o, ["realized_fill_rate_pct", "actual_fill_rate_pct"]),
     expected_slippage_cents: finiteOrNull(o.expected_slippage_cents),
     realized_slippage_cents: finiteOrNull(o.realized_slippage_cents),
     rolling_net_pnl_dollars: pickNum(o, ["rolling_net_pnl_dollars", "net_pnl_dollars"]) ?? 0,
@@ -1064,20 +1064,21 @@ function computeOverallHealth(
   }
 
   const avg30 =
-    finiteOrNull(rawOverall?.avg_markout_30s_cents) ??
+    finiteOrNull(rawOverall?.avg_markout_30s_cents ?? rawOverall?.markout_30s_cents) ??
     (m30.length > 0 ? Number((m30.reduce((a, b) => a + b, 0) / m30.length).toFixed(2)) : null);
   const avgRes =
-    finiteOrNull(rawOverall?.avg_slippage_residual_cents) ??
+    finiteOrNull(rawOverall?.avg_slippage_residual_cents ?? rawOverall?.slippage_residual_cents) ??
     (slipRes.length > 0 ? Number((slipRes.reduce((a, b) => a + b, 0) / slipRes.length).toFixed(2)) : null);
 
   return {
-    active_count: Math.max(0, Math.round(finiteOrNull(rawOverall?.active_count) ?? active)),
-    throttled_count: Math.max(0, Math.round(finiteOrNull(rawOverall?.throttled_count) ?? throttled)),
-    quarantined_count: Math.max(0, Math.round(finiteOrNull(rawOverall?.quarantined_count) ?? quarantined)),
-    rolling_fills: Math.max(0, Math.round(finiteOrNull(rawOverall?.rolling_fills) ?? rollingFills)),
+    active_count: Math.max(0, Math.round(finiteOrNull(rawOverall?.active_count ?? rawOverall?.active_strategies) ?? active)),
+    throttled_count: Math.max(0, Math.round(finiteOrNull(rawOverall?.throttled_count ?? rawOverall?.throttled_strategies) ?? throttled)),
+    quarantined_count: Math.max(0, Math.round(finiteOrNull(rawOverall?.quarantined_count ?? rawOverall?.quarantined_strategies) ?? quarantined)),
+    rolling_fills: Math.max(0, Math.round(finiteOrNull(rawOverall?.rolling_fills ?? rawOverall?.total_fills) ?? rollingFills)),
     avg_markout_30s_cents: avg30,
     avg_slippage_residual_cents: avgRes,
-    rolling_net_pnl_dollars: finiteOrNull(rawOverall?.rolling_net_pnl_dollars) ?? Number(netPnl.toFixed(2)),
+    rolling_net_pnl_dollars:
+      finiteOrNull(rawOverall?.rolling_net_pnl_dollars ?? rawOverall?.realized_net_pnl_dollars) ?? Number(netPnl.toFixed(2)),
   };
 }
 
@@ -1190,6 +1191,7 @@ export async function overrideQuarantine(
   action: "reset" | "quarantine",
   csrfToken?: string,
   reason?: string,
+  dataset?: Dataset,
 ): Promise<ExecutionHealthResponse> {
   const cleanStrategy = strategy.trim();
   if (!cleanStrategy) {
@@ -1214,7 +1216,7 @@ export async function overrideQuarantine(
   if (body.execution_health && typeof body.execution_health === "object") {
     return normalizeExecutionHealth(body.execution_health, "server");
   }
-  return fetchExecutionHealth();
+  return fetchExecutionHealth(dataset);
 }
 
 export async function syncAllocatorToRunner(
@@ -1249,9 +1251,14 @@ export async function syncAllocatorToRunner(
       auto_pause_drawdown_dollars: s.auto_pause_drawdown_dollars,
       enabled: s.enabled,
     }));
-  const skippedQuarantined = Array.isArray(body.skipped_quarantined)
-    ? body.skipped_quarantined.filter((v): v is string => typeof v === "string" && v.trim().length > 0)
-    : [];
+  const rawSkipped = Array.isArray(body.skipped_quarantined)
+    ? body.skipped_quarantined
+    : Array.isArray(body.excluded_quarantined)
+      ? body.excluded_quarantined
+      : [];
+  const skippedQuarantined = rawSkipped.filter(
+    (v): v is string => typeof v === "string" && v.trim().length > 0,
+  );
   const safeMode: RunnerMode =
     status?.mode === "shadow" || normalizeMode(body.mode) === "shadow" ? "shadow" : "stopped";
   return {
