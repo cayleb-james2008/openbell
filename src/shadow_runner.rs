@@ -1575,22 +1575,35 @@ impl ShadowRunner {
                             (na_c, nb_c, snap.no_bid_size)
                         };
 
-                        let limit_cents = if exec_mode == "taker" {
-                            side_ask_c
-                        } else if quote_cents >= side_ask_c {
-                            if side_ask_c <= 1 {
-                                continue;
-                            }
-                            side_ask_c - 1
-                        } else {
-                            quote_cents
-                        };
-                        if !(1..=99).contains(&limit_cents) {
+                        let (limit_cents, eff_contracts, taker_exact_cents, taker_slip_cents) =
+                            if exec_mode == "taker" {
+                                let (fc, qty, exact_c, slip, _used_l2) = resolve_taker_execution(
+                                    &app.orderbook,
+                                    ticker,
+                                    &strat.side,
+                                    max_contracts,
+                                    side_bid_c,
+                                    side_ask_c,
+                                    quote_cents,
+                                );
+                                (fc, qty, exact_c, slip)
+                            } else {
+                                let lc = if quote_cents >= side_ask_c {
+                                    if side_ask_c <= 1 {
+                                        continue;
+                                    }
+                                    side_ask_c - 1
+                                } else {
+                                    quote_cents
+                                };
+                                (lc, max_contracts, lc as f64, 0.0)
+                            };
+                        if !(1..=99).contains(&limit_cents) || eff_contracts == 0 {
                             continue;
                         }
 
                         let affordable = (slot_budget / (limit_cents as f64 / 100.0)).floor() as u32;
-                        let contracts = max_contracts.min(affordable);
+                        let contracts = eff_contracts.min(affordable);
                         if contracts == 0 {
                             continue;
                         }
@@ -1620,6 +1633,11 @@ impl ShadowRunner {
                         // Shadow execution: record QuotePosted, then either immediate taker fill or resting maker quote.
                         let queue_initial = if exec_mode == "taker" || limit_cents > side_bid_c {
                             0
+                        } else if let Some(l2_q) = app
+                            .orderbook
+                            .queue_ahead_at_fresh(ticker, &strat.side, limit_cents)
+                        {
+                            l2_q.min(u32::MAX as u64) as u32
                         } else if limit_cents == side_bid_c {
                             side_bid_sz.round().max(0.0) as u32
                         } else {
@@ -1681,10 +1699,16 @@ impl ShadowRunner {
                         publish_runner_sse("quote_posted", &post_ev);
 
                         if exec_mode == "taker" {
-                            let slip = (limit_cents as f64 - quote_cents as f64).max(0.0);
-                            let fee_d = taker_fee_dollars(limit_cents as f64 / 100.0)
+                            let fee_d = taker_fee_dollars(taker_exact_cents / 100.0)
                                 * (contracts as f64);
-                            st.record_fill(&order, limit_cents, slip, 0.0, fee_d, snap.fetched_at);
+                            st.record_fill(
+                                &order,
+                                limit_cents,
+                                taker_slip_cents,
+                                0.0,
+                                fee_d,
+                                snap.fetched_at,
+                            );
                         } else {
                             st.open_quotes.push(RestingQuote {
                                 order,
@@ -1957,7 +1981,192 @@ pub fn start_background_runner(app: Arc<App>) {
     });
 }
 
+/// Resolve taker execution price (`fill_cents`, `fillable_contracts`, `exact_vwap_cents`,
+/// `slippage_cents`, `used_l2`) using `OrderbookStore::walk_book_fresh` when a fresh L2 book
+/// is available, or falling back cleanly to quote midpoint when missing/stale.
+pub fn resolve_taker_execution(
+    orderbook: &crate::orderbook::OrderbookStore,
+    ticker: &str,
+    side: &str,
+    contracts: u32,
+    side_bid_c: u8,
+    side_ask_c: u8,
+    quote_cents: u8,
+) -> (u8, u32, f64, f64, bool) {
+    if let Some(walk) = orderbook.walk_book_fresh(ticker, side, contracts as u64) {
+        let fill_c = walk.vwap_cents.round().clamp(1.0, 99.0) as u8;
+        let filled_qty = (walk.fillable_qty as u32).min(contracts).max(1);
+        let slip = (walk.vwap_cents - (quote_cents as f64)).max(0.0);
+        return (fill_c, filled_qty, walk.vwap_cents, slip, true);
+    }
+    orderbook.record_walk_fallback();
+    let mid = ((side_bid_c as f64) + (side_ask_c as f64)) * 0.5;
+    let fill_c = mid.round().clamp(1.0, 99.0) as u8;
+    let slip = (mid - (quote_cents as f64)).max(0.0);
+    (fill_c, contracts, mid, slip, false)
+}
+
 #[allow(dead_code)]
 fn _iso_z_keepalive(e: i64) -> String {
     iso_z(e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orderbook::OrderbookStore;
+    use std::io::Write;
+
+    #[test]
+    fn taker_execution_uses_l2_vwap_when_fresh_and_midpoint_fallback_when_stale() {
+        let ob = OrderbookStore::with_stale_threshold_ms(PathBuf::new(), 5_000);
+        // Empty book -> midpoint (54 + 60) / 2 = 57c, fallback incremented.
+        let (fc0, q0, exact0, _, used0) =
+            resolve_taker_execution(&ob, "KXBTC15M-T1", "yes", 10, 54, 60, 56);
+        assert!(!used0);
+        assert_eq!(fc0, 57);
+        assert!((exact0 - 57.0).abs() < 1e-9);
+        assert_eq!(q0, 10);
+        assert_eq!(ob.walk_fallback_count(), 1);
+
+        // Fresh L2 book: NO bids [40, 5] -> YES ask 60x5; [36, 5] -> YES ask 64x5.
+        // Walking 10 contracts -> 5@60 + 5@64 => VWAP = 62.0c.
+        ob.ingest_snapshot("KXBTC15M-T1", &[[54, 20]], &[[40, 5], [36, 5]], 1, "ws");
+        let (fc1, q1, exact1, slip1, used1) =
+            resolve_taker_execution(&ob, "KXBTC15M-T1", "yes", 10, 54, 60, 58);
+        assert!(used1);
+        assert_eq!(fc1, 62);
+        assert!((exact1 - 62.0).abs() < 1e-9);
+        assert!((slip1 - 4.0).abs() < 1e-9);
+        assert_eq!(q1, 10);
+        assert_eq!(ob.walk_fallback_count(), 1);
+
+        // Mark stale -> falls back to midpoint and increments fallback count.
+        ob.mark_stale_for_test("KXBTC15M-T1", 10_000);
+        let (fc2, _, _, _, used2) =
+            resolve_taker_execution(&ob, "KXBTC15M-T1", "yes", 10, 54, 60, 56);
+        assert!(!used2);
+        assert_eq!(fc2, 57);
+        assert_eq!(ob.walk_fallback_count(), 2);
+    }
+
+    #[test]
+    fn shadow_runner_step_once_uses_vwap_vs_midpoint_and_l2_queue() {
+        let dir = std::env::temp_dir().join(format!("ob-sr-l2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data_dir = dir.join("data");
+        let strat_dir = dir.join("strategies");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&strat_dir).unwrap();
+
+        std::fs::write(
+            strat_dir.join("taker_test.rn"),
+            r#"
+pub fn name() { "taker-test" }
+pub fn side() { "yes" }
+pub fn allow_entry(yes_ask, no_ask, secs_to_close) { secs_to_close >= 60 }
+pub fn entry_quote(yes_ask, no_ask, secs_to_close) { Some(0.55) }
+"#,
+        )
+        .unwrap();
+
+        let snap_line = serde_json::json!({
+            "fetched_at": 1_800_000_000i64,
+            "ticker": "KXBTC15M-VWAP",
+            "event_ticker": "KXBTC15M-EV",
+            "series": "KXBTC15M",
+            "close_time": "2027-01-20T00:15:00Z",
+            "status": "open",
+            "result": "",
+            "yes_bid": 0.50,
+            "yes_ask": 0.60,
+            "no_bid": 0.40,
+            "no_ask": 0.50,
+            "last_price": 0.55,
+            "yes_bid_size": 10.0,
+            "no_bid_size": 10.0
+        });
+        std::fs::write(data_dir.join("snapshots.jsonl"), format!("{snap_line}\n")).unwrap();
+
+        let app = App::new(data_dir.clone(), strat_dir, 500.0, 60);
+        // Fresh L2 book: NO bids 40c x 4 (YES ask 60c x 4) and 34c x 6 (YES ask 66c x 6).
+        // Walking 10 contracts -> (4*60 + 6*66) / 10 = 63.6c -> rounds to 64c!
+        app.orderbook.ingest_snapshot(
+            "KXBTC15M-VWAP",
+            &[[50, 20]],
+            &[[40, 4], [34, 6]],
+            1,
+            "ws",
+        );
+
+        app.runner
+            .configure(
+                RunnerConfigRequest {
+                    slots: vec![RunnerSlotConfig {
+                        slot_id: 1,
+                        strategy: "taker-test".to_string(),
+                        series: vec!["KXBTC15M".to_string()],
+                        max_contracts: 10,
+                        execution_mode: "taker".to_string(),
+                        auto_pause_drawdown_dollars: 50.0,
+                        enabled: true,
+                    }],
+                    cancel_before_close_secs: 30,
+                    bankroll_dollars: 500.0,
+                    tick_interval_ms: Some(100),
+                },
+                false,
+                false,
+            )
+            .unwrap();
+        app.runner.start("shadow", false, false, false).unwrap();
+
+        let mut cached = CachedStrategies::new();
+        app.runner.step_once(&app, &mut cached);
+
+        let ledger = app.runner.ledger_query(20, None, None);
+        let fill_ev = ledger
+            .entries
+            .iter()
+            .find(|e| e.event == "OrderFilled" && e.ticker == "KXBTC15M-VWAP")
+            .expect("expected OrderFilled on fresh L2 book");
+        assert_eq!(fill_ev.fill_cents, Some(64));
+        assert_eq!(app.orderbook.walk_fallback_count(), 0);
+
+        // Now add a second ticker WITHOUT L2 book -> should fall back to midpoint (50+60)/2 = 55c and increment fallback!
+        let snap2 = serde_json::json!({
+            "fetched_at": 1_800_000_010i64,
+            "ticker": "KXBTC15M-MID",
+            "event_ticker": "KXBTC15M-EV2",
+            "series": "KXBTC15M",
+            "close_time": "2027-01-20T00:15:00Z",
+            "status": "open",
+            "result": "",
+            "yes_bid": 0.50,
+            "yes_ask": 0.60,
+            "no_bid": 0.40,
+            "no_ask": 0.50,
+            "last_price": 0.55,
+            "yes_bid_size": 10.0,
+            "no_bid_size": 10.0
+        });
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(data_dir.join("snapshots.jsonl"))
+            .unwrap();
+        writeln!(f, "{snap2}").unwrap();
+        drop(f);
+
+        app.runner.step_once(&app, &mut cached);
+        let ledger2 = app.runner.ledger_query(20, None, None);
+        let mid_ev = ledger2
+            .entries
+            .iter()
+            .find(|e| e.event == "OrderFilled" && e.ticker == "KXBTC15M-MID")
+            .expect("expected OrderFilled via midpoint fallback");
+        assert_eq!(mid_ev.fill_cents, Some(55));
+        assert_eq!(app.orderbook.walk_fallback_count(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

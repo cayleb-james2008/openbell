@@ -110,6 +110,21 @@ pub fn validate_api_base_url(raw: &str) -> Result<String, String> {
     Err("api_base_url must start with https:// (or http:// on loopback)".to_string())
 }
 
+/// Validate a Kalshi market ticker (`1..=128` ASCII `[A-Za-z0-9_-]`).
+pub fn validate_ticker(ticker: &str) -> Result<&str, String> {
+    let trimmed = ticker.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return Err("ticker must be 1..=128 characters".to_string());
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("invalid ticker format".to_string());
+    }
+    Ok(trimmed)
+}
+
 /// Validate a Kalshi order ID before interpolating into `DELETE /portfolio/orders/{id}`.
 pub fn validate_order_id(id: &str) -> Result<&str, String> {
     let trimmed = id.trim();
@@ -633,7 +648,7 @@ impl RsaSigningKey {
     }
 }
 
-/// Build the exact Kalshi v2 signing payload:
+/// Build the exact Kalshi v2 signing payload for REST paths:
 /// `timestamp_ms + METHOD + "/trade-api/v2" + path_without_query`.
 pub fn build_signing_message(timestamp_ms: &str, method: &str, rel_path: &str) -> String {
     let path_no_query = rel_path.split('?').next().unwrap_or(rel_path);
@@ -650,6 +665,19 @@ pub fn build_signing_message(timestamp_ms: &str, method: &str, rel_path: &str) -
         method.trim().to_ascii_uppercase(),
         normalized
     )
+}
+
+/// Build the exact Kalshi v2 WebSocket handshake signing payload:
+/// `timestamp_ms + "GET" + ws_path_without_query` (default `/trade-api/ws/v2`).
+pub fn build_ws_signing_message(timestamp_ms: &str, ws_path: Option<&str>) -> String {
+    let raw = ws_path.unwrap_or("/trade-api/ws/v2");
+    let path_no_query = raw.split('?').next().unwrap_or(raw).trim();
+    let normalized = if path_no_query.starts_with('/') {
+        path_no_query.to_string()
+    } else {
+        format!("/{path_no_query}")
+    };
+    format!("{}GET{}", timestamp_ms.trim(), normalized)
 }
 
 fn now_millis_string() -> String {
@@ -807,6 +835,12 @@ impl KalshiOrderRequest {
         req.post_only = Some(true);
         Ok(req)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KalshiOrderbookResponse {
+    pub yes: Vec<[u64; 2]>,
+    pub no: Vec<[u64; 2]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1175,6 +1209,29 @@ impl KalshiLiveClient {
         self.request_json("DELETE", &path, None)
     }
 
+    /// Fetch L2 orderbook levels for a single market (`GET /markets/{ticker}/orderbook`).
+    pub fn get_market_orderbook(&self, ticker: &str) -> Result<KalshiOrderbookResponse, String> {
+        let safe = validate_ticker(ticker)?;
+        let path = format!("/markets/{safe}/orderbook");
+        let val = self.request_json("GET", &path, None)?;
+        parse_kalshi_orderbook_json(&val)
+    }
+
+    /// Generate signed Kalshi v2 WebSocket handshake headers (`KALSHI-ACCESS-*`).
+    pub fn sign_ws_handshake_headers(
+        &self,
+        ws_path: Option<&str>,
+    ) -> Result<Vec<(String, String)>, String> {
+        let ts = now_millis_string();
+        let signing_msg = build_ws_signing_message(&ts, ws_path);
+        let sig = self.signer.sign_base64(&signing_msg)?;
+        Ok(vec![
+            ("KALSHI-ACCESS-KEY".to_string(), self.api_key_id.clone()),
+            ("KALSHI-ACCESS-TIMESTAMP".to_string(), ts),
+            ("KALSHI-ACCESS-SIGNATURE".to_string(), sig),
+        ])
+    }
+
     /// Fetch all resting orders (`status=resting`) and cancel every one, continuing
     /// past per-order errors so one failed cancel never stops the kill switch.
     pub fn cancel_all_orders(&self) -> CancelAllReport {
@@ -1203,6 +1260,138 @@ impl KalshiLiveClient {
             cancelled_ids,
             errors,
         }
+    }
+}
+
+fn parse_orderbook_side_levels(val: Option<&serde_json::Value>, dollars: bool) -> Vec<[u64; 2]> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let Some(pair) = entry.as_array() else {
+            continue;
+        };
+        if pair.len() < 2 {
+            continue;
+        }
+        let price_c = if dollars {
+            pair[0]
+                .as_f64()
+                .or_else(|| pair[0].as_str().and_then(|s| s.parse::<f64>().ok()))
+                .map(|d| (d * 100.0).round())
+                .filter(|p| p.is_finite() && (1.0..=99.0).contains(p))
+                .map(|p| p as u64)
+        } else {
+            pair[0]
+                .as_u64()
+                .or_else(|| pair[0].as_f64().map(|f| f.round() as u64))
+                .filter(|p| (1..=99).contains(p))
+        };
+        let qty = pair[1]
+            .as_u64()
+            .or_else(|| pair[1].as_f64().map(|f| f.round().max(0.0) as u64))
+            .or_else(|| {
+                pair[1]
+                    .as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|f| f.round().max(0.0) as u64)
+            });
+        if let (Some(p), Some(q)) = (price_c, qty) {
+            if q > 0 {
+                out.push([p, q]);
+            }
+        }
+    }
+    out
+}
+
+/// Parse Kalshi v2 REST `/markets/{ticker}/orderbook` JSON (both cents and `_fp` dollar variants).
+pub fn parse_kalshi_orderbook_json(val: &serde_json::Value) -> Result<KalshiOrderbookResponse, String> {
+    if let Some(fp) = val.get("orderbook_fp").and_then(|v| v.as_object()) {
+        return Ok(KalshiOrderbookResponse {
+            yes: parse_orderbook_side_levels(fp.get("yes_dollars"), true),
+            no: parse_orderbook_side_levels(fp.get("no_dollars"), true),
+        });
+    }
+    let obj = val.get("orderbook").unwrap_or(val);
+    if !obj.is_object() {
+        return Err("Kalshi orderbook response missing orderbook object".to_string());
+    }
+    if obj.get("yes_dollars").is_some() || obj.get("no_dollars").is_some() {
+        return Ok(KalshiOrderbookResponse {
+            yes: parse_orderbook_side_levels(obj.get("yes_dollars"), true),
+            no: parse_orderbook_side_levels(obj.get("no_dollars"), true),
+        });
+    }
+    Ok(KalshiOrderbookResponse {
+        yes: parse_orderbook_side_levels(obj.get("yes"), false),
+        no: parse_orderbook_side_levels(obj.get("no"), false),
+    })
+}
+
+/// Public unauthenticated REST L2 orderbook fetch (`GET /markets/{ticker}/orderbook`),
+/// allowing live orderbook polling even when API trading credentials are absent.
+pub fn fetch_public_market_orderbook(
+    base_url: &str,
+    ticker: &str,
+) -> Result<KalshiOrderbookResponse, String> {
+    let valid_base = validate_api_base_url(base_url)?;
+    let safe_ticker = validate_ticker(ticker)?;
+    let full_url = format!(
+        "{}/markets/{}/orderbook",
+        valid_base.trim_end_matches('/'),
+        safe_ticker
+    );
+
+    #[cfg(target_os = "windows")]
+    if full_url.starts_with("https://") {
+        let out = std::process::Command::new("curl.exe")
+            .args(["-q", "-sS", "-m", "5", "-w", "\n%{http_code}", &full_url])
+            .output()
+            .map_err(|e| format!("curl.exe orderbook fetch failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "curl.exe orderbook error: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let (body_part, status_part) = stdout
+            .rsplit_once('\n')
+            .unwrap_or((stdout.as_ref(), "200"));
+        let status: u16 = status_part.trim().parse().unwrap_or(502);
+        if !(200..300).contains(&status) {
+            return Err(format!("Kalshi orderbook HTTP {status}"));
+        }
+        let val: serde_json::Value =
+            serde_json::from_str(body_part).map_err(|e| format!("invalid orderbook JSON: {e}"))?;
+        return parse_kalshi_orderbook_json(&val);
+    }
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(3))
+        .timeout(Duration::from_secs(5))
+        .build();
+    match agent
+        .get(&full_url)
+        .set("Accept", "application/json")
+        .call()
+    {
+        Ok(resp) => {
+            let text = resp
+                .into_string()
+                .map_err(|e| format!("failed reading orderbook response: {e}"))?;
+            let val: serde_json::Value =
+                serde_json::from_str(&text).map_err(|e| format!("invalid orderbook JSON: {e}"))?;
+            parse_kalshi_orderbook_json(&val)
+        }
+        Err(ureq::Error::Status(code, err_resp)) => {
+            let msg = err_resp.into_string().unwrap_or_default();
+            let snippet: String = msg.chars().take(180).collect();
+            Err(format!("Kalshi orderbook HTTP {code}: {snippet}"))
+        }
+        Err(ureq::Error::Transport(t)) => Err(format!("Kalshi orderbook transport error: {t}")),
     }
 }
 
@@ -1669,5 +1858,67 @@ pub(crate) mod tests {
             maker_json.contains("\"post_only\":true"),
             "maker_limit() must serialize post_only:true: {maker_json}"
         );
+    }
+
+    #[test]
+    fn ws_handshake_headers_and_orderbook_rest_parse() {
+        let (pkcs8, _pkcs1, pub_der) = generate_ephemeral_test_rsa();
+        let client = KalshiLiveClient::from_parts(
+            "ws-key-12345678",
+            &pkcs8,
+            KalshiEnv::Demo,
+            "http://127.0.0.1:18999/trade-api/v2",
+        )
+        .unwrap();
+        let hdrs = client.sign_ws_handshake_headers(None).unwrap();
+        let ts = hdrs
+            .iter()
+            .find(|(k, _)| k == "KALSHI-ACCESS-TIMESTAMP")
+            .unwrap()
+            .1
+            .clone();
+        let sig_b64 = hdrs
+            .iter()
+            .find(|(k, _)| k == "KALSHI-ACCESS-SIGNATURE")
+            .unwrap()
+            .1
+            .clone();
+        let expected_msg = format!("{ts}GET/trade-api/ws/v2");
+        assert_eq!(build_ws_signing_message(&ts, None), expected_msg);
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let sig_bytes = base64::engine::general_purpose::STANDARD
+                .decode(&sig_b64)
+                .unwrap();
+            let pk = ring::signature::UnparsedPublicKey::new(
+                &ring::signature::RSA_PSS_2048_8192_SHA256,
+                &pub_der,
+            );
+            pk.verify(expected_msg.as_bytes(), &sig_bytes)
+                .expect("WS RSA-PSS signature valid");
+        }
+        #[cfg(target_os = "windows")]
+        let _ = (&pub_der, &sig_b64);
+
+        let cents_json = serde_json::json!({
+            "orderbook": {
+                "yes": [[54, 120], [52, 80]],
+                "no": [[44, 60]]
+            }
+        });
+        let ob1 = parse_kalshi_orderbook_json(&cents_json).unwrap();
+        assert_eq!(ob1.yes, vec![[54, 120], [52, 80]]);
+        assert_eq!(ob1.no, vec![[44, 60]]);
+
+        let fp_json = serde_json::json!({
+            "orderbook_fp": {
+                "yes_dollars": [["0.5500", "25.00"]],
+                "no_dollars": [["0.4200", "40.00"]]
+            }
+        });
+        let ob2 = parse_kalshi_orderbook_json(&fp_json).unwrap();
+        assert_eq!(ob2.yes, vec![[55, 25]]);
+        assert_eq!(ob2.no, vec![[42, 40]]);
     }
 }

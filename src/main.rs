@@ -14,6 +14,7 @@ mod embedded_chunks;
 mod gzip_inflate;
 mod kalshi_live;
 mod open;
+mod orderbook;
 mod recalibration;
 mod risk_rails;
 mod scaling;
@@ -2907,6 +2908,8 @@ struct App {
     live_desk: std::sync::Mutex<LiveDeskManager>,
     /// Tick-driven Paper/Shadow Orderbook Matching Engine & Fail-Closed Automated Runner.
     runner: Arc<shadow_runner::ShadowRunner>,
+    /// Live L2 Orderbook Depth Store, WebSocket/REST stream & book-walking engine.
+    orderbook: Arc<orderbook::OrderbookStore>,
     tape_cache: std::sync::RwLock<Option<TapeEntry>>,
     /// Serializes cold tape parses so 30+ concurrent readers share one 100k-line parse.
     tape_compute_lock: std::sync::Mutex<()>,
@@ -2981,6 +2984,7 @@ impl App {
         let live_cfg = kalshi_live::load_live_config(&data_dir);
         let live_rails = risk_rails::RiskRailsState::load(&data_dir);
         let runner = Arc::new(shadow_runner::ShadowRunner::load(&data_dir, paper_pot));
+        let orderbook = Arc::new(orderbook::OrderbookStore::new(data_dir.clone()));
         let live_snapshots_path = data_dir.join("snapshots.jsonl");
         Self {
             data_dir,
@@ -2998,6 +3002,7 @@ impl App {
                 connected: false,
             }),
             runner,
+            orderbook,
             tape_cache: std::sync::RwLock::new(None),
             tape_compute_lock: std::sync::Mutex::new(()),
             analysis_cache: std::sync::RwLock::new(None),
@@ -4144,6 +4149,7 @@ impl App {
         rails.max_daily_loss_dollars.to_bits().hash(&mut h);
         rails.max_open_exposure_dollars.to_bits().hash(&mut h);
         rails.allowed_ticker_prefix.hash(&mut h);
+        self.orderbook.revision().hash(&mut h);
         let req_hash = h.finish();
 
         {
@@ -4160,8 +4166,14 @@ impl App {
         }
 
         let ctx = self.tournament_ctx_shared(dpath);
-        let rep =
-            auto_allocator::compute_auto_allocator_report(&ctx, &san, &rails, live_armed, killed);
+        let rep = auto_allocator::compute_auto_allocator_report_with_orderbook(
+            &ctx,
+            &san,
+            &rails,
+            live_armed,
+            killed,
+            Some(&self.orderbook),
+        );
         let json = Arc::new(serde_json::to_string(&rep).unwrap_or_else(|_| "{}".into()));
 
         let mut guard = self.allocator_cache.write().unwrap_or_else(|p| p.into_inner());
@@ -5295,6 +5307,7 @@ fn home_json_body(app: &App) -> String {
         mode: &'a str,
         series: Vec<String>,
         sse: bool,
+        orderbook_l2: bool,
         capabilities: &'static [&'static str],
     }
     let body = HomeBody {
@@ -5310,6 +5323,7 @@ fn home_json_body(app: &App) -> String {
         mode: mode_str,
         series: active_series(),
         sse: true,
+        orderbook_l2: true,
         capabilities: &[
             "sse",
             "calibration",
@@ -5326,6 +5340,7 @@ fn home_json_body(app: &App) -> String {
             "live_kalshi",
             "risk_rails",
             "shadow_runner",
+            "orderbook_l2",
         ],
     };
     serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string())
@@ -5743,6 +5758,8 @@ fn try_handle_inline_get(
     if path.starts_with("/api/live")
         || path.starts_with("/api/runner")
         || path.starts_with("/api/tape/stream")
+        || path.starts_with("/api/stream")
+        || path.starts_with("/api/orderbook")
     {
         return None;
     }
@@ -6951,6 +6968,61 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 .ledger_query(limit, strategy.as_deref(), mode.as_deref());
             json_response(200, &serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()))
         }
+        ("GET", "/api/orderbook") => {
+            let Some(raw_ticker) = query_param(query, "ticker") else {
+                return json_ok_err_response(400, "missing ticker parameter");
+            };
+            let clean = match kalshi_live::validate_ticker(&raw_ticker) {
+                Ok(t) => t.to_string(),
+                Err(e) => return json_ok_err_response(400, &e),
+            };
+            let snap = app.orderbook.snapshot(&clean);
+            json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
+        }
+        ("GET", "/api/orderbook/stream-status") => {
+            let status = app.orderbook.stream_status();
+            json_response(200, &serde_json::to_string(&status).unwrap_or_else(|_| "{}".into()))
+        }
+        ("POST", "/api/orderbook/subscribe") => {
+            let parsed = match parse_json_object_body(
+                body,
+                false,
+                "Orderbook subscribe request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let res = if let Some(arr_v) = parsed.get("tickers") {
+                let Some(arr) = arr_v.as_array() else {
+                    return json_ok_err_response(400, "\"tickers\" must be an array of strings");
+                };
+                let mut list = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let Some(s) = item.as_str() else {
+                        return json_ok_err_response(400, "each entry in \"tickers\" must be a string");
+                    };
+                    list.push(s.to_string());
+                }
+                app.orderbook.subscribe_tickers(&list, true)
+            } else if let Some(t_v) = parsed.get("ticker") {
+                let Some(t) = t_v.as_str() else {
+                    return json_ok_err_response(400, "\"ticker\" must be a string");
+                };
+                app.orderbook.subscribe_tickers(&[t.to_string()], false)
+            } else {
+                return json_ok_err_response(400, "missing \"ticker\" or \"tickers\" field");
+            };
+            match res {
+                Ok(subscribed_tickers) => {
+                    let payload = serde_json::json!({
+                        "ok": true,
+                        "subscribed_tickers": subscribed_tickers,
+                    });
+                    json_response(200, &payload.to_string())
+                }
+                Err(e) => json_ok_err_response(400, &e),
+            }
+        }
         _ => json_response(404, "{\"error\":\"not found\"}"),
     }
 }
@@ -7388,11 +7460,12 @@ fn main() {
                                 break;
                             }
                             let route = path.split_once('?').map(|(r, _)| r).unwrap_or(&path);
-                            if route == "/api/live"
+                            let is_strict_live = route == "/api/live"
                                 || route.starts_with("/api/live/")
                                 || route == "/api/runner"
                                 || route.starts_with("/api/runner/")
-                            {
+                                || route == "/api/orderbook/subscribe";
+                            if is_strict_live {
                                 if let Some((status, message)) =
                                     refuse_live_request(&method, host, &headers)
                                 {
@@ -7400,7 +7473,9 @@ fn main() {
                                     let _ = stream.write_all(response.as_bytes());
                                     break;
                                 }
-                                if (route == "/api/runner" || route.starts_with("/api/runner/"))
+                                if (route == "/api/runner"
+                                    || route.starts_with("/api/runner/")
+                                    || route == "/api/orderbook/subscribe")
                                     && !matches!(method.as_str(), "GET" | "HEAD")
                                 {
                                     let ct = headers
@@ -7413,14 +7488,14 @@ fn main() {
                                     {
                                         let response = json_err_response(
                                             415,
-                                            "runner mutations require Content-Type: application/json",
+                                            "mutations require Content-Type: application/json",
                                         );
                                         let _ = stream.write_all(response.as_bytes());
                                         break;
                                     }
                                 }
                             }
-                            if method == "GET" && route == "/api/tape/stream" {
+                            if method == "GET" && (route == "/api/tape/stream" || route == "/api/stream") {
                                 let sse_app = app.clone();
                                 sse_handed_off = true;
                                 std::thread::spawn(move || {
@@ -7476,6 +7551,7 @@ fn main() {
     }
     start_background_collector(app.clone());
     shadow_runner::start_background_runner(app.clone());
+    orderbook::start_background_orderbook(app.clone());
     updater().start_background();
     println!("{}", start_banner(&url, &data_dir, updater().cfg.mode, opening));
 

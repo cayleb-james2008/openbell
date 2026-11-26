@@ -1046,6 +1046,19 @@ pub fn compute_auto_allocator_report(
     live_armed: bool,
     killed: bool,
 ) -> AutoAllocatorReport {
+    compute_auto_allocator_report_with_orderbook(ctx, raw_req, rails, live_armed, killed, None)
+}
+
+/// Same as `compute_auto_allocator_report`, optionally incorporating live L2 depth
+/// from `OrderbookStore` (`walk_book_fresh` + `queue_ahead_at_fresh`) in capacity sizing.
+pub fn compute_auto_allocator_report_with_orderbook(
+    ctx: &TournamentTapeContext,
+    raw_req: &AutoAllocatorRequest,
+    rails: &RiskRailsConfig,
+    live_armed: bool,
+    killed: bool,
+    orderbook: Option<&crate::orderbook::OrderbookStore>,
+) -> AutoAllocatorReport {
     let req = raw_req.sanitized();
     let is_maker = req.execution_mode == "maker";
     let slip_dollars = if is_maker {
@@ -1379,8 +1392,14 @@ pub fn compute_auto_allocator_report(
         killed,
         live_armed,
     );
-    let liquidity_capacity =
-        compute_liquidity_capacity(ctx, &req, &oos_by_strat, &dry_run_plan, is_maker);
+    let liquidity_capacity = compute_liquidity_capacity(
+        ctx,
+        &req,
+        &oos_by_strat,
+        &dry_run_plan,
+        is_maker,
+        orderbook,
+    );
 
     // Compute $500/day net expectancy readiness verdict with concrete blockers.
     let daily_target = compute_daily_target_verdict(
@@ -2080,6 +2099,7 @@ fn compute_liquidity_capacity(
     oos_by_strat: &[Vec<&TournamentEntry>],
     plan: &DryRunOrderPlan,
     is_maker: bool,
+    orderbook: Option<&crate::orderbook::OrderbookStore>,
 ) -> LiquidityCapacityReport {
     if plan.legs.is_empty() {
         return LiquidityCapacityReport {
@@ -2146,7 +2166,26 @@ fn compute_liquidity_capacity(
                 }
             }
         }
-        let (causal_depth, depth_source) = if let Some(m) = median_f64_slice(&mut obs_depths) {
+        let live_l2_ticker = orderbook.and_then(|ob| ob.fresh_ticker_for_series(&leg.series));
+        let l2_total_depth = match (orderbook, &live_l2_ticker) {
+            (Some(ob), Some(lt)) => ob
+                .walk_book_fresh(lt, &leg.side, 10_000)
+                .map(|w| w.fillable_qty as f64)
+                .filter(|&d| d > 0.0),
+            _ => None,
+        };
+        let (causal_depth, depth_source) = if let Some(d) = l2_total_depth {
+            let maker_q = if is_maker {
+                orderbook
+                    .zip(live_l2_ticker.as_deref())
+                    .and_then(|(ob, lt)| ob.queue_ahead_at_fresh(lt, &leg.side, leg.max_limit_cents))
+                    .map(|q| q as f64)
+                    .filter(|&q| q > 0.0)
+            } else {
+                None
+            };
+            (maker_q.unwrap_or(d), "live_l2_orderbook")
+        } else if let Some(m) = median_f64_slice(&mut obs_depths) {
             (m, "observed_l1")
         } else {
             (
@@ -2159,12 +2198,23 @@ fn compute_liquidity_capacity(
         let p = (leg.max_limit_cents as f64) / 100.0;
         let pre_impact_ev_no_fee =
             leg.gross_oos_ev_cents - leg.spread_cross_cost_cents - leg.slippage_cost_cents;
+        let eval_impact = |c: u32| -> (f64, f64) {
+            if c > 0 {
+                if let (Some(ob), Some(lt)) = (orderbook, live_l2_ticker.as_deref()) {
+                    if let Some(w) = ob.walk_book_fresh(lt, &leg.side, c as u64) {
+                        let fill_ratio = (w.fillable_qty as f64 / (c as f64)).clamp(0.0, 1.0);
+                        return (fill_ratio, finite_or(w.slippage_cents.max(0.0), 0.0));
+                    }
+                }
+            }
+            liquidity_impact_cents(c, causal_depth, mean_spread_cents)
+        };
         let net_at = |c: u32| -> f64 {
             if c == 0 {
                 return pre_impact_ev_no_fee - leg.maker_fee_per_ct_cents;
             }
             let fee_c = (kalshi_order_fee_dollars(c, p, is_maker) * 100.0) / (c as f64);
-            let (_, impact) = liquidity_impact_cents(c, causal_depth, mean_spread_cents);
+            let (_, impact) = eval_impact(c);
             finite_or(pre_impact_ev_no_fee - fee_c - impact, -100.0)
         };
 
@@ -2199,8 +2249,7 @@ fn compute_liquidity_capacity(
         };
         for (si, &sf) in scale_factors.iter().enumerate() {
             let c = leg.target_contracts.saturating_mul(sf);
-            let (fill_ratio, impact_drag_cents) =
-                liquidity_impact_cents(c, causal_depth, mean_spread_cents);
+            let (fill_ratio, impact_drag_cents) = eval_impact(c);
             let net_ev_after_impact_cents = if c > 0 {
                 net_at(c)
             } else {
