@@ -44,6 +44,18 @@ export type DiversificationGuardReport = {
 };
 
 export type RegimeStabilityStatus = "ALL-REGIME" | "CALM-ONLY" | "VOL-SENSITIVE" | "NO_DATA" | string;
+export type SlippageCushionStatus = "SAFE" | "MODERATE" | "THIN" | "NO_DATA" | string;
+
+export type SlippageLadderStep = {
+  extra_slippage_cents: number;
+  net_expectancy_cents: number | null;
+  projected_daily_net_dollars: number;
+  oos_net_pnl_dollars: number;
+  daily_rail_breach_prob_pct: number;
+  positive_ev: boolean;
+  rail_safe: boolean;
+  survival_ok: boolean;
+};
 
 export type RegimeStabilityReport = {
   status: RegimeStabilityStatus;
@@ -76,6 +88,9 @@ export type SessionBriefingReport = {
   regime_stability: RegimeStabilityStatus;
   calm_expectancy_cents: number | null;
   high_vol_expectancy_cents: number | null;
+  breakeven_slippage_cents: number | null;
+  slippage_cushion_status: SlippageCushionStatus;
+  slippage_ladder: SlippageLadderStep[];
   summary: string;
 };
 
@@ -182,6 +197,9 @@ export type StrategyPresetCandidate = {
   calm_stress_1c_survival: boolean;
   high_vol_stress_1c_survival: boolean;
   regime_stability: RegimeStabilityStatus;
+  breakeven_slippage_cents: number | null;
+  slippage_cushion_status: SlippageCushionStatus;
+  slippage_ladder: SlippageLadderStep[];
   note: string;
 };
 
@@ -330,6 +348,9 @@ export type AutoAllocatorReport = {
   preset_leaderboard: StrategyPresetCandidate[];
   top_safe_preset: string | null;
   regime_stability: RegimeStabilityReport;
+  breakeven_slippage_cents: number | null;
+  slippage_cushion_status: SlippageCushionStatus;
+  slippage_ladder: SlippageLadderStep[];
   forward_envelope: ForwardEnvelopeMonitor;
   diversification: DiversificationGuardReport;
   session_briefing: SessionBriefingReport;
@@ -374,6 +395,54 @@ function finiteOpt(v: unknown): number | null {
 
 function strOr(v: unknown, fallback: string): string {
   return typeof v === "string" && v.trim().length > 0 ? v : fallback;
+}
+
+function normalizeSlippageLadder(raw: unknown): SlippageLadderStep[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((s): s is Record<string, unknown> => !!s && typeof s === "object")
+    .map((s) => ({
+      extra_slippage_cents: finiteOr(s.extra_slippage_cents, 0),
+      net_expectancy_cents: finiteOpt(s.net_expectancy_cents),
+      projected_daily_net_dollars: finiteOr(s.projected_daily_net_dollars, 0),
+      oos_net_pnl_dollars: finiteOr(s.oos_net_pnl_dollars, 0),
+      daily_rail_breach_prob_pct: finiteOr(s.daily_rail_breach_prob_pct, 0),
+      positive_ev: Boolean(s.positive_ev),
+      rail_safe: Boolean(s.rail_safe),
+      survival_ok: Boolean(s.survival_ok),
+    }));
+}
+
+function makeOfflineSlippageLadder(
+  hasWinners: boolean,
+  expectedEvCents: number | null,
+): {
+  slippage_ladder: SlippageLadderStep[];
+  breakeven_slippage_cents: number | null;
+  slippage_cushion_status: SlippageCushionStatus;
+} {
+  const ladder: SlippageLadderStep[] = [0, 1, 2, 3].map((extra) => {
+    const netEv = hasWinners && expectedEvCents !== null ? Number((expectedEvCents - extra).toFixed(2)) : null;
+    const positiveEv = netEv !== null && netEv > 0;
+    return {
+      extra_slippage_cents: extra,
+      net_expectancy_cents: netEv,
+      projected_daily_net_dollars: 0,
+      oos_net_pnl_dollars: 0,
+      daily_rail_breach_prob_pct: 0,
+      positive_ev: positiveEv,
+      rail_safe: true,
+      survival_ok: hasWinners && positiveEv,
+    };
+  });
+  const cushion = hasWinners && expectedEvCents !== null ? Math.max(0, expectedEvCents) : null;
+  const status: SlippageCushionStatus =
+    cushion === null ? "NO_DATA" : cushion < 1 ? "THIN" : cushion >= 2 ? "SAFE" : "MODERATE";
+  return {
+    slippage_ladder: ladder,
+    breakeven_slippage_cents: cushion,
+    slippage_cushion_status: status,
+  };
 }
 
 function normalizeReport(raw: unknown): AutoAllocatorReport | null {
@@ -617,6 +686,9 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
           calm_stress_1c_survival: Boolean(p.calm_stress_1c_survival),
           high_vol_stress_1c_survival: Boolean(p.high_vol_stress_1c_survival),
           regime_stability: strOr(p.regime_stability, "NO_DATA"),
+          breakeven_slippage_cents: finiteOpt(p.breakeven_slippage_cents),
+          slippage_cushion_status: strOr(p.slippage_cushion_status, "NO_DATA"),
+          slippage_ladder: normalizeSlippageLadder(p.slippage_ladder),
           note: strOr(p.note, ""),
         };
       }),
@@ -633,6 +705,9 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
       all_regime_safe_presets: Math.max(0, Math.round(finiteOr(regStabRaw.all_regime_safe_presets, 0))),
       summary: strOr(regStabRaw.summary, "Awaiting OOS trades for causal regime stability validation."),
     },
+    breakeven_slippage_cents: finiteOpt(o.breakeven_slippage_cents),
+    slippage_cushion_status: strOr(o.slippage_cushion_status, "NO_DATA"),
+    slippage_ladder: normalizeSlippageLadder(o.slippage_ladder),
     forward_envelope: {
       status: strOr(envRaw.status, "NO_DATA"),
       active_preset_id: typeof envRaw.active_preset_id === "string" && envRaw.active_preset_id.trim().length > 0 ? envRaw.active_preset_id : null,
@@ -700,6 +775,9 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
       regime_stability: strOr(briefRaw.regime_stability, strOr(regStabRaw.status, "NO_DATA")),
       calm_expectancy_cents: finiteOpt(briefRaw.calm_expectancy_cents),
       high_vol_expectancy_cents: finiteOpt(briefRaw.high_vol_expectancy_cents),
+      breakeven_slippage_cents: finiteOpt(briefRaw.breakeven_slippage_cents ?? o.breakeven_slippage_cents),
+      slippage_cushion_status: strOr(briefRaw.slippage_cushion_status, strOr(o.slippage_cushion_status, "NO_DATA")),
+      slippage_ladder: normalizeSlippageLadder(briefRaw.slippage_ladder ?? o.slippage_ladder),
       summary: strOr(briefRaw.summary, "Awaiting OOS winners for session briefing attribution."),
     },
     comparison: {
@@ -814,6 +892,7 @@ function makeOfflineSessionBriefing(
   winnersCount: number,
 ): SessionBriefingReport {
   const reg = hasWinners && (expectedEvCents ?? 0) > 1 ? "ALL-REGIME" : hasWinners ? "VOL-SENSITIVE" : "NO_DATA";
+  const slip = makeOfflineSlippageLadder(hasWinners, expectedEvCents);
   return {
     status: hasWinners ? "HOLD_PAPER" : "NO_DATA",
     live_armed: false,
@@ -832,6 +911,7 @@ function makeOfflineSessionBriefing(
     regime_stability: reg,
     calm_expectancy_cents: expectedEvCents,
     high_vol_expectancy_cents: expectedEvCents,
+    ...slip,
     summary: hasWinners
       ? "Offline paper preview: slippage/rail attribution requires live server pipeline."
       : "No active winners for session briefing attribution.",
@@ -907,6 +987,7 @@ export function computeClientFallbackReport(
       preset_leaderboard: [],
       top_safe_preset: null,
       regime_stability: makeOfflineRegimeStability(false, null),
+      ...makeOfflineSlippageLadder(false, null),
       forward_envelope: {
         status: "NO_DATA",
         active_preset_id: null,
@@ -1228,6 +1309,10 @@ export function computeClientFallbackReport(
     preset_leaderboard: [],
     top_safe_preset: null,
     regime_stability: makeOfflineRegimeStability(
+      rawWinners.length > 0,
+      rawWinners.length > 0 ? rawWinners[0].oos_net_expectancy_cents : null,
+    ),
+    ...makeOfflineSlippageLadder(
       rawWinners.length > 0,
       rawWinners.length > 0 ? rawWinners[0].oos_net_expectancy_cents : null,
     ),

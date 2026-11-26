@@ -76,6 +76,13 @@ function regimeTone(status: string | undefined): "success" | "warning" | "error"
   return "neutral";
 }
 
+function cushionTone(status: string | undefined): "success" | "warning" | "error" | "neutral" {
+  if (status === "SAFE") return "success";
+  if (status === "MODERATE") return "warning";
+  if (status === "THIN") return "error";
+  return "neutral";
+}
+
 export type StagedOrderDraft = {
   ticker: string;
   side: "yes" | "no";
@@ -298,6 +305,9 @@ export function AutoAllocatorPanel({
         live_armed: false,
       },
       regime_stability: report.regime_stability,
+      breakeven_slippage_cents: report.breakeven_slippage_cents ?? null,
+      slippage_cushion_status: report.slippage_cushion_status ?? "NO_DATA",
+      slippage_ladder: report.slippage_ladder ?? [],
       diversification: report.diversification,
       daily_target: report.daily_target,
     };
@@ -1072,6 +1082,18 @@ export function AutoAllocatorPanel({
                   ? "NO DATA"
                   : report.session_briefing.regime_stability}
               </StatusPill>
+              <StatusPill
+                id="allocator-briefing-cushion-pill"
+                tone={cushionTone(report.session_briefing.slippage_cushion_status)}
+              >
+                Cushion:{" "}
+                {report.session_briefing.breakeven_slippage_cents === null
+                  ? "n/a"
+                  : `${report.session_briefing.breakeven_slippage_cents.toFixed(2)}c`}{" "}
+                · {report.session_briefing.slippage_cushion_status === "NO_DATA"
+                  ? "NO DATA"
+                  : report.session_briefing.slippage_cushion_status}
+              </StatusPill>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <Button
@@ -1148,6 +1170,39 @@ export function AutoAllocatorPanel({
               </div>
             </div>
           </div>
+          {report.session_briefing.slippage_ladder?.length > 0 && (
+            <div
+              id="allocator-slippage-ladder"
+              className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4"
+            >
+              {report.session_briefing.slippage_ladder.map((step) => (
+                <div
+                  key={step.extra_slippage_cents}
+                  className="rounded-lg border border-hairline bg-surface px-2.5 py-1.5"
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="mono font-semibold text-ink">
+                      +{step.extra_slippage_cents.toFixed(0)}c Slip
+                    </span>
+                    <span
+                      className={
+                        "mono font-semibold " +
+                        (step.survival_ok ? "text-success-foreground" : "text-destructive-foreground")
+                      }
+                    >
+                      {step.survival_ok ? "SAFE" : step.rail_safe ? "<=0c" : "RAIL"}
+                    </span>
+                  </div>
+                  <div className="mono mt-0.5 text-ink-2">
+                    {fmtCents(step.net_expectancy_cents)} · {money(step.projected_daily_net_dollars)}/d
+                  </div>
+                  <div className="mono text-xs text-ink-3">
+                    OOS {step.oos_net_pnl_dollars >= 0 ? "+" : ""}{money(step.oos_net_pnl_dollars)} · Breach {fmtBreachPct(step.daily_rail_breach_prob_pct)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
           <p className="text-xs text-ink-2">{report.session_briefing.summary}</p>
         </div>
       )}
@@ -1366,6 +1421,11 @@ export function AutoAllocatorPanel({
                         )}
                         <StatusPill tone={regimeTone(preset.regime_stability)}>
                           {preset.regime_stability}
+                        </StatusPill>
+                        <StatusPill tone={cushionTone(preset.slippage_cushion_status)}>
+                          {preset.breakeven_slippage_cents === null
+                            ? preset.slippage_cushion_status
+                            : `${preset.breakeven_slippage_cents.toFixed(1)}c ${preset.slippage_cushion_status}`}
                         </StatusPill>
                       </div>
                       <div className="text-xs text-ink-3">{preset.subtitle}</div>
@@ -1608,7 +1668,7 @@ export function AutoAllocatorPanel({
 
         {filteredWinners.length === 0 ? (
           <p role="status" className="p-4 text-xs text-ink-2">
-            0 strategies currently clear the OOS positive expectancy &amp; depth gate — holding{" "}
+            0 strategies clear the OOS positive expectancy and depth gate, so the desk holds{" "}
             <span className="mono font-semibold text-ink">{fmtPct(cashReservePct, 0)} cash reserve</span> until forward evidence qualifies.
           </p>
         ) : (

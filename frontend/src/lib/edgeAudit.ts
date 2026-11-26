@@ -197,10 +197,10 @@ export async function fetchEdgeAudit(
   })();
 
   return {
-    mode_notice: "Paper edge audit — strictly read-only simulation, no venue capital at risk.",
+    mode_notice: "Paper edge audit: read-only simulation, no venue capital at risk.",
     dataset,
     verdict: "NO_GO",
-    verdict_label: "NO-GO — Paper Research Only",
+    verdict_label: "NO-GO: Paper Research Only",
     blocking_reasons: scale.readinessGates.blockingReasons,
     slippage_cents: slip,
     strategies_total: tour.rankings.length,

@@ -411,7 +411,7 @@ export function evaluateOrderRails(
       detail: !status.configured
         ? "API credentials not configured"
         : status.killed
-          ? "Kill switch active — re-arm required"
+          ? "Kill switch active, re-arm required"
           : status.liveArmed
             ? `Armed (${status.environment.toUpperCase()})`
             : "Disarmed (Paper Mode)",

@@ -1635,9 +1635,16 @@ impl CompiledSandboxStrategy {
             .build();
 
         let diag_text = if !diagnostics.is_empty() {
-            let mut buf = rune::termcolor::Buffer::no_color();
-            let _ = diagnostics.emit(&mut buf, &sources);
-            String::from_utf8_lossy(buf.as_slice()).trim().to_string()
+            diagnostics
+                .diagnostics()
+                .iter()
+                .map(|d| match d {
+                    rune::diagnostics::Diagnostic::Fatal(f) => f.to_string(),
+                    rune::diagnostics::Diagnostic::Warning(w) => format!("warning: {w}"),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         } else {
             String::new()
         };

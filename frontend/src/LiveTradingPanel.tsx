@@ -779,7 +779,7 @@ export function LiveDeskWorkspace({
               onClick={onRequestArm}
             >
               <ShieldCheck className="size-3.5" aria-hidden />
-              <span>Disarmed — Arm Live Trading to Submit</span>
+              <span>Disarmed: arm live trading to submit</span>
             </Button>
           ) : (
             <Button
@@ -1136,7 +1136,7 @@ export function LiveSettingsSection({
 
           <div>
             <label htmlFor="live-pem-path" className="text-xs text-ink-3">
-              Private Key PEM File Path {status.keyPathConfigured ? "(PEM saved — never echoed)" : ""}
+              Private Key PEM File Path {status.keyPathConfigured ? "(PEM saved, never echoed)" : ""}
             </label>
             <input
               id="live-pem-path"

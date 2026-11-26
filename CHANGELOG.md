@@ -4,6 +4,13 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.21.0 - 2026-11-25
+
+- Added causal slippage sensitivity ladder across `+0c`, `+1c`, `+2c`, and `+3c` adverse fill levels in `src/auto_allocator.rs` (`compute_slippage_ladder_and_cushion`, `SlippageLadderStep`), plus break-even slippage ceiling (`c`) and cushion status (`THIN` under `1c`, `MODERATE` `1c` to `2c`, `SAFE` at `>=2c` with `0.0%` daily rail breach).
+- Wired `#allocator-briefing-cushion-pill` and the four-step `#allocator-slippage-ladder` strip into `frontend/src/AutoAllocatorPanel.tsx` along with leaderboard preset cushion pills, `buildBriefingPayload` fields, and offline client parity in `frontend/src/lib/allocator.ts`.
+- Disabled default `rune` `emit` diagnostics formatting in `Cargo.toml` and `src/analytics.rs`, moved `num-bigint` to Windows/dev dependencies, shrunk `build_latest_markets_json` allocations and omitted zero depth fields in `src/main.rs`, and sized the HTTP pool to 16 workers with pre-framed hot close payloads (`5.88 MB` release binary, `18.23 MB` Peak `VmHWM`, `4,011.4 req/s` cold-close).
+- Cleaned prose across `README.md`, this changelog entry, and UI strings in `AutoAllocatorPanel.tsx` and `LiveTradingPanel.tsx`.
+
 ## 0.20.0 - 2026-11-25
 
 - **Walk-Forward Regime Stability Validator (`src/tournament.rs`, `src/auto_allocator.rs`, `frontend/src/AutoAllocatorPanel.tsx`, `frontend/src/lib/allocator.ts`):**

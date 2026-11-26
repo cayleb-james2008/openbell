@@ -504,7 +504,7 @@ export function computeScalePlanClient(
   if (!modelingEdgePositive) {
     negativeEdgeReason =
       oosTrades.length === 0
-        ? "No settled out-of-sample paper trades yet — cannot estimate bankroll scaling."
+        ? "No settled out-of-sample paper trades yet; cannot estimate bankroll scaling."
         : `Out-of-sample expectancy after fees and ${slippageCents}c slippage is ${(empiricalCentsPerContract ?? 0).toFixed(2)}c/contract (<= 0). Scaling bankroll on non-positive edge increases expected drawdown.`;
   } else {
     const winProb = oosTrades.length > 0 ? Math.min(0.95, Math.max(0.05, oosWins / oosTrades.length)) : Math.min(0.92, avgEntryPrice + edgePerContractDollars);

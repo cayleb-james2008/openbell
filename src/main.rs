@@ -442,6 +442,11 @@ impl<'de> Deserialize<'de> for OptPrice {
     }
 }
 
+#[inline]
+fn is_zero_f32(v: &f32) -> bool {
+    *v == 0.0
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Snapshot {
     fetched_at: i64,
@@ -456,9 +461,9 @@ struct Snapshot {
     no_bid: OptPrice,
     no_ask: OptPrice,
     last_price: OptPrice,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
     yes_bid_size: f32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
     no_bid_size: f32,
 }
 
@@ -2635,7 +2640,9 @@ struct TapeEntry {
 fn build_latest_markets_json(grouped: &BTreeMap<String, Vec<Snapshot>>) -> Arc<String> {
     let mut latest: Vec<&Snapshot> = grouped.values().filter_map(|w| w.last()).collect();
     latest.sort_by(|a, b| a.close_time.cmp(&b.close_time));
-    Arc::new(serde_json::to_string(&latest).unwrap_or_else(|_| "[]".to_string()))
+    let mut s = serde_json::to_string(&latest).unwrap_or_else(|_| "[]".to_string());
+    s.shrink_to_fit();
+    Arc::new(s)
 }
 
 /// Fold health aggregates from one parsed snapshot.
@@ -2817,10 +2824,27 @@ struct LiveDeskManager {
 struct LiveHotSnapshot {
     until: Option<std::time::Instant>,
     markets_json: Option<Arc<String>>,
+    home_http_close: Option<Arc<Vec<u8>>>,
+    strategies_http_close: Option<Arc<Vec<u8>>>,
+    slots_http_close: Option<Arc<Vec<u8>>>,
+    equity_http_close: Option<Arc<Vec<u8>>>,
     home_json: Option<Arc<String>>,
     strategies_json: Option<Arc<String>>,
     slots_json: Option<Arc<String>>,
     equity_json: Option<Arc<String>>,
+}
+
+#[inline]
+fn build_http_close_json(body: &[u8]) -> Arc<Vec<u8>> {
+    use std::io::Write as _;
+    let mut out = Vec::with_capacity(body.len() + 192);
+    let _ = write!(
+        out,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{SEC_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    out.extend_from_slice(body);
+    Arc::new(out)
 }
 
 struct App {
@@ -3195,6 +3219,7 @@ impl App {
         let grouped = Arc::new(grouped_map);
         let latest_json = build_latest_markets_json(&grouped);
         results_by_ticker.shrink_to_fit();
+        trim_heap();
         let conflicting_settlements = results_by_ticker
             .values()
             .filter(|r| matches!(r, ResultTrack::Conflict))
@@ -3219,7 +3244,7 @@ impl App {
         out
     }
 
-    /// Zero-scan `/api/markets` JSON cache lookup once `dpath` is already security-checked.
+    /// Zero-scan `/api/markets` JSON cache lookup once `dpath` is security-checked.
     fn tape_latest_json(&self, path: &Path) -> Arc<String> {
         if let Some((len, mtime)) = tape_stat(path) {
             let guard = self.tape_cache.read().unwrap_or_else(|p| p.into_inner());
@@ -4158,6 +4183,7 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
         }
     }
     e.latest_json = build_latest_markets_json(&e.grouped);
+    trim_heap();
     e.conflicting_settlements = e
         .results_by_ticker
         .values()
@@ -5258,7 +5284,13 @@ fn try_serve_fast_get(
             if let Some(now) = now_inst {
                 if let Ok(guard) = app.live_hot_cache.try_read() {
                     if guard.until.is_some_and(|u| now <= u) {
-                        if let Some(b) = &guard.home_json {
+                        if !keep_alive {
+                            if let Some(raw) = &guard.home_http_close {
+                                let raw = raw.clone();
+                                drop(guard);
+                                return stream.write_all(&raw).is_ok();
+                            }
+                        } else if let Some(b) = &guard.home_json {
                             let body = b.clone();
                             drop(guard);
                             return write_json_bytes_inline(
@@ -5285,11 +5317,13 @@ fn try_serve_fast_get(
             } else {
                 let b = home_json_shared(app);
                 if let Some(now) = now_inst {
+                    let close_raw = build_http_close_json(b.as_bytes());
                     if let Ok(mut guard) = app.live_hot_cache.write() {
                         if guard.until.is_none_or(|u| now > u) {
                             *guard = LiveHotSnapshot::default();
                             guard.until = Some(now + ttl);
                         }
+                        guard.home_http_close = Some(close_raw);
                         guard.home_json = Some(b.clone());
                     }
                 }
@@ -5374,22 +5408,35 @@ fn try_serve_fast_get(
             if let Some(now) = now_inst {
                 if let Ok(guard) = app.live_hot_cache.try_read() {
                     if guard.until.is_some_and(|u| now <= u) {
-                        let hit = match route {
-                            "/api/strategies" => &guard.strategies_json,
-                            "/api/slots" => &guard.slots_json,
-                            _ => &guard.equity_json,
-                        };
-                        if let Some(b) = hit {
-                            let body = b.clone();
-                            drop(guard);
-                            return write_json_bytes_inline(
-                                stream,
-                                200,
-                                body.as_bytes(),
-                                sock_ref,
-                                keep_alive,
-                            )
-                            .is_some();
+                        if !keep_alive {
+                            let hit_raw = match route {
+                                "/api/strategies" => &guard.strategies_http_close,
+                                "/api/slots" => &guard.slots_http_close,
+                                _ => &guard.equity_http_close,
+                            };
+                            if let Some(raw) = hit_raw {
+                                let raw = raw.clone();
+                                drop(guard);
+                                return stream.write_all(&raw).is_ok();
+                            }
+                        } else {
+                            let hit = match route {
+                                "/api/strategies" => &guard.strategies_json,
+                                "/api/slots" => &guard.slots_json,
+                                _ => &guard.equity_json,
+                            };
+                            if let Some(b) = hit {
+                                let body = b.clone();
+                                drop(guard);
+                                return write_json_bytes_inline(
+                                    stream,
+                                    200,
+                                    body.as_bytes(),
+                                    sock_ref,
+                                    keep_alive,
+                                )
+                                .is_some();
+                            }
                         }
                     }
                 }
@@ -5433,11 +5480,17 @@ fn try_serve_fast_get(
                 Ok((dataset, dpath)) => {
                     let (s_json, sl_json, eq_json) = app.desk_json_shared(&dpath, &dataset);
                     if let Some(now) = now_inst {
+                        let s_raw = build_http_close_json(s_json.as_bytes());
+                        let sl_raw = build_http_close_json(sl_json.as_bytes());
+                        let eq_raw = build_http_close_json(eq_json.as_bytes());
                         if let Ok(mut guard) = app.live_hot_cache.write() {
                             if guard.until.is_none_or(|u| now > u) {
                                 *guard = LiveHotSnapshot::default();
                             }
                             guard.until = Some(now + ttl);
+                            guard.strategies_http_close = Some(s_raw);
+                            guard.slots_http_close = Some(sl_raw);
+                            guard.equity_http_close = Some(eq_raw);
                             guard.strategies_json = Some(s_json.clone());
                             guard.slots_json = Some(sl_json.clone());
                             guard.equity_json = Some(eq_json.clone());
@@ -7098,7 +7151,8 @@ fn main() {
     static ACTIVE_HTTP_CONNS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
     const MAX_CONCURRENT_HTTP_CONNS: usize = 128;
-    const HTTP_POOL_WORKERS: usize = 24;
+    const HTTP_POOL_WORKERS: usize = 16;
+    const MAX_HTTP_POOL_WORKERS: usize = 36;
 
     struct ConnGuard;
     impl Drop for ConnGuard {
@@ -7112,16 +7166,27 @@ fn main() {
         _guard: ConnGuard,
     }
 
-    let queue: Arc<(Mutex<VecDeque<QueuedConn>>, Condvar)> =
-        Arc::new((Mutex::new(VecDeque::with_capacity(64)), Condvar::new()));
+    struct HttpPoolInner {
+        queue: VecDeque<QueuedConn>,
+        idle_workers: usize,
+        total_workers: usize,
+    }
+
+    let pool: Arc<(Mutex<HttpPoolInner>, Condvar)> = Arc::new((
+        Mutex::new(HttpPoolInner {
+            queue: VecDeque::with_capacity(64),
+            idle_workers: 0,
+            total_workers: HTTP_POOL_WORKERS,
+        }),
+        Condvar::new(),
+    ));
     let allowed_hosts = Arc::new(allowed_hosts);
-    let worker_stack = 2 * 1024 * 1024;
-    for _ in 0..HTTP_POOL_WORKERS {
-        let queue = queue.clone();
-        let app = app.clone();
-        let allowed_hosts = allowed_hosts.clone();
+    let spawn_worker = |pool: Arc<(Mutex<HttpPoolInner>, Condvar)>,
+                        app: Arc<App>,
+                        allowed_hosts: Arc<Vec<String>>,
+                        burst: bool| {
         let _ = std::thread::Builder::new()
-            .stack_size(worker_stack)
+            .stack_size(2 * 1024 * 1024)
             .spawn(move || {
                 let mut buf = [0u8; 4096];
                 loop {
@@ -7129,12 +7194,26 @@ fn main() {
                         mut stream,
                         _guard: conn_guard,
                     } = {
-                        let (lock, cv) = &*queue;
-                        let mut q = lock.lock().unwrap_or_else(|p| p.into_inner());
-                        while q.is_empty() {
-                            q = cv.wait(q).unwrap_or_else(|p| p.into_inner());
+                        let (lock, cv) = &*pool;
+                        let mut st = lock.lock().unwrap_or_else(|p| p.into_inner());
+                        st.idle_workers += 1;
+                        while st.queue.is_empty() {
+                            if burst && st.total_workers > HTTP_POOL_WORKERS {
+                                let (next_st, res) = cv
+                                    .wait_timeout(st, std::time::Duration::from_secs(5))
+                                    .unwrap_or_else(|p| p.into_inner());
+                                st = next_st;
+                                if res.timed_out() && st.queue.is_empty() && st.total_workers > HTTP_POOL_WORKERS {
+                                    st.idle_workers = st.idle_workers.saturating_sub(1);
+                                    st.total_workers = st.total_workers.saturating_sub(1);
+                                    return;
+                                }
+                            } else {
+                                st = cv.wait(st).unwrap_or_else(|p| p.into_inner());
+                            }
                         }
-                        q.pop_front().unwrap()
+                        st.idle_workers = st.idle_workers.saturating_sub(1);
+                        st.queue.pop_front().unwrap()
                     };
                     let _ = stream.set_nodelay(true);
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
@@ -7158,7 +7237,6 @@ fn main() {
                             if keep_alive {
                                 if !in_keep_alive {
                                     in_keep_alive = true;
-                                    let _ = stream.set_nodelay(true);
                                     let _ = stream.set_read_timeout(Some(
                                         std::time::Duration::from_millis(500),
                                     ));
@@ -7262,30 +7340,37 @@ fn main() {
                     let _ = sse_handed_off;
                 }
             });
+    };
+    for _ in 0..HTTP_POOL_WORKERS {
+        spawn_worker(pool.clone(), app.clone(), allowed_hosts.clone(), false);
     }
     start_background_collector(app.clone());
     updater().start_background();
     println!("{}", start_banner(&url, &data_dir, updater().cfg.mode, opening));
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                if ACTIVE_HTTP_CONNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    >= MAX_CONCURRENT_HTTP_CONNS
-                {
-                    ACTIVE_HTTP_CONNS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    let resp = json_response(503, "{\"error\":\"server busy\"}");
-                    let _ = stream.write_all(resp.as_bytes());
-                    continue;
-                }
-                let (lock, cv) = &*queue;
-                lock.lock().unwrap_or_else(|p| p.into_inner()).push_back(QueuedConn {
-                    stream,
-                    _guard: ConnGuard,
-                });
-                cv.notify_one();
-            }
-            Err(_) => continue,
+    for mut stream in listener.incoming().flatten() {
+        if ACTIVE_HTTP_CONNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            >= MAX_CONCURRENT_HTTP_CONNS
+        {
+            ACTIVE_HTTP_CONNS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            let resp = json_response(503, "{\"error\":\"server busy\"}");
+            let _ = stream.write_all(resp.as_bytes());
+            continue;
+        }
+        let (lock, cv) = &*pool;
+        let mut st = lock.lock().unwrap_or_else(|p| p.into_inner());
+        st.queue.push_back(QueuedConn {
+            stream,
+            _guard: ConnGuard,
+        });
+        let need_burst = st.idle_workers == 0 && st.total_workers < MAX_HTTP_POOL_WORKERS;
+        if need_burst {
+            st.total_workers += 1;
+        }
+        drop(st);
+        cv.notify_one();
+        if need_burst {
+            spawn_worker(pool.clone(), app.clone(), allowed_hosts.clone(), true);
         }
     }
 }

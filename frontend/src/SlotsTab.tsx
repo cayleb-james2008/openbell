@@ -497,7 +497,7 @@ export function SlotsTab({
               </dl>
               <p className="mt-3 text-xs text-ink-2">
                 {liveBundle.status.configured
-                  ? `${liveBundle.status.environment.toUpperCase()} (${liveBundle.status.liveArmed ? "Live Armed" : "Disarmed, Paper Mode"}) — ${liveBundle.account.note}`
+                  ? `${liveBundle.status.environment.toUpperCase()} (${liveBundle.status.liveArmed ? "Live Armed" : "Disarmed, Paper Mode"}): ${liveBundle.account.note}`
                   : home?.account.note || "Configure Kalshi v2 API credentials in Settings to connect."}
               </p>
               <div className="mt-3 flex flex-wrap items-center gap-2">

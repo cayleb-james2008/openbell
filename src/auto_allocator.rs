@@ -406,6 +406,19 @@ pub struct DailyTargetVerdict {
     pub blockers: Vec<String>,
 }
 
+/// One rung on the causal adverse-fill slippage sensitivity ladder (`+0c`..`+3c`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlippageLadderStep {
+    pub extra_slippage_cents: f64,
+    pub net_expectancy_cents: Option<f64>,
+    pub projected_daily_net_dollars: f64,
+    pub oos_net_pnl_dollars: f64,
+    pub daily_rail_breach_prob_pct: f64,
+    pub positive_ev: bool,
+    pub rail_safe: bool,
+    pub survival_ok: bool,
+}
+
 /// Zero-config strategy preset ranked across OOS + `+1c` adverse-fill bootstrap trials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyPresetCandidate {
@@ -431,6 +444,9 @@ pub struct StrategyPresetCandidate {
     pub calm_stress_1c_survival: bool,
     pub high_vol_stress_1c_survival: bool,
     pub regime_stability: String,
+    pub breakeven_slippage_cents: Option<f64>,
+    pub slippage_cushion_status: String,
+    pub slippage_ladder: Vec<SlippageLadderStep>,
     pub note: String,
 }
 
@@ -519,6 +535,9 @@ pub struct SessionBriefingReport {
     pub regime_stability: String,
     pub calm_expectancy_cents: Option<f64>,
     pub high_vol_expectancy_cents: Option<f64>,
+    pub breakeven_slippage_cents: Option<f64>,
+    pub slippage_cushion_status: String,
+    pub slippage_ladder: Vec<SlippageLadderStep>,
     pub summary: String,
 }
 
@@ -555,6 +574,9 @@ pub struct AutoAllocatorReport {
     pub preset_leaderboard: Vec<StrategyPresetCandidate>,
     pub top_safe_preset: Option<String>,
     pub regime_stability: RegimeStabilityReport,
+    pub breakeven_slippage_cents: Option<f64>,
+    pub slippage_cushion_status: String,
+    pub slippage_ladder: Vec<SlippageLadderStep>,
     pub forward_envelope: ForwardEnvelopeMonitor,
     pub diversification: DiversificationGuardReport,
     pub session_briefing: SessionBriefingReport,
@@ -1209,6 +1231,45 @@ pub fn compute_auto_allocator_report(
         live_armed,
     );
 
+    let active_weighted_ev_cents = if active_winners.is_empty() {
+        None
+    } else {
+        let w_sum: f64 = active_winners.iter().map(|w| w.allocated_pct.max(0.01)).sum();
+        if w_sum > 1e-12 {
+            finite_opt(
+                active_winners
+                    .iter()
+                    .map(|w| w.oos_net_expectancy_cents * (w.allocated_pct.max(0.01) / w_sum))
+                    .sum::<f64>(),
+            )
+        } else {
+            None
+        }
+    };
+    let active_legs: Vec<(f64, f64, usize, f64)> = active_winners
+        .iter()
+        .map(|w| {
+            (
+                w.allocated_pct,
+                w.oos_avg_entry_price,
+                w.oos_trades,
+                w.oos_net_expectancy_cents,
+            )
+        })
+        .collect();
+    let (slippage_ladder, breakeven_slippage_cents, slippage_cushion_status) =
+        compute_slippage_ladder_and_cushion(
+            active_weighted_ev_cents,
+            &active_legs,
+            ctx.windows_settled_oos,
+            &req,
+            rails.max_daily_loss_dollars,
+            &bootstrap_stress,
+            &oos_window_returns,
+            is_maker,
+            1_000,
+        );
+
     // Compute $500/day net expectancy readiness verdict with concrete blockers.
     let daily_target = compute_daily_target_verdict(
         ctx,
@@ -1231,6 +1292,9 @@ pub fn compute_auto_allocator_report(
         &comparison,
         &daily_target,
         &regime_stability,
+        breakeven_slippage_cents,
+        &slippage_cushion_status,
+        &slippage_ladder,
         &oos_window_returns,
         live_armed,
     );
@@ -1326,6 +1390,9 @@ pub fn compute_auto_allocator_report(
         preset_leaderboard,
         top_safe_preset,
         regime_stability,
+        breakeven_slippage_cents,
+        slippage_cushion_status,
+        slippage_ladder,
         forward_envelope,
         diversification,
         session_briefing,
@@ -1907,7 +1974,7 @@ fn replay_oos_comparison(
     winner_weights_by_idx: &HashMap<usize, f64>,
     is_maker: bool,
     selection_basis: String,
-) -> (AllocatorComparison, f64, f64, String, Vec<(f64, f64)>) {
+) -> (AllocatorComparison, f64, f64, String, Vec<[f64; 4]>) {
     let start_eq = req.starting_bankroll;
     let legacy_slot_frac = 1.0 / (ctx.strategies.len().max(1) as f64);
     let taker_slip = req.slippage_cents / 100.0;
@@ -1923,7 +1990,7 @@ fn replay_oos_comparison(
     let mut alloc_current_dd_pct = 0.0f64;
     let mut alloc_fees = 0.0f64;
     let mut recent_returns: Vec<f64> = Vec::with_capacity(16);
-    let mut oos_window_returns: Vec<(f64, f64)> = Vec::with_capacity(oos_by_epoch.len());
+    let mut oos_window_returns: Vec<[f64; 4]> = Vec::with_capacity(oos_by_epoch.len());
 
     let mut curve: Vec<ComparisonPoint> = Vec::with_capacity(oos_by_epoch.len());
 
@@ -2003,10 +2070,12 @@ fn replay_oos_comparison(
             }
         }
         if prev_alloc > 1e-9 && (!winner_weights_by_idx.is_empty()) {
+            let ct_f = alloc_epoch_contracts as f64;
             let r0 = finite_or((alloc_epoch_pnl / prev_alloc).clamp(-0.95, 5.0), 0.0);
-            let pnl_1c = alloc_epoch_pnl - (alloc_epoch_contracts as f64) * 0.01;
-            let r1 = finite_or((pnl_1c / prev_alloc).clamp(-0.95, 5.0), 0.0);
-            oos_window_returns.push((r0, r1));
+            let r1 = finite_or(((alloc_epoch_pnl - ct_f * 0.01) / prev_alloc).clamp(-0.95, 5.0), 0.0);
+            let r2 = finite_or(((alloc_epoch_pnl - ct_f * 0.02) / prev_alloc).clamp(-0.95, 5.0), 0.0);
+            let r3 = finite_or(((alloc_epoch_pnl - ct_f * 0.03) / prev_alloc).clamp(-0.95, 5.0), 0.0);
+            oos_window_returns.push([r0, r1, r2, r3]);
         }
         if alloc_traded && prev_alloc > 1e-9 {
             recent_returns.push(finite_or(alloc_epoch_pnl / prev_alloc, 0.0));
@@ -2168,7 +2237,7 @@ fn run_bootstrap_scenario(
 }
 
 fn compute_bootstrap_stress_sim(
-    oos_window_returns: &[(f64, f64)],
+    oos_window_returns: &[[f64; 4]],
     starting_bankroll: f64,
     max_daily_loss_dollars: f64,
 ) -> BootstrapStressSummary {
@@ -2181,7 +2250,7 @@ fn compute_bootstrap_stress_sim(
 }
 
 fn compute_bootstrap_stress_sim_trials(
-    oos_window_returns: &[(f64, f64)],
+    oos_window_returns: &[[f64; 4]],
     starting_bankroll: f64,
     max_daily_loss_dollars: f64,
     trials: usize,
@@ -2222,8 +2291,8 @@ fn compute_bootstrap_stress_sim_trials(
         };
     }
 
-    let r0: Vec<f64> = oos_window_returns.iter().map(|&(a, _)| a).collect();
-    let r1: Vec<f64> = oos_window_returns.iter().map(|&(_, b)| b).collect();
+    let r0: Vec<f64> = oos_window_returns.iter().map(|r| r[0]).collect();
+    let r1: Vec<f64> = oos_window_returns.iter().map(|r| r[1]).collect();
     let base = run_bootstrap_scenario(
         &r0,
         starting_bankroll,
@@ -2598,6 +2667,108 @@ fn apply_diversification_guard(
     )
 }
 
+/// Compute causal adverse-fill slippage ladder (`+0c`, `+1c`, `+2c`, `+3c`) and exact
+/// break-even slippage ceiling (`c`) respecting the `0.0%` daily loss rail gate.
+#[allow(clippy::too_many_arguments)]
+fn compute_slippage_ladder_and_cushion(
+    weighted_ev_cents: Option<f64>,
+    winner_legs: &[(f64, f64, usize, f64)],
+    windows_settled_oos: usize,
+    req: &AutoAllocatorRequest,
+    max_daily_loss_dollars: f64,
+    bootstrap_stress: &BootstrapStressSummary,
+    oos_window_returns: &[[f64; 4]],
+    is_maker: bool,
+    trials: usize,
+) -> (Vec<SlippageLadderStep>, Option<f64>, String) {
+    let oos_windows = windows_settled_oos.max(1) as f64;
+    let fill_rate = if is_maker { req.maker_fill_rate } else { 1.0 };
+    let mut base_daily_per_dollar = 0.0f64;
+    let mut daily_contracts_per_dollar = 0.0f64;
+    for &(alloc_pct, avg_entry_price, oos_trades, oos_ev_cents) in winner_legs {
+        let alloc_frac = alloc_pct.max(0.0) / 100.0;
+        if alloc_frac <= 0.0 {
+            continue;
+        }
+        let p = avg_entry_price.clamp(0.01, 0.99);
+        let fire_rate = (oos_trades as f64 / oos_windows).min(1.0);
+        let ct_rate = (alloc_frac / p) * fire_rate * fill_rate;
+        daily_contracts_per_dollar += ct_rate;
+        base_daily_per_dollar += ct_rate * (oos_ev_cents / 100.0);
+    }
+
+    let trials = trials.max(100);
+    let mut ladder = Vec::with_capacity(4);
+    for (k, extra_c) in [0.0f64, 1.0, 2.0, 3.0].into_iter().enumerate() {
+        let net_ev = weighted_ev_cents.and_then(|ev| finite_opt(ev - extra_c));
+        let daily_dollars = if winner_legs.is_empty() {
+            0.0
+        } else {
+            finite_or(
+                req.starting_bankroll
+                    * WINDOWS_PER_DAY_15M
+                    * (base_daily_per_dollar - (extra_c / 100.0) * daily_contracts_per_dollar),
+                0.0,
+            )
+        };
+        let oos_net_pnl = if oos_window_returns.is_empty() || winner_legs.is_empty() {
+            0.0
+        } else {
+            let mut eq = req.starting_bankroll;
+            for row in oos_window_returns {
+                eq = (eq * (1.0 + row[k])).max(0.0);
+            }
+            finite_or(eq - req.starting_bankroll, 0.0)
+        };
+        let breach_prob = match k {
+            0 => bootstrap_stress.daily_rail_breach_prob_pct,
+            1 => bootstrap_stress.stress_1c_daily_rail_breach_prob_pct,
+            _ if oos_window_returns.is_empty() || winner_legs.is_empty() => 0.0,
+            _ => {
+                let rk: Vec<f64> = oos_window_returns.iter().map(|r| r[k]).collect();
+                run_bootstrap_scenario(
+                    &rk,
+                    req.starting_bankroll,
+                    max_daily_loss_dollars,
+                    trials,
+                    30,
+                    96,
+                    0x4F50_454E_4245_4C4C,
+                )
+                .daily_rail_breach_prob_pct
+            }
+        };
+        let positive_ev = net_ev.is_some_and(|ev| ev > 0.0);
+        let rail_safe = breach_prob <= 1e-9;
+        let survival_ok = !winner_legs.is_empty() && positive_ev && rail_safe;
+        ladder.push(SlippageLadderStep {
+            extra_slippage_cents: extra_c,
+            net_expectancy_cents: net_ev,
+            projected_daily_net_dollars: daily_dollars,
+            oos_net_pnl_dollars: oos_net_pnl,
+            daily_rail_breach_prob_pct: breach_prob,
+            positive_ev,
+            rail_safe,
+            survival_ok,
+        });
+    }
+
+    let breakeven_cents = if winner_legs.is_empty() {
+        None
+    } else {
+        weighted_ev_cents.and_then(|ev| finite_opt(ev.max(0.0)))
+    };
+    let status = match breakeven_cents {
+        None => "NO_DATA",
+        Some(c) if c < 1.0 || !ladder[0].rail_safe || !ladder[1].rail_safe => "THIN",
+        Some(c) if c >= 2.0 && ladder[2].survival_ok => "SAFE",
+        Some(_) => "MODERATE",
+    }
+    .to_string();
+
+    (ladder, breakeven_cents, status)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_session_briefing(
     req: &AutoAllocatorRequest,
@@ -2610,7 +2781,10 @@ fn compute_session_briefing(
     comparison: &AllocatorComparison,
     daily_target: &DailyTargetVerdict,
     regime_stability: &RegimeStabilityReport,
-    oos_window_returns: &[(f64, f64)],
+    breakeven_slippage_cents: Option<f64>,
+    slippage_cushion_status: &str,
+    slippage_ladder: &[SlippageLadderStep],
+    oos_window_returns: &[[f64; 4]],
     live_armed: bool,
 ) -> SessionBriefingReport {
     let expected_fill_edge_cents = forward_envelope
@@ -2644,10 +2818,10 @@ fn compute_session_briefing(
     if !oos_window_returns.is_empty() {
         let day_len = oos_window_returns.len().min(96);
         let mut acc = 0.0f64;
-        for (i, &(_, r_1c)) in oos_window_returns.iter().enumerate() {
-            acc += r_1c;
+        for (i, row) in oos_window_returns.iter().enumerate() {
+            acc += row[1];
             if i >= day_len {
-                acc -= oos_window_returns[i - day_len].1;
+                acc -= oos_window_returns[i - day_len][1];
             }
             if acc < worst_day_ret {
                 worst_day_ret = acc;
@@ -2687,8 +2861,11 @@ fn compute_session_briefing(
     let real_str = realized_fill_edge_cents
         .map(|v| format!("{v:+.2}c"))
         .unwrap_or_else(|| "n/a".to_string());
+    let cushion_str = breakeven_slippage_cents
+        .map(|v| format!("{v:.2}c"))
+        .unwrap_or_else(|| "n/a".to_string());
     let summary = format!(
-        "{status}: expected {exp_str} vs realized {real_str} · fee drag {fee_drag_cents:.2}c/ct · cluster trim {correlation_cluster_penalty_pct:.1}% · daily rail headroom ${daily_loss_headroom_dollars:.2} ({daily_loss_headroom_pct:.0}%) · regime {}",
+        "{status}: expected {exp_str} vs realized {real_str} · fee drag {fee_drag_cents:.2}c/ct · cluster trim {correlation_cluster_penalty_pct:.1}% · daily rail headroom ${daily_loss_headroom_dollars:.2} ({daily_loss_headroom_pct:.0}%) · regime {} · slip cushion {cushion_str} ({slippage_cushion_status})",
         regime_stability.status
     );
 
@@ -2710,6 +2887,9 @@ fn compute_session_briefing(
         regime_stability: regime_stability.status.clone(),
         calm_expectancy_cents: regime_stability.active_calm_ev_cents,
         high_vol_expectancy_cents: regime_stability.active_high_vol_ev_cents,
+        breakeven_slippage_cents,
+        slippage_cushion_status: slippage_cushion_status.to_string(),
+        slippage_ladder: slippage_ladder.to_vec(),
         summary,
     }
 }
@@ -3146,6 +3326,24 @@ fn compute_preset_leaderboard(
             is_maker,
             slip_dollars,
         );
+        let preset_legs: Vec<(f64, f64, usize, f64)> = oos_sel
+            .accepted
+            .iter()
+            .zip(guarded_oos_weights.iter())
+            .map(|(c, &w)| (w, c.avg_entry_price, c.trades, c.net_expectancy_cents))
+            .collect();
+        let (slippage_ladder, breakeven_slippage_cents, slippage_cushion_status) =
+            compute_slippage_ladder_and_cushion(
+                net_expectancy_cents,
+                &preset_legs,
+                ctx.windows_settled_oos,
+                &cand_req,
+                rails.max_daily_loss_dollars,
+                &boot,
+                &oos_returns,
+                is_maker,
+                500,
+            );
 
         let note = if active_winners_count == 0 {
             format!("0 qualifying winners at min_oos >= {}", cand_req.min_oos_trades)
@@ -3155,8 +3353,11 @@ fn compute_preset_leaderboard(
                 boot.daily_rail_breach_prob_pct, boot.stress_1c_daily_rail_breach_prob_pct
             )
         } else {
+            let cushion_label = breakeven_slippage_cents
+                .map(|c| format!("{c:.2}c ({slippage_cushion_status})"))
+                .unwrap_or_else(|| "n/a".to_string());
             format!(
-                "0.0% rail breach (OOS & +1c) · {regime_stability} · +1c P50 ${:.2} · +1c P95 DD {:.1}%",
+                "0.0% rail breach (OOS & +1c) · {regime_stability} · cushion {cushion_label} · +1c P50 ${:.2} · +1c P95 DD {:.1}%",
                 boot.stress_1c_p50_end_equity, boot.stress_1c_p95_max_drawdown_pct
             )
         };
@@ -3184,6 +3385,9 @@ fn compute_preset_leaderboard(
             calm_stress_1c_survival,
             high_vol_stress_1c_survival,
             regime_stability,
+            breakeven_slippage_cents,
+            slippage_cushion_status,
+            slippage_ladder,
             note,
         });
     }
@@ -4470,5 +4674,118 @@ mod tests {
         };
         let calm_rep = compute_auto_allocator_report(&calm_ctx, &calm_req, &rails, false, false);
         assert_eq!(calm_rep.regime_stability.status, "CALM-ONLY");
+    }
+
+    #[test]
+    fn slippage_ladder_degrades_monotonically_and_computes_exact_breakeven_cushion() {
+        let mut entries = Vec::new();
+        for i in 0..123 {
+            let epoch = 1_773_000_000 + i * 900;
+            entries.push(TournamentEntry {
+                ticker: format!("KXBTC15M-SLIP-{i:03}"),
+                series: "KXBTC15M".into(),
+                close_epoch: epoch,
+                secs_to_close: 300,
+                strategy_idx: 0,
+                strategy: "safe-edge".into(),
+                side: "yes".into(),
+                entry_price: 0.60,
+                // 75% WR at 60c: gross EV = +15.0c, maker fee = 0.42c -> net EV ≈ +14.58c (SAFE >= 2c).
+                won: (i % 4) != 0,
+            });
+            entries.push(TournamentEntry {
+                ticker: format!("KXBTC15M-SLIP-{i:03}"),
+                series: "KXBTC15M".into(),
+                close_epoch: epoch,
+                secs_to_close: 300,
+                strategy_idx: 1,
+                strategy: "sub1c-edge".into(),
+                side: "yes".into(),
+                entry_price: 0.60,
+                // 25/41 = 60.976% WR at 60c across OOS (i = 82..123): gross +0.976c - 0.42c fee = +0.556c -> THIN (< 1c).
+                won: (i % 41) < 25,
+            });
+        }
+        let ctx_safe = make_ctx(
+            vec![StrategyMeta {
+                name: "safe-edge".into(),
+                side: "yes".into(),
+            }],
+            entries.iter().filter(|e| e.strategy_idx == 0).cloned().collect(),
+            123,
+            41,
+            1_773_000_000 + 82 * 900,
+        );
+        let ctx_thin = make_ctx(
+            vec![StrategyMeta {
+                name: "sub1c-edge".into(),
+                side: "yes".into(),
+            }],
+            entries
+                .iter()
+                .filter(|e| e.strategy_idx == 1)
+                .cloned()
+                .map(|mut e| {
+                    e.strategy_idx = 0;
+                    e
+                })
+                .collect(),
+            123,
+            41,
+            1_773_000_000 + 82 * 900,
+        );
+        let rails = RiskRailsConfig {
+            max_daily_loss_dollars: 500.0,
+            ..RiskRailsConfig::default()
+        };
+        let req_safe = AutoAllocatorRequest {
+            starting_bankroll: 500.0,
+            maker_fill_rate: 0.50,
+            max_slot_risk_pct: 0.5,
+            max_total_heat_pct: 2.0,
+            min_oos_trades: 20,
+            require_stress_resilience: false,
+            ..Default::default()
+        };
+        let req_thin = AutoAllocatorRequest {
+            starting_bankroll: 500.0,
+            min_oos_trades: 20,
+            require_stress_resilience: false,
+            ..Default::default()
+        };
+        let rep_safe = compute_auto_allocator_report(&ctx_safe, &req_safe, &rails, false, false);
+        assert!(!rep_safe.live_armed);
+        assert_eq!(rep_safe.slippage_ladder.len(), 4);
+        assert_eq!(rep_safe.session_briefing.slippage_ladder.len(), 4);
+        for k in 0..3 {
+            let cur = &rep_safe.slippage_ladder[k];
+            let nxt = &rep_safe.slippage_ladder[k + 1];
+            assert!(
+                cur.net_expectancy_cents.unwrap() > nxt.net_expectancy_cents.unwrap(),
+                "ladder EV must strictly decrease with slippage"
+            );
+            assert!(
+                cur.projected_daily_net_dollars >= nxt.projected_daily_net_dollars - 1e-6,
+                "daily net must not increase with slippage"
+            );
+            assert!(
+                cur.daily_rail_breach_prob_pct <= nxt.daily_rail_breach_prob_pct + 1e-9,
+                "rail breach prob must be monotone across slippage rungs"
+            );
+        }
+        assert!(rep_safe.breakeven_slippage_cents.unwrap() >= 2.0);
+        assert_eq!(rep_safe.slippage_cushion_status, "SAFE");
+        assert_eq!(
+            rep_safe.session_briefing.slippage_cushion_status,
+            rep_safe.slippage_cushion_status
+        );
+
+        let rep_thin = compute_auto_allocator_report(&ctx_thin, &req_thin, &rails, false, false);
+        assert_eq!(rep_thin.slippage_ladder.len(), 4);
+        let thin_be = rep_thin.breakeven_slippage_cents.unwrap();
+        assert!(thin_be < 1.0, "expected <1c break-even cushion, got {thin_be}");
+        assert_eq!(rep_thin.slippage_cushion_status, "THIN");
+        assert!(!rep_thin.slippage_ladder[1].positive_ev);
+        assert!(!rep_thin.slippage_ladder[1].survival_ok);
     }
 }

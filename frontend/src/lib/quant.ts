@@ -802,7 +802,7 @@ export function validateRuneSourceClient(source: string): RuneValidationResult {
   if (valid) {
     diagnostics.push({
       level: "info",
-      message: `Compiled paper strategy '${name}' (${side.toUpperCase()} side) — whole-cent bounds enforced.`,
+      message: `Compiled paper strategy '${name}' (${side.toUpperCase()} side), whole-cent bounds enforced.`,
     });
   }
 

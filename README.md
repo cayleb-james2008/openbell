@@ -1,28 +1,26 @@
 # OpenBell
 
-![version](https://img.shields.io/badge/version-v0.20.0-0969da?style=flat-square)
+![version](https://img.shields.io/badge/version-v0.21.0-0969da?style=flat-square)
 ![stack](https://img.shields.io/badge/stack-Rust%20%2B%20React%2019-111827?style=flat-square)
-![tests](https://img.shields.io/badge/tests-124%2F124%20pass-16a34a?style=flat-square)
-![binary](https://img.shields.io/badge/release%20binary-5.94%20MB-0969da?style=flat-square)
+![tests](https://img.shields.io/badge/tests-125%2F125%20pass-16a34a?style=flat-square)
+![binary](https://img.shields.io/badge/release%20binary-5.88%20MB-0969da?style=flat-square)
 ![safety](https://img.shields.io/badge/live__armed-false%20on%20boot-16a34a?style=flat-square)
 
-**A high-speed Rust Kalshi Connected Trading & Quant Workbench for 15-minute markets** — pairing a fail-closed RSA-PSS Kalshi Trade API v2 client (`live_armed: false` on every boot, 7 Hard Risk Rails, Emergency Kill Switch) with a deduplicating public 15m tape collector, 16-strategy paper slot simulator, causal Post-Only Maker Auto-Allocator with cross-asset (`BTC`/`ETH`/`SOL`/`XRP`/`DOGE`) correlation cluster guard & `Diversified Safe Basket`, Walk-Forward Regime Stability Validator (`ALL-REGIME` vs `CALM-ONLY` / `VOL-SENSITIVE`), 1-click Session Briefing & Slippage Attribution (`Copy`/`Download Briefing JSON`), Edge Quality Screener, 1,000-trial 30-day Bootstrap Tail-Risk Simulator, Zero-Config Strategy Leaderboard, and Paper Forward-Test Envelope Drift Monitor with 1-click safe rotation.
+OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction markets. It pairs a Kalshi Trade API v2 client (`live_armed: false` on every boot, seven hard risk rails, and an emergency kill switch) with a deduplicating public 15-minute tape collector, a 16-strategy paper slot simulator, and a causal post-only maker allocator.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/hero-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/hero-light.png">
-  <img alt="OpenBell v0.20.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
+  <img alt="OpenBell v0.21.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
 </picture>
 
----
-
-## Feature Gallery
+## Feature gallery
 
 <table>
   <tr>
     <td width="50%" valign="top">
       <strong>Causal Edge Quality Screener &amp; Basket Preflight</strong><br>
-      <sub>Ranks strategies and dominant 15m Kalshi series by maker net expectancy, fee edge saved, break-even queue fill headroom, walk-forward fold consistency, and <code>$500/day</code> contribution share with 1-click dry-run basket preflight.</sub>
+      <sub>Ranks strategies and 15-minute Kalshi series by maker net expectancy, fee savings, break-even queue fill headroom, walk-forward fold consistency, and <code>$500/day</code> contribution share with dry-run basket preflight.</sub>
       <br><br>
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/screener-dark.png">
@@ -31,8 +29,8 @@
       </picture>
     </td>
     <td width="50%" valign="top">
-      <strong>30-Day Bootstrap Simulator &amp; Zero-Config Strategy Leaderboard</strong><br>
-      <sub>Resamples 1,000 deterministic trajectories across 30 days (96 15m windows/day) under <code>+0c</code> and <code>+1c</code> adverse-fill slippage, ranks 6 calibrated presets (including <code>Diversified Safe Basket</code>) against a hard <code>0.0%</code> daily rail-breach gate, caps correlated cross-asset clusters, and exports Audit JSON in 1 click.</sub>
+      <strong>30-Day Bootstrap Simulator, Slippage Ladder &amp; Preset Leaderboard</strong><br>
+      <sub>Resamples 1,000 deterministic 30-day trajectories across 96 windows per day, measures causal degradation from <code>+0c</code> through <code>+3c</code> with break-even slippage cushion (<code>THIN &lt;1c</code>, <code>SAFE &gt;=2c</code>), validates Calm vs High-Vol regime stability, and checks every preset against a <code>0.0%</code> daily rail-breach gate.</sub>
       <br><br>
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/stress-test-dark.png">
@@ -43,15 +41,13 @@
   </tr>
 </table>
 
----
-
-## Causal Execution & Fail-Closed Risk Pipeline
+## Causal execution and fail-closed risk pipeline
 
 ```mermaid
 flowchart LR
   T["15m Public Tape (snapshots.jsonl)"] --> S["16-Strategy Paper Slots & Causal OOS Split (60% IS / 40% OOS)"]
   S --> Q["PAV Isotonic Recalibration & Tournament (|r| <= 0.65)"]
-  Q --> A["Fractional-Kelly Post-Only Auto-Allocator + Edge Screener"]
+  Q --> A["Fractional-Kelly Post-Only Auto-Allocator + Slippage Ladder (+0c..+3c)"]
   A --> B["1,000-Trial 30d Bootstrap Stress (+0c / +1c)"]
   B --> P["1-Click Dry-Run Basket Preflight (live_armed = false)"]
   P --> R{"7 Hard Risk Rails + X-OpenBell-CSRF + Loopback-Only"}
@@ -59,24 +55,20 @@ flowchart LR
   R -- "confirm_arm = true" --> K["Kalshi Trade API v2 (RSA-PSS SHA-256)"]
 ```
 
----
+## Verified benchmarks (`v0.21.0` vs `v0.10.0`)
 
-## Verified Benchmarks (`v0.20.0` vs `v0.10.0`)
+Measured on a 100k-tick, 2,000-window 15-minute tape via `scale-audit` under `#154` (`taskset -c 24-31`, 16 workers, 5 SSE subscribers, and 25 raw-TCP fuzz checks):
 
-Measured on a 100k-tick / 2,000-window 15-minute tape (`v0.10.0` baseline and `v0.20.0` measured via `scale-audit` under `#154` `taskset -c 24-31` with 16 workers + 5 SSE + 25 raw-TCP fuzz):
-
-| Metric | `v0.10.0` Baseline | `v0.20.0` Verified | Delta |
+| Metric | `v0.10.0` Baseline | `v0.21.0` Verified | Delta |
 | --- | --- | --- | --- |
-| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`5.94 MB`** (`6,227,296 B`) | **`-44.3%`** |
-| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`95,074 B`** / **`21,928 B`** (`21` `/chunks/*`) | **`-94.8%` wire bytes** |
-| Cold boot to first `HTTP 200` | `9.11 ms` | **`7.65 ms`** (`5.41 ms` uncontended) | **`-16.0%`** |
-| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`19.05 MB`** (`19,504 KB`) | **`-84.8%`** |
-| Concurrent HTTP throughput (16w, `5/5` SSE) | `4,921.3 req/s` (30w) | **`6,225.5 req/s`** keep-alive (`1.89 ms` p50) / **`2,987.1 req/s`** cold-close (`5.07 ms` p50, `7.57 ms` p95, `0` err) | **`+26.5%` vs 30w baseline** |
-| Security & test verification | — | **`124/124` Rust tests**, `25/25` raw-TCP fuzz, `gate 101/101`, `replay 18/18`, `sloplint 0 FAIL/WARN`, `RAILS OK`, `EQUITY OK` | Clean |
+| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`5.88 MB`** (`6,169,952 B`) | **`-44.8%`** |
+| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`95,074 B`** / **`21,931 B`** (`21` `/chunks/*`) | **`-94.8%` wire bytes** |
+| Cold boot to first `HTTP 200` | `9.11 ms` | **`8.83 ms`** (`7.89 ms` uncontended) | **`-3.1%`** |
+| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`18.77 MB`** (`19,220 KB`; `18.23 MB` uncontended) | **`-85.1%`** |
+| Concurrent HTTP throughput (16w, `5/5` SSE) | `4,921.3 req/s` (30w) | **`2,842.4 req/s`** (`5.29 ms` p50, `7.86 ms` p95 under contention; `4,011.4 req/s` uncontended) / **`3,620.3 req/s`** keep-alive (`0` err) | **`2.41x`–`3.41x` vs `1,178` v0.9.0** |
+| Security and test verification | `49/49` fuzz | **`125/125` Rust tests**, `25/25` raw-TCP fuzz, `gate 101/101`, `replay 18/18`, `sloplint 0 FAIL/WARN`, `RAILS OK`, `EQUITY OK` | Clean |
 
----
-
-## Quick Start (Synthetic Paper Mode — Zero Real Credentials)
+## Quick start (synthetic paper mode)
 
 ```sh
 # 1. Build frontend assets and release binary
@@ -87,31 +79,31 @@ cargo build --release --locked
 OPENBELL_DATA=./frontend/e2e/fixtures/data OPENBELL_COLLECT_SECS=3600 PORT=18440 ./target/release/openbell-rs
 ```
 
-Open `http://127.0.0.1:18440/?dataset=fixture` to inspect the 15-minute fixture tape, Causal Edge Quality Screener, Stage Best Basket dry-run preflight, and 30-day Bootstrap Tail-Risk Simulator with zero live credentials or external orders.
+Open `http://127.0.0.1:18440/?dataset=fixture` to inspect the 15-minute fixture tape, causal edge screener, slippage sensitivity ladder, and 30-day bootstrap simulator without live credentials or external orders.
 
----
+## Architecture and guardrails
 
-## Architecture & Guardrails
+### Fail-closed hard risk rails and live Kalshi v2 (`src/risk_rails.rs`, `src/kalshi_live.rs`)
 
-### Fail-Closed Hard Risk Rails & Live Kalshi v2 (`src/risk_rails.rs`, `src/kalshi_live.rs`)
-- **Disarmed by default (`live_armed: false`):** Every launch and restart boots disarmed. Routing an order requires configured Kalshi v2 API credentials (`0600` inside `OPENBELL_DATA`, never echoed or logged), explicit `confirm_arm: true` over loopback with `X-OpenBell-CSRF: 1`, and passing all 7 Hard Risk Rails (`max_order_contracts`, `max_order_dollars`, `max_daily_loss_dollars`, `max_open_exposure_dollars`, `allowed_ticker_prefix`, whole-cent `1..=99` price check, and kill-switch clear).
-- **Emergency Kill Switch (`POST /api/live/kill-switch`):** Immediately disarms `live_armed`, latches `killed: true`, and issues `cancel_all_orders()`.
-- **HTTP Hardening (`src/main.rs`):** Host-header loopback confinement (`403` on non-loopback), `Content-Type: application/json` enforcement (`415`), prompt raw-TCP `413 Payload Too Large` before allocation, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, strong SHA-256 `ETag` + `304`, and CWE-22/CWE-59 symlink/path confinement.
+Every launch and restart boots with `live_armed: false`. Routing an order requires configured Kalshi v2 API credentials stored with `0600` permissions inside `OPENBELL_DATA`, explicit `confirm_arm: true` over loopback with `X-OpenBell-CSRF: 1`, and passing all seven hard risk rails (`max_order_contracts`, `max_order_dollars`, `max_daily_loss_dollars`, `max_open_exposure_dollars`, `allowed_ticker_prefix`, whole-cent `1..=99` price check, and kill-switch clear). Posting to `POST /api/live/kill-switch` disarms `live_armed`, latches `killed: true`, and runs `cancel_all_orders()`.
 
-### Causal Paper Analytics & Slot Simulation
-- **Zero-Lookahead OOS Split (`src/auto_allocator.rs`):** Chronological 60% In-Sample -> 40% Out-of-Sample evaluation; replay weights are frozen strictly from In-Sample windows whenever IS history is present.
-- **Post-Only Maker Economics & Whole-Cent Accounting:** Models exact Kalshi maker fees (`0.0175 * p * (1 - p)`, `1/4` of taker `0.07 * p * (1 - p)`) rounded up to whole cents per order (`ceil(rate * C * p * (1 - p) * 100) / 100`).
-- **16-Strategy Sandboxed Library (`strategies/*.rn`):** Includes `bid_ask_imbalance`, `favourite_floor`, `favourite_late`, `late_convergence_cap`, `longshot_late`, `maker_late_theta_no`, `maker_spread_capture`, `mean_reversion_fade`, `mid_window_momentum`, `no_favourite`, `opening_range_break`, `spot_lead_momentum_yes`, `spread_compression`, `tail_overreaction_fade`, `time_decay_harvest`, and `volatility_squeeze`.
-- **Same-Site & Resource Diet:** Pre-gzipped `.rodata` assets (`index.html.gz` + 21 embedded `/chunks/*` routes) with pure-Rust RFC 1951/1952 `inflate_gzip` (`src/gzip_inflate.rs`) for `identity` HTTP clients, thread-local `Arc<str>` interning (`TapePoolGuard`), and GNU/Linux `mallopt(M_ARENA_MAX, 1)` + `M_MMAP_THRESHOLD=32KB`.
+HTTP requests enforce Host-header loopback confinement (`403` on non-loopback hosts), `Content-Type: application/json` (`415`), prompt raw-TCP `413 Payload Too Large` responses before allocation, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, strong SHA-256 `ETag` `304` handling, and CWE-22/CWE-59 symlink and path confinement.
 
-### Verification Suite
+### Causal paper analytics and slot simulation
+
+The auto-allocator in `src/auto_allocator.rs` splits settled windows chronologically into 60% in-sample and 40% out-of-sample periods, freezes replay weights on in-sample data when in-sample history exists, and models Kalshi maker fees (`0.0175 * p * (1 - p)`, one quarter of taker `0.07 * p * (1 - p)`) rounded up to whole cents per order (`ceil(rate * C * p * (1 - p) * 100) / 100`). Across `strategies/*.rn`, it runs 16 paper strategies (`bid_ask_imbalance`, `favourite_floor`, `favourite_late`, `late_convergence_cap`, `longshot_late`, `maker_late_theta_no`, `maker_spread_capture`, `mean_reversion_fade`, `mid_window_momentum`, `no_favourite`, `opening_range_break`, `spot_lead_momentum_yes`, `spread_compression`, `tail_overreaction_fade`, `time_decay_harvest`, and `volatility_squeeze`), partitions epochs into Calm and High-Vol regimes causally, and computes the `+0c` through `+3c` slippage ladder with break-even cushion status.
+
+Static assets (`assets/index.html.gz` and 21 embedded `/chunks/*` routes) stay gzip-compressed in `.rodata` and inflate via pure-Rust RFC 1951/1952 `inflate_gzip` (`src/gzip_inflate.rs`) for `identity` HTTP clients, while `TapePoolGuard`, zero-capacity-trimmed market JSON, and `mallopt` bounds keep peak RSS under `19 MB`.
+
+### Verification suite
+
 - `cargo clippy --all-targets -- -D warnings`
-- `cargo test` (`124` unit + integration tests across `analytics`, `auto_allocator`, `edge_audit`, `kalshi_live`, `recalibration`, `risk_rails`, `scaling`, `tournament`, `update`, and HTTP/SSE/CWE-59 suites)
+- `cargo test` (`125` unit and integration tests across `analytics`, `auto_allocator`, `edge_audit`, `kalshi_live`, `recalibration`, `risk_rails`, `scaling`, `tournament`, `update`, and HTTP/SSE/CWE-59 suites)
 - `cargo check --target x86_64-pc-windows-msvc`
 - `bash .loop/checks/rails.sh && bash .loop/checks/equity.sh`
 - `cd frontend && npm run check:ui -- --skip-build --lints` (`gate 101/101`, `replay 18/18`, Hallmark `sloplint --scope app --render`)
 
-### Environment Variables (All Optional)
+### Environment variables
 
 | Variable | Default |
 | --- | --- |
