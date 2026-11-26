@@ -521,7 +521,8 @@ for (const m of measures) {
   ok('Strategy Sandbox editor opens inline', await p.locator('#rune-sandbox #rune-editor').isVisible())
   await p.locator('#sandbox-validate-btn').click(); await p.waitForTimeout(250)
   ok('Validate Strategy reports compile diagnostics', (await p.locator('#sandbox-diagnostics').innerText()).includes('Compile passed'))
-  await p.locator('#sandbox-backtest-btn').click(); await p.waitForTimeout(350)
+  await p.locator('#sandbox-backtest-btn').click()
+  await p.waitForFunction(() => (document.querySelector('[data-sandbox-results]')?.textContent || '').includes('Paper Net P&L'), { timeout: 5000 }).catch(() => {})
   const sbTxt = await p.locator('[data-sandbox-results]').innerText()
   ok('Backtest on Tape renders paper P&L, Sharpe, Max Drawdown & Brier',
     sbTxt.includes('Paper Net P&L') && sbTxt.includes('Sharpe') && sbTxt.includes('Max Drawdown') && sbTxt.includes('Brier Score'),
@@ -2650,6 +2651,235 @@ for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light'
   await p.goto(FX); await ready(p); await p.waitForTimeout(300)
   ok('empty tape shows Collect live tape onboarding', (await p.locator('#markets-card').innerText()).includes('No snapshots collected yet'))
   ok('empty library named in standing tile', (await p.locator('#standing-label').innerText()).includes('No strategies in the library'))
+  await ctx.close()
+}
+
+// 6b. Cycle 3 H1 edge-case hardening: E1 empty/malformed/aborted history, E2 null sync & double-submit locks, E3 null markout N/A & double-submit locks
+{
+  const { ctx, p } = await open(390, 844, 'light')
+  await p.route('**/api/home*', async r => {
+    const res = await r.fetch()
+    const j = await res.json()
+    j.version = '0.32.0'
+    j.capabilities = ['sse', 'live_kalshi', 'risk_rails', 'shadow_runner', 'live_reconcile', 'execution_health']
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
+  })
+  await p.route('**/api/orderbook/stream-status*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ws_connected: true,
+      mode: 'ws',
+      subscribed_tickers: ['KXBTC15M-MOCK', 'KXETH15M-MOCK'],
+      active_l2_tickers: ['KXBTC15M-MOCK', 'KXETH15M-MOCK'],
+      active_books: 2,
+      stale_books: 0,
+      auto_subscribed_count: 2,
+      last_trade_ms: null,
+      tape_sync_rate_hz: 1.5,
+    }),
+  }))
+  await p.route(/\/api\/orderbook\/history(\?.*)?$/, async r => {
+    const u = new URL(r.request().url())
+    const t = (u.searchParams.get('ticker') || '').toUpperCase()
+    if (t === 'KXBTC15M-MOCK') {
+      await new Promise(res => setTimeout(res, 350))
+      try {
+        await r.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            ok: true,
+            ticker: t,
+            records: [
+              { ticker: t, last_seq: 99, updated_ms: 9e18, yes_bids: [[50, 10]], yes_asks: [[52, 10]], best_yes_bid: 50, best_yes_ask: 52, spread_cents: 2 },
+            ],
+          }),
+        })
+      } catch {}
+      return
+    }
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, ticker: t, records: [] }),
+    })
+  })
+  await p.route(/\/api\/orderbook(\?.*)?$/, r => {
+    const u = new URL(r.request().url())
+    const t = (u.searchParams.get('ticker') || 'KXBTC15M-MOCK').toUpperCase()
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, ticker: t, yes_bids: [[54, 12]], yes_asks: [[56, 10]], best_yes_bid: 54, best_yes_ask: 56, spread_cents: 2, last_seq: 10, updated_ms: 9e18, source: 'ws', stale: false }),
+    })
+  })
+
+  let reconcilePosts = 0
+  let resetKillPosts = 0
+  let syncPosts = 0
+  let quarantinePosts = 0
+  let killedState = true
+
+  await p.route('**/api/live/status*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      configured: true,
+      environment: 'demo',
+      connected: true,
+      mode: 'paper',
+      live_armed: false,
+      killed: killedState,
+      kill_reason: killedState ? 'operator_kill_switch' : null,
+      last_venue_sync_epoch: null,
+      venue_sync_stale: false,
+      daily_realized_loss_dollars: 0,
+      open_exposure_dollars: 0,
+      rails: { max_order_contracts: 25, max_order_dollars: 25, max_daily_loss_dollars: 50, max_open_exposure_dollars: 100, allowed_ticker_prefix: 'KX' },
+    }),
+  }))
+  await p.route('**/api/live/account*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"configured":true,"connected":true,"balance_dollars":500,"portfolio_value_dollars":500}' }))
+  await p.route('**/api/live/positions*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"market_positions":[]}' }))
+  await p.route('**/api/live/orders*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"orders":[]}' }))
+  await p.route('**/api/live/fills*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"fills":[]}' }))
+  await p.unroute(/\/api\/live\/reconcile(\?.*)?$/)
+  await p.route(/\/api\/live\/reconcile(\?.*)?$/, async r => {
+    if (r.request().method() === 'POST') {
+      reconcilePosts += 1
+      await new Promise(res => setTimeout(res, 250))
+      return r.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ ok: true, last_sync_epoch: null, sync_stale: false, utc_day_loss_dollars: 0, open_exposure_dollars: 0, executions: [], discrepancies: [] }),
+      })
+    }
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, last_sync_epoch: null, sync_stale: false, utc_day_loss_dollars: 0, open_exposure_dollars: 0, executions: [], discrepancies: [] }),
+    })
+  })
+  await p.route('**/api/live/reset-kill*', async r => {
+    resetKillPosts += 1
+    killedState = false
+    await new Promise(res => setTimeout(res, 250))
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, status: { configured: true, environment: 'demo', connected: true, mode: 'paper', live_armed: false, killed: false, kill_reason: null } }),
+    })
+  })
+  await p.route('**/api/runner/status*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ mode: 'stopped', live_armed: false, killed: false, tick_interval_ms: 2000, cancel_before_close_secs: 30, bankroll_dollars: 250, active_slots: [], open_quotes: [], stats: { quotes_posted: 0, fills: 0, fill_rate_pct: 0, realized_pnl_dollars: 0, unrealized_exposure_dollars: 0, avg_fill_slippage_cents: 0, avg_queue_wait_secs: 0 } }),
+  }))
+  await p.route('**/api/runner/ledger*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"entries":[],"summary_by_strategy":[]}' }))
+  await p.route('**/api/runner/sync-allocator*', async r => {
+    syncPosts += 1
+    await new Promise(res => setTimeout(res, 250))
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, live_armed: false, mode: 'stopped', synced_slots: [], skipped_quarantined: ['null-markout-strat'] }) })
+  })
+  await p.unroute(/\/api\/analytics\/execution-health(\?.*)?$/)
+  await p.route('**/api/analytics/execution-health*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ok: true,
+      strategies: [
+        {
+          strategy: 'null-markout-strat',
+          status: 'active',
+          throttle_mult: 1.0,
+          reason: 'Pending +10s/+30s/+60s markout telemetry',
+          rolling_fills: 0,
+          markout_10s_cents: null,
+          markout_30s_cents: null,
+          markout_60s_cents: null,
+          settlement_markout_cents: null,
+          predicted_prob: null,
+          realized_win_rate: null,
+          assumed_fill_rate_pct: null,
+          realized_fill_rate_pct: null,
+          expected_slippage_cents: null,
+          realized_slippage_cents: null,
+          rolling_net_pnl_dollars: 0,
+        },
+      ],
+    }),
+  }))
+  await p.route('**/api/analytics/quarantine/override*', async r => {
+    quarantinePosts += 1
+    await new Promise(res => setTimeout(res, 250))
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        execution_health: {
+          ok: true,
+          strategies: [
+            { strategy: 'null-markout-strat', status: 'quarantined', throttle_mult: 0, reason: 'Operator override', rolling_fills: 0, markout_10s_cents: null, markout_30s_cents: null, markout_60s_cents: null, settlement_markout_cents: null, rolling_net_pnl_dollars: 0 },
+          ],
+        },
+      }),
+    })
+  })
+
+  await p.goto(FX); await ready(p); await p.waitForTimeout(250)
+  // E1: open live ticker KXBTC15M-MOCK then immediately switch to KXETH15M-MOCK (empty records + malformed timestamp guard)
+  await p.locator('#tab-tape').click(); await p.waitForTimeout(150)
+  await p.locator('#l2-active-ticker-select').selectOption('KXBTC15M-MOCK')
+  await p.locator('#l2-inspect-ticker-btn').click(); await p.waitForTimeout(60)
+  await p.keyboard.press('Escape'); await p.waitForTimeout(100)
+  await p.locator('#l2-active-ticker-select').selectOption('KXETH15M-MOCK')
+  await p.locator('#l2-inspect-ticker-btn').click(); await p.waitForTimeout(450)
+  const drawerHistoryTxt = await p.locator('[data-market-drawer] [data-orderbook-history]').innerText()
+  const drawerBodyTxt = await p.locator('[data-market-drawer]').innerText()
+  await p.keyboard.press('Escape'); await p.waitForTimeout(200)
+  ok('E1 empty records[], malformed timestamps & rapid ticker switch AbortController guard hold at 390px',
+    drawerHistoryTxt.includes('No recorded L2 snapshots yet') && !/\bNaN\b|\bInvalid\b/i.test(drawerBodyTxt),
+    drawerHistoryTxt.slice(0, 80))
+
+  // E2: null last_sync_epoch + empty executions[] + double-submit locks on Reconcile Now & Reset Kill Latch
+  await p.locator('#tab-live').click(); await p.waitForTimeout(250)
+  await p.evaluate(() => {
+    const btn = document.querySelector('#reconcile-now-btn')
+    if (btn) { btn.click(); btn.click() }
+  })
+  await p.waitForTimeout(350)
+  await p.locator('#reset-kill-latch-btn').click(); await p.waitForTimeout(150)
+  await p.locator('#reset-kill-checkbox').click()
+  await p.evaluate(() => {
+    const btn = document.querySelector('#confirm-reset-kill-btn')
+    if (btn) { btn.click(); btn.click() }
+  })
+  await p.waitForTimeout(350)
+  const reconcilePanelTxt = await p.locator('#live-reconcile-panel').innerText()
+  ok('E2 null last_sync_epoch, empty executions[] & double-submit locks on Reconcile Now / Reset Kill Latch hold without NaN',
+    reconcilePosts === 1 && resetKillPosts === 1 && reconcilePanelTxt.includes('Not synced') && !/\bNaN\b|\bundefined\b/.test(reconcilePanelTxt),
+    `recPosts=${reconcilePosts} resetPosts=${resetKillPosts}`)
+
+  // E3: missing/null +10s/+30s/+60s markout renders N/A cleanly + double-submit locks on Sync to Runner & Quarantine override
+  await p.evaluate(() => {
+    const btn = document.querySelector('#execution-health-panel [data-quarantine-btn="null-markout-strat"]')
+    if (btn) { btn.click(); btn.click() }
+  })
+  await p.waitForTimeout(350)
+  const execNullTxt = await p.locator('#execution-health-panel').innerText()
+  const execM = await p.evaluate(MEASURE)
+  await p.locator('#tab-slots').click(); await p.waitForTimeout(250)
+  await p.locator('#sync-allocator-runner-btn:not([disabled])').waitFor({ state: 'visible', timeout: 5000 })
+  await p.evaluate(() => {
+    const btn = document.querySelector('#sync-allocator-runner-btn')
+    if (btn) { btn.click(); btn.click() }
+  })
+  await p.waitForTimeout(350)
+  const syncM = await p.evaluate(MEASURE)
+  ok('E3 null markout N/A formatting, 390px overflow & double-submit locks on Quarantine / Sync to Runner hold',
+    quarantinePosts === 1 && syncPosts === 1 && execNullTxt.includes('N/A / N/A / N/A') && !/\bNaN\b|\bundefined\b/.test(execNullTxt) && execM.docOverflow <= 0 && syncM.docOverflow <= 0,
+    `qPosts=${quarantinePosts} sPosts=${syncPosts} hasNA=${execNullTxt.includes('N/A / N/A / N/A')} execOv=${execM.docOverflow} syncOv=${syncM.docOverflow}`)
   await ctx.close()
 }
 

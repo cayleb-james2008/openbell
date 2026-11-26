@@ -205,6 +205,13 @@ function pickNum(o: Record<string, unknown>, keys: string[]): number | null {
   return null;
 }
 
+function safeEpochSecs(raw: number | null): number | null {
+  if (raw === null || !Number.isFinite(raw) || raw <= 0 || raw > 8_640_000_000_000) {
+    return null;
+  }
+  return Math.round(raw);
+}
+
 function centsOrDollars(o: Record<string, unknown>, dollarKeys: string[], centKeys: string[]): number | null {
   const d = pickNum(o, dollarKeys);
   if (d !== null) return d;
@@ -271,7 +278,7 @@ export function normalizeLiveStatus(raw: unknown, source: "server" | "client" = 
     dailyRealizedLossDollars: pickNum(o, ["daily_realized_loss_dollars", "daily_loss_dollars"]) ?? 0,
     openExposureDollars: pickNum(o, ["open_exposure_dollars"]) ?? 0,
     ordersPlacedToday: Math.max(0, Math.round(pickNum(o, ["orders_placed_today"]) ?? 0)),
-    lastVenueSyncEpoch: pickNum(o, ["last_venue_sync_epoch", "last_sync_epoch"]),
+    lastVenueSyncEpoch: safeEpochSecs(pickNum(o, ["last_venue_sync_epoch", "last_sync_epoch"])),
     venueSyncStale: Boolean(o.venue_sync_stale ?? o.sync_stale ?? false),
     lastError: typeof o.last_error === "string" && o.last_error ? o.last_error : null,
     source,
@@ -305,7 +312,7 @@ function normalizeReconcileExecutions(raw: unknown): ReconcileExecution[] {
       const priceCents =
         pickNum(x, ["price_cents", side === "yes" ? "yes_price" : "no_price", "yes_price", "no_price"]) ?? 50;
       return {
-        ts: Math.max(0, Math.round(pickNum(x, ["ts", "epoch", "created_epoch"]) ?? 0)),
+        ts: safeEpochSecs(pickNum(x, ["ts", "epoch", "created_epoch"])) ?? 0,
         orderId: cleanStr(x.order_id, ""),
         clientOrderId: cleanStr(x.client_order_id, ""),
         tradeId: cleanStr(x.trade_id ?? x.venue_id ?? x.fill_id ?? x.id, `exec-${idx}`),
@@ -313,7 +320,7 @@ function normalizeReconcileExecutions(raw: unknown): ReconcileExecution[] {
         side,
         action,
         count: Math.max(0, Math.round(pickNum(x, ["count", "contracts"]) ?? 0)),
-        priceCents: Math.round(priceCents),
+        priceCents: Number.isFinite(priceCents) ? Math.round(priceCents) : 50,
         isTaker: Boolean(x.is_taker),
         feeDollars: centsOrDollars(x, ["fee_dollars", "fee_cost_dollars"], ["fee_cents"]) ?? 0,
         revenueCents: Math.round(pickNum(x, ["revenue_cents"]) ?? 0),
@@ -343,7 +350,7 @@ export function normalizeLiveReconcile(
   const o = raw as Record<string, unknown>;
   return {
     ok: Boolean(o.ok ?? true),
-    lastSyncEpoch: pickNum(o, ["last_sync_epoch", "last_venue_sync_epoch"]),
+    lastSyncEpoch: safeEpochSecs(pickNum(o, ["last_sync_epoch", "last_venue_sync_epoch"])),
     syncStale: Boolean(o.sync_stale ?? o.venue_sync_stale ?? false),
     utcDayLossDollars:
       pickNum(o, ["utc_day_loss_dollars", "daily_realized_loss_dollars", "daily_loss_dollars"]) ?? 0,

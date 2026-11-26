@@ -100,23 +100,23 @@ function healthStatusProps(status: ExecutionHealthStatus): {
 }
 
 function fmtOptCents(v: number | null | undefined): string {
-  if (!isNum(v) || !Number.isFinite(v)) return "n/a";
+  if (!isNum(v) || !Number.isFinite(v)) return "N/A";
   return `${v >= 0 ? "+" : ""}${v.toFixed(2)}c`;
 }
 
 function fmtOptProbPct(v: number | null | undefined): string {
-  if (!isNum(v) || !Number.isFinite(v)) return "n/a";
+  if (!isNum(v) || !Number.isFinite(v)) return "N/A";
   const pct = v >= 0 && v <= 1 ? v * 100 : v;
   return `${pct.toFixed(1)}%`;
 }
 
 function fmtOptPct(v: number | null | undefined): string {
-  if (!isNum(v) || !Number.isFinite(v)) return "n/a";
+  if (!isNum(v) || !Number.isFinite(v)) return "N/A";
   return `${v.toFixed(1)}%`;
 }
 
 function fmtOptPp(v: number | null | undefined): string {
-  if (!isNum(v) || !Number.isFinite(v)) return "n/a";
+  if (!isNum(v) || !Number.isFinite(v)) return "N/A";
   return `${v >= 0 ? "+" : ""}${v.toFixed(1)}pp`;
 }
 
@@ -129,7 +129,35 @@ function MarkoutSparkline({
   m30: number | null;
   m60: number | null;
 }) {
-  const vals = [m10 ?? 0, m30 ?? m10 ?? 0, m60 ?? m30 ?? m10 ?? 0];
+  const n10 = isNum(m10) ? m10 : null;
+  const n30 = isNum(m30) ? m30 : null;
+  const n60 = isNum(m60) ? m60 : null;
+  if (n10 === null && n30 === null && n60 === null) {
+    return (
+      <svg
+        width={56}
+        height={24}
+        viewBox="0 0 56 24"
+        aria-hidden="true"
+        className="shrink-0 text-ink-3"
+      >
+        <line
+          x1={2}
+          y1={12}
+          x2={54}
+          y2={12}
+          stroke="currentColor"
+          strokeOpacity={0.35}
+          strokeDasharray="2 2"
+          strokeWidth={1}
+        />
+      </svg>
+    );
+  }
+  const first = n10 ?? n30 ?? n60 ?? 0;
+  const second = n30 ?? first;
+  const third = n60 ?? second;
+  const vals = [first, second, third];
   const minV = Math.min(-1, ...vals);
   const maxV = Math.max(1, ...vals);
   const span = Math.max(0.5, maxV - minV);
@@ -164,9 +192,9 @@ function MarkoutSparkline({
         strokeLinejoin="round"
         points={pts}
       />
-      <circle cx={4} cy={mapY(vals[0])} r={1.8} fill="currentColor" />
-      <circle cx={28} cy={mapY(vals[1])} r={1.8} fill="currentColor" />
-      <circle cx={52} cy={mapY(vals[2])} r={2.2} fill="currentColor" />
+      {n10 !== null && <circle cx={4} cy={mapY(vals[0])} r={1.8} fill="currentColor" />}
+      {n30 !== null && <circle cx={28} cy={mapY(vals[1])} r={1.8} fill="currentColor" />}
+      {n60 !== null && <circle cx={52} cy={mapY(vals[2])} r={2.2} fill="currentColor" />}
     </svg>
   );
 }
@@ -364,6 +392,15 @@ export function ShadowRunnerPanel({
   const [overrideBusy, setOverrideBusy] = useState<string | null>(null);
   const [overrideError, setOverrideError] = useState<string | null>(null);
   const actionLockRef = useRef(false);
+  const overrideLockRef = useRef(false);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const serverSupported = supportsShadowRunner(home);
 
@@ -670,11 +707,13 @@ export function ShadowRunnerPanel({
 
   const handleOverrideQuarantine = useCallback(
     async (strategy: string, action: "reset" | "quarantine") => {
-      if (overrideBusy) return;
+      if (overrideLockRef.current || overrideBusy !== null) return;
+      overrideLockRef.current = true;
       setOverrideBusy(strategy);
       setOverrideError(null);
       try {
         const nextHealth = await overrideQuarantine(strategy, action, "1", undefined, dataset);
+        if (!mountedRef.current) return;
         setExecutionHealth(nextHealth);
         toast.success(
           action === "quarantine"
@@ -683,11 +722,13 @@ export function ShadowRunnerPanel({
         );
         void refreshAll(false);
       } catch (e) {
+        if (!mountedRef.current) return;
         const msg = e instanceof Error ? e.message : String(e);
         setOverrideError(msg);
         toast.error(`Quarantine override failed: ${msg}`);
       } finally {
-        setOverrideBusy(null);
+        overrideLockRef.current = false;
+        if (mountedRef.current) setOverrideBusy(null);
       }
     },
     [overrideBusy, refreshAll, dataset],
@@ -1163,7 +1204,7 @@ export function ShadowRunnerPanel({
         className="overflow-hidden rounded-[10px] border border-hairline bg-surface"
       >
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-board/50 px-4 py-3">
-          <div>
+          <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="text-sm font-semibold text-ink">Execution Health &amp; Markout</h3>
               <StatusPill
@@ -1200,41 +1241,45 @@ export function ShadowRunnerPanel({
         </div>
 
         <dl className="grid grid-cols-2 divide-y divide-hairline border-b border-hairline bg-board/25 text-xs sm:grid-cols-4 sm:divide-x sm:divide-y-0">
-          <div className="px-4 py-2.5">
+          <div className="min-w-0 px-4 py-2.5">
             <dt className="text-ink-2">Strategy Health</dt>
             <dd id="exec-health-counts" className="mono mt-0.5 text-sm font-semibold tabular-nums text-ink">
               {executionHealth.overall.active_count}A / {executionHealth.overall.throttled_count}T / {executionHealth.overall.quarantined_count}Q
             </dd>
           </div>
-          <div className="px-4 py-2.5">
+          <div className="min-w-0 px-4 py-2.5">
             <dt className="text-ink-2">Rolling Fills</dt>
             <dd id="exec-health-fills" className="mono mt-0.5 text-sm font-semibold tabular-nums text-ink">
               {executionHealth.overall.rolling_fills}
             </dd>
           </div>
-          <div className="px-4 py-2.5">
+          <div className="min-w-0 px-4 py-2.5">
             <dt className="text-ink-2">Avg +30s Markout</dt>
             <dd
               id="exec-health-avg-markout"
               className={
                 "mono mt-0.5 text-sm font-semibold tabular-nums " +
-                ((executionHealth.overall.avg_markout_30s_cents ?? 0) >= 0
-                  ? "text-success-foreground"
-                  : "text-destructive-foreground")
+                (executionHealth.overall.avg_markout_30s_cents === null
+                  ? "text-ink-3"
+                  : executionHealth.overall.avg_markout_30s_cents >= 0
+                    ? "text-success-foreground"
+                    : "text-destructive-foreground")
               }
             >
               {fmtOptCents(executionHealth.overall.avg_markout_30s_cents)}
             </dd>
           </div>
-          <div className="px-4 py-2.5">
+          <div className="min-w-0 px-4 py-2.5">
             <dt className="text-ink-2">Avg Slippage Residual</dt>
             <dd
               id="exec-health-avg-slip-res"
               className={
                 "mono mt-0.5 text-sm font-semibold tabular-nums " +
-                ((executionHealth.overall.avg_slippage_residual_cents ?? 0) <= 0
-                  ? "text-success-foreground"
-                  : "text-destructive-foreground")
+                (executionHealth.overall.avg_slippage_residual_cents === null
+                  ? "text-ink-3"
+                  : executionHealth.overall.avg_slippage_residual_cents <= 0
+                    ? "text-success-foreground"
+                    : "text-destructive-foreground")
               }
             >
               {fmtOptCents(executionHealth.overall.avg_slippage_residual_cents)}
@@ -1315,7 +1360,7 @@ export function ShadowRunnerPanel({
                         )}
                       </div>
                       {row.reason && (
-                        <div className="mt-0.5 text-xs text-ink-2">{row.reason}</div>
+                        <div className="mt-0.5 break-words text-xs text-ink-2">{row.reason}</div>
                       )}
                     </TableCell>
                     <TableCell className="mono tabular-nums text-right text-xs">
@@ -1367,20 +1412,22 @@ export function ShadowRunnerPanel({
                       </div>
                     </TableCell>
                     <TableCell className="m-full text-xs">
-                      <div className="flex items-center gap-2">
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
                         <MarkoutSparkline
                           m10={row.markout_10s_cents}
                           m30={row.markout_30s_cents}
                           m60={row.markout_60s_cents}
                         />
-                        <div className="mono tabular-nums space-y-0.5">
+                        <div className="mono min-w-0 tabular-nums space-y-0.5">
                           <div className="text-ink">
                             {fmtOptCents(row.markout_10s_cents)} /{" "}
                             <span
                               className={
-                                (row.markout_30s_cents ?? 0) >= 0
-                                  ? "font-semibold text-success-foreground"
-                                  : "font-semibold text-destructive-foreground"
+                                row.markout_30s_cents === null
+                                  ? "text-ink-3"
+                                  : row.markout_30s_cents >= 0
+                                    ? "font-semibold text-success-foreground"
+                                    : "font-semibold text-destructive-foreground"
                               }
                             >
                               {fmtOptCents(row.markout_30s_cents)}
@@ -1414,7 +1461,7 @@ export function ShadowRunnerPanel({
                             data-reset-quarantine-btn={row.strategy}
                             variant="outline"
                             size="sm"
-                            disabled={rowBusy}
+                            disabled={overrideBusy !== null || rowBusy}
                             onClick={() => void handleOverrideQuarantine(row.strategy, "reset")}
                           >
                             <RotateCcw className="size-3.5" strokeWidth={1.5} aria-hidden />
@@ -1426,7 +1473,7 @@ export function ShadowRunnerPanel({
                             data-quarantine-btn={row.strategy}
                             variant="danger"
                             size="sm"
-                            disabled={rowBusy}
+                            disabled={overrideBusy !== null || rowBusy}
                             onClick={() => void handleOverrideQuarantine(row.strategy, "quarantine")}
                           >
                             <ShieldBan className="size-3.5" strokeWidth={1.5} aria-hidden />

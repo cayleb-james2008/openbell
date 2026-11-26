@@ -409,9 +409,9 @@ export function TapeTab({
   return (
     <section id="markets-card" aria-label="Live 15-minute Kalshi market tape" className="space-y-3">
       {/* Toolbar: segmented status track + dynamically derived series pills + SSE status */}
-      <div className="flex flex-wrap items-center justify-between gap-2.5">
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-2.5">
         <div
-          className="inline-flex flex-wrap items-center gap-0.5 rounded-md border border-hairline bg-track p-0.5"
+          className="inline-flex max-w-full flex-wrap items-center gap-0.5 rounded-md border border-hairline bg-track p-0.5"
           role="group"
           aria-label="Filter markets by status"
         >
@@ -451,8 +451,8 @@ export function TapeTab({
           })}
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Filter markets by crypto series">
+        <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
+          <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1" role="group" aria-label="Filter markets by crypto series">
             {seriesChips.map((sym) => (
               <button
                 key={sym}
@@ -524,8 +524,8 @@ export function TapeTab({
           id="tape-inline-chart"
           className="rounded-[10px] border border-hairline bg-surface p-3"
         >
-          <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex flex-wrap items-center gap-2">
+          <div className="mb-1.5 flex min-w-0 flex-wrap items-center justify-between gap-2">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
               <Badge variant="outline" className="mono text-xs">
                 {seriesShort(featuredMarket.series, featuredMarket.ticker)} 15m
               </Badge>
