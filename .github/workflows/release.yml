@@ -45,8 +45,17 @@ jobs:
           grep -qE "^## \[?$crate\]?( |$)" CHANGELOG.md || { echo "CHANGELOG.md has no entry for version $crate"; exit 1; }
           echo "publish=true" >> "$GITHUB_OUTPUT"
 
-  build:
+  test:
     needs: plan
+    if: ${{ needs.plan.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo test --locked
+
+  build:
+    needs: [plan, test]
     if: ${{ needs.plan.outputs.publish == 'true' }}
     strategy:
       fail-fast: false
