@@ -1,7 +1,7 @@
 // OpenBell Shadow & Fail-Closed Auto-Live Runner Control Deck & Persistent Ledger UI.
 // Supports mode control (Stopped / Shadow / confirmation-gated Live Auto), slot config,
 // live resting quotes with queue-ahead bar & fill ETA, strategy stats rollup, and filterable ledger.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Play,
@@ -61,6 +61,31 @@ import {
   subscribeRunnerStream,
   supportsShadowRunner,
 } from "@/lib/runner";
+
+function parseOptSlotInt(raw: string, minVal: number, maxVal: number): number | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n)) return undefined;
+  return Math.min(maxVal, Math.max(minVal, Math.round(n)));
+}
+
+function toSlotConfig(s: RunnerSlotConfig): RunnerSlotConfig {
+  return {
+    slot_id: s.slot_id,
+    strategy: s.strategy,
+    series: s.series,
+    max_contracts: s.max_contracts,
+    execution_mode: s.execution_mode,
+    auto_pause_drawdown_dollars: s.auto_pause_drawdown_dollars,
+    enabled: s.enabled,
+    ...(isNum(s.reprice_cooldown_secs) ? { reprice_cooldown_secs: s.reprice_cooldown_secs } : {}),
+    ...(isNum(s.max_replaces_per_window) ? { max_replaces_per_window: s.max_replaces_per_window } : {}),
+    ...(isNum(s.take_profit_cents) && s.take_profit_cents > 0 ? { take_profit_cents: s.take_profit_cents } : {}),
+    ...(isNum(s.stop_loss_cents) && s.stop_loss_cents > 0 ? { stop_loss_cents: s.stop_loss_cents } : {}),
+    ...(isNum(s.exit_before_close_secs) ? { exit_before_close_secs: s.exit_before_close_secs } : {}),
+  };
+}
 
 function shortUtcTime(iso: string, epoch: number): string {
   if (iso && iso.length >= 19) {
@@ -363,15 +388,7 @@ export function ShadowRunnerPanel({
   const [status, setStatus] = useState<RunnerStatus>(initialPreview.status);
   const [ledger, setLedger] = useState<RunnerLedgerResponse>(initialPreview.ledger);
   const [draftSlots, setDraftSlots] = useState<RunnerSlotConfig[]>(() =>
-    initialPreview.status.active_slots.map((s) => ({
-      slot_id: s.slot_id,
-      strategy: s.strategy,
-      series: s.series,
-      max_contracts: s.max_contracts,
-      execution_mode: s.execution_mode,
-      auto_pause_drawdown_dollars: s.auto_pause_drawdown_dollars,
-      enabled: s.enabled,
-    })),
+    initialPreview.status.active_slots.map((s) => toSlotConfig(s)),
   );
   const [cancelBeforeCloseSecs, setCancelBeforeCloseSecs] = useState<string>(
     String(initialPreview.status.cancel_before_close_secs),
@@ -417,17 +434,7 @@ export function ShadowRunnerPanel({
   }, [strategies, draftSlots]);
 
   const syncDraftFromStatus = useCallback((next: RunnerStatus) => {
-    setDraftSlots(
-      next.active_slots.map((s) => ({
-        slot_id: s.slot_id,
-        strategy: s.strategy,
-        series: s.series,
-        max_contracts: s.max_contracts,
-        execution_mode: s.execution_mode,
-        auto_pause_drawdown_dollars: s.auto_pause_drawdown_dollars,
-        enabled: s.enabled,
-      })),
-    );
+    setDraftSlots(next.active_slots.map((s) => toSlotConfig(s)));
     setCancelBeforeCloseSecs(String(next.cancel_before_close_secs));
     setBankrollDollars(String(next.bankroll_dollars));
     setConfigDirty(false);
@@ -539,7 +546,7 @@ export function ShadowRunnerPanel({
     try {
       const payload = {
         slots: draftSlots.map((s, idx) => ({
-          ...s,
+          ...toSlotConfig(s),
           slot_id: idx + 1,
           max_contracts: Math.max(1, Math.round(Number(s.max_contracts) || 1)),
           auto_pause_drawdown_dollars: Math.max(1, Number(s.auto_pause_drawdown_dollars) || 10),
@@ -1025,8 +1032,15 @@ export function ShadowRunnerPanel({
             {draftSlots.map((slot, idx) => {
               const runtime = runtimeBySlotId.get(slot.slot_id);
               const isPaused = Boolean(runtime?.paused);
+              const hasLifecycleBadges =
+                isNum(slot.reprice_cooldown_secs) ||
+                isNum(slot.max_replaces_per_window) ||
+                (isNum(slot.take_profit_cents) && slot.take_profit_cents > 0) ||
+                (isNum(slot.stop_loss_cents) && slot.stop_loss_cents > 0) ||
+                isNum(slot.exit_before_close_secs);
               return (
-                <TableRow key={`slot-${slot.slot_id}-${idx}`} data-runner-slot-row={slot.slot_id}>
+                <Fragment key={`slot-${slot.slot_id}-${idx}`}>
+                <TableRow data-runner-slot-row={slot.slot_id}>
                   <TableCell className="text-xs font-semibold text-ink">
                     <div className="flex flex-wrap items-center gap-1.5">
                       <span className="mono tabular-nums">#{slot.slot_id}</span>
@@ -1050,6 +1064,38 @@ export function ShadowRunnerPanel({
                         </StatusPill>
                       )}
                     </div>
+                    {hasLifecycleBadges && (
+                      <div
+                        data-slot-lifecycle-badges={slot.slot_id}
+                        className="mt-1.5 flex flex-wrap items-center gap-1 font-normal"
+                      >
+                        {isNum(slot.reprice_cooldown_secs) && (
+                          <Badge variant="outline" className="text-xs">
+                            Reprice {slot.reprice_cooldown_secs}s
+                          </Badge>
+                        )}
+                        {isNum(slot.max_replaces_per_window) && (
+                          <Badge variant="outline" className="text-xs">
+                            Max {slot.max_replaces_per_window}x
+                          </Badge>
+                        )}
+                        {isNum(slot.take_profit_cents) && slot.take_profit_cents > 0 && (
+                          <Badge variant="success" className="text-xs">
+                            TP +{slot.take_profit_cents}c
+                          </Badge>
+                        )}
+                        {isNum(slot.stop_loss_cents) && slot.stop_loss_cents > 0 && (
+                          <Badge variant="error" className="text-xs">
+                            SL -{slot.stop_loss_cents}c
+                          </Badge>
+                        )}
+                        {isNum(slot.exit_before_close_secs) && (
+                          <Badge variant="secondary" className="text-xs">
+                            Exit {slot.exit_before_close_secs}s
+                          </Badge>
+                        )}
+                      </div>
+                    )}
                     {runtime?.pause_reason && (
                       <div
                         data-slot-pause-reason={slot.slot_id}
@@ -1191,6 +1237,133 @@ export function ShadowRunnerPanel({
                     </Button>
                   </TableCell>
                 </TableRow>
+                <TableRow data-slot-lifecycle-row={slot.slot_id}>
+                  <td colSpan={9} className="m-full bg-board/40 px-3 py-2.5 align-middle text-sm text-ink">
+                    <div className="grid w-full grid-cols-2 gap-2.5 sm:grid-cols-3 lg:grid-cols-5">
+                      <div>
+                        <label
+                          htmlFor={`slot-${slot.slot_id}-reprice-cooldown`}
+                          className="block text-xs text-ink-3"
+                        >
+                          Reprice Cooldown (s)
+                        </label>
+                        <input
+                          id={`slot-${slot.slot_id}-reprice-cooldown`}
+                          data-slot-reprice-cooldown={slot.slot_id}
+                          type="number"
+                          min={0}
+                          max={300}
+                          step={1}
+                          placeholder="Off"
+                          value={isNum(slot.reprice_cooldown_secs) ? slot.reprice_cooldown_secs : ""}
+                          onChange={(e) =>
+                            updateSlot(idx, {
+                              reprice_cooldown_secs: parseOptSlotInt(e.target.value, 0, 300),
+                            })
+                          }
+                          className="mono mt-1 min-h-11 w-full rounded-md border border-hairline bg-surface px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+                        />
+                      </div>
+                      <div>
+                        <label
+                          htmlFor={`slot-${slot.slot_id}-max-replaces`}
+                          className="block text-xs text-ink-3"
+                        >
+                          Max Replaces / Win
+                        </label>
+                        <input
+                          id={`slot-${slot.slot_id}-max-replaces`}
+                          data-slot-max-replaces={slot.slot_id}
+                          type="number"
+                          min={0}
+                          max={50}
+                          step={1}
+                          placeholder="Off"
+                          value={isNum(slot.max_replaces_per_window) ? slot.max_replaces_per_window : ""}
+                          onChange={(e) =>
+                            updateSlot(idx, {
+                              max_replaces_per_window: parseOptSlotInt(e.target.value, 0, 50),
+                            })
+                          }
+                          className="mono mt-1 min-h-11 w-full rounded-md border border-hairline bg-surface px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+                        />
+                      </div>
+                      <div>
+                        <label
+                          htmlFor={`slot-${slot.slot_id}-take-profit`}
+                          className="block text-xs text-ink-3"
+                        >
+                          Take Profit (c)
+                        </label>
+                        <input
+                          id={`slot-${slot.slot_id}-take-profit`}
+                          data-slot-take-profit={slot.slot_id}
+                          type="number"
+                          min={1}
+                          max={99}
+                          step={1}
+                          placeholder="Off"
+                          value={isNum(slot.take_profit_cents) && slot.take_profit_cents > 0 ? slot.take_profit_cents : ""}
+                          onChange={(e) =>
+                            updateSlot(idx, {
+                              take_profit_cents: parseOptSlotInt(e.target.value, 1, 99),
+                            })
+                          }
+                          className="mono mt-1 min-h-11 w-full rounded-md border border-hairline bg-surface px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+                        />
+                      </div>
+                      <div>
+                        <label
+                          htmlFor={`slot-${slot.slot_id}-stop-loss`}
+                          className="block text-xs text-ink-3"
+                        >
+                          Stop Loss (c)
+                        </label>
+                        <input
+                          id={`slot-${slot.slot_id}-stop-loss`}
+                          data-slot-stop-loss={slot.slot_id}
+                          type="number"
+                          min={1}
+                          max={99}
+                          step={1}
+                          placeholder="Off"
+                          value={isNum(slot.stop_loss_cents) && slot.stop_loss_cents > 0 ? slot.stop_loss_cents : ""}
+                          onChange={(e) =>
+                            updateSlot(idx, {
+                              stop_loss_cents: parseOptSlotInt(e.target.value, 1, 99),
+                            })
+                          }
+                          className="mono mt-1 min-h-11 w-full rounded-md border border-hairline bg-surface px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+                        />
+                      </div>
+                      <div>
+                        <label
+                          htmlFor={`slot-${slot.slot_id}-exit-before-close`}
+                          className="block text-xs text-ink-3"
+                        >
+                          Exit Before Close (s)
+                        </label>
+                        <input
+                          id={`slot-${slot.slot_id}-exit-before-close`}
+                          data-slot-exit-before-close={slot.slot_id}
+                          type="number"
+                          min={0}
+                          max={600}
+                          step={1}
+                          placeholder="Off"
+                          value={isNum(slot.exit_before_close_secs) ? slot.exit_before_close_secs : ""}
+                          onChange={(e) =>
+                            updateSlot(idx, {
+                              exit_before_close_secs: parseOptSlotInt(e.target.value, 0, 600),
+                            })
+                          }
+                          className="mono mt-1 min-h-11 w-full rounded-md border border-hairline bg-surface px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+                        />
+                      </div>
+                    </div>
+                  </td>
+                </TableRow>
+                </Fragment>
               );
             })}
           </TableBody>
@@ -1533,12 +1706,27 @@ export function ShadowRunnerPanel({
                       <span>{ord.strategy}</span>
                     </TableCell>
                     <TableCell>
-                      <div className="flex items-center gap-1.5">
-                        <Badge variant="outline" className="mono text-xs">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <Badge
+                          variant={ord.action === "sell" ? "warning" : "outline"}
+                          data-quote-action={ord.order_id}
+                          className="text-xs"
+                        >
+                          {ord.action === "sell" ? "SELL" : "BUY"}
+                        </Badge>
+                        <Badge variant="outline" className="text-xs">
                           {ord.side.toUpperCase()}
                         </Badge>
-                        <Badge variant={ord.mode === "live" ? "warning" : "secondary"} className="mono text-xs">
+                        <Badge variant={ord.mode === "live" ? "warning" : "secondary"} className="text-xs">
                           {ord.mode === "live" ? "Live" : "Shadow"}
+                        </Badge>
+                        <Badge
+                          variant={ord.replace_count > 0 ? "warning" : "outline"}
+                          data-quote-replace-count={ord.order_id}
+                          className="text-xs"
+                          title={`Order repriced ${ord.replace_count} time${ord.replace_count === 1 ? "" : "s"}`}
+                        >
+                          {ord.replace_count > 0 ? `Repriced ${ord.replace_count}x` : "0 reprices"}
                         </Badge>
                       </div>
                     </TableCell>
@@ -1654,7 +1842,7 @@ export function ShadowRunnerPanel({
           <div>
             <h3 className="text-sm font-semibold text-ink">Persistent Fill &amp; Settlement Ledger</h3>
             <p className="mt-0.5 text-xs text-ink-2">
-              Append-only record of quotes, fills, cancels, settlements, and slot pauses.
+              Append-only record of quotes, amendments, fills, exits, cancels, settlements, and slot pauses.
             </p>
           </div>
 
@@ -1730,17 +1918,24 @@ export function ShadowRunnerPanel({
                       variant={
                         ev.event === "SlotPaused"
                           ? "error"
-                          : ev.event === "OrderFilled" || ev.event === "WindowSettled"
-                            ? "success"
-                            : "outline"
+                          : ev.event === "OrderAmended"
+                            ? "warning"
+                            : ev.event === "PositionExited"
+                              ? isNum(ev.pnl_dollars) && ev.pnl_dollars < 0
+                                ? "error"
+                                : "success"
+                              : ev.event === "OrderFilled" || ev.event === "WindowSettled"
+                                ? "success"
+                                : "outline"
                       }
-                      className="mono text-xs"
+                      data-ledger-event={ev.event}
+                      className="text-xs"
                     >
                       {ev.event}
                     </Badge>
                   </TableCell>
                   <TableCell>
-                    <Badge variant={ev.mode === "live" ? "warning" : "secondary"} className="mono text-xs">
+                    <Badge variant={ev.mode === "live" ? "warning" : "secondary"} className="text-xs">
                       {ev.mode === "live" ? "Live" : "Shadow"}
                     </Badge>
                   </TableCell>
@@ -1751,9 +1946,11 @@ export function ShadowRunnerPanel({
                     {ev.ticker}
                   </TableCell>
                   <TableCell className="mono text-right text-xs text-ink">
+                    {ev.action ? `${ev.action.toUpperCase()} ` : ""}
                     {ev.side ? `${ev.side.toUpperCase()} ` : ""}
                     {isNum(ev.price_cents) ? `${Math.round(ev.price_cents)}c` : "-"}
                     {isNum(ev.contracts) ? ` x ${ev.contracts}` : ""}
+                    {isNum(ev.replace_count) && ev.replace_count > 0 ? ` (R${ev.replace_count})` : ""}
                   </TableCell>
                   <TableCell className="mono text-right text-xs text-ink-2">
                     {isNum(ev.slippage_cents) ? signedCents(ev.slippage_cents) : "-"} /{" "}

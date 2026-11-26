@@ -64,6 +64,7 @@ export type LiveOrder = {
   count: number;
   remainingCount: number;
   priceCents: number;
+  replaceCount?: number;
   createdTime: string;
 };
 
@@ -148,6 +149,49 @@ export type LiveOrderPayload = {
   dry_run?: boolean;
   client_order_id?: string;
 };
+
+export type AmendLiveOrderPayload = {
+  price_cents: number;
+  count?: number;
+};
+
+export type AmendLiveOrderResult = {
+  ok: boolean;
+  orderId: string;
+  status: string;
+  priceCents: number;
+  count: number | null;
+  remainingCount: number | null;
+  order: LiveOrder | null;
+  message: string;
+};
+
+export type FlattenLivePositionPayload = {
+  side?: "yes" | "no";
+  price_cents?: number;
+  post_only?: boolean;
+};
+
+export type FlattenLivePositionResult = {
+  ok: boolean;
+  orderId: string;
+  ticker: string;
+  side: "yes" | "no";
+  status: string;
+  count: number | null;
+  priceCents: number | null;
+  order: LiveOrder | null;
+  message: string;
+};
+
+export class LiveApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "LiveApiError";
+    this.status = status;
+  }
+}
 
 export type LiveOrderPreflightResult = {
   allowed: boolean;
@@ -456,6 +500,7 @@ function normalizeOrders(raw: unknown): LiveOrder[] {
         pickNum(x, ["price_cents", side === "yes" ? "yes_price" : "no_price", "yes_price", "no_price"]) ?? 50;
       const count = Math.max(0, Math.round(pickNum(x, ["count", "initial_count", "contracts"]) ?? 0));
       const remainingCount = Math.max(0, Math.round(pickNum(x, ["remaining_count", "remaining"]) ?? count));
+      const replaceCount = pickNum(x, ["replace_count", "replaces"]);
       return {
         orderId: cleanStr(x.order_id ?? x.id, ""),
         clientOrderId: cleanStr(x.client_order_id, ""),
@@ -466,6 +511,7 @@ function normalizeOrders(raw: unknown): LiveOrder[] {
         count,
         remainingCount,
         priceCents: Math.round(priceCents),
+        replaceCount: replaceCount !== null ? Math.max(0, Math.round(replaceCount)) : undefined,
         createdTime: typeof x.created_time === "string" ? x.created_time : "",
       };
     })
@@ -649,12 +695,13 @@ export async function fetchLiveBundle(home: Home | null): Promise<LiveDeskBundle
 async function parseErrorMessage(r: Response, fallback: string): Promise<string> {
   const body = (await r.json().catch(() => ({}))) as {
     error?: string;
+    message?: string;
     rail_violations?: string[];
   };
   if (Array.isArray(body.rail_violations) && body.rail_violations.length > 0) {
     return body.rail_violations.join("; ");
   }
-  return body.error || fallback;
+  return body.error || body.message || fallback;
 }
 
 export async function saveLiveConfig(payload: LiveConfigPayload, home: Home | null): Promise<LiveStatus> {
@@ -835,6 +882,137 @@ export async function cancelLiveOrder(orderId: string, home: Home | null): Promi
     headers: MUTATION_HEADERS,
   });
   if (!r.ok) throw new Error(await parseErrorMessage(r, `Cancel order answered ${r.status}`));
+}
+
+const pendingAmendOrderIds = new Set<string>();
+const pendingFlattenKeys = new Set<string>();
+
+export async function amendLiveOrder(
+  orderId: string,
+  payload: AmendLiveOrderPayload,
+  home?: Home | null,
+  csrfToken?: string,
+): Promise<AmendLiveOrderResult> {
+  if (home && !supportsV080(home, "live_kalshi") && !supportsV080(home, "risk_rails")) {
+    throw new LiveApiError(400, "Live Kalshi v2 order amend requires OpenBell v0.8.0+ server.");
+  }
+  const cleanId = orderId.trim();
+  if (!cleanId) {
+    throw new LiveApiError(400, "Order ID is required to amend an order.");
+  }
+  if (!Number.isInteger(payload.price_cents) || payload.price_cents < 1 || payload.price_cents > 99) {
+    throw new LiveApiError(400, "Limit price must be a whole-cent integer between 1 and 99.");
+  }
+  if (payload.count !== undefined && (!Number.isInteger(payload.count) || payload.count < 1)) {
+    throw new LiveApiError(400, "Amended contract count must be a positive integer.");
+  }
+  if (pendingAmendOrderIds.has(cleanId)) {
+    throw new LiveApiError(409, "Order amend is already pending for this order.");
+  }
+
+  pendingAmendOrderIds.add(cleanId);
+  try {
+    const reqBody: AmendLiveOrderPayload = {
+      price_cents: payload.price_cents,
+      ...(payload.count !== undefined ? { count: payload.count } : {}),
+    };
+    const r = await fetch(`/api/live/orders/${encodeURIComponent(cleanId)}/amend`, {
+      method: "POST",
+      headers: mutationHeaders(csrfToken),
+      body: JSON.stringify(reqBody),
+    });
+    if (!r.ok) {
+      throw new LiveApiError(r.status, await parseErrorMessage(r, `Amend order answered ${r.status}`));
+    }
+    const body = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+    const rawOrder = body.order && typeof body.order === "object" ? body.order : body;
+    const normalized = normalizeOrders([rawOrder])[0] ?? null;
+    const priceCents = normalized?.priceCents ?? (isNum(body.price_cents) ? Math.round(body.price_cents) : payload.price_cents);
+    const count =
+      normalized?.count ?? (isNum(body.count) ? Math.max(1, Math.round(body.count)) : payload.count ?? null);
+    const remainingCount =
+      normalized?.remainingCount ??
+      (isNum(body.remaining_count) ? Math.max(0, Math.round(body.remaining_count)) : count);
+    const status = normalized?.status || cleanStr(body.status, "resting");
+    const resolvedId = normalized?.orderId || cleanStr(body.order_id, cleanId);
+    return {
+      ok: body.ok === undefined ? true : Boolean(body.ok),
+      orderId: resolvedId,
+      status,
+      priceCents,
+      count,
+      remainingCount,
+      order: normalized,
+      message: cleanStr(body.message, `Amended order ${resolvedId} to ${priceCents}c.`),
+    };
+  } finally {
+    pendingAmendOrderIds.delete(cleanId);
+  }
+}
+
+export async function flattenLivePosition(
+  ticker: string,
+  payload: FlattenLivePositionPayload = {},
+  home?: Home | null,
+  csrfToken?: string,
+): Promise<FlattenLivePositionResult> {
+  if (home && !supportsV080(home, "live_kalshi") && !supportsV080(home, "risk_rails")) {
+    throw new LiveApiError(400, "Live Kalshi v2 position flatten requires OpenBell v0.8.0+ server.");
+  }
+  const cleanTicker = ticker.trim().toUpperCase();
+  if (!cleanTicker) {
+    throw new LiveApiError(400, "Ticker is required to flatten a position.");
+  }
+  if (
+    payload.price_cents !== undefined &&
+    (!Number.isInteger(payload.price_cents) || payload.price_cents < 1 || payload.price_cents > 99)
+  ) {
+    throw new LiveApiError(400, "Flatten limit price must be a whole-cent integer between 1 and 99.");
+  }
+  const lockKey = `${cleanTicker}:${payload.side ?? "any"}`;
+  if (pendingFlattenKeys.has(lockKey)) {
+    throw new LiveApiError(409, "Flatten request is already pending for this position.");
+  }
+
+  pendingFlattenKeys.add(lockKey);
+  try {
+    const reqBody: FlattenLivePositionPayload = {
+      ...(payload.side ? { side: payload.side } : {}),
+      ...(payload.price_cents !== undefined ? { price_cents: payload.price_cents } : {}),
+      ...(payload.post_only !== undefined ? { post_only: payload.post_only } : {}),
+    };
+    const r = await fetch(`/api/live/positions/${encodeURIComponent(cleanTicker)}/flatten`, {
+      method: "POST",
+      headers: mutationHeaders(csrfToken),
+      body: JSON.stringify(reqBody),
+    });
+    if (!r.ok) {
+      throw new LiveApiError(r.status, await parseErrorMessage(r, `Flatten position answered ${r.status}`));
+    }
+    const body = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+    const rawOrder = body.order && typeof body.order === "object" ? body.order : body;
+    const normalized = normalizeOrders([rawOrder])[0] ?? null;
+    const sideRaw = String(body.side ?? normalized?.side ?? payload.side ?? "yes").toLowerCase();
+    const side: "yes" | "no" = sideRaw === "no" ? "no" : "yes";
+    const count = normalized?.count ?? (isNum(body.count) ? Math.max(0, Math.round(body.count)) : null);
+    const priceCents =
+      normalized?.priceCents ?? (isNum(body.price_cents) ? Math.round(body.price_cents) : payload.price_cents ?? null);
+    const status = normalized?.status || cleanStr(body.status, "submitted");
+    const orderId = normalized?.orderId || cleanStr(body.order_id, "flattened");
+    return {
+      ok: body.ok === undefined ? true : Boolean(body.ok),
+      orderId,
+      ticker: cleanTicker,
+      side,
+      status,
+      count,
+      priceCents,
+      order: normalized,
+      message: cleanStr(body.message, `Flatten exit submitted for ${cleanTicker} (${side.toUpperCase()}).`),
+    };
+  } finally {
+    pendingFlattenKeys.delete(lockKey);
+  }
 }
 
 export async function triggerKillSwitch(

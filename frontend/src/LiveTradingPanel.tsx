@@ -1,7 +1,7 @@
 // OpenBell v0.8.0 Live Kalshi v2 Account Strip, Paper/Live Mode Switcher, Arm Confirmation Modal,
 // Live Order Ticket with Real-Time Hard Risk Rails, Positions/Orders/Fills tables, Kill Switch,
 // and Settings API & Risk Rails configuration panel. NEVER echoes private key PEM bytes.
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   AlertOctagon,
@@ -41,15 +41,21 @@ import {
   timeUtcFullLabel,
 } from "@/lib/desk";
 import {
+  type AmendLiveOrderPayload,
+  type FlattenLivePositionPayload,
   type LiveConfigPayload,
   type LiveDeskBundle,
   type LiveEnvironment,
+  type LiveOrder,
   type LiveOrderPayload,
+  type LivePosition,
   type LiveReconcileResponse,
   type LiveStatus,
+  amendLiveOrder,
   defaultLiveReconcile,
   evaluateOrderRails,
   fetchLiveReconcile,
+  flattenLivePosition,
   resetKillSwitch,
   triggerLiveReconcile,
 } from "@/lib/live";
@@ -921,7 +927,7 @@ export function LiveAccountStrip({
                 className={
                   "inline-flex min-h-11 cursor-pointer items-center gap-1.5 rounded px-3 text-xs font-medium outline-none transition-[color,background-color] focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8 " +
                   (status.liveArmed
-                    ? "bg-blue text-blue-fg"
+                    ? "bg-blue-soft text-info-foreground"
                     : "text-ink-2 hover:text-ink")
                 }
               >
@@ -1131,6 +1137,9 @@ export function LiveDeskWorkspace({
   busy,
   onSubmitOrder,
   onCancelOrder,
+  onAmendOrder,
+  onFlattenPosition,
+  onRefresh,
   onRequestArm,
   onOpenSettings,
 }: {
@@ -1144,10 +1153,33 @@ export function LiveDeskWorkspace({
   busy: boolean;
   onSubmitOrder: (payload: LiveOrderPayload) => Promise<void>;
   onCancelOrder: (orderId: string) => Promise<void>;
+  onAmendOrder?: (orderId: string, payload: AmendLiveOrderPayload) => Promise<void>;
+  onFlattenPosition?: (ticker: string, payload: FlattenLivePositionPayload) => Promise<void>;
+  onRefresh?: () => void;
   onRequestArm: () => void;
   onOpenSettings: () => void;
 }) {
   const { status, positions, orders, fills } = bundle;
+  const [localOrders, setLocalOrders] = useState<LiveOrder[] | null>(null);
+  const [localPositions, setLocalPositions] = useState<LivePosition[] | null>(null);
+
+  useEffect(() => {
+    setLocalOrders(null);
+  }, [orders]);
+
+  useEffect(() => {
+    setLocalPositions(null);
+  }, [positions]);
+
+  const displayOrders = localOrders ?? orders;
+  const displayPositions = localPositions ?? positions;
+  const canMutateLive = status.liveArmed && !status.killed;
+  const liveGuardReason = status.killed
+    ? "Kill switch active: clear the kill latch and re-arm live trading before amending orders or flattening positions."
+    : !status.liveArmed
+      ? "Paper mode (live_armed: false): arm live trading to enable order amend and 1-click position flatten."
+      : "";
+
   const defaultTicker = useMemo(() => {
     if (prefillTicker) return prefillTicker;
     const openFirst = markets.find((m) => m && !m.result && m.ticker);
@@ -1163,6 +1195,25 @@ export function LiveDeskWorkspace({
   const [subTab, setSubTab] = useState<"orders" | "positions" | "fills">("orders");
   const [submitting, setSubmitting] = useState(false);
   const submitLockRef = useRef(false);
+
+  const [amendingOrderId, setAmendingOrderId] = useState<string | null>(null);
+  const [amendPriceInput, setAmendPriceInput] = useState("");
+  const [amendCountInput, setAmendCountInput] = useState("");
+  const [pendingAmendId, setPendingAmendId] = useState<string | null>(null);
+  const [amendError, setAmendError] = useState<string | null>(null);
+  const amendLockRef = useRef(false);
+
+  const [pendingFlattenKey, setPendingFlattenKey] = useState<string | null>(null);
+  const [flattenFeedback, setFlattenFeedback] = useState<{ tone: "ok" | "error"; message: string } | null>(null);
+  const flattenLockRef = useRef<Set<string>>(new Set());
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (prefillTicker) setTicker(prefillTicker);
@@ -1242,6 +1293,128 @@ export function LiveDeskWorkspace({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     void doSubmitOrder();
+  };
+
+  const openAmendPopover = (ord: LiveOrder) => {
+    if (!canMutateLive) return;
+    if (amendingOrderId === ord.orderId) {
+      setAmendingOrderId(null);
+      setAmendError(null);
+      return;
+    }
+    const safePrice = Number.isFinite(ord.priceCents) ? Math.min(99, Math.max(1, Math.round(ord.priceCents))) : 50;
+    setAmendingOrderId(ord.orderId);
+    setAmendPriceInput(String(safePrice));
+    setAmendCountInput("");
+    setAmendError(null);
+  };
+
+  const parseWholeInt = (raw: string): number | null => {
+    const trimmed = raw.trim();
+    if (!/^\d+$/.test(trimmed)) return null;
+    const n = Number(trimmed);
+    return Number.isSafeInteger(n) ? n : null;
+  };
+
+  const handleConfirmAmend = async (ord: LiveOrder) => {
+    if (!canMutateLive || busy || amendLockRef.current || pendingAmendId !== null) return;
+    const maxQty = Math.max(1, Number.isFinite(ord.remainingCount) && ord.remainingCount > 0 ? ord.remainingCount : ord.count);
+    const nextPrice = parseWholeInt(amendPriceInput);
+    if (nextPrice === null || nextPrice < 1 || nextPrice > 99) {
+      setAmendError("Limit price must be a whole integer between 1 and 99 cents.");
+      return;
+    }
+    let nextCount: number | undefined;
+    if (amendCountInput.trim().length > 0) {
+      const parsedQty = parseWholeInt(amendCountInput);
+      if (parsedQty === null || parsedQty < 1 || parsedQty > maxQty) {
+        setAmendError(`Reduced count must be a whole integer from 1 to ${maxQty}.`);
+        return;
+      }
+      nextCount = parsedQty;
+    }
+
+    amendLockRef.current = true;
+    setPendingAmendId(ord.orderId);
+    setAmendError(null);
+    try {
+      const payload: AmendLiveOrderPayload = {
+        price_cents: nextPrice,
+        ...(nextCount !== undefined ? { count: nextCount } : {}),
+      };
+      if (onAmendOrder) {
+        await onAmendOrder(ord.orderId, payload);
+        if (mountedRef.current) setAmendingOrderId(null);
+      } else {
+        const res = await amendLiveOrder(ord.orderId, payload);
+        if (!mountedRef.current) return;
+        setLocalOrders((prev) =>
+          (prev ?? orders).map((item) => {
+            if (item.orderId !== ord.orderId) return item;
+            if (res.order) return res.order;
+            const updatedCount = res.count ?? item.count;
+            const updatedRem = res.remainingCount ?? (res.count !== null ? Math.min(item.remainingCount, res.count) : item.remainingCount);
+            return {
+              ...item,
+              priceCents: res.priceCents,
+              count: updatedCount,
+              remainingCount: updatedRem,
+              status: res.status || item.status,
+              replaceCount: (item.replaceCount ?? 0) + 1,
+            };
+          }),
+        );
+        setAmendingOrderId(null);
+        toast.success(res.message);
+        onRefresh?.();
+      }
+    } catch (e) {
+      if (!mountedRef.current) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      setAmendError(msg);
+      toast.error(`Amend failed: ${msg}`);
+    } finally {
+      amendLockRef.current = false;
+      if (mountedRef.current) setPendingAmendId(null);
+    }
+  };
+
+  const handleFlatten = async (pos: LivePosition) => {
+    const lockKey = `${pos.ticker}:${pos.side}`;
+    if (!canMutateLive || busy || pos.position <= 0 || flattenLockRef.current.has(lockKey) || pendingFlattenKey === lockKey) {
+      return;
+    }
+    flattenLockRef.current.add(lockKey);
+    setPendingFlattenKey(lockKey);
+    setFlattenFeedback(null);
+    try {
+      const payload: FlattenLivePositionPayload = { side: pos.side };
+      if (onFlattenPosition) {
+        await onFlattenPosition(pos.ticker, payload);
+      } else {
+        const res = await flattenLivePosition(pos.ticker, payload);
+        if (!mountedRef.current) return;
+        if (res.order && res.status === "resting") {
+          setLocalOrders((prev) => [res.order!, ...(prev ?? orders).filter((o) => o.orderId !== res.order!.orderId)]);
+        }
+        if (res.status === "executed" || res.status === "filled") {
+          setLocalPositions((prev) =>
+            (prev ?? positions).filter((p) => !(p.ticker === pos.ticker && p.side === pos.side)),
+          );
+        }
+        setFlattenFeedback({ tone: "ok", message: res.message });
+        toast.success(res.message);
+        onRefresh?.();
+      }
+    } catch (e) {
+      if (!mountedRef.current) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      setFlattenFeedback({ tone: "error", message: msg });
+      toast.error(`Flatten failed: ${msg}`);
+    } finally {
+      flattenLockRef.current.delete(lockKey);
+      if (mountedRef.current) setPendingFlattenKey(null);
+    }
   };
 
   return (
@@ -1530,8 +1703,8 @@ export function LiveDeskWorkspace({
             <div className="flex items-center gap-1" role="group" aria-label="Portfolio view">
               {(
                 [
-                  ["orders", `Orders (${orders.length})`],
-                  ["positions", `Positions (${positions.length})`],
+                  ["orders", `Orders (${displayOrders.length})`],
+                  ["positions", `Positions (${displayPositions.length})`],
                   ["fills", `Fills (${fills.length})`],
                 ] as const
               ).map(([id, label]) => (
@@ -1554,9 +1727,28 @@ export function LiveDeskWorkspace({
             </div>
           </div>
 
+          {!canMutateLive && (subTab === "orders" || subTab === "positions") && (
+            <div
+              id="live-lifecycle-guard-banner"
+              role="status"
+              className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-board/60 px-4 py-2 text-xs text-ink-2"
+            >
+              <span>{liveGuardReason}</span>
+              {!status.killed && (
+                <button
+                  type="button"
+                  onClick={onRequestArm}
+                  className="min-h-11 cursor-pointer font-medium text-info-foreground hover:underline sm:min-h-7"
+                >
+                  Arm Live
+                </button>
+              )}
+            </div>
+          )}
+
           {subTab === "orders" && (
             <div id="live-orders-table">
-              {orders.length === 0 ? (
+              {displayOrders.length === 0 ? (
                 <p role="status" className="p-5 text-xs text-ink-2">
                   No resting Kalshi orders right now.
                 </p>
@@ -1573,38 +1765,156 @@ export function LiveDeskWorkspace({
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {orders.map((ord) => (
-                      <TableRow key={ord.orderId} data-live-order-row={ord.orderId}>
-                        <TableCell className="mono m-grow max-w-[200px] break-all text-xs font-semibold text-ink">
-                          {ord.ticker}
-                        </TableCell>
-                        <TableCell className="mono text-xs text-ink-2">
-                          {`${ord.action} ${ord.side}`.toUpperCase()}
-                        </TableCell>
-                        <TableCell className="mono text-right text-xs font-semibold text-ink">
-                          {ord.priceCents}c
-                        </TableCell>
-                        <TableCell className="mono text-right text-xs text-ink-2">
-                          {ord.remainingCount}/{ord.count}
-                        </TableCell>
-                        <TableCell>
-                          <Badge variant="outline" className="mono text-xs">
-                            {ord.status}
-                          </Badge>
-                        </TableCell>
-                        <TableCell className="text-right">
-                          <Button
-                            variant="outline"
-                            data-cancel-order={ord.orderId}
-                            disabled={busy}
-                            onClick={() => void onCancelOrder(ord.orderId)}
-                            className="min-h-11 border-dot-red/60 px-2.5 text-xs text-destructive-foreground sm:min-h-8"
-                          >
-                            Cancel
-                          </Button>
-                        </TableCell>
-                      </TableRow>
-                    ))}
+                    {displayOrders.map((ord) => {
+                      const isAmending = amendingOrderId === ord.orderId;
+                      const isPendingAmend = pendingAmendId === ord.orderId;
+                      const maxQty = Math.max(
+                        1,
+                        Number.isFinite(ord.remainingCount) && ord.remainingCount > 0 ? ord.remainingCount : ord.count,
+                      );
+                      const draftPrice = parseWholeInt(amendPriceInput);
+                      const draftCountTrimmed = amendCountInput.trim();
+                      const draftCount = draftCountTrimmed ? parseWholeInt(draftCountTrimmed) : undefined;
+                      const amendValid =
+                        draftPrice !== null &&
+                        draftPrice >= 1 &&
+                        draftPrice <= 99 &&
+                        (draftCount === undefined || (draftCount !== null && draftCount >= 1 && draftCount <= maxQty));
+                      return (
+                        <Fragment key={ord.orderId}>
+                          <TableRow data-live-order-row={ord.orderId}>
+                            <TableCell className="mono m-grow max-w-[200px] break-all text-xs font-semibold text-ink">
+                              {ord.ticker}
+                            </TableCell>
+                            <TableCell className="mono text-xs text-ink-2">
+                              {`${ord.action} ${ord.side}`.toUpperCase()}
+                            </TableCell>
+                            <TableCell className="mono text-right text-xs font-semibold text-ink">
+                              {Number.isFinite(ord.priceCents) ? `${ord.priceCents}c` : "-"}
+                            </TableCell>
+                            <TableCell className="mono text-right text-xs text-ink-2">
+                              {Number.isFinite(ord.remainingCount) ? ord.remainingCount : 0}/
+                              {Number.isFinite(ord.count) ? ord.count : 0}
+                            </TableCell>
+                            <TableCell>
+                              <Badge variant="outline" className="text-xs">
+                                {ord.status}
+                              </Badge>
+                            </TableCell>
+                            <TableCell className="m-right text-right">
+                              <div className="flex flex-wrap items-center justify-end gap-1.5">
+                                <Button
+                                  variant="outline"
+                                  data-amend-order={ord.orderId}
+                                  aria-expanded={isAmending}
+                                  disabled={busy || !canMutateLive || isPendingAmend}
+                                  title={canMutateLive ? "Amend resting order price or reduce count" : liveGuardReason}
+                                  onClick={() => openAmendPopover(ord)}
+                                  className="min-h-11 px-2.5 text-xs sm:min-h-8"
+                                >
+                                  Amend
+                                </Button>
+                                <Button
+                                  variant="outline"
+                                  data-cancel-order={ord.orderId}
+                                  disabled={busy || isPendingAmend}
+                                  onClick={() => void onCancelOrder(ord.orderId)}
+                                  className="min-h-11 border-dot-red/60 px-2.5 text-xs text-destructive-foreground sm:min-h-8"
+                                >
+                                  Cancel
+                                </Button>
+                              </div>
+                            </TableCell>
+                          </TableRow>
+                          {isAmending && (
+                            <TableRow data-amend-popover={ord.orderId}>
+                              <td colSpan={6} className="m-full bg-board/50 px-3 py-3 align-middle text-sm text-ink">
+                                <div className="w-full space-y-2.5">
+                                  <div className="flex flex-wrap items-end gap-2.5">
+                                    <div className="min-w-[120px] flex-1">
+                                      <label htmlFor={`amend-price-${ord.orderId}`} className="block text-xs text-ink-3">
+                                        New Price (1-99c)
+                                      </label>
+                                      <input
+                                        id={`amend-price-${ord.orderId}`}
+                                        data-amend-price={ord.orderId}
+                                        type="number"
+                                        min={1}
+                                        max={99}
+                                        step={1}
+                                        value={amendPriceInput}
+                                        onChange={(e) => {
+                                          setAmendPriceInput(e.target.value);
+                                          setAmendError(null);
+                                        }}
+                                        className="mono mt-1 min-h-11 w-full rounded-md border border-hairline bg-surface px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+                                      />
+                                    </div>
+                                    <div className="min-w-[140px] flex-1">
+                                      <label htmlFor={`amend-count-${ord.orderId}`} className="block text-xs text-ink-3">
+                                        Reduce Qty (opt, max {maxQty})
+                                      </label>
+                                      <input
+                                        id={`amend-count-${ord.orderId}`}
+                                        data-amend-count={ord.orderId}
+                                        type="number"
+                                        min={1}
+                                        max={maxQty}
+                                        step={1}
+                                        placeholder={`Keep ${maxQty}`}
+                                        value={amendCountInput}
+                                        onChange={(e) => {
+                                          setAmendCountInput(e.target.value);
+                                          setAmendError(null);
+                                        }}
+                                        className="mono mt-1 min-h-11 w-full rounded-md border border-hairline bg-surface px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+                                      />
+                                    </div>
+                                    <div className="flex flex-wrap items-center gap-1.5">
+                                      <Button
+                                        variant="default"
+                                        data-confirm-amend={ord.orderId}
+                                        disabled={busy || !canMutateLive || isPendingAmend || !amendValid}
+                                        onClick={() => void handleConfirmAmend(ord)}
+                                        className="min-h-11 px-3 text-xs sm:min-h-8"
+                                      >
+                                        {isPendingAmend ? "Amending..." : "Apply Amend"}
+                                      </Button>
+                                      <Button
+                                        variant="ghost"
+                                        data-close-amend={ord.orderId}
+                                        disabled={isPendingAmend}
+                                        onClick={() => {
+                                          setAmendingOrderId(null);
+                                          setAmendError(null);
+                                        }}
+                                        className="min-h-11 px-2.5 text-xs sm:min-h-8"
+                                      >
+                                        Close
+                                      </Button>
+                                    </div>
+                                  </div>
+                                  {!amendValid && !amendError && (
+                                    <p className="text-xs text-warning-foreground">
+                                      Enter a whole-cent limit from 1 to 99 and an optional count up to {maxQty}.
+                                    </p>
+                                  )}
+                                  {amendError && (
+                                    <div
+                                      role="alert"
+                                      data-amend-error={ord.orderId}
+                                      className="border-l-2 border-dot-red bg-surface px-3 py-1.5 text-xs text-destructive-foreground"
+                                    >
+                                      {amendError}
+                                    </div>
+                                  )}
+                                </div>
+                              </td>
+                            </TableRow>
+                          )}
+                        </Fragment>
+                      );
+                    })}
                   </TableBody>
                 </Table>
               )}
@@ -1613,7 +1923,21 @@ export function LiveDeskWorkspace({
 
           {subTab === "positions" && (
             <div id="live-positions-table">
-              {positions.length === 0 ? (
+              {flattenFeedback && (
+                <div
+                  id="live-flatten-feedback"
+                  role={flattenFeedback.tone === "error" ? "alert" : "status"}
+                  className={
+                    "border-b border-hairline px-4 py-2 text-xs " +
+                    (flattenFeedback.tone === "error"
+                      ? "bg-board text-destructive-foreground"
+                      : "bg-board/50 text-success-foreground")
+                  }
+                >
+                  {flattenFeedback.message}
+                </div>
+              )}
+              {displayPositions.length === 0 ? (
                 <p role="status" className="p-5 text-xs text-ink-2">
                   No open Kalshi positions on this account.
                 </p>
@@ -1626,39 +1950,62 @@ export function LiveDeskWorkspace({
                       <TableHead className="text-right">Contracts</TableHead>
                       <TableHead className="text-right">Exposure</TableHead>
                       <TableHead className="text-right">Realized P&amp;L</TableHead>
+                      <TableHead className="text-right">Exit</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {positions.map((pos) => (
-                      <TableRow key={`${pos.ticker}-${pos.side}`} data-live-position-row={pos.ticker}>
-                        <TableCell className="mono m-grow max-w-[220px] break-all text-xs font-semibold text-ink">
-                          {pos.ticker}
-                        </TableCell>
-                        <TableCell>
-                          <Badge variant="outline" className="mono text-xs">
-                            {pos.side.toUpperCase()}
-                          </Badge>
-                        </TableCell>
-                        <TableCell className="mono text-right text-xs font-semibold text-ink">
-                          {pos.position}
-                        </TableCell>
-                        <TableCell className="mono text-right text-xs text-ink-2">
-                          {money(pos.marketExposureDollars)}
-                        </TableCell>
-                        <TableCell
-                          className={
-                            "mono text-right text-xs font-semibold " +
-                            (pos.realizedPnlDollars > 0
-                              ? "text-success-foreground"
-                              : pos.realizedPnlDollars < 0
-                                ? "text-destructive-foreground"
-                                : "text-ink-2")
-                          }
-                        >
-                          {moneySigned(pos.realizedPnlDollars)}
-                        </TableCell>
-                      </TableRow>
-                    ))}
+                    {displayPositions.map((pos) => {
+                      const flattenKey = `${pos.ticker}:${pos.side}`;
+                      const isFlattening = pendingFlattenKey === flattenKey;
+                      const safeQty = Number.isFinite(pos.position) ? Math.max(0, Math.round(pos.position)) : 0;
+                      return (
+                        <TableRow key={`${pos.ticker}-${pos.side}`} data-live-position-row={pos.ticker}>
+                          <TableCell className="mono m-grow max-w-[220px] break-all text-xs font-semibold text-ink">
+                            {pos.ticker}
+                          </TableCell>
+                          <TableCell>
+                            <Badge variant="outline" className="text-xs">
+                              {pos.side.toUpperCase()}
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="mono text-right text-xs font-semibold text-ink">
+                            {safeQty}
+                          </TableCell>
+                          <TableCell className="mono text-right text-xs text-ink-2">
+                            {money(pos.marketExposureDollars)}
+                          </TableCell>
+                          <TableCell
+                            className={
+                              "mono text-right text-xs font-semibold " +
+                              (pos.realizedPnlDollars > 0
+                                ? "text-success-foreground"
+                                : pos.realizedPnlDollars < 0
+                                  ? "text-destructive-foreground"
+                                  : "text-ink-2")
+                            }
+                          >
+                            {moneySigned(pos.realizedPnlDollars)}
+                          </TableCell>
+                          <TableCell className="m-right text-right">
+                            <Button
+                              variant="outline"
+                              data-flatten-position={pos.ticker}
+                              data-flatten-side={pos.side}
+                              disabled={busy || !canMutateLive || safeQty <= 0 || isFlattening}
+                              title={
+                                canMutateLive
+                                  ? `Submit 1-click flatten sell order for ${safeQty} ${pos.side.toUpperCase()} contracts`
+                                  : liveGuardReason
+                              }
+                              onClick={() => void handleFlatten(pos)}
+                              className="min-h-11 border-dot-red/60 px-2.5 text-xs text-destructive-foreground sm:min-h-8"
+                            >
+                              {isFlattening ? "Flattening..." : "Flatten"}
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
                   </TableBody>
                 </Table>
               )}
