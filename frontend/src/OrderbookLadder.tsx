@@ -1,16 +1,18 @@
 // OpenBell E2 Institutional L2 Depth-of-Market (DOM) Ladder component.
 // Renders paired YES Bids & YES Asks with proportional horizontal depth bars,
 // cumulative depth, spread & microprice header, WS/REST live/stale status pill,
-// clickable price rows, and live book-walk VWAP + slippage estimate.
-import { useCallback, useMemo } from "react";
-import { Activity, AlertTriangle, Layers, RefreshCw } from "lucide-react";
+// clickable price rows, live book-walk VWAP + slippage estimate, and L2 snapshot history scrubber.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Activity, AlertTriangle, ChevronLeft, ChevronRight, History, Layers, RefreshCw } from "lucide-react";
 import { Badge, Button, StatusPill } from "@/components/ui";
+import { timeUtcFullLabel } from "@/lib/desk";
 import {
   type OrderbookLevel,
   type OrderbookSnapshot,
   type OrderbookStreamStatus,
   computeMicropriceCents,
   deriveSideBookLevels,
+  fetchOrderbookHistory,
   isOrderbookCrossed,
   walkBookLevels,
 } from "@/lib/orderbook";
@@ -26,6 +28,7 @@ export type OrderbookLadderProps = {
   loading?: boolean;
   error?: string | null;
   maxLevels?: number;
+  historyLimit?: number;
   onSelectPrice?: (priceCents: number) => void;
   onRefresh?: () => void;
   className?: string;
@@ -34,7 +37,11 @@ export type OrderbookLadderProps = {
 function statusBadgeInfo(
   snapshot: OrderbookSnapshot | null,
   streamStatus?: OrderbookStreamStatus | null,
+  inspectingHistory = false,
 ): { tone: "success" | "info" | "warning" | "neutral"; label: string } {
+  if (inspectingHistory && snapshot) {
+    return { tone: "info", label: `History #${snapshot.last_seq}` };
+  }
   const mode = streamStatus?.mode ?? (snapshot?.source === "ws" ? "ws" : snapshot?.source === "rest" ? "rest" : "offline");
   if (snapshot?.stale) {
     return {
@@ -169,13 +176,63 @@ export function OrderbookLadder({
   loading = false,
   error = null,
   maxLevels = 8,
+  historyLimit = 20,
   onSelectPrice,
   onRefresh,
   className = "",
 }: OrderbookLadderProps) {
+  const cleanTicker = ticker.trim().toUpperCase();
+  const [historyRecords, setHistoryRecords] = useState<OrderbookSnapshot[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [selectedHistoryIdx, setSelectedHistoryIdx] = useState<number | null>(null);
+  const historySeqRef = useRef(0);
+
+  const loadHistory = useCallback(async () => {
+    if (!cleanTicker) {
+      setHistoryRecords([]);
+      setHistoryError(null);
+      setHistoryLoading(false);
+      return;
+    }
+    const reqId = ++historySeqRef.current;
+    setHistoryLoading(true);
+    try {
+      const res = await fetchOrderbookHistory(cleanTicker, historyLimit);
+      if (reqId !== historySeqRef.current) return;
+      setHistoryRecords(res.records);
+      setHistoryError(null);
+    } catch (e) {
+      if (reqId !== historySeqRef.current) return;
+      setHistoryError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (reqId === historySeqRef.current) setHistoryLoading(false);
+    }
+  }, [cleanTicker, historyLimit]);
+
+  useEffect(() => {
+    setSelectedHistoryIdx(null);
+    void loadHistory();
+  }, [loadHistory]);
+
+  const handleRefreshAll = useCallback(() => {
+    setSelectedHistoryIdx(null);
+    onRefresh?.();
+    void loadHistory();
+  }, [onRefresh, loadHistory]);
+
+  const selectedHistorySnap =
+    selectedHistoryIdx !== null &&
+    selectedHistoryIdx >= 0 &&
+    selectedHistoryIdx < historyRecords.length
+      ? historyRecords[selectedHistoryIdx]
+      : null;
+  const activeSnapshot = selectedHistorySnap ?? snapshot;
+  const inspectingHistory = selectedHistorySnap !== null;
+
   const qty = Number.isFinite(orderQty) && orderQty > 0 ? Math.floor(orderQty) : 1;
-  const bids = useMemo(() => (snapshot?.yes_bids ?? []).slice(0, maxLevels), [snapshot, maxLevels]);
-  const asks = useMemo(() => (snapshot?.yes_asks ?? []).slice(0, maxLevels), [snapshot, maxLevels]);
+  const bids = useMemo(() => (activeSnapshot?.yes_bids ?? []).slice(0, maxLevels), [activeSnapshot, maxLevels]);
+  const asks = useMemo(() => (activeSnapshot?.yes_asks ?? []).slice(0, maxLevels), [activeSnapshot, maxLevels]);
 
   const maxCumQty = useMemo(() => {
     let m = 0;
@@ -185,16 +242,15 @@ export function OrderbookLadder({
   }, [bids, asks]);
 
   const walkLevels = useMemo(
-    () => deriveSideBookLevels(snapshot, side, action),
-    [snapshot, side, action],
+    () => deriveSideBookLevels(activeSnapshot, side, action),
+    [activeSnapshot, side, action],
   );
   const walk = useMemo(() => walkBookLevels(walkLevels, qty), [walkLevels, qty]);
-  const microprice = useMemo(() => computeMicropriceCents(snapshot), [snapshot]);
-  const statusInfo = statusBadgeInfo(snapshot, streamStatus);
-  const isCrossed = isOrderbookCrossed(snapshot);
-  const isStale = Boolean(snapshot?.stale);
+  const microprice = useMemo(() => computeMicropriceCents(activeSnapshot), [activeSnapshot]);
+  const statusInfo = statusBadgeInfo(activeSnapshot, streamStatus, inspectingHistory);
+  const isCrossed = isOrderbookCrossed(activeSnapshot);
+  const isStale = !inspectingHistory && Boolean(activeSnapshot?.stale);
   const hasDepth = bids.length > 0 || asks.length > 0;
-  const cleanTicker = ticker.trim().toUpperCase();
 
   const selectedYesPriceCents = useMemo(() => {
     if (selectedPriceCents === null || selectedPriceCents === undefined || !Number.isFinite(selectedPriceCents)) {
@@ -248,7 +304,7 @@ export function OrderbookLadder({
               size="icon"
               aria-label="Refresh L2 orderbook"
               className="size-11 sm:size-8"
-              onClick={onRefresh}
+              onClick={handleRefreshAll}
             >
               <RefreshCw className={`size-3.5 ${loading ? "animate-spin" : ""}`} strokeWidth={1.5} aria-hidden />
             </Button>
@@ -261,16 +317,16 @@ export function OrderbookLadder({
         <div>
           <dt className="text-ink-3">Best YES Bid</dt>
           <dd className="mono mt-0.5 font-semibold text-success-foreground">
-            {snapshot?.best_yes_bid !== null && snapshot?.best_yes_bid !== undefined
-              ? `${snapshot.best_yes_bid}c`
+            {activeSnapshot?.best_yes_bid !== null && activeSnapshot?.best_yes_bid !== undefined
+              ? `${activeSnapshot.best_yes_bid}c`
               : "-"}
           </dd>
         </div>
         <div>
           <dt className="text-ink-3">Best YES Ask</dt>
           <dd className="mono mt-0.5 font-semibold text-destructive-foreground">
-            {snapshot?.best_yes_ask !== null && snapshot?.best_yes_ask !== undefined
-              ? `${snapshot.best_yes_ask}c`
+            {activeSnapshot?.best_yes_ask !== null && activeSnapshot?.best_yes_ask !== undefined
+              ? `${activeSnapshot.best_yes_ask}c`
               : "-"}
           </dd>
         </div>
@@ -283,10 +339,10 @@ export function OrderbookLadder({
               (isCrossed ? "text-destructive-foreground" : "text-ink")
             }
           >
-            {snapshot?.spread_cents !== null && snapshot?.spread_cents !== undefined
+            {activeSnapshot?.spread_cents !== null && activeSnapshot?.spread_cents !== undefined
               ? isCrossed
-                ? `${snapshot.spread_cents}c (crossed)`
-                : `${snapshot.spread_cents}c`
+                ? `${activeSnapshot.spread_cents}c (crossed)`
+                : `${activeSnapshot.spread_cents}c`
               : "-"}
           </dd>
         </div>
@@ -337,6 +393,30 @@ export function OrderbookLadder({
         )}
       </div>
 
+      {/* Historical Snapshot Inspection Banner */}
+      {selectedHistorySnap && (
+        <div
+          role="status"
+          data-orderbook-history-banner
+          className="mb-2.5 flex flex-wrap items-center justify-between gap-2 border-b border-hairline pb-2 text-xs text-info-foreground"
+        >
+          <span className="mono font-medium">
+            Inspecting L2 history seq #{selectedHistorySnap.last_seq}{" "}
+            {selectedHistorySnap.updated_ms > 0
+              ? `(${timeUtcFullLabel(Math.floor(selectedHistorySnap.updated_ms / 1000))})`
+              : ""}
+          </span>
+          <button
+            type="button"
+            data-orderbook-history-live
+            onClick={() => setSelectedHistoryIdx(null)}
+            className="min-h-11 cursor-pointer rounded border border-hairline bg-board px-2.5 text-xs font-medium text-ink hover:bg-surface sm:min-h-7"
+          >
+            Return to live
+          </button>
+        </div>
+      )}
+
       {/* Stale / Crossed / Feed Warning Banners */}
       {isCrossed && (
         <div
@@ -347,13 +427,13 @@ export function OrderbookLadder({
           <span className="flex items-center gap-1.5 font-medium">
             <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
             <span>
-              Crossed L2 book (YES bid {snapshot?.best_yes_bid}c &gt; YES ask {snapshot?.best_yes_ask}c). Resync depth before staging orders.
+              Crossed L2 book (YES bid {activeSnapshot?.best_yes_bid}c &gt; YES ask {activeSnapshot?.best_yes_ask}c). Resync depth before staging orders.
             </span>
           </span>
           {onRefresh && (
             <button
               type="button"
-              onClick={onRefresh}
+              onClick={handleRefreshAll}
               className="min-h-11 cursor-pointer rounded border border-hairline bg-surface px-2.5 text-xs font-medium text-ink hover:bg-canvas sm:min-h-7"
             >
               Resync
@@ -362,7 +442,7 @@ export function OrderbookLadder({
         </div>
       )}
 
-      {(isStale || (Boolean(error) && hasDepth)) && (
+      {(isStale || (!inspectingHistory && Boolean(error) && hasDepth)) && (
         <div
           role="status"
           data-orderbook-stale-banner
@@ -379,7 +459,7 @@ export function OrderbookLadder({
           {onRefresh && (
             <button
               type="button"
-              onClick={onRefresh}
+              onClick={handleRefreshAll}
               className="min-h-11 cursor-pointer rounded border border-hairline bg-surface px-2.5 text-xs font-medium text-ink hover:bg-canvas sm:min-h-7"
             >
               Resubscribe
@@ -389,13 +469,13 @@ export function OrderbookLadder({
       )}
 
       {/* Main Content: Loading / Degraded / Paired DOM Columns */}
-      {loading && !snapshot ? (
+      {loading && !activeSnapshot ? (
         <div className="space-y-2 py-2">
           <div className="h-8 w-full animate-pulse rounded bg-track" />
           <div className="h-8 w-full animate-pulse rounded bg-track" />
           <div className="h-8 w-full animate-pulse rounded bg-track" />
         </div>
-      ) : error && !hasDepth ? (
+      ) : error && !hasDepth && !inspectingHistory ? (
         <div
           role="alert"
           data-orderbook-empty
@@ -404,7 +484,7 @@ export function OrderbookLadder({
           <p className="font-medium text-ink">Orderbook feed unavailable</p>
           <p className="mt-1 text-ink-3">{error}</p>
           {onRefresh && (
-            <Button variant="outline" size="sm" onClick={onRefresh} className="mt-2.5">
+            <Button variant="outline" size="sm" onClick={handleRefreshAll} className="mt-2.5">
               Retry
             </Button>
           )}
@@ -449,6 +529,143 @@ export function OrderbookLadder({
             ? "Click any YES row to stage the complement NO limit price (100 - YES)."
             : "Click any bid or ask row to populate the ticket limit price."}
         </p>
+      )}
+
+      {/* Compact L2 Snapshot History Scrubber & Transition List */}
+      {cleanTicker && (
+        <div data-orderbook-history className="mt-3 border-t border-hairline pt-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5 text-xs">
+              <History className="size-3.5 shrink-0 text-info-foreground" strokeWidth={1.5} aria-hidden />
+              <span className="font-semibold text-ink">L2 Snapshot History</span>
+              <span className="mono text-ink-2">
+                {historyLoading && historyRecords.length === 0
+                  ? "Loading…"
+                  : `(${historyRecords.length})`}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-1.5">
+              {inspectingHistory && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedHistoryIdx(null)}
+                  className="min-h-11 cursor-pointer rounded border border-hairline bg-board px-2.5 text-xs font-medium text-ink hover:bg-surface sm:min-h-7"
+                >
+                  Live
+                </button>
+              )}
+              <button
+                type="button"
+                aria-label="Refresh L2 snapshot history"
+                onClick={() => void loadHistory()}
+                disabled={historyLoading}
+                className="inline-flex min-h-11 min-w-11 cursor-pointer items-center justify-center rounded border border-hairline bg-board px-2 text-xs font-medium text-ink-2 hover:bg-surface hover:text-ink disabled:pointer-events-none disabled:bg-track disabled:text-ink-3 sm:min-h-7 sm:min-w-7"
+              >
+                <RefreshCw className={`size-3 ${historyLoading ? "animate-spin" : ""}`} strokeWidth={1.5} aria-hidden />
+              </button>
+            </div>
+          </div>
+
+          {historyError ? (
+            <p className="mt-1.5 text-xs text-ink-2">History unavailable ({historyError})</p>
+          ) : historyRecords.length === 0 ? (
+            <p className="mt-1.5 text-xs text-ink-2">No recorded L2 snapshots yet.</p>
+          ) : (
+            <div className="mt-2 space-y-2">
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  aria-label="Previous L2 snapshot"
+                  disabled={selectedHistoryIdx === 0}
+                  onClick={() => {
+                    setSelectedHistoryIdx((prev) => {
+                      if (prev === null) return Math.max(0, historyRecords.length - 1);
+                      return Math.max(0, prev - 1);
+                    });
+                  }}
+                  className="inline-flex min-h-11 min-w-11 shrink-0 cursor-pointer items-center justify-center rounded border border-hairline bg-board text-ink-2 hover:bg-surface hover:text-ink disabled:pointer-events-none disabled:bg-track disabled:text-ink-3 sm:min-h-7 sm:min-w-7"
+                >
+                  <ChevronLeft className="size-3.5" strokeWidth={1.5} aria-hidden />
+                </button>
+                <input
+                  type="range"
+                  min={0}
+                  max={Math.max(0, historyRecords.length - 1)}
+                  value={selectedHistoryIdx ?? historyRecords.length - 1}
+                  onChange={(e) => setSelectedHistoryIdx(Number(e.target.value))}
+                  aria-label="Scrub L2 snapshot history"
+                  data-orderbook-history-scrubber
+                  className="min-h-11 min-w-0 flex-1 cursor-pointer accent-[var(--blue)] sm:min-h-7"
+                />
+                <button
+                  type="button"
+                  aria-label="Next L2 snapshot"
+                  disabled={selectedHistoryIdx === null}
+                  onClick={() => {
+                    setSelectedHistoryIdx((prev) => {
+                      if (prev === null) return null;
+                      return prev + 1 >= historyRecords.length ? null : prev + 1;
+                    });
+                  }}
+                  className="inline-flex min-h-11 min-w-11 shrink-0 cursor-pointer items-center justify-center rounded border border-hairline bg-board text-ink-2 hover:bg-surface hover:text-ink disabled:pointer-events-none disabled:bg-track disabled:text-ink-3 sm:min-h-7 sm:min-w-7"
+                >
+                  <ChevronRight className="size-3.5" strokeWidth={1.5} aria-hidden />
+                </button>
+              </div>
+
+              <div
+                role="list"
+                aria-label="Recorded L2 depth transitions"
+                data-orderbook-history-list
+                className="max-h-36 divide-y divide-hairline overflow-y-auto border-t border-hairline"
+              >
+                {[...historyRecords]
+                  .map((rec, origIdx) => ({ rec, origIdx }))
+                  .reverse()
+                  .map(({ rec, origIdx }) => {
+                    const active = selectedHistoryIdx === origIdx;
+                    const tsLabel =
+                      rec.updated_ms > 0
+                        ? timeUtcFullLabel(Math.floor(rec.updated_ms / 1000))
+                        : "-";
+                    return (
+                      <button
+                        key={`${rec.last_seq}-${rec.updated_ms}-${origIdx}`}
+                        type="button"
+                        role="listitem"
+                        data-orderbook-history-item
+                        data-history-seq={rec.last_seq}
+                        aria-pressed={active}
+                        onClick={() => setSelectedHistoryIdx(active ? null : origIdx)}
+                        className={
+                          "mono flex min-h-11 w-full cursor-pointer flex-wrap items-center justify-between gap-2 px-2 py-1.5 text-left text-xs outline-none transition-[background-color,color] duration-(--dur-press) focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8 " +
+                          (active
+                            ? "bg-blue-soft font-semibold text-ink"
+                            : "text-ink-2 hover:bg-board/70 hover:text-ink")
+                        }
+                      >
+                        <span className="flex items-center gap-2">
+                          <span className="text-ink">#{rec.last_seq}</span>
+                          <span>{tsLabel}</span>
+                        </span>
+                        <span className="flex items-center gap-2">
+                          <span className="text-ink">
+                            YES {rec.best_yes_bid !== null ? `${rec.best_yes_bid}c` : "-"}/
+                            {rec.best_yes_ask !== null ? `${rec.best_yes_ask}c` : "-"}
+                          </span>
+                          <span>sp {rec.spread_cents !== null ? `${rec.spread_cents}c` : "-"}</span>
+                          <span>
+                            {rec.yes_bids.length}x{rec.yes_asks.length}
+                          </span>
+                        </span>
+                      </button>
+                    );
+                  })}
+              </div>
+            </div>
+          )}
+        </div>
       )}
     </section>
   );

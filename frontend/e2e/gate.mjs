@@ -203,7 +203,11 @@ async function open(w, h, theme = 'light', extra = {}) {
     } catch {}
     const u = new URL(r.request().url())
     if (u.pathname.endsWith('/stream-status')) {
-      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ws_connected: false, mode: 'offline', subscribed_tickers: [], active_books: 0, stale_books: 0, last_error: null, delta_count: 0, resync_count: 0 }) })
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ws_connected: false, mode: 'offline', subscribed_tickers: [], active_books: 0, stale_books: 0, last_error: null, delta_count: 0, resync_count: 0, auto_subscribed_count: 0, active_l2_tickers: [], last_trade_ms: null, tape_sync_rate_hz: 0 }) })
+    }
+    if (u.pathname.endsWith('/history')) {
+      const ticker = u.searchParams.get('ticker') || ''
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, ticker, records: [] }) })
     }
     if (u.pathname.endsWith('/subscribe')) {
       return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: false, subscribed_tickers: [] }) })
@@ -1371,12 +1375,47 @@ for (const m of measures) {
       body: JSON.stringify({
         ws_connected: true,
         mode: 'ws',
-        subscribed_tickers: ['KXBTC15M-MOCK'],
-        active_books: 1,
+        subscribed_tickers: ['KXBTC15M-MOCK', 'KXETH15M-MOCK'],
+        active_books: 2,
         stale_books: 0,
         last_error: null,
         delta_count: 14,
         resync_count: 1,
+        auto_subscribed_count: 2,
+        active_l2_tickers: ['KXBTC15M-MOCK', 'KXETH15M-MOCK'],
+        last_trade_ms: Date.now() - 4000,
+        tape_sync_rate_hz: 2.5,
+      }),
+    })
+  })
+  await p.route(/\/api\/orderbook\/history(\?.*)?$/, r => {
+    hits.add('orderbook-history')
+    const u = new URL(r.request().url())
+    const ticker = (u.searchParams.get('ticker') || 'KXBTC15M-MOCK').toUpperCase()
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        ticker,
+        records: [
+          {
+            ts_ms: 1700000840000,
+            ticker,
+            seq: 38,
+            source: 'ws',
+            yes_bids: [[51, 18], [49, 25]],
+            no_bids: [[43, 12], [41, 20]],
+          },
+          {
+            ts_ms: 1700000870000,
+            ticker,
+            seq: 40,
+            source: 'ws',
+            yes_bids: [[53, 15], [50, 22]],
+            no_bids: [[44, 10], [42, 18]],
+          },
+        ],
       }),
     })
   })
@@ -1562,11 +1601,35 @@ for (const m of measures) {
       runnerLockedBeforeArm && runnerShadowActive && runnerLiveActive && runnerHaltedAfterKill,
     `locked=${runnerLockedBeforeArm} shadow=${runnerShadowActive} live=${runnerLiveActive} halt=${runnerHaltedAfterKill}`)
   await p.locator('#tab-tape').click(); await p.waitForTimeout(200)
+  const tapeL2PillTxt = (await p.locator('#tape-l2-feed-pill').innerText()).trim()
+  const stripL2PillTxt = (await p.locator('#l2-feed-pill').innerText()).trim()
+  const autoSubTxt = (await p.locator('[data-l2-autosub-count]').innerText()).trim()
+  const lastTradeTxt = (await p.locator('[data-l2-last-trade]').innerText()).trim()
+  const syncHzTxt = (await p.locator('[data-l2-sync-hz]').innerText()).trim()
+  await p.locator('#l2-active-ticker-select').selectOption('KXETH15M-MOCK'); await p.waitForTimeout(100)
+  const selectedL2Val = await p.locator('#l2-active-ticker-select').inputValue()
+  ok('TapeTab & AutoCollectorStrip surface live L2 multi-ticker feed pill, auto-sub count, active ticker selector, last trade age & sync Hz',
+    tapeL2PillTxt.includes('L2 WS (2)') &&
+      stripL2PillTxt.includes('L2 WS (2)') &&
+      autoSubTxt.includes('2') &&
+      /just now|\d+s ago/.test(lastTradeTxt) &&
+      syncHzTxt.includes('2.5 Hz') &&
+      selectedL2Val === 'KXETH15M-MOCK',
+    `tapePill=${tapeL2PillTxt} stripPill=${stripL2PillTxt} autoSub=${autoSubTxt} trade=${lastTradeTxt} hz=${syncHzTxt} sel=${selectedL2Val}`)
   await p.locator('#markets-card button[data-market-row]').first().click(); await p.waitForTimeout(350)
   const drawerObOk =
     (await p.locator('[data-market-drawer] [data-orderbook-ladder]').isVisible()) &&
     (await p.locator('[data-market-drawer] [data-orderbook-ladder] [data-depth-bar]').count()) >= 4 &&
     (await p.locator('[data-market-drawer] [data-orderbook-spread]').innerText()).trim() === '2c'
+  const histCount = await p.locator('[data-market-drawer] [data-orderbook-history-item]').count()
+  await p.locator('[data-market-drawer] [data-orderbook-history-item][data-history-seq="38"]').click(); await p.waitForTimeout(100)
+  const histBannerVisible = await p.locator('[data-market-drawer] [data-orderbook-history-banner]').isVisible()
+  const histSpread = (await p.locator('[data-market-drawer] [data-orderbook-spread]').innerText()).trim()
+  await p.locator('[data-market-drawer] [data-orderbook-history-live]').click(); await p.waitForTimeout(100)
+  const liveSpreadRestored = (await p.locator('[data-market-drawer] [data-orderbook-spread]').innerText()).trim()
+  ok('OrderbookLadder L2 Snapshot History scrubber/list loads /api/orderbook/history, previews historical depth & returns to live',
+    hits.has('orderbook-history') && histCount === 2 && histBannerVisible && histSpread === '6c' && liveSpreadRestored === '2c',
+    `histCount=${histCount} banner=${histBannerVisible} histSpread=${histSpread} live=${liveSpreadRestored}`)
   await p.keyboard.press('Escape'); await p.waitForTimeout(350)
   ok('L2 Orderbook DOM ladder renders depth bars, spread badge, live VWAP book-walk updates on qty change, click-to-fill price & Market Inspector auto-subscribe',
     ['orderbook', 'orderbook-stream-status', 'orderbook-subscribe'].every(k => hits.has(k)) &&
@@ -1741,7 +1804,10 @@ for (const m of measures) {
   await p.route(/\/api\/orderbook(\/.*|\?.*)?$/, r => {
     const u = new URL(r.request().url())
     if (u.pathname.endsWith('/stream-status')) {
-      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ws_connected: bookMode === 'normal', mode: bookMode === 'normal' ? 'ws' : 'rest', subscribed_tickers: ['KXBTC15M-MOCK'], active_books: bookMode === 'empty' ? 0 : 1, stale_books: bookMode === 'crossed_stale' ? 1 : 0, last_error: null, delta_count: 5, resync_count: 1 }) })
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ws_connected: bookMode === 'normal', mode: bookMode === 'normal' ? 'ws' : 'rest', subscribed_tickers: ['KXBTC15M-MOCK'], active_books: bookMode === 'empty' ? 0 : 1, stale_books: bookMode === 'crossed_stale' ? 1 : 0, last_error: null, delta_count: 5, resync_count: 1, auto_subscribed_count: 1, active_l2_tickers: ['KXBTC15M-MOCK'], last_trade_ms: null, tape_sync_rate_hz: 0 }) })
+    }
+    if (u.pathname.endsWith('/history')) {
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, ticker: 'KXBTC15M-MOCK', records: [] }) })
     }
     if (u.pathname.endsWith('/subscribe')) {
       return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, subscribed_tickers: ['KXBTC15M-MOCK'] }) })
