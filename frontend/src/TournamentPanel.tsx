@@ -249,7 +249,7 @@ export function TournamentPanel({
                       <div className="flex flex-wrap items-center gap-1.5">
                         <span className="break-all text-xs font-semibold text-ink sm:text-sm">{row.strategy}</span>
                         {row.inOptimalLineup && (
-                          <Badge variant="outline" className="border-blue bg-blue-soft font-mono text-xs text-info-foreground">
+                          <Badge variant="outline" className="border-blue bg-blue-soft text-xs text-info-foreground">
                             Lineup
                           </Badge>
                         )}

@@ -278,7 +278,7 @@ function StrategyInspector({
                   ) : (
                     <ul className="divide-y divide-hairline border-t border-hairline">
                       {[...trades].reverse().slice(0, 40).map((t, idx) => (
-                        <li key={idx} className="flex flex-wrap items-center justify-between gap-2 py-2 font-mono text-xs">
+                        <li key={idx} className="flex flex-wrap items-center justify-between gap-2 py-2 text-xs tabular-nums">
                           <span className="text-ink-2">
                             {dayLabel(t.close_epoch)} {timeUtcLabel(t.close_epoch)}
                           </span>

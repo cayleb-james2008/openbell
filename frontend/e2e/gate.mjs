@@ -780,7 +780,7 @@ for (const m of measures) {
   await p.route('**/api/home', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.28.0'
+    j.version = '0.29.0'
     j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan', 'tournament', 'auto_collector', 'live_kalshi', 'risk_rails', 'edge_audit', 'shadow_runner', 'strategy_v2', 'strategy_crud', 'synthesizer']
     j.collector = {
       ...j.collector,
@@ -1753,7 +1753,7 @@ for (const m of measures) {
   await p.route('**/api/home*', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.28.0'
+    j.version = '0.29.0'
     j.capabilities = ['sse', 'sandbox', 'live_kalshi', 'risk_rails', 'shadow_runner', 'strategy_v2', 'strategy_crud', 'synthesizer']
     return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
   })

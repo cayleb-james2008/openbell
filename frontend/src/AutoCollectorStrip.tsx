@@ -204,7 +204,7 @@ export function AutoCollectorStrip({
           </StatusPill>
 
           {status?.rateLimited && (
-            <span className="inline-flex items-center gap-1 font-mono text-xs text-warning-foreground">
+            <span className="inline-flex items-center gap-1 text-xs text-warning-foreground">
               <AlertTriangle className="size-3.5" aria-hidden />
               Adaptive 429 backoff active
             </span>

@@ -355,7 +355,7 @@ export function ScalePlannerPanel({
                   style={{ width: `${Math.min(100, Math.max(2, fillPct))}%` }}
                 />
               </div>
-              <div className="mt-2 flex flex-wrap items-center justify-between gap-2 font-mono text-xs text-ink-2">
+              <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs tabular-nums text-ink-2">
                 <span>1 series max: {moneyWhole(plan.liquidityCeiling.singleSeriesMaxDailyDollars)}/d</span>
                 <span>
                   {plan.liquidityCeiling.activeSeriesCount} series max:{" "}

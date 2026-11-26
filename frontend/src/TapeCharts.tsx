@@ -140,7 +140,7 @@ export function MarketHistoryChart({
     <div ref={ref} className="min-w-0" data-market-price-spread-chart>
       <div
         data-market-crosshair-tooltip
-        className="mb-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded-md border border-hairline bg-board/60 px-2.5 py-1 font-mono text-xs tabular-nums"
+        className="mb-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded-md border border-hairline bg-board/60 px-2.5 py-1 text-xs tabular-nums"
       >
         <span className="font-medium text-ink">
           {isNum(active.raw.fetched_at) ? timeUtcFullLabel(active.raw.fetched_at) : "Latest"}

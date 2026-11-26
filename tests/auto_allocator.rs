@@ -81,6 +81,7 @@ fn spawn_server(dir: &Path, port: u16) -> ServerGuard {
         .env("OPENBELL_COLLECT_SECS", "3600")
         .env("OPENBELL_UPDATE_MODE", "off")
         .env("OPENBELL_NO_OPEN", "1")
+        .env("OPENBELL_ORDERBOOK_OFFLINE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

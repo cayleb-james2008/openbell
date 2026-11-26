@@ -398,7 +398,7 @@ export function SlotsTab({
                 {retiredSlots.map((r, i) => (
                   <li key={i} className="flex flex-wrap items-center justify-between gap-2 py-2">
                     <div className="flex flex-wrap items-center gap-2">
-                      <StatusPill tone="error" className="min-h-6 px-2 py-0.5 font-mono text-xs text-destructive-foreground">
+                      <StatusPill tone="error" className="min-h-6 px-2 py-0.5 text-xs tabular-nums text-destructive-foreground">
                         3/3 strikes
                       </StatusPill>
                       <span className="break-all font-medium text-ink">

@@ -985,7 +985,7 @@ export function RuneSandbox({
                 ) : (
                   <ul className="max-h-44 divide-y divide-hairline overflow-y-auto border-t border-hairline">
                     {[...result.trades].reverse().slice(0, 12).map((t, idx) => (
-                      <li key={idx} className="flex flex-wrap items-center justify-between gap-2 py-1.5 font-mono text-xs">
+                      <li key={idx} className="flex flex-wrap items-center justify-between gap-2 py-1.5 text-xs tabular-nums">
                         <span className="text-ink-2">
                           {dayLabel(t.closeEpoch)} {timeUtcLabel(t.closeEpoch)}
                         </span>

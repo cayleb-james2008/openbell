@@ -343,6 +343,7 @@ struct PendingLiveOrderIntent {
     posted_at: i64,
     close_epoch: i64,
     client_order_id: String,
+    replay_mode: bool,
 }
 
 pub struct ShadowRunner {
@@ -2058,7 +2059,7 @@ impl ShadowRunner {
                             last_bid_cents: 0,
                             last_l2_updated_ms: 0,
                             last_l2_trade_ms: None,
-                            replay_mode: false,
+                            replay_mode: intent_info.replay_mode,
                         });
                     }
                 }
@@ -2314,6 +2315,7 @@ fn evaluate_slots_for_market(
                 posted_at: eval_ts,
                 close_epoch,
                 client_order_id: order_id,
+                replay_mode,
             });
             continue;
         }

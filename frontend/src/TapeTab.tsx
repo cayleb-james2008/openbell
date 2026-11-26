@@ -150,7 +150,7 @@ function MarketInspector({
                   <Drawer.Title className="mono mt-2 break-all text-base font-semibold text-ink">
                     {cleanStr(market.ticker, "unnamed market")}
                   </Drawer.Title>
-                  <Drawer.Description className="mt-0.5 font-mono text-xs text-ink-2">
+                  <Drawer.Description className="mt-0.5 text-xs tabular-nums text-ink-2">
                     Close {typeof market.close_time === "string" && market.close_time ? market.close_time : "unknown"}
                   </Drawer.Description>
                 </div>
@@ -233,7 +233,7 @@ function MarketInspector({
                   </h3>
                   <ul className="divide-y divide-hairline border-t border-hairline">
                     {(history && history.length > 0 ? [...history].reverse().slice(0, 30) : [market]).map((pt, idx) => (
-                      <li key={idx} className="flex flex-wrap items-center justify-between gap-2 py-2 font-mono text-xs">
+                      <li key={idx} className="flex flex-wrap items-center justify-between gap-2 py-2 text-xs tabular-nums">
                         <span className="text-ink-2">{timeUtcFullLabel(pt.fetched_at)}</span>
                         <span className="text-ink">
                           YES {cents(pt.yes_bid)}/{cents(pt.yes_ask)} | NO {cents(pt.no_bid)}/{cents(pt.no_ask)}

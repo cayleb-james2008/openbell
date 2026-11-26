@@ -42,7 +42,7 @@ export function TremorSpark({
   const pts = validPoints(points);
   const s0 = isNum(start) ? start : 0;
   if (pts.length < 2) {
-    return <span className="font-mono text-xs text-ink-3">no trades</span>;
+    return <span className="text-xs text-ink-3">no trades</span>;
   }
   const vals = pts.map((p) => p[1]);
   const lo = Math.min(...vals);
@@ -115,7 +115,7 @@ export function HeroEquityChart({
               ? `Live tape recording (${snapshots.toLocaleString()} snapshots across ${openMarkets} open 15m markets)`
               : "Awaiting first settled paper window"}
           </span>
-          <span className="font-mono text-ink-3">Start {money(s0)} / Stage 1 {moneyWhole(target)}</span>
+          <span className="tabular-nums text-ink-3">Start {money(s0)} / Stage 1 {moneyWhole(target)}</span>
         </div>
         <svg
           role="img"
@@ -367,7 +367,7 @@ export function EquityDrawdownChart({
             {dayLabel(active.t)} {timeUtcLabel(active.t)}
           </span>
         </div>
-        <span className="font-mono text-ink-3">
+        <span className="tabular-nums text-ink-3">
           Max DD {actualMaxDd.toFixed(2)}%
         </span>
       </div>
@@ -1755,7 +1755,7 @@ export function AllocatorComparisonChart({
 
   return (
     <div ref={boxRef} className="w-full space-y-2">
-      <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-xs text-ink-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs tabular-nums text-ink-2">
         <span>
           {activePt.close_epoch > 0
             ? `${dayLabel(activePt.close_epoch)} ${timeUtcLabel(activePt.close_epoch)} UTC`
@@ -1964,7 +1964,7 @@ export function BootstrapStressFanChart({
 
   return (
     <div ref={ref} className="w-full space-y-2">
-      <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-xs text-ink-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs tabular-nums text-ink-2">
         <span>Day {pt.day} of {trajectory[trajectory.length - 1].day}</span>
         <div className="flex flex-wrap items-center gap-3">
           <span className="text-ink-2">P5 {money(pt.p5_equity)}</span>

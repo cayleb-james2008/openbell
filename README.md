@@ -1,17 +1,17 @@
 # OpenBell
 
-![version](https://img.shields.io/badge/version-v0.28.0-0969da?style=flat-square)
+![version](https://img.shields.io/badge/version-v0.29.0-0969da?style=flat-square)
 ![stack](https://img.shields.io/badge/stack-Rust%20%2B%20React%2019-111827?style=flat-square)
-![tests](https://img.shields.io/badge/tests-150%2F150%20pass-16a34a?style=flat-square)
-![binary](https://img.shields.io/badge/release%20binary-6.18%20MiB-0969da?style=flat-square)
+![tests](https://img.shields.io/badge/tests-152%2F152%20pass-16a34a?style=flat-square)
+![binary](https://img.shields.io/badge/release%20binary-6.24%20MiB-0969da?style=flat-square)
 ![safety](https://img.shields.io/badge/live__armed-false%20on%20boot-16a34a?style=flat-square)
 
-OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction markets. It includes a Kalshi Trade API v2 client (`live_armed: false` on every boot, seven hard risk rails, and an emergency kill switch), a live WebSocket and REST L2 orderbook stream (`OrderbookStore` book-walk VWAP sizing, crossed-book detection, and DOM depth ladder), a tick-driven shadow orderbook runner (`entry_quote` resting quotes, queue-ahead depletion, idempotent settlement logging, and restart clamping), a causal Strategy Runtime v2 with confined script library CRUD and a walk-forward BH-FDR edge synthesizer, a deduplicating public 15-minute tape collector, and a post-only maker allocator.
+OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction markets. It includes a Kalshi Trade API v2 client (`live_armed: false` on every boot, seven hard risk rails, and an emergency kill switch), a live WebSocket and REST L2 orderbook stream (`OrderbookStore` auto-subscription up to 32 active markets, trade channel ingestion, bounded snapshot history, book-walk VWAP sizing, and DOM depth ladder), a tick-driven shadow orderbook runner (decoupled resting-quote management, direct L2 touch/cross/trade matching, idempotent settlement logging, and restart clamping), a causal Strategy Runtime v2 with confined script library CRUD and a walk-forward BH-FDR edge synthesizer, a deduplicating public 15-minute tape collector, and a post-only maker allocator.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/hero-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/hero-light.png">
-  <img alt="OpenBell v0.28.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
+  <img alt="OpenBell v0.29.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
 </picture>
 
 ## Feature gallery
@@ -99,6 +99,18 @@ OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction marke
       </picture>
     </td>
   </tr>
+  <tr>
+    <td colspan="2" valign="top">
+      <strong>L2 Auto-Subscription Telemetry and Snapshot History Scrubber (<code>v0.29.0</code>)</strong><br>
+      <sub>Automatically subscribes active open 15-minute markets to L2 depth and trade streams (up to 32 tickers), decouples <code>ShadowRunner</code> resting-quote fills and expiry checks from cursor position, and renders a live L2 telemetry strip plus a historical L2 depth scrubber.</sub>
+      <br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/l2-autosub-dark.png">
+        <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/l2-autosub-light.png">
+        <img alt="OpenBell v0.29.0 L2 Auto-Subscription Telemetry and Snapshot History Scrubber" src="docs/screenshots/l2-autosub-light.png">
+      </picture>
+    </td>
+  </tr>
 </table>
 
 ## Causal execution and fail-closed risk pipeline
@@ -116,16 +128,16 @@ flowchart LR
   R -- "confirm_arm = true" --> K["Kalshi Trade API v2 (RSA-PSS SHA-256)"]
 ```
 
-## Verified baseline (`v0.28.0`)
+## Verified baseline (`v0.29.0`)
 
-| Metric | `v0.10.0` Baseline | `v0.28.0` Verified | Delta |
+| Metric | `v0.10.0` Baseline | `v0.29.0` Verified | Delta |
 | --- | --- | --- | --- |
-| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`6.18 MiB`** (`6,485,352 B`) | **`-42.0%`** |
-| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`97,049 B`** (`95 kB`) / **`22,307 B`** (`22 kB`, `24` chunks) | **`-94.7%` wire bytes** |
-| Cold boot to first `HTTP 200` | `9.11 ms` | **`16.16 ms`** | Under `20 ms` |
-| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`18.09 MB`** (`18,520 KB`) | **`-85.6%`** |
-| Concurrent HTTP throughput (`16w`, `5/5` SSE) | `4,921.3 req/s` | **`5,117.6 req/s`** (`4.72 ms` p95, `0/12,806` errors) | **`+4.0%`** |
-| Security and test verification | `49/49` fuzz | **`150/150` Rust tests**, `25/25` raw-TCP fuzz, `gate 114/114`, `replay 18/18`, `sloplint 0/0/0`, `RAILS OK`, `EQUITY OK` | Clean |
+| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`6.24 MiB`** (`6,538,600 B`) | **`-41.5%`** |
+| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`99,079 B`** (`97 kB`) / **`22,748 B`** (`22 kB`, `24` chunks) | **`-94.6%` wire bytes** |
+| Cold boot to first `HTTP 200` | `9.11 ms` | **`4.91 ms`** | Under `20 ms` |
+| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`18.91 MB`** (`19,368 KB`) | **`-84.9%`** |
+| Concurrent HTTP throughput (`16w`, `5/5` SSE) | `4,921.3 req/s` | **`4,935.8 req/s`** (`4.69 ms` p95, `0/12,355` errors) | **`+0.3%`** |
+| Security and test verification | `49/49` fuzz | **`152/152` Rust tests**, `25/25` raw-TCP fuzz, `gate 116/116`, `replay 18/18`, `sloplint 0/0/0`, `RAILS OK`, `EQUITY OK` | Clean |
 
 ## Quick start (synthetic paper mode)
 
