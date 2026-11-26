@@ -315,6 +315,8 @@ struct RunnerState {
     settled_or_filled_slot_tickers: HashMap<String, HashSet<usize>>,
     terminal_order_ids: HashSet<String>,
     terminal_order_queue: VecDeque<String>,
+    applied_live_trade_ids: HashSet<String>,
+    applied_live_trade_queue: VecDeque<String>,
     ticker_cursor: HashMap<String, usize>,
     l2_eval_ms: HashMap<String, i64>,
     ledger: Vec<LedgerEvent>,
@@ -338,7 +340,6 @@ struct PendingLiveOrderIntent {
     execution_mode: String,
     side: String,
     limit_cents: u8,
-    quote_cents: u8,
     contracts: u32,
     posted_at: i64,
     close_epoch: i64,
@@ -529,6 +530,23 @@ impl RunnerState {
         true
     }
 
+    fn mark_applied_live_trade(&mut self, trade_id: &str) -> bool {
+        let trimmed = trade_id.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+        if !self.applied_live_trade_ids.insert(trimmed.to_string()) {
+            return false;
+        }
+        self.applied_live_trade_queue.push_back(trimmed.to_string());
+        while self.applied_live_trade_queue.len() > MAX_TERMINAL_ORDER_IDS {
+            if let Some(old) = self.applied_live_trade_queue.pop_front() {
+                self.applied_live_trade_ids.remove(&old);
+            }
+        }
+        true
+    }
+
     fn emit_quote_canceled(
         &mut self,
         q: &VirtualOrLiveOrder,
@@ -628,6 +646,86 @@ impl RunnerState {
             contracts: q.contracts,
             slippage_cents: Some(safe_slip),
             queue_wait_secs: Some(safe_wait),
+            fee_dollars: Some(safe_fee),
+            realized_pnl_dollars: None,
+            result: None,
+            reason: None,
+            live_order_id: q.live_order_id.clone(),
+        };
+        self.append_and_publish(ev, "quote_filled");
+    }
+
+    /// Record a partial or full live venue fill with real fill price, slippage, and fee.
+    fn record_live_fill(
+        &mut self,
+        q: &mut VirtualOrLiveOrder,
+        fill_cents: u8,
+        fill_contracts: u32,
+        fee_dollars: f64,
+        filled_at: i64,
+    ) {
+        let remaining_cap = q.contracts.saturating_sub(q.filled_contracts);
+        let applied = fill_contracts.min(remaining_cap);
+        if applied == 0 {
+            return;
+        }
+        let fill_cents = fill_cents.clamp(1, 99);
+        let safe_slip = (fill_cents as f64) - (q.limit_cents as f64);
+        let wait_s = (filled_at - q.posted_at).max(0) as f64;
+        let safe_fee = if fee_dollars.is_finite() && fee_dollars >= 0.0 {
+            fee_dollars
+        } else {
+            0.0
+        };
+
+        q.filled_contracts = q.filled_contracts.saturating_add(applied);
+        if q.filled_contracts >= q.contracts {
+            q.status = "filled".to_string();
+            let _ = self.mark_terminal_order(&q.order_id);
+        } else {
+            q.status = "partial".to_string();
+        }
+
+        self.total_fills = self.total_fills.saturating_add(1);
+        self.slippage_sum_cents += safe_slip;
+        self.slippage_count = self.slippage_count.saturating_add(1);
+        self.queue_wait_sum_secs += wait_s;
+        self.queue_wait_count = self.queue_wait_count.saturating_add(1);
+        if let Some(slot) = self.slots.iter_mut().find(|s| s.cfg.slot_id == q.slot_id) {
+            slot.fills = slot.fills.saturating_add(1);
+        }
+        self.mark_slot_ticker(q.slot_id, &q.ticker);
+        self.filled_positions.push(FilledPosition {
+            order_id: q.order_id.clone(),
+            slot_id: q.slot_id,
+            strategy: q.strategy.clone(),
+            ticker: q.ticker.clone(),
+            series: q.series.clone(),
+            mode: q.mode.clone(),
+            execution_mode: q.execution_mode.clone(),
+            side: q.side.clone(),
+            fill_cents,
+            contracts: applied,
+            fee_dollars: safe_fee,
+            live_order_id: q.live_order_id.clone(),
+        });
+        let ev = LedgerEvent {
+            seq: 0,
+            ts: filled_at,
+            event: "OrderFilled".to_string(),
+            mode: q.mode.clone(),
+            slot_id: q.slot_id,
+            strategy: q.strategy.clone(),
+            ticker: q.ticker.clone(),
+            series: q.series.clone(),
+            order_id: q.order_id.clone(),
+            side: q.side.clone(),
+            execution_mode: q.execution_mode.clone(),
+            limit_cents: q.limit_cents,
+            fill_cents: Some(fill_cents),
+            contracts: applied,
+            slippage_cents: Some(safe_slip),
+            queue_wait_secs: Some(wait_s),
             fee_dollars: Some(safe_fee),
             realized_pnl_dollars: None,
             result: None,
@@ -1041,6 +1139,8 @@ impl ShadowRunner {
                 settled_or_filled_slot_tickers,
                 terminal_order_ids,
                 terminal_order_queue,
+                applied_live_trade_ids: HashSet::new(),
+                applied_live_trade_queue: VecDeque::new(),
                 ticker_cursor: HashMap::new(),
                 l2_eval_ms: HashMap::new(),
                 ledger,
@@ -1383,6 +1483,178 @@ impl ShadowRunner {
         }
     }
 
+    /// Reconcile open live orders and filled live positions against fresh venue
+    /// `orders`, `fills`, and `settlements`, recording partial/full fills with real
+    /// fill prices, slippage, and maker/taker fees. Returns remaining open `(live_order_id, ticker)`.
+    pub fn reconcile_live_data(
+        &self,
+        orders: &[kalshi_live::KalshiOrder],
+        fills: &[kalshi_live::KalshiFill],
+        settlements: &[kalshi_live::KalshiSettlement],
+        now: i64,
+    ) -> Vec<(String, String)> {
+        let mut fills_by_order: HashMap<&str, Vec<&kalshi_live::KalshiFill>> = HashMap::new();
+        for f in fills {
+            if !f.order_id.is_empty() {
+                fills_by_order.entry(f.order_id.as_str()).or_default().push(f);
+            }
+        }
+        let orders_by_id: HashMap<&str, &kalshi_live::KalshiOrder> = orders
+            .iter()
+            .map(|o| (o.order_id.as_str(), o))
+            .collect();
+
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let existing = std::mem::take(&mut st.open_quotes);
+        let mut next_open = Vec::with_capacity(existing.len());
+
+        for mut rq in existing {
+            if rq.order.mode != "live" {
+                next_open.push(rq);
+                continue;
+            }
+            let Some(ref lid) = rq.order.live_order_id.clone() else {
+                next_open.push(rq);
+                continue;
+            };
+
+            // 1. Apply any unapplied real venue fills (supports partial fills & real price/fee).
+            if let Some(order_fills) = fills_by_order.get(lid.as_str()) {
+                for f in order_fills {
+                    if !f.trade_id.trim().is_empty() && !st.mark_applied_live_trade(&f.trade_id) {
+                        continue;
+                    }
+                    let count_u32 = u32::try_from(f.count.max(0)).unwrap_or(0);
+                    if count_u32 == 0 {
+                        continue;
+                    }
+                    let fill_c_i64 = if rq.order.side == "yes" {
+                        f.yes_price.or_else(|| f.no_price.map(|p| 100 - p))
+                    } else {
+                        f.no_price.or_else(|| f.yes_price.map(|p| 100 - p))
+                    }
+                    .unwrap_or(rq.order.limit_cents as i64);
+                    let fill_c = fill_c_i64.clamp(1, 99) as u8;
+                    let is_taker = f.is_taker.unwrap_or(rq.order.execution_mode == "taker");
+                    let fee_d = f
+                        .fee_cost_dollars
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .unwrap_or_else(|| {
+                            let fee_fn = if is_taker {
+                                taker_fee_dollars
+                            } else {
+                                maker_fee_dollars
+                            };
+                            fee_fn(fill_c as f64 / 100.0) * (count_u32 as f64)
+                        });
+                    let fill_ts = f
+                        .ts
+                        .or_else(|| f.created_time.as_deref().and_then(parse_iso_z))
+                        .unwrap_or(now);
+                    st.record_live_fill(&mut rq.order, fill_c, count_u32, fee_d, fill_ts);
+                }
+            }
+
+            if rq.order.filled_contracts >= rq.order.contracts {
+                continue;
+            }
+
+            match orders_by_id.get(lid.as_str()) {
+                Some(vo)
+                    if vo.status.eq_ignore_ascii_case("canceled")
+                        || vo.status.eq_ignore_ascii_case("cancelled") =>
+                {
+                    st.emit_quote_canceled(&rq.order, now, "venue_canceled");
+                }
+                Some(vo)
+                    if vo.status.eq_ignore_ascii_case("executed")
+                        || (vo.remaining_count == 0 && vo.fill_count > 0) =>
+                {
+                    // Fallback when a venue reports executed without granular fill rows.
+                    let rem = rq.order.contracts.saturating_sub(rq.order.filled_contracts);
+                    if rem > 0 {
+                        let fill_c_i64 = if rq.order.side == "yes" {
+                            vo.yes_price.or_else(|| vo.no_price.map(|p| 100 - p))
+                        } else {
+                            vo.no_price.or_else(|| vo.yes_price.map(|p| 100 - p))
+                        }
+                        .unwrap_or(rq.order.limit_cents as i64);
+                        let fill_c = fill_c_i64.clamp(1, 99) as u8;
+                        let fee_fn = if rq.order.execution_mode == "maker" {
+                            maker_fee_dollars
+                        } else {
+                            taker_fee_dollars
+                        };
+                        let fee_d = fee_fn(fill_c as f64 / 100.0) * (rem as f64);
+                        st.record_live_fill(&mut rq.order, fill_c, rem, fee_d, now);
+                    }
+                }
+                Some(vo) if vo.fill_count > 0 && vo.remaining_count > 0 => {
+                    rq.order.status = "partial".to_string();
+                    next_open.push(rq);
+                }
+                _ => next_open.push(rq),
+            }
+        }
+        st.open_quotes = next_open;
+
+        // 2. Grade any live filled positions / open quotes on settled tickers.
+        for s in settlements {
+            let res = s.market_result.trim().to_ascii_lowercase();
+            if res != "yes" && res != "no" {
+                continue;
+            }
+            let has_live = st
+                .open_quotes
+                .iter()
+                .any(|rq| rq.order.mode == "live" && rq.order.ticker == s.ticker)
+                || st
+                    .filled_positions
+                    .iter()
+                    .any(|p| p.mode == "live" && p.ticker == s.ticker);
+            if has_live {
+                let settled_ts = s
+                    .settled_time
+                    .as_deref()
+                    .and_then(parse_iso_z)
+                    .unwrap_or(now);
+                st.settle_ticker(&s.ticker, &res, settled_ts);
+            }
+        }
+
+        st.open_quotes
+            .iter()
+            .filter_map(|rq| {
+                if rq.order.mode == "live" {
+                    rq.order
+                        .live_order_id
+                        .as_ref()
+                        .map(|lid| (lid.clone(), rq.order.ticker.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn mark_live_order_canceled(&self, live_order_id: &str, now: i64, reason: &str) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let existing = std::mem::take(&mut st.open_quotes);
+        let mut kept = Vec::with_capacity(existing.len());
+        let mut canceled = Vec::new();
+        for rq in existing {
+            if rq.order.live_order_id.as_deref() == Some(live_order_id) {
+                canceled.push(rq.order);
+            } else {
+                kept.push(rq);
+            }
+        }
+        st.open_quotes = kept;
+        for q in canceled {
+            st.emit_quote_canceled(&q, now, reason);
+        }
+    }
+
     /// Execute one tick of the matching & strategy evaluation engine.
     pub fn step_once(&self, app: &App, cached_strats: &mut CachedStrategies) {
         let (live_armed, killed, live_cfg_opt) = {
@@ -1414,10 +1686,11 @@ impl ShadowRunner {
                 return;
             }
             let poll = st.mode == RunnerMode::LiveAuto
-                && st
+                && (st
                     .open_quotes
                     .iter()
                     .any(|rq| rq.order.mode == "live" && rq.order.live_order_id.is_some())
+                    || st.filled_positions.iter().any(|p| p.mode == "live"))
                 && st
                     .live_poll_last
                     .is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
@@ -1427,52 +1700,26 @@ impl ShadowRunner {
             (st.mode, poll)
         };
 
-        // Reconcile open live orders against venue outside any state locks.
+        // Reconcile open live orders, partial/full fills, and settlements against venue outside state locks.
         if need_live_poll {
-            if let Some(ref cfg) = live_cfg_opt {
-                if let Ok(client) = kalshi_live::KalshiLiveClient::from_config(cfg) {
-                    if let Ok(venue_orders) = client.get_orders(None) {
-                        let by_id: HashMap<&str, &kalshi_live::KalshiOrder> = venue_orders
-                            .iter()
-                            .map(|o| (o.order_id.as_str(), o))
-                            .collect();
-                        let now = now_unix();
-                        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                        let mut next_open = Vec::with_capacity(st.open_quotes.len());
-                        let existing = std::mem::take(&mut st.open_quotes);
-                        for rq in existing {
-                            if rq.order.mode != "live" {
-                                next_open.push(rq);
-                                continue;
-                            }
-                            let Some(ref lid) = rq.order.live_order_id else {
-                                next_open.push(rq);
-                                continue;
-                            };
-                            match by_id.get(lid.as_str()) {
-                                Some(vo) if vo.status == "executed" || (vo.remaining_count == 0 && vo.fill_count > 0) => {
-                                    let fill_cents = rq.order.limit_cents;
-                                    let fee_fn = if rq.order.execution_mode == "maker" {
-                                        maker_fee_dollars
-                                    } else {
-                                        taker_fee_dollars
-                                    };
-                                    let fee_d = fee_fn(fill_cents as f64 / 100.0)
-                                        * (rq.order.contracts as f64);
-                                    let wait_s = (now - rq.order.posted_at).max(0) as f64;
-                                    st.record_fill(&rq.order, fill_cents, 0.0, wait_s, fee_d, now);
-                                }
-                                Some(vo) if vo.status == "canceled" || vo.status == "cancelled" => {
-                                    st.emit_quote_canceled(&rq.order, now, "venue_canceled");
-                                }
-                                _ => next_open.push(rq),
-                            }
-                        }
-                        st.open_quotes = next_open;
-                    }
-                }
-            }
+            let _ = crate::reconcile_live_venue(app);
         }
+
+        // Fail-closed gate: `live_auto` refuses new orders if live credentials are configured
+        // AND (`last_venue_sync_epoch` is `None` or `> 30s` old). Paper `Shadow` mode is unaffected.
+        let allow_live_entries = if mode == RunnerMode::LiveAuto && live_cfg_opt.is_some() {
+            let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+            let stale = ld.rails.is_venue_sync_stale(now_unix());
+            if stale {
+                ld.rails.last_error = Some(
+                    "refusing live_auto new orders: venue sync is stale (>30s) or pending"
+                        .to_string(),
+                );
+            }
+            !stale
+        } else {
+            true
+        };
 
         let mut pending_live_intents: Vec<PendingLiveOrderIntent> = Vec::new();
         let mut live_cancels: Vec<(String, VirtualOrLiveOrder, i64, String)> = Vec::new();
@@ -1662,31 +1909,33 @@ impl ShadowRunner {
                                         } else {
                                             None
                                         };
-                                        evaluate_slots_for_market(
-                                            &mut st,
-                                            app,
-                                            cached_strats,
-                                            mode,
-                                            bankroll,
-                                            ticker,
-                                            last.series.as_str(),
-                                            wall_now,
-                                            close_epoch,
-                                            secs_to_close,
-                                            (ya_c as f64) / 100.0,
-                                            (na_c as f64) / 100.0,
-                                            ya_c,
-                                            na_c,
-                                            yb_c,
-                                            nb_c,
-                                            yb_sz,
-                                            nb_sz,
-                                            cur_ctx.as_ref(),
-                                            false,
-                                            ob.updated_ms,
-                                            ob.last_trade_ms,
-                                            &mut pending_live_intents,
-                                        );
+                                        if allow_live_entries {
+                                            evaluate_slots_for_market(
+                                                &mut st,
+                                                app,
+                                                cached_strats,
+                                                mode,
+                                                bankroll,
+                                                ticker,
+                                                last.series.as_str(),
+                                                wall_now,
+                                                close_epoch,
+                                                secs_to_close,
+                                                (ya_c as f64) / 100.0,
+                                                (na_c as f64) / 100.0,
+                                                ya_c,
+                                                na_c,
+                                                yb_c,
+                                                nb_c,
+                                                yb_sz,
+                                                nb_sz,
+                                                cur_ctx.as_ref(),
+                                                false,
+                                                ob.updated_ms,
+                                                ob.last_trade_ms,
+                                                &mut pending_live_intents,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1863,7 +2112,7 @@ impl ShadowRunner {
                     st.open_quotes = kept_quotes;
 
                     // 2. Evaluate active slots without a quote or filled position on this ticker.
-                    if secs_to_close <= cancel_before {
+                    if secs_to_close <= cancel_before || !allow_live_entries {
                         continue;
                     }
                     let replay_mode = wall_now >= close_epoch && snap.fetched_at < close_epoch;
@@ -1893,7 +2142,9 @@ impl ShadowRunner {
                         &mut pending_live_intents,
                     );
                 }
-                st.ticker_cursor.insert(ticker.to_string(), snaps.len());
+                if allow_live_entries || !snaps.last().is_some_and(|s| s.result.is_empty()) {
+                    st.ticker_cursor.insert(ticker.to_string(), snaps.len());
+                }
             }
         }
 
@@ -1902,7 +2153,30 @@ impl ShadowRunner {
             if let Some(ref cfg) = live_cfg_opt {
                 if let Ok(client) = kalshi_live::KalshiLiveClient::from_config(cfg) {
                     for (lid, q, ts, reason) in live_cancels {
-                        let _ = client.cancel_order(&lid);
+                        if client.cancel_order(&lid).is_ok() {
+                            let rem = q.contracts.saturating_sub(q.filled_contracts);
+                            let notional = (rem as f64) * (q.limit_cents as f64 / 100.0);
+                            let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                            let reserved = ld.reserved_order_exposure.remove(&lid).unwrap_or(notional);
+                            ld.rails.release_exposure(reserved);
+                            ld.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                                kind: "order_canceled".to_string(),
+                                venue_id: lid.clone(),
+                                ts,
+                                order_id: lid.clone(),
+                                client_order_id: Some(q.order_id.clone()),
+                                trade_id: None,
+                                ticker: q.ticker.clone(),
+                                side: q.side.clone(),
+                                action: "buy".to_string(),
+                                count: rem as i64,
+                                price_cents: q.limit_cents,
+                                is_taker: None,
+                                fee_dollars: 0.0,
+                                revenue_cents: None,
+                                realized_pnl_dollars: None,
+                            });
+                        }
                         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
                         st.open_quotes.retain(|rq| rq.order.order_id != q.order_id);
                         st.emit_quote_canceled(&q, ts, &reason);
@@ -1929,6 +2203,10 @@ impl ShadowRunner {
                 let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
                 if !ld.rails.live_armed || ld.rails.killed {
                     Err("disarmed or killed".to_string())
+                } else if ld.rails.is_venue_sync_stale(now_unix()) {
+                    let msg = "refusing live_auto new order: venue sync is stale (>30s) or pending".to_string();
+                    ld.rails.last_error = Some(msg.clone());
+                    Err(msg)
                 } else {
                     match ld.rails.authorize_order(&live_intent) {
                         Ok((base_req, check)) => {
@@ -1971,6 +2249,25 @@ impl ShadowRunner {
                         ld.rails.last_error = None;
                         ld.rails
                             .record_submitted_order("buy", check.order_notional_dollars);
+                        ld.reserved_order_exposure
+                            .insert(placed.order_id.clone(), check.order_notional_dollars);
+                        ld.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                            kind: "order_submitted".to_string(),
+                            venue_id: placed.order_id.clone(),
+                            ts: intent_info.posted_at,
+                            order_id: placed.order_id.clone(),
+                            client_order_id: Some(intent_info.client_order_id.clone()),
+                            trade_id: None,
+                            ticker: intent_info.ticker.clone(),
+                            side: intent_info.side.clone(),
+                            action: "buy".to_string(),
+                            count: intent_info.contracts as i64,
+                            price_cents: intent_info.limit_cents,
+                            is_taker: Some(intent_info.execution_mode != "maker"),
+                            fee_dollars: 0.0,
+                            revenue_cents: None,
+                            realized_pnl_dollars: None,
+                        });
                     }
                     let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     if st.mode != RunnerMode::LiveAuto || self.halted.load(Ordering::SeqCst) {
@@ -1987,7 +2284,9 @@ impl ShadowRunner {
                     {
                         sl.quotes_posted = sl.quotes_posted.saturating_add(1);
                     }
-                    let order = VirtualOrLiveOrder {
+                    let immediate_full = placed.status == "executed"
+                        || (placed.remaining_count == 0 && placed.fill_count > 0);
+                    let mut order = VirtualOrLiveOrder {
                         order_id: intent_info.client_order_id.clone(),
                         slot_id: intent_info.slot_id,
                         strategy: intent_info.strategy.clone(),
@@ -1998,7 +2297,7 @@ impl ShadowRunner {
                         side: intent_info.side.clone(),
                         limit_cents: intent_info.limit_cents,
                         contracts: intent_info.contracts,
-                        filled_contracts: placed.fill_count.max(0) as u32,
+                        filled_contracts: 0,
                         queue_ahead_initial: 0,
                         queue_ahead_remaining: 0,
                         posted_at: intent_info.posted_at,
@@ -2031,24 +2330,25 @@ impl ShadowRunner {
                     };
                     st.append_and_publish(post_ev, "quote_posted");
 
-                    if placed.status == "executed"
-                        || (placed.remaining_count == 0 && placed.fill_count > 0)
-                    {
+                    if immediate_full {
+                        let actual_c = if order.side == "yes" {
+                            placed.yes_price.or_else(|| placed.no_price.map(|p| 100 - p))
+                        } else {
+                            placed.no_price.or_else(|| placed.yes_price.map(|p| 100 - p))
+                        }
+                        .unwrap_or(intent_info.limit_cents as i64)
+                        .clamp(1, 99) as u8;
                         let fee_fn = if intent_info.execution_mode == "maker" {
                             maker_fee_dollars
                         } else {
                             taker_fee_dollars
                         };
-                        let fee_d = fee_fn(intent_info.limit_cents as f64 / 100.0)
+                        let fee_d = fee_fn(actual_c as f64 / 100.0)
                             * (intent_info.contracts as f64);
-                        let slip = (intent_info.limit_cents as f64
-                            - intent_info.quote_cents as f64)
-                            .max(0.0);
-                        st.record_fill(
-                            &order,
-                            intent_info.limit_cents,
-                            slip,
-                            0.0,
+                        st.record_live_fill(
+                            &mut order,
+                            actual_c,
+                            intent_info.contracts,
                             fee_d,
                             intent_info.posted_at,
                         );
@@ -2310,7 +2610,6 @@ fn evaluate_slots_for_market(
                 execution_mode: eff_exec_mode,
                 side: entry_side,
                 limit_cents,
-                quote_cents,
                 contracts,
                 posted_at: eval_ts,
                 close_epoch,
@@ -2795,6 +3094,179 @@ pub fn entry_quote(yes_ask, no_ask, secs_to_close) { Some(0.55) }
         assert_eq!(sanitize_non_neg_size(f32::INFINITY), 0.0);
         assert_eq!(sanitize_non_neg_size(-12.5), 0.0);
         assert_eq!(sanitize_non_neg_size(42.0), 42.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_reconcile_partial_fills_real_prices_fees_and_stale_gate() {
+        let dir = std::env::temp_dir().join(format!("ob-sr-reconcile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data_dir = dir.join("data");
+        let strat_dir = dir.join("strategies");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&strat_dir).unwrap();
+
+        let runner = ShadowRunner::load(&data_dir, 500.0);
+        runner
+            .configure(
+                RunnerConfigRequest {
+                    slots: vec![RunnerSlotConfig {
+                        slot_id: 1,
+                        strategy: "demo-strat".to_string(),
+                        series: vec!["KXBTC15M".to_string()],
+                        max_contracts: 10,
+                        execution_mode: "maker".to_string(),
+                        auto_pause_drawdown_dollars: 50.0,
+                        enabled: true,
+                    }],
+                    cancel_before_close_secs: 30,
+                    bankroll_dollars: 500.0,
+                    tick_interval_ms: Some(100),
+                },
+                true,
+                false,
+            )
+            .unwrap();
+        runner.start("live_auto", true, true, false).unwrap();
+
+        {
+            let mut st = runner.state.lock().unwrap();
+            st.open_quotes.push(RestingQuote {
+                order: VirtualOrLiveOrder {
+                    order_id: "cid-live-1".to_string(),
+                    slot_id: 1,
+                    strategy: "demo-strat".to_string(),
+                    ticker: "KXBTC15M-REC1".to_string(),
+                    series: "KXBTC15M".to_string(),
+                    mode: "live".to_string(),
+                    execution_mode: "maker".to_string(),
+                    side: "yes".to_string(),
+                    limit_cents: 60,
+                    contracts: 10,
+                    filled_contracts: 0,
+                    queue_ahead_initial: 0,
+                    queue_ahead_remaining: 0,
+                    posted_at: 1_800_000_000,
+                    close_epoch: 1_800_000_900,
+                    live_order_id: Some("kalshi-ord-1".to_string()),
+                    status: "resting".to_string(),
+                },
+                last_bid_size: 0.0,
+                last_bid_cents: 0,
+                last_l2_updated_ms: 0,
+                last_l2_trade_ms: None,
+                replay_mode: false,
+            });
+        }
+
+        // Partial fill #1: 4 contracts filled at 57c (price improvement -3.0c), maker fee 0.0175*0.57*0.43*4.
+        let partial_ord = kalshi_live::KalshiOrder {
+            order_id: "kalshi-ord-1".to_string(),
+            client_order_id: Some("cid-live-1".to_string()),
+            ticker: "KXBTC15M-REC1".to_string(),
+            status: "resting".to_string(),
+            action: "buy".to_string(),
+            side: "yes".to_string(),
+            order_type: "limit".to_string(),
+            yes_price: Some(60),
+            no_price: None,
+            initial_count: 10,
+            remaining_count: 6,
+            fill_count: 4,
+            created_time: None,
+        };
+        let fill_1 = kalshi_live::KalshiFill {
+            trade_id: "tr-part-1".to_string(),
+            order_id: "kalshi-ord-1".to_string(),
+            ticker: "KXBTC15M-REC1".to_string(),
+            action: "buy".to_string(),
+            side: "yes".to_string(),
+            count: 4,
+            yes_price: Some(57),
+            no_price: None,
+            is_taker: Some(false),
+            fee_cost_dollars: None,
+            created_time: None,
+            ts: Some(1_800_000_010),
+        };
+        let rem_open = runner.reconcile_live_data(&[partial_ord], &[fill_1.clone()], &[], 1_800_000_011);
+        assert_eq!(rem_open.len(), 1);
+        assert_eq!(rem_open[0].0, "kalshi-ord-1");
+        {
+            let st = runner.state.lock().unwrap();
+            assert_eq!(st.open_quotes.len(), 1);
+            assert_eq!(st.open_quotes[0].order.filled_contracts, 4);
+            assert_eq!(st.open_quotes[0].order.status, "partial");
+        }
+
+        // Re-running with same trade_id is idempotent; adding partial fill #2 (6 @ 59c taker) completes it,
+        // and settlement grades all 10 contracts!
+        let exec_ord = kalshi_live::KalshiOrder {
+            order_id: "kalshi-ord-1".to_string(),
+            client_order_id: Some("cid-live-1".to_string()),
+            ticker: "KXBTC15M-REC1".to_string(),
+            status: "executed".to_string(),
+            action: "buy".to_string(),
+            side: "yes".to_string(),
+            order_type: "limit".to_string(),
+            yes_price: Some(60),
+            no_price: None,
+            initial_count: 10,
+            remaining_count: 0,
+            fill_count: 10,
+            created_time: None,
+        };
+        let fill_2 = kalshi_live::KalshiFill {
+            trade_id: "tr-part-2".to_string(),
+            order_id: "kalshi-ord-1".to_string(),
+            ticker: "KXBTC15M-REC1".to_string(),
+            action: "buy".to_string(),
+            side: "yes".to_string(),
+            count: 6,
+            yes_price: Some(59),
+            no_price: None,
+            is_taker: Some(true),
+            fee_cost_dollars: Some(0.11),
+            created_time: None,
+            ts: Some(1_800_000_020),
+        };
+        let settle = kalshi_live::KalshiSettlement {
+            ticker: "KXBTC15M-REC1".to_string(),
+            event_ticker: None,
+            market_result: "yes".to_string(),
+            yes_count: 10,
+            yes_total_cost: 582,
+            no_count: 0,
+            no_total_cost: 0,
+            revenue: 1000,
+            value: None,
+            fee_cost_dollars: 0.0,
+            settled_time: None,
+        };
+        let rem_open2 = runner.reconcile_live_data(
+            &[exec_ord],
+            &[fill_1, fill_2],
+            &[settle],
+            1_800_000_030,
+        );
+        assert!(rem_open2.is_empty());
+
+        let ledger = runner.ledger_query(20, None, None);
+        let fills: Vec<&LedgerEvent> = ledger
+            .entries
+            .iter()
+            .filter(|e| e.event == "OrderFilled")
+            .collect();
+        assert_eq!(fills.len(), 2);
+        assert!(fills.iter().any(|e| e.fill_cents == Some(57) && e.contracts == 4 && e.slippage_cents == Some(-3.0)));
+        assert!(fills.iter().any(|e| e.fill_cents == Some(59) && e.contracts == 6 && e.fee_dollars == Some(0.11)));
+        let settles: Vec<&LedgerEvent> = ledger
+            .entries
+            .iter()
+            .filter(|e| e.event == "WindowSettled")
+            .collect();
+        assert_eq!(settles.len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

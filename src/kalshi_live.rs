@@ -742,7 +742,38 @@ pub struct KalshiFill {
     pub yes_price: Option<i64>,
     pub no_price: Option<i64>,
     pub is_taker: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_cost_dollars: Option<f64>,
     pub created_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KalshiSettlement {
+    pub ticker: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_ticker: Option<String>,
+    pub market_result: String,
+    pub yes_count: i64,
+    pub yes_total_cost: i64,
+    pub no_count: i64,
+    pub no_total_cost: i64,
+    pub revenue: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<i64>,
+    #[serde(default)]
+    pub fee_cost_dollars: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_time: Option<String>,
+}
+
+impl KalshiSettlement {
+    /// Net realized settlement P&L in dollars (before fill fees if `fee_cost_dollars` is 0).
+    pub fn realized_pnl_dollars(&self) -> f64 {
+        let total_cost = self.yes_total_cost.saturating_add(self.no_total_cost);
+        ((self.revenue - total_cost) as f64) / 100.0 - self.fee_cost_dollars
+    }
 }
 
 /// Request payload for `POST /portfolio/orders` on Kalshi Trade API v2.
@@ -1148,49 +1179,107 @@ impl KalshiLiveClient {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let trade_id = r
-                .get("trade_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let order_id = r
-                .get("order_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let ticker = r
-                .get("ticker")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if ticker.is_empty() && order_id.is_empty() {
-                continue;
+        Ok(rows.iter().filter_map(parse_kalshi_fill).collect())
+    }
+
+    /// Fetch cursor-paginated fills from `GET /portfolio/fills`, optionally bounded by `min_ts`
+    /// and starting at `cursor`. Follows `cursor` until exhausted (capped at 50 pages).
+    pub fn get_fills_since(
+        &self,
+        min_ts: Option<i64>,
+        cursor: Option<&str>,
+    ) -> Result<Vec<KalshiFill>, String> {
+        const MAX_PAGES: usize = 50;
+        let mut out = Vec::new();
+        let mut cur_cursor = cursor
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+        let mut seen_cursors = std::collections::HashSet::new();
+        if let Some(ref c) = cur_cursor {
+            seen_cursors.insert(c.clone());
+        }
+
+        for _ in 0..MAX_PAGES {
+            let mut params = vec!["limit=200".to_string()];
+            if let Some(ts) = min_ts.filter(|t| *t >= 0) {
+                params.push(format!("min_ts={ts}"));
             }
-            out.push(KalshiFill {
-                trade_id,
-                order_id,
-                ticker,
-                action: r
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                side: r
-                    .get("side")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                count: r.get("count").and_then(|v| v.as_i64()).unwrap_or(0),
-                yes_price: r.get("yes_price").and_then(|v| v.as_i64()),
-                no_price: r.get("no_price").and_then(|v| v.as_i64()),
-                is_taker: r.get("is_taker").and_then(|v| v.as_bool()),
-                created_time: r
-                    .get("created_time")
-                    .and_then(|v| v.as_str())
-                    .map(ToString::to_string),
-            });
+            if let Some(ref c) = cur_cursor {
+                params.push(format!("cursor={}", url_encode_query_val(c)));
+            }
+            let path = format!("/portfolio/fills?{}", params.join("&"));
+            let val = self.request_json("GET", &path, None)?;
+            if let Some(rows) = val.get("fills").and_then(|v| v.as_array()) {
+                for r in rows {
+                    if let Some(f) = parse_kalshi_fill(r) {
+                        out.push(f);
+                    }
+                }
+            }
+            let next_cursor = val
+                .get("cursor")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(ToString::to_string);
+            match next_cursor {
+                Some(next) if seen_cursors.insert(next.clone()) => cur_cursor = Some(next),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch cursor-paginated settlements from `GET /portfolio/settlements`.
+    pub fn get_settlements(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<KalshiSettlement>, String> {
+        const MAX_PAGES: usize = 50;
+        let mut out = Vec::new();
+        let mut cur_cursor = cursor
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+        let mut seen_cursors = std::collections::HashSet::new();
+        if let Some(ref c) = cur_cursor {
+            seen_cursors.insert(c.clone());
+        }
+        let clamped_limit = limit.map(|l| l.clamp(1, 200));
+
+        for _ in 0..MAX_PAGES {
+            let mut params = Vec::new();
+            if let Some(l) = clamped_limit {
+                params.push(format!("limit={l}"));
+            }
+            if let Some(ref c) = cur_cursor {
+                params.push(format!("cursor={}", url_encode_query_val(c)));
+            }
+            let path = if params.is_empty() {
+                "/portfolio/settlements".to_string()
+            } else {
+                format!("/portfolio/settlements?{}", params.join("&"))
+            };
+            let val = self.request_json("GET", &path, None)?;
+            if let Some(rows) = val.get("settlements").and_then(|v| v.as_array()) {
+                for r in rows {
+                    if let Some(s) = parse_kalshi_settlement(r) {
+                        out.push(s);
+                    }
+                }
+            }
+            let next_cursor = val
+                .get("cursor")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(ToString::to_string);
+            match next_cursor {
+                Some(next) if seen_cursors.insert(next.clone()) => cur_cursor = Some(next),
+                _ => break,
+            }
         }
         Ok(out)
     }
@@ -1407,6 +1496,149 @@ pub fn fetch_public_market_orderbook(
         }
         Err(ureq::Error::Transport(t)) => Err(format!("Kalshi orderbook transport error: {t}")),
     }
+}
+
+fn url_encode_query_val(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn parse_optional_fee_dollars(v: &serde_json::Value) -> Option<f64> {
+    for key in ["fee_cost", "fee_cost_dollars", "fee_dollars"] {
+        if let Some(d) = v
+            .get(key)
+            .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+        {
+            if d.is_finite() && d >= 0.0 {
+                return Some(d);
+            }
+        }
+    }
+    if let Some(c) = v
+        .get("fee_cents")
+        .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+    {
+        if c.is_finite() && c >= 0.0 {
+            return Some(c / 100.0);
+        }
+    }
+    None
+}
+
+fn parse_cents_or_dollars(v: &serde_json::Value, cents_key: &str, dollars_key: &str) -> i64 {
+    if let Some(c) = v.get(cents_key).and_then(|x| x.as_i64()) {
+        return c;
+    }
+    if let Some(d) = v
+        .get(dollars_key)
+        .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+    {
+        if d.is_finite() {
+            return (d * 100.0).round() as i64;
+        }
+    }
+    0
+}
+
+fn parse_kalshi_fill(r: &serde_json::Value) -> Option<KalshiFill> {
+    let trade_id = r
+        .get("trade_id")
+        .or_else(|| r.get("fill_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let order_id = r
+        .get("order_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let ticker = r
+        .get("ticker")
+        .or_else(|| r.get("market_ticker"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if ticker.is_empty() && order_id.is_empty() {
+        return None;
+    }
+    let yes_price = r.get("yes_price").and_then(|v| v.as_i64()).or_else(|| {
+        r.get("yes_price_dollars")
+            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .filter(|d| d.is_finite())
+            .map(|d| (d * 100.0).round() as i64)
+    });
+    let no_price = r.get("no_price").and_then(|v| v.as_i64()).or_else(|| {
+        r.get("no_price_dollars")
+            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .filter(|d| d.is_finite())
+            .map(|d| (d * 100.0).round() as i64)
+    });
+    Some(KalshiFill {
+        trade_id,
+        order_id,
+        ticker,
+        action: r
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        side: r
+            .get("side")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        count: r.get("count").and_then(|v| v.as_i64()).unwrap_or(0),
+        yes_price,
+        no_price,
+        is_taker: r.get("is_taker").and_then(|v| v.as_bool()),
+        fee_cost_dollars: parse_optional_fee_dollars(r),
+        created_time: r
+            .get("created_time")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        ts: r.get("ts").and_then(|v| v.as_i64()),
+    })
+}
+
+fn parse_kalshi_settlement(r: &serde_json::Value) -> Option<KalshiSettlement> {
+    let ticker = r
+        .get("ticker")
+        .or_else(|| r.get("market_ticker"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    Some(KalshiSettlement {
+        ticker,
+        event_ticker: r
+            .get("event_ticker")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        market_result: r
+            .get("market_result")
+            .or_else(|| r.get("result"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        yes_count: r.get("yes_count").and_then(|v| v.as_i64()).unwrap_or(0),
+        yes_total_cost: parse_cents_or_dollars(r, "yes_total_cost", "yes_total_cost_dollars"),
+        no_count: r.get("no_count").and_then(|v| v.as_i64()).unwrap_or(0),
+        no_total_cost: parse_cents_or_dollars(r, "no_total_cost", "no_total_cost_dollars"),
+        revenue: parse_cents_or_dollars(r, "revenue", "revenue_dollars"),
+        value: r.get("value").and_then(|v| v.as_i64()),
+        fee_cost_dollars: parse_optional_fee_dollars(r).unwrap_or(0.0),
+        settled_time: r
+            .get("settled_time")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+    })
 }
 
 fn parse_dollars_or_cents(v: &serde_json::Value, dollars_key: &str, cents_fallback: i64) -> f64 {
@@ -1934,5 +2166,148 @@ pub(crate) mod tests {
         let ob2 = parse_kalshi_orderbook_json(&fp_json).unwrap();
         assert_eq!(ob2.yes, vec![[55, 25]]);
         assert_eq!(ob2.no, vec![[42, 40]]);
+    }
+
+    #[test]
+    fn paginated_fills_since_and_settlements_mock() {
+        let (pkcs8, _, pub_der) = generate_ephemeral_test_rsa();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pub_der_srv = pub_der.clone();
+
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming().take(4) {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let mut headers = std::collections::HashMap::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':') {
+                        headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                    }
+                }
+                let ts = headers.get("kalshi-access-timestamp").cloned().unwrap_or_default();
+                let sig_b64 = headers.get("kalshi-access-signature").cloned().unwrap_or_default();
+                let expected_msg = build_signing_message(&ts, &method, &path);
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let sig_raw = base64::engine::general_purpose::STANDARD.decode(&sig_b64).unwrap();
+                    let pk = ring::signature::UnparsedPublicKey::new(
+                        &ring::signature::RSA_PSS_2048_8192_SHA256,
+                        &pub_der_srv,
+                    );
+                    pk.verify(expected_msg.as_bytes(), &sig_raw)
+                        .expect("signature valid even with query params");
+                }
+                #[cfg(target_os = "windows")]
+                let _ = (&pub_der_srv, &sig_b64, &expected_msg);
+
+                let resp = if path.starts_with("/trade-api/v2/portfolio/fills") {
+                    if path.contains("cursor=p2") {
+                        serde_json::json!({
+                            "fills": [{
+                                "trade_id": "tr-page2",
+                                "order_id": "ord-2",
+                                "ticker": "KXBTC15M-P2",
+                                "action": "buy",
+                                "side": "no",
+                                "count": 4,
+                                "no_price": 42,
+                                "is_taker": false,
+                                "fee_cost": "0.02"
+                            }],
+                            "cursor": ""
+                        })
+                    } else {
+                        assert!(path.contains("min_ts=1700000000"), "missing min_ts in {path}");
+                        serde_json::json!({
+                            "fills": [{
+                                "trade_id": "tr-page1",
+                                "order_id": "ord-1",
+                                "ticker": "KXBTC15M-P1",
+                                "action": "buy",
+                                "side": "yes",
+                                "count": 5,
+                                "yes_price": 58,
+                                "is_taker": true
+                            }],
+                            "cursor": "p2"
+                        })
+                    }
+                } else if path.starts_with("/trade-api/v2/portfolio/settlements") {
+                    if path.contains("cursor=sc2") {
+                        serde_json::json!({
+                            "settlements": [{
+                                "ticker": "KXBTC15M-P2",
+                                "market_result": "no",
+                                "yes_count": 0,
+                                "yes_total_cost": 0,
+                                "no_count": 4,
+                                "no_total_cost": 168,
+                                "revenue": 400,
+                                "fee_cost": "0.02",
+                                "settled_time": "2026-11-26T12:15:00Z"
+                            }]
+                        })
+                    } else {
+                        serde_json::json!({
+                            "settlements": [{
+                                "ticker": "KXBTC15M-P1",
+                                "market_result": "no",
+                                "yes_count": 5,
+                                "yes_total_cost": 290,
+                                "no_count": 0,
+                                "no_total_cost": 0,
+                                "revenue": 0,
+                                "fee_cost": "0.09",
+                                "settled_time": "2026-11-26T12:00:00Z"
+                            }],
+                            "cursor": "sc2"
+                        })
+                    }
+                } else {
+                    serde_json::json!({})
+                };
+                let body_str = resp.to_string();
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
+                    body_str.len()
+                );
+                let _ = stream.write_all(http.as_bytes());
+            }
+        });
+
+        let client = KalshiLiveClient::from_parts(
+            "pag-key-1234",
+            &pkcs8,
+            KalshiEnv::Demo,
+            &format!("http://{addr}/trade-api/v2"),
+        )
+        .unwrap();
+
+        let fills = client.get_fills_since(Some(1_700_000_000), None).unwrap();
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].trade_id, "tr-page1");
+        assert_eq!(fills[1].trade_id, "tr-page2");
+        assert_eq!(fills[1].fee_cost_dollars, Some(0.02));
+
+        let settles = client.get_settlements(None, Some(50)).unwrap();
+        assert_eq!(settles.len(), 2);
+        assert_eq!(settles[0].ticker, "KXBTC15M-P1");
+        assert!((settles[0].realized_pnl_dollars() - (-2.99)).abs() < 1e-9);
+        assert_eq!(settles[1].ticker, "KXBTC15M-P2");
+        assert!((settles[1].realized_pnl_dollars() - 2.30).abs() < 1e-9);
+
+        handle.join().unwrap();
     }
 }

@@ -3081,6 +3081,9 @@ struct LiveDeskManager {
     config: kalshi_live::PersistedLiveConfig,
     rails: risk_rails::RiskRailsState,
     connected: bool,
+    executions: risk_rails::LiveExecutionLedger,
+    reserved_order_exposure: std::collections::HashMap<String, f64>,
+    last_discrepancies: Vec<risk_rails::ReconcileDiscrepancy>,
 }
 
 #[derive(Default)]
@@ -3127,6 +3130,10 @@ struct App {
     collector_scheduler: Arc<CollectorScheduler>,
     /// Live Kalshi Trade API v2 connection config & fail-closed risk rails (always boots disarmed).
     live_desk: std::sync::Mutex<LiveDeskManager>,
+    /// Serializes live venue reconciliation passes across HTTP calls and background polling.
+    reconcile_sync_lock: std::sync::Mutex<()>,
+    /// Wakeup signal for the background live venue reconciler thread.
+    reconcile_wake: Arc<(Mutex<u64>, Condvar)>,
     /// Tick-driven Paper/Shadow Orderbook Matching Engine & Fail-Closed Automated Runner.
     runner: Arc<shadow_runner::ShadowRunner>,
     /// Live L2 Orderbook Depth Store, WebSocket/REST stream & book-walking engine.
@@ -3194,6 +3201,14 @@ impl App {
         }
     }
 
+    fn notify_reconcile(&self) {
+        let (lock, cv) = &*self.reconcile_wake;
+        let mut seq = lock.lock().unwrap_or_else(|p| p.into_inner());
+        *seq = seq.saturating_add(1);
+        drop(seq);
+        cv.notify_all();
+    }
+
     fn new_with_auto_collect(
         data_dir: PathBuf,
         strategies_dir: PathBuf,
@@ -3204,6 +3219,7 @@ impl App {
     ) -> Self {
         let live_cfg = kalshi_live::load_live_config(&data_dir);
         let live_rails = risk_rails::RiskRailsState::load(&data_dir);
+        let live_executions = risk_rails::LiveExecutionLedger::load(&data_dir);
         let runner = Arc::new(shadow_runner::ShadowRunner::load(&data_dir, paper_pot));
         let orderbook = Arc::new(orderbook::OrderbookStore::new(data_dir.clone()));
         let runner_for_ob = runner.clone();
@@ -3225,7 +3241,12 @@ impl App {
                 config: live_cfg,
                 rails: live_rails,
                 connected: false,
+                executions: live_executions,
+                reserved_order_exposure: std::collections::HashMap::new(),
+                last_discrepancies: Vec::new(),
             }),
+            reconcile_sync_lock: std::sync::Mutex::new(()),
+            reconcile_wake: Arc::new((Mutex::new(0), Condvar::new())),
             runner,
             orderbook,
             tape_cache: std::sync::RwLock::new(None),
@@ -5605,9 +5626,16 @@ fn home_json_shared(app: &App) -> Arc<String> {
     let dpath = app.data_dir.join("snapshots.jsonl");
     let (len, mtime) = tape_stat(&dpath).unwrap_or((0, 0));
     let key = strategies_dir_key(&app.strategies_dir, app.paper_pot);
-    let (live_armed, configured, killed) = {
+    let (live_armed, configured, killed, last_sync, sync_stale) = {
         let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
-        (st.rails.live_armed, st.config.is_configured(), st.rails.killed)
+        let cfg_ok = st.config.is_configured();
+        (
+            st.rails.live_armed,
+            cfg_ok,
+            st.rails.killed,
+            st.rails.last_venue_sync_epoch,
+            cfg_ok && st.rails.is_venue_sync_stale(now),
+        )
     };
     let sched = app.collector_scheduler.snapshot();
     let in_flight = PASSES_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed);
@@ -5618,6 +5646,8 @@ fn home_json_shared(app: &App) -> Arc<String> {
     live_armed.hash(&mut h);
     configured.hash(&mut h);
     killed.hash(&mut h);
+    last_sync.hash(&mut h);
+    sync_stale.hash(&mut h);
     in_flight.hash(&mut h);
     sched.enabled.hash(&mut h);
     sched.runs_total.hash(&mut h);
@@ -6960,6 +6990,8 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 let _ = st.rails.update_rails(&validated_rails);
                 if creds_changed {
                     st.connected = false;
+                    st.rails.last_venue_sync_epoch = None;
+                    let _ = st.rails.save_runtime(&app.data_dir);
                     if !st.config.is_configured() {
                         st.rails.disarm();
                     }
@@ -6967,6 +6999,10 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 st.rails.last_error = None;
                 st.rails.status_snapshot(&st.config, st.connected)
             };
+            app.invalidate_live_hot();
+            if snap.configured {
+                app.notify_reconcile();
+            }
             publish_live_status_json(&snap)
         }
         ("POST", "/api/live/arm") => {
@@ -7091,19 +7127,45 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             };
             match client.place_order(&kalshi_req) {
                 Ok(order) => {
+                    let now_ts = now_unix();
                     let snap = {
                         let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
                         st.connected = true;
                         st.rails.last_error = None;
                         st.rails
                             .record_submitted_order(&intent.action, check.order_notional_dollars);
+                        if intent.action.eq_ignore_ascii_case("buy") {
+                            st.reserved_order_exposure
+                                .insert(order.order_id.clone(), check.order_notional_dollars);
+                        }
+                        st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                            kind: "order_submitted".to_string(),
+                            venue_id: order.order_id.clone(),
+                            ts: now_ts,
+                            order_id: order.order_id.clone(),
+                            client_order_id: order
+                                .client_order_id
+                                .clone()
+                                .or_else(|| Some(kalshi_req.client_order_id.clone())),
+                            trade_id: None,
+                            ticker: order.ticker.clone(),
+                            side: intent.side.clone(),
+                            action: intent.action.clone(),
+                            count: intent.count as i64,
+                            price_cents: intent.price_cents,
+                            is_taker: Some(!post_only),
+                            fee_dollars: 0.0,
+                            revenue_cents: None,
+                            realized_pnl_dollars: None,
+                        });
                         st.rails.status_snapshot(&st.config, st.connected)
                     };
+                    app.invalidate_live_hot();
                     let ev = format!(
                         "{{\"type\":\"live_order\",\"action\":\"placed\",\"order_id\":{},\"ticker\":{},\"ts\":{}}}",
                         serde_json::to_string(&order.order_id).unwrap_or_else(|_| "\"\"".to_string()),
                         serde_json::to_string(&order.ticker).unwrap_or_else(|_| "\"\"".to_string()),
-                        now_unix(),
+                        now_ts,
                     );
                     tape_hub().publish(ev);
                     let body = format!(
@@ -7140,16 +7202,68 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             };
             match client.cancel_order(order_id) {
                 Ok(venue_resp) => {
+                    let now_ts = now_unix();
+                    let snap = {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        let released = st
+                            .reserved_order_exposure
+                            .remove(order_id)
+                            .or_else(|| st.executions.submitted_notional_for(order_id))
+                            .or_else(|| {
+                                let o = venue_resp.get("order").unwrap_or(&venue_resp);
+                                let rem = o.get("remaining_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                                let px = o
+                                    .get("yes_price")
+                                    .or_else(|| o.get("no_price"))
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0);
+                                if rem > 0 && px > 0 {
+                                    Some((rem as f64) * (px as f64 / 100.0))
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0.0);
+                        st.rails.release_exposure(released);
+                        let sub_rec = st
+                            .executions
+                            .records()
+                            .iter()
+                            .find(|rec| rec.kind == "order_submitted" && rec.order_id == order_id)
+                            .cloned();
+                        st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                            kind: "order_canceled".to_string(),
+                            venue_id: order_id.to_string(),
+                            ts: now_ts,
+                            order_id: order_id.to_string(),
+                            client_order_id: sub_rec.as_ref().and_then(|s| s.client_order_id.clone()),
+                            trade_id: None,
+                            ticker: sub_rec.as_ref().map(|s| s.ticker.clone()).unwrap_or_default(),
+                            side: sub_rec.as_ref().map(|s| s.side.clone()).unwrap_or_default(),
+                            action: sub_rec.as_ref().map(|s| s.action.clone()).unwrap_or_default(),
+                            count: sub_rec.as_ref().map(|s| s.count).unwrap_or(0),
+                            price_cents: sub_rec.as_ref().map(|s| s.price_cents).unwrap_or(0),
+                            is_taker: None,
+                            fee_dollars: 0.0,
+                            revenue_cents: None,
+                            realized_pnl_dollars: None,
+                        });
+                        st.rails.status_snapshot(&st.config, st.connected)
+                    };
+                    app.runner
+                        .mark_live_order_canceled(order_id, now_ts, "operator_canceled");
+                    app.invalidate_live_hot();
                     let ev = format!(
                         "{{\"type\":\"live_order\",\"action\":\"cancelled\",\"order_id\":{},\"ts\":{}}}",
                         serde_json::to_string(order_id).unwrap_or_else(|_| "\"\"".to_string()),
-                        now_unix(),
+                        now_ts,
                     );
                     tape_hub().publish(ev);
                     let body = format!(
-                        "{{\"ok\":true,\"order_id\":{},\"cancelled\":true,\"venue_response\":{}}}",
+                        "{{\"ok\":true,\"order_id\":{},\"cancelled\":true,\"venue_response\":{},\"status\":{}}}",
                         serde_json::to_string(order_id).unwrap_or_else(|_| "\"\"".into()),
                         serde_json::to_string(&venue_resp).unwrap_or_else(|_| "{}".into()),
+                        serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()),
                     );
                     json_response(200, &body)
                 }
@@ -7162,6 +7276,73 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 }
             }
         }
+        ("GET", "/api/live/reconcile") => {
+            let snap = build_reconcile_snapshot(app);
+            json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
+        }
+        ("POST", "/api/live/reconcile") => {
+            if let Err(resp) = parse_json_object_body(
+                body,
+                true,
+                "Reconcile request body must be a JSON object",
+            ) {
+                return resp;
+            }
+            match reconcile_live_venue(app) {
+                Ok(snap) => json_response(
+                    200,
+                    &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()),
+                ),
+                Err((code, msg)) => json_ok_err_response(code, &msg),
+            }
+        }
+        ("POST", "/api/live/reset-kill") => {
+            let parsed = match parse_json_object_body(
+                body,
+                false,
+                "Reset-kill request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let confirm = parsed
+                .get("confirm_reset_kill")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !confirm {
+                return json_ok_err_response(
+                    400,
+                    "Explicit confirmation (confirm_reset_kill: true) is required to reset kill latch.",
+                );
+            }
+            let snap = {
+                let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                if let Err(e) = st.rails.reset_kill(true) {
+                    return json_ok_err_response(400, &e);
+                }
+                st.rails.last_error = None;
+                let _ = st.rails.save_runtime(&app.data_dir);
+                st.rails.status_snapshot(&st.config, st.connected)
+            };
+            app.invalidate_live_hot();
+            let ev = format!(
+                "{{\"type\":\"live_status\",\"configured\":{},\"live_armed\":{},\"killed\":false,\"environment\":\"{}\",\"ts\":{}}}",
+                snap.configured,
+                snap.live_armed,
+                if snap.environment == "prod" { "prod" } else { "demo" },
+                now_unix(),
+            );
+            tape_hub().publish(ev);
+            let mut val = serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("ok".to_string(), serde_json::Value::Bool(true));
+                obj.insert(
+                    "status".to_string(),
+                    serde_json::to_value(&snap).unwrap_or_default(),
+                );
+            }
+            json_response(200, &val.to_string())
+        }
         ("POST", "/api/live/kill-switch") => {
             let reason: Option<String> = if body.trim().is_empty() {
                 None
@@ -7170,7 +7351,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     .ok()
                     .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
             };
-            // Fail-closed FIRST under lock: disarm & latch killed BEFORE network calls!
+            // Fail-closed FIRST under lock: disarm, latch killed, and persist runtime BEFORE network calls!
             let (why, client_opt) = {
                 let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
                 let why = reason
@@ -7182,6 +7363,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 st.rails.live_armed = false;
                 st.rails.killed = true;
                 st.rails.kill_reason = Some(why.clone());
+                let _ = st.rails.save_runtime(&app.data_dir);
                 let client_opt = if st.config.is_configured() {
                     kalshi_live::KalshiLiveClient::from_config(&st.config).ok()
                 } else {
@@ -7200,13 +7382,48 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     errors: Vec::new(),
                 },
             };
+            let now_ts = now_unix();
             let snap = {
                 let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                for cid in &report.cancelled_ids {
+                    if let Some(released) = st
+                        .reserved_order_exposure
+                        .remove(cid)
+                        .or_else(|| st.executions.submitted_notional_for(cid))
+                    {
+                        st.rails.release_exposure(released);
+                    }
+                    let sub_rec = st
+                        .executions
+                        .records()
+                        .iter()
+                        .find(|rec| rec.kind == "order_submitted" && rec.order_id == *cid)
+                        .cloned();
+                    st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                        kind: "order_canceled".to_string(),
+                        venue_id: cid.clone(),
+                        ts: now_ts,
+                        order_id: cid.clone(),
+                        client_order_id: sub_rec.as_ref().and_then(|s| s.client_order_id.clone()),
+                        trade_id: None,
+                        ticker: sub_rec.as_ref().map(|s| s.ticker.clone()).unwrap_or_default(),
+                        side: sub_rec.as_ref().map(|s| s.side.clone()).unwrap_or_default(),
+                        action: sub_rec.as_ref().map(|s| s.action.clone()).unwrap_or_default(),
+                        count: sub_rec.as_ref().map(|s| s.count).unwrap_or(0),
+                        price_cents: sub_rec.as_ref().map(|s| s.price_cents).unwrap_or(0),
+                        is_taker: None,
+                        fee_dollars: 0.0,
+                        revenue_cents: None,
+                        realized_pnl_dollars: None,
+                    });
+                }
                 if !report.errors.is_empty() {
                     st.rails.last_error = Some(report.errors.join("; "));
                 }
+                let _ = st.rails.save_runtime(&app.data_dir);
                 st.rails.status_snapshot(&st.config, st.connected)
             };
+            app.invalidate_live_hot();
             let ev = format!(
                 "{{\"type\":\"kill_switch\",\"disarmed\":true,\"killed\":true,\"cancelled_count\":{},\"ts\":{}}}",
                 report.cancelled_count,
@@ -7628,6 +7845,414 @@ fn start_background_collector(app: Arc<App>) {
     });
 }
 
+fn build_reconcile_snapshot(app: &App) -> risk_rails::LiveReconcileResponse {
+    let now = now_unix();
+    let today = risk_rails::current_utc_day();
+    let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+    let configured = st.config.is_configured();
+    let sync_stale = configured && st.rails.is_venue_sync_stale(now);
+    let bd = st.executions.utc_day_breakdown(today);
+    let persisted_same_day_loss = if st.rails.utc_day_num == today {
+        st.rails.daily_realized_loss_dollars
+    } else {
+        0.0
+    };
+    let utc_day_loss = bd.realized_loss_dollars.max(persisted_same_day_loss);
+    risk_rails::LiveReconcileResponse {
+        ok: true,
+        configured,
+        connected: st.connected,
+        last_sync_epoch: st.rails.last_venue_sync_epoch,
+        sync_stale,
+        utc_day_loss_dollars: utc_day_loss,
+        utc_day_realized_pnl_dollars: bd.realized_pnl_dollars,
+        utc_day_fees_dollars: bd.fees_dollars,
+        utc_day_breakdown: bd,
+        open_exposure_dollars: st.rails.open_exposure_dollars,
+        executions: st.executions.records().to_vec(),
+        discrepancies: st.last_discrepancies.clone(),
+        last_error: st.rails.last_error.clone(),
+    }
+}
+
+pub(crate) fn reconcile_live_venue(
+    app: &App,
+) -> Result<risk_rails::LiveReconcileResponse, (u16, String)> {
+    let _sync_guard = app
+        .reconcile_sync_lock
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (cfg, min_ts) = {
+        let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+        let min_ts = st
+            .executions
+            .last_fill_ts()
+            .map(|t| t.saturating_sub(300));
+        (st.config.clone(), min_ts)
+    };
+    if !cfg.is_configured() {
+        return Err((
+            412,
+            "Kalshi API key ID and private key PEM are not configured.".to_string(),
+        ));
+    }
+    let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+            st.connected = false;
+            st.rails.last_error = Some(e.clone());
+            return Err((502, e));
+        }
+    };
+
+    struct VenueFetch {
+        positions: Vec<kalshi_live::KalshiPosition>,
+        orders: Vec<kalshi_live::KalshiOrder>,
+        fills: Vec<kalshi_live::KalshiFill>,
+        settlements: Vec<kalshi_live::KalshiSettlement>,
+    }
+
+    let fetch_res: Result<VenueFetch, String> = (|| {
+        let positions = client.get_positions()?;
+        let orders = client.get_orders(None)?;
+        let fills = client.get_fills_since(min_ts, None)?;
+        let settlements = client.get_settlements(None, Some(100))?;
+        Ok(VenueFetch {
+            positions,
+            orders,
+            fills,
+            settlements,
+        })
+    })();
+
+    let VenueFetch {
+        positions,
+        orders,
+        fills,
+        settlements,
+    } = match fetch_res {
+        Ok(data) => data,
+        Err(e) => {
+            let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+            st.connected = false;
+            st.rails.last_error = Some(e.clone());
+            st.last_discrepancies = vec![risk_rails::ReconcileDiscrepancy {
+                kind: "sync_error".to_string(),
+                message: e.clone(),
+                ticker: None,
+                order_id: None,
+            }];
+            return Err((502, e));
+        }
+    };
+
+    let now = now_unix();
+    let open_live_quotes = app
+        .runner
+        .reconcile_live_data(&orders, &fills, &settlements, now);
+
+    let resp = {
+        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+        let mut order_cid_map: std::collections::HashMap<&str, Option<String>> =
+            std::collections::HashMap::new();
+        for o in &orders {
+            order_cid_map.insert(o.order_id.as_str(), o.client_order_id.clone());
+        }
+
+        // 1. Append fills idempotently by trade_id.
+        for f in &fills {
+            let ts = f
+                .ts
+                .or_else(|| f.created_time.as_deref().and_then(parse_iso_z))
+                .unwrap_or(now);
+            let price_c = if f.side.eq_ignore_ascii_case("no") {
+                f.no_price.or_else(|| f.yes_price.map(|p| 100 - p))
+            } else {
+                f.yes_price.or_else(|| f.no_price.map(|p| 100 - p))
+            }
+            .unwrap_or(50)
+            .clamp(1, 99) as u8;
+            let fee_dollars = f
+                .fee_cost_dollars
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .unwrap_or_else(|| {
+                    let p = price_c as f64 / 100.0;
+                    let rate = if f.is_taker == Some(false) {
+                        0.0175
+                    } else {
+                        0.07
+                    };
+                    rate * p * (1.0 - p) * (f.count.max(0) as f64)
+                });
+            let venue_id = if !f.trade_id.trim().is_empty() {
+                f.trade_id.clone()
+            } else {
+                format!("{}:{}:{}", f.order_id, ts, f.count)
+            };
+            let cid = order_cid_map
+                .get(f.order_id.as_str())
+                .cloned()
+                .flatten()
+                .or_else(|| st.executions.client_order_id_for(&f.order_id));
+            st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                kind: "fill".to_string(),
+                venue_id,
+                ts,
+                order_id: f.order_id.clone(),
+                client_order_id: cid,
+                trade_id: if f.trade_id.trim().is_empty() {
+                    None
+                } else {
+                    Some(f.trade_id.clone())
+                },
+                ticker: f.ticker.clone(),
+                side: f.side.clone(),
+                action: f.action.clone(),
+                count: f.count,
+                price_cents: price_c,
+                is_taker: f.is_taker,
+                fee_dollars,
+                revenue_cents: None,
+                realized_pnl_dollars: None,
+            });
+        }
+
+        // 2. Append canceled orders & prune reserved exposure for filled/canceled orders.
+        for o in &orders {
+            if o.status.eq_ignore_ascii_case("canceled")
+                || o.status.eq_ignore_ascii_case("cancelled")
+            {
+                st.reserved_order_exposure.remove(&o.order_id);
+                let price_c = if o.side.eq_ignore_ascii_case("no") {
+                    o.no_price.or_else(|| o.yes_price.map(|p| 100 - p))
+                } else {
+                    o.yes_price.or_else(|| o.no_price.map(|p| 100 - p))
+                }
+                .unwrap_or(50)
+                .clamp(1, 99) as u8;
+                let ts = o
+                    .created_time
+                    .as_deref()
+                    .and_then(parse_iso_z)
+                    .unwrap_or(now);
+                st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                    kind: "order_canceled".to_string(),
+                    venue_id: o.order_id.clone(),
+                    ts,
+                    order_id: o.order_id.clone(),
+                    client_order_id: o.client_order_id.clone(),
+                    trade_id: None,
+                    ticker: o.ticker.clone(),
+                    side: o.side.clone(),
+                    action: o.action.clone(),
+                    count: o.remaining_count.max(0),
+                    price_cents: price_c,
+                    is_taker: None,
+                    fee_dollars: 0.0,
+                    revenue_cents: None,
+                    realized_pnl_dollars: None,
+                });
+            } else if o.status.eq_ignore_ascii_case("executed") || o.remaining_count <= 0 {
+                st.reserved_order_exposure.remove(&o.order_id);
+            }
+        }
+
+        // 3. Append settlements idempotently by ticker.
+        for s in &settlements {
+            let ts = s
+                .settled_time
+                .as_deref()
+                .and_then(parse_iso_z)
+                .unwrap_or(now);
+            let side = if s.yes_count >= s.no_count {
+                "yes".to_string()
+            } else {
+                "no".to_string()
+            };
+            let count = s.yes_count.saturating_add(s.no_count).max(0);
+            let pnl = s.realized_pnl_dollars();
+            st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                kind: "settlement".to_string(),
+                venue_id: s.ticker.clone(),
+                ts,
+                order_id: String::new(),
+                client_order_id: None,
+                trade_id: None,
+                ticker: s.ticker.clone(),
+                side,
+                action: "settle".to_string(),
+                count,
+                price_cents: 0,
+                is_taker: None,
+                fee_dollars: s.fee_cost_dollars,
+                revenue_cents: Some(s.revenue),
+                realized_pnl_dollars: Some(pnl),
+            });
+        }
+
+        // 4. Authoritative open exposure = filled position exposure + resting buy orders notional.
+        let pos_exposure: f64 = positions
+            .iter()
+            .map(|p| p.market_exposure_dollars.abs())
+            .sum();
+        let resting_buy_exposure: f64 = orders
+            .iter()
+            .filter(|o| {
+                o.status.eq_ignore_ascii_case("resting")
+                    && o.action.eq_ignore_ascii_case("buy")
+                    && o.remaining_count > 0
+            })
+            .map(|o| {
+                let px = if o.side.eq_ignore_ascii_case("no") {
+                    o.no_price.unwrap_or(0)
+                } else {
+                    o.yes_price.unwrap_or(0)
+                };
+                (o.remaining_count as f64) * (px.clamp(0, 99) as f64 / 100.0)
+            })
+            .sum();
+        let open_exposure = pos_exposure + resting_buy_exposure;
+
+        let today = risk_rails::current_utc_day();
+        let bd = st.executions.utc_day_breakdown(today);
+        let pos_loss: f64 = positions
+            .iter()
+            .filter(|p| p.realized_pnl_dollars < 0.0)
+            .map(|p| -p.realized_pnl_dollars)
+            .sum();
+        let prev_same_day_loss = if st.rails.utc_day_num == today {
+            st.rails.daily_realized_loss_dollars
+        } else {
+            0.0
+        };
+        let effective_loss = bd.realized_loss_dollars.max(pos_loss).max(prev_same_day_loss);
+
+        // 5. Cross-check local vs venue discrepancies.
+        let mut discrepancies = Vec::new();
+        let runner_ids: std::collections::HashSet<&str> = open_live_quotes
+            .iter()
+            .map(|(lid, _)| lid.as_str())
+            .collect();
+        let fill_order_ids: std::collections::HashSet<&str> =
+            fills.iter().map(|f| f.order_id.as_str()).collect();
+        for (lid, ticker) in &open_live_quotes {
+            if !order_cid_map.contains_key(lid.as_str()) && !fill_order_ids.contains(lid.as_str()) {
+                discrepancies.push(risk_rails::ReconcileDiscrepancy {
+                    kind: "missing_on_venue".to_string(),
+                    message: format!("runner live order {lid} on {ticker} not found on venue"),
+                    ticker: Some(ticker.clone()),
+                    order_id: Some(lid.clone()),
+                });
+            }
+        }
+        for o in &orders {
+            if o.status.eq_ignore_ascii_case("resting")
+                && !runner_ids.contains(o.order_id.as_str())
+                && !st.executions.has_order_submitted(&o.order_id)
+            {
+                discrepancies.push(risk_rails::ReconcileDiscrepancy {
+                    kind: "untracked_venue_order".to_string(),
+                    message: format!(
+                        "resting venue order {} on {} is not in local execution ledger",
+                        o.order_id, o.ticker
+                    ),
+                    ticker: Some(o.ticker.clone()),
+                    order_id: Some(o.order_id.clone()),
+                });
+            }
+        }
+        for p in &positions {
+            if p.position != 0 && !st.executions.has_fill_for_ticker(&p.ticker) {
+                discrepancies.push(risk_rails::ReconcileDiscrepancy {
+                    kind: "unreconciled_position".to_string(),
+                    message: format!(
+                        "venue position {} ({}) on {} has no matching fill in execution ledger",
+                        p.position, p.ticker, p.ticker
+                    ),
+                    ticker: Some(p.ticker.clone()),
+                    order_id: None,
+                });
+            }
+        }
+
+        st.connected = true;
+        st.rails.last_error = None;
+        st.last_discrepancies = discrepancies.clone();
+        st.rails.record_venue_sync(now, open_exposure, effective_loss);
+
+        risk_rails::LiveReconcileResponse {
+            ok: true,
+            configured: true,
+            connected: true,
+            last_sync_epoch: Some(now),
+            sync_stale: false,
+            utc_day_loss_dollars: effective_loss,
+            utc_day_realized_pnl_dollars: bd.realized_pnl_dollars,
+            utc_day_fees_dollars: bd.fees_dollars,
+            utc_day_breakdown: bd,
+            open_exposure_dollars: open_exposure,
+            executions: st.executions.records().to_vec(),
+            discrepancies,
+            last_error: None,
+        }
+    };
+
+    app.invalidate_live_hot();
+    let ev = format!(
+        "{{\"type\":\"live_reconcile\",\"last_sync_epoch\":{},\"sync_stale\":false,\"utc_day_loss_dollars\":{},\"open_exposure_dollars\":{},\"executions_count\":{},\"ts\":{}}}",
+        now,
+        resp.utc_day_loss_dollars,
+        resp.open_exposure_dollars,
+        resp.executions.len(),
+        now,
+    );
+    tape_hub().publish(ev);
+    Ok(resp)
+}
+
+/// Background reconciler thread polling Kalshi when live credentials are configured,
+/// keeping `last_venue_sync_epoch` < 30s and reconciling fills/settlements/exposure.
+/// Parks idle on `Condvar` (0% CPU / 0 network) when live credentials are absent.
+fn start_background_reconciler(app: Arc<App>) {
+    let poll_secs = std::env::var("OPENBELL_RECONCILE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10)
+        .clamp(1, 25);
+    std::thread::spawn(move || {
+        let mut last_seen_seq = 0u64;
+        loop {
+            let configured = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                st.config.is_configured()
+            };
+            if !configured {
+                let (lock, cv) = &*app.reconcile_wake;
+                let mut seq = lock.lock().unwrap_or_else(|p| p.into_inner());
+                while *seq == last_seen_seq {
+                    seq = cv.wait(seq).unwrap_or_else(|p| p.into_inner());
+                }
+                last_seen_seq = *seq;
+                continue;
+            }
+
+            let _ = reconcile_live_venue(&app);
+
+            let (lock, cv) = &*app.reconcile_wake;
+            let seq = lock.lock().unwrap_or_else(|p| p.into_inner());
+            if *seq == last_seen_seq {
+                let (next_seq, _) = cv
+                    .wait_timeout(seq, std::time::Duration::from_secs(poll_secs))
+                    .unwrap_or_else(|p| p.into_inner());
+                last_seen_seq = *next_seq;
+            } else {
+                last_seen_seq = *seq;
+            }
+        }
+    });
+}
+
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 unsafe extern "C" {
     fn mallopt(param: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
@@ -7911,7 +8536,9 @@ fn main() {
                                 }
                                 if (route == "/api/runner"
                                     || route.starts_with("/api/runner/")
-                                    || route == "/api/orderbook/subscribe")
+                                    || route == "/api/orderbook/subscribe"
+                                    || route == "/api/live/reconcile"
+                                    || route == "/api/live/reset-kill")
                                     && !matches!(method.as_str(), "GET" | "HEAD")
                                 {
                                     let ct = headers
@@ -7987,6 +8614,7 @@ fn main() {
     }
     start_background_collector(app.clone());
     shadow_runner::start_background_runner(app.clone());
+    start_background_reconciler(app.clone());
     orderbook::start_background_orderbook(app.clone());
     startup_discover_open_markets(app.clone());
     updater().start_background();

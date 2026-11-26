@@ -276,6 +276,15 @@ fn spawn_mock_kalshi_v2() -> (u16, Arc<Mutex<MockKalshiState>>) {
 
             let mut st = state_bg.lock().unwrap();
             let (status, resp_json) = match (method.as_str(), path_no_query) {
+                ("GET", "/trade-api/v2/portfolio/positions") => {
+                    (200, serde_json::json!({ "market_positions": [] }))
+                }
+                ("GET", "/trade-api/v2/portfolio/fills") => {
+                    (200, serde_json::json!({ "fills": [] }))
+                }
+                ("GET", "/trade-api/v2/portfolio/settlements") => {
+                    (200, serde_json::json!({ "settlements": [] }))
+                }
                 ("GET", "/trade-api/v2/portfolio/orders") => {
                     (200, serde_json::json!({ "orders": st.orders }))
                 }
