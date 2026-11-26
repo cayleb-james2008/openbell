@@ -4,6 +4,12 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.25.0 - 2026-11-26
+
+- Added a continuous tick-driven Paper/Shadow Orderbook Matching Engine and fail-closed automated multi-slot Strategy Runner in `src/shadow_runner.rs` (`ShadowRunner`), wired into `src/main.rs` via `/api/runner/{status,config,start,stop,ledger}`, `event: runner` SSE frames, and atomic `runner.emergency_halt()` inside `POST /api/live/kill-switch` before `cancel_all_orders()`.
+- Invoked `Strategy::entry_quote()` cleanly on active open 15-minute markets to rest whole-cent maker quotes, track queue-ahead depletion and touch/cross fills, cancel unfilled quotes before expiry, grade venue settlements into persistent `<OPENBELL_DATA>/shadow_ledger.jsonl` and `runner_state.json` (never persisting `live_auto`), and pause slots automatically on realized shadow drawdown.
+- Added `frontend/src/lib/runner.ts` and `frontend/src/ShadowRunnerPanel.tsx` mounted in `LiveTradingPanel.tsx` and `App.tsx`, plus end-to-end Rust and Playwright verification (`tests/v025_shadow_runner.rs`, `frontend/e2e/gate.mjs`).
+
 ## 0.24.0 - 2026-11-25
 
 - Added Causal Liquidity Depth & Scalable Bankroll Capacity Check (`compute_liquidity_capacity`, `LiquidityCapacityReport`, `LiquidityCapacityLeg`, `LiquidityScaleScenario` in `src/auto_allocator.rs`) backed by pre-settlement orderbook depth extraction (`window_depth_contracts` in `src/tournament.rs`) to evaluate `1x`, `2x`, and `5x` sizing partial-fill ratios, convex queue impact drag, `LIQUID` / `TIGHT` / `CROWDED` capacity tiers, and exact `max_scalable_dollars` and `max_scalable_bankroll` ceilings before impact erases post-fee OOS expectancy, while keeping `live_armed: false`.

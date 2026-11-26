@@ -1,17 +1,17 @@
 # OpenBell
 
-![version](https://img.shields.io/badge/version-v0.24.0-0969da?style=flat-square)
+![version](https://img.shields.io/badge/version-v0.25.0-0969da?style=flat-square)
 ![stack](https://img.shields.io/badge/stack-Rust%20%2B%20React%2019-111827?style=flat-square)
-![tests](https://img.shields.io/badge/tests-128%2F128%20pass-16a34a?style=flat-square)
-![binary](https://img.shields.io/badge/release%20binary-5.84%20MiB-0969da?style=flat-square)
+![tests](https://img.shields.io/badge/tests-129%2F129%20pass-16a34a?style=flat-square)
+![binary](https://img.shields.io/badge/release%20binary-5.96%20MiB-0969da?style=flat-square)
 ![safety](https://img.shields.io/badge/live__armed-false%20on%20boot-16a34a?style=flat-square)
 
-OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction markets. It pairs a Kalshi Trade API v2 client (`live_armed: false` on every boot, seven hard risk rails, and an emergency kill switch) with a deduplicating public 15-minute tape collector, a 16-strategy paper slot simulator, and a causal post-only maker allocator.
+OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction markets. It pairs a Kalshi Trade API v2 client (`live_armed: false` on every boot, seven hard risk rails, and an emergency kill switch) with a continuous tick-driven shadow orderbook runner (`entry_quote` resting quotes, queue-ahead depletion, and persistent fill/settlement logging), a deduplicating public 15-minute tape collector, and a causal post-only maker allocator.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/hero-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/hero-light.png">
-  <img alt="OpenBell v0.24.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
+  <img alt="OpenBell v0.25.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
 </picture>
 
 ## Feature gallery
@@ -39,6 +39,18 @@ OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction marke
       </picture>
     </td>
   </tr>
+  <tr>
+    <td colspan="2" valign="top">
+      <strong>Tick-Driven Shadow Orderbook Runner &amp; Fail-Closed Live Auto Gate (<code>v0.25.0</code>)</strong><br>
+      <sub>Runs continuous multi-slot paper shadow execution against live 15-minute orderbooks with <code>entry_quote()</code> resting quotes, queue-ahead depletion tracking, persistent <code>shadow_ledger.jsonl</code> settlement grading, drawdown pause guards, and fail-closed Live Auto gating (<code>403</code> until explicitly armed).</sub>
+      <br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/shadow-runner-dark.png">
+        <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/shadow-runner-light.png">
+        <img alt="Shadow and Auto-Live Runner Control Deck" src="docs/screenshots/shadow-runner-light.png">
+      </picture>
+    </td>
+  </tr>
 </table>
 
 ## Causal execution and fail-closed risk pipeline
@@ -55,9 +67,9 @@ flowchart LR
   R -- "confirm_arm = true" --> K["Kalshi Trade API v2 (RSA-PSS SHA-256)"]
 ```
 
-## Verified benchmarks (`v0.24.0` vs `v0.10.0`)
+## Verified baseline (`v0.24.0`) and `v0.25.0` shadow runner
 
-Measured on a 100k-tick, 2,000-window 15-minute tape via `scale-audit` under `#154` (`taskset -c 24-31`, 16 workers, 5 SSE subscribers, and 25 raw-TCP fuzz checks):
+`v0.25.0` adds live tick-driven shadow orderbook execution (`ShadowRunner`), `entry_quote()` resting limit quotes, queue-ahead fill simulation, and persistent `shadow_ledger.jsonl` settlement grading under `/api/runner/*`, while preserving `live_armed: false` on every boot (`v0.24.0` baseline metrics measured under `#154` 16-worker isolation shown below; `v0.25.0` verified on 129 Rust tests + 103/103 UI gates).
 
 | Metric | `v0.10.0` Baseline | `v0.24.0` Verified | Delta |
 | --- | --- | --- | --- |
@@ -98,10 +110,10 @@ Static assets (`assets/index.html.gz` and 21 embedded `/chunks/*` routes) stay g
 ### Verification suite
 
 - `cargo clippy --all-targets -- -D warnings`
-- `cargo test` (`128` unit and integration tests across `analytics`, `auto_allocator`, `edge_audit`, `kalshi_live`, `recalibration`, `risk_rails`, `scaling`, `tournament`, `update`, and HTTP/SSE/CWE-59 suites)
+- `cargo test` (`129` unit and integration tests across `analytics`, `auto_allocator`, `edge_audit`, `kalshi_live`, `recalibration`, `risk_rails`, `scaling`, `shadow_runner` / `v025_shadow_runner`, `tournament`, `update`, and HTTP/SSE/CWE-59 suites)
 - `cargo check --target x86_64-pc-windows-msvc`
 - `bash .loop/checks/rails.sh && bash .loop/checks/equity.sh`
-- `cd frontend && npm run check:ui -- --skip-build --lints` (`gate 101/101`, `replay 18/18`, Hallmark `sloplint --scope app --render`)
+- `cd frontend && npm run check:ui -- --skip-build --lints` (`gate 103/103`, `replay 18/18`, Hallmark `sloplint --scope app --render`)
 
 ### Environment variables
 

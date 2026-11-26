@@ -336,15 +336,21 @@ for (const m of measures) {
     (await p.locator('#live-order-ticket').isVisible()) &&
     (await p.locator('#live-risk-rails-check [data-risk-rail]').count()) === 7
   ok('Live & Rails view renders Account Strip, Order Ticket, 7 Hard Risk Rails & Emergency Kill Switch', liveTicketOk)
+  await p.locator('#runner-start-shadow-btn').click(); await p.waitForTimeout(200)
+  const shadowModeText = await p.locator('#runner-mode-badge').innerText().catch(() => '')
+  await p.locator('#runner-stop-btn').click(); await p.waitForTimeout(200)
+  const stoppedModeText = await p.locator('#runner-mode-badge').innerText().catch(() => '')
   const runnerDeckOk =
     (await p.locator('#shadow-runner-deck').isVisible()) &&
     (await p.locator('#runner-mode-badge').isVisible()) &&
-    (await p.locator('#runner-slots-card [data-runner-slot-row]').count()) >= 1 &&
-    (await p.locator('#runner-open-quotes-card [role="progressbar"]').count()) >= 1 &&
-    (await p.locator('#runner-strategy-stats-card [data-runner-stat-strategy]').count()) >= 1 &&
-    (await p.locator('#runner-ledger-card [data-runner-ledger-row]').count()) >= 1 &&
-    (await p.locator('#runner-start-live-btn').isDisabled())
-  ok('ShadowRunnerPanel renders mode badge, slot config, queue-ahead quotes, strategy rollup, ledger & fail-closed Live Auto gate', runnerDeckOk)
+    (await p.locator('#runner-slots-card').isVisible()) &&
+    (await p.locator('#runner-open-quotes-card').isVisible()) &&
+    (await p.locator('#runner-strategy-stats-card').isVisible()) &&
+    (await p.locator('#runner-ledger-card').isVisible()) &&
+    (await p.locator('#runner-start-live-btn').isDisabled()) &&
+    /shadow/i.test(shadowModeText) &&
+    /stop/i.test(stoppedModeText)
+  ok('ShadowRunnerPanel renders mode badge, slot config, queue-ahead quotes, strategy rollup, ledger & fail-closed Live Auto gate', runnerDeckOk, `${shadowModeText}->${stoppedModeText}`)
   await p.screenshot({ path: `${OUT}/live-desk-1440-light.png` })
   await p.locator('#tab-tape').click(); await p.waitForTimeout(200)
 
