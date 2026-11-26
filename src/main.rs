@@ -544,8 +544,16 @@ fn active_series() -> Vec<String> {
     SERIES.iter().map(|s| (*s).to_string()).collect()
 }
 
+fn markets_api_base() -> String {
+    std::env::var("OPENBELL_API_BASE")
+        .ok()
+        .and_then(|u| kalshi_live::validate_api_base_url(&u).ok())
+        .unwrap_or_else(|| API_BASE.to_string())
+}
+
 fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize, bool), String> {
-    let url = format!("{API_BASE}/markets?series_ticker={series}&status={status}&limit=100");
+    let base = markets_api_base();
+    let url = format!("{base}/markets?series_ticker={series}&status={status}&limit=100");
     let mut last_err = "venue response had no markets array".to_string();
     let mut hit_rate_limit = false;
     for attempt in 0..4u32 {
@@ -948,8 +956,30 @@ impl CollectorScheduler {
     }
 }
 
+fn prioritized_open_tickers(snaps: &[Snapshot]) -> Vec<String> {
+    let mut ranked: Vec<(i64, String)> = snaps
+        .iter()
+        .filter(|s| s.result.is_empty() && matches!(s.status.as_str(), "open" | "active"))
+        .map(|s| {
+            let close_ep = parse_iso_z(s.close_time.as_str()).unwrap_or(i64::MAX);
+            (close_ep, s.ticker.as_str().to_string())
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut out: Vec<String> = Vec::with_capacity(ranked.len());
+    for (_, t) in ranked {
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
 /// Run one pass with rate-limit telemetry. Strictly public read-only GETs only.
-fn collect_once_detailed(data_dir: &Path) -> Result<CollectPassReport, (String, bool)> {
+fn collect_once_detailed(
+    data_dir: &Path,
+    orderbook: Option<&orderbook::OrderbookStore>,
+) -> Result<CollectPassReport, (String, bool)> {
     let _guard = COLLECT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let _pass = PassGuard::new();
     let _ = std::fs::create_dir_all(data_dir);
@@ -1058,6 +1088,12 @@ fn collect_once_detailed(data_dir: &Path) -> Result<CollectPassReport, (String, 
         return Err((msg, any_rate_limited));
     }
     append_tape(&path, &buf).map_err(|e| (e.to_string(), any_rate_limited))?;
+    if let Some(ob) = orderbook {
+        let open_tickers = prioritized_open_tickers(&pass_snaps);
+        if !open_tickers.is_empty() {
+            ob.sync_active_markets(&open_tickers, &[]);
+        }
+    }
     let event = format!(
         "{{\"type\":\"collect\",\"snapshots_written\":{written},\"deduplicated\":{deduplicated},\"series_failed\":{},\"rate_limited\":{any_rate_limited},\"ts\":{}}}",
         errors.len(),
@@ -1077,7 +1113,7 @@ fn collect_once_detailed(data_dir: &Path) -> Result<CollectPassReport, (String, 
 /// the API can say so instead of returning a cheerful 200 with 0.
 #[allow(dead_code)]
 fn collect_once(data_dir: &Path) -> Result<(usize, usize, Vec<String>), String> {
-    collect_once_detailed(data_dir)
+    collect_once_detailed(data_dir, None)
         .map(|r| (r.written, r.deduplicated, r.errors))
         .map_err(|(e, _)| e)
 }
@@ -3170,6 +3206,10 @@ impl App {
         let live_rails = risk_rails::RiskRailsState::load(&data_dir);
         let runner = Arc::new(shadow_runner::ShadowRunner::load(&data_dir, paper_pot));
         let orderbook = Arc::new(orderbook::OrderbookStore::new(data_dir.clone()));
+        let runner_for_ob = runner.clone();
+        orderbook.set_runner_notify(move || {
+            runner_for_ob.notify_tick();
+        });
         let live_snapshots_path = data_dir.join("snapshots.jsonl");
         Self {
             data_dir,
@@ -6062,7 +6102,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
         }
         ("POST", "/api/collect") => {
             app.collector_scheduler.mark_in_flight(true);
-            let res = collect_once_detailed(&app.data_dir);
+            let res = collect_once_detailed(&app.data_dir, Some(&app.orderbook));
             let _ = app.collector_scheduler.record_pass_result(&res);
             match res {
                 Ok(rep) => {
@@ -7310,6 +7350,30 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let snap = app.orderbook.snapshot(&clean);
             json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
         }
+        ("GET", "/api/orderbook/history") => {
+            let Some(raw_ticker) = query_param(query, "ticker") else {
+                return json_ok_err_response(400, "missing ticker parameter");
+            };
+            let clean = match kalshi_live::validate_ticker(&raw_ticker) {
+                Ok(t) => t.to_string(),
+                Err(e) => return json_ok_err_response(400, &e),
+            };
+            let limit: usize = query_param(query, "limit")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(100)
+                .clamp(1, 500);
+            match app.orderbook.read_history(&clean, limit) {
+                Ok(records) => {
+                    let payload = serde_json::json!({
+                        "ok": true,
+                        "ticker": clean,
+                        "records": records,
+                    });
+                    json_response(200, &payload.to_string())
+                }
+                Err(e) => json_ok_err_response(400, &e),
+            }
+        }
         ("GET", "/api/orderbook/stream-status") => {
             let status = app.orderbook.stream_status();
             json_response(200, &serde_json::to_string(&status).unwrap_or_else(|_| "{}".into()))
@@ -7529,7 +7593,7 @@ fn start_background_collector(app: Arc<App>) {
             }
             st.in_flight = true;
         }
-        let res = collect_once_detailed(&app.data_dir);
+        let res = collect_once_detailed(&app.data_dir, Some(&app.orderbook));
         let updated = app.collector_scheduler.record_pass_result(&res);
         match res {
             Ok(rep) => {
@@ -7924,6 +7988,7 @@ fn main() {
     start_background_collector(app.clone());
     shadow_runner::start_background_runner(app.clone());
     orderbook::start_background_orderbook(app.clone());
+    startup_discover_open_markets(app.clone());
     updater().start_background();
     println!("{}", start_banner(&url, &data_dir, updater().cfg.mode, opening));
 
@@ -7952,6 +8017,36 @@ fn main() {
             spawn_worker(pool.clone(), app.clone(), allowed_hosts.clone(), true);
         }
     }
+}
+
+/// Discover active open markets across `active_series()` at startup (non-blocking)
+/// and sync them into `OrderbookStore` so L2 WS/REST begins streaming immediately.
+fn startup_discover_open_markets(app: Arc<App>) {
+    std::thread::spawn(move || {
+        if std::env::var("OPENBELL_ORDERBOOK_OFFLINE").as_deref() == Ok("1") {
+            return;
+        }
+
+        // Public REST discovery of currently open markets across active_series().
+        let pace_ms: u64 = std::env::var("OPENBELL_COLLECT_PACE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50)
+            .min(500);
+        let mut live_open: Vec<Snapshot> = Vec::new();
+        for (idx, series) in active_series().iter().enumerate() {
+            if idx > 0 && pace_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(pace_ms));
+            }
+            if let Ok((snaps, _, _)) = fetch_markets(series, "open") {
+                live_open.extend(snaps);
+            }
+        }
+        let open_tickers = prioritized_open_tickers(&live_open);
+        if !open_tickers.is_empty() {
+            app.orderbook.sync_active_markets(&open_tickers, &[]);
+        }
+    });
 }
 
 /// Self-update state, one per process: the production entry starts its

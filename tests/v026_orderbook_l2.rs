@@ -476,7 +476,7 @@ fn orderbook_l2_ws_delta_resync_rest_fallback_sse_and_security() {
     );
     assert_eq!(st_bad_q, 400);
 
-    // 5. Subscribe security checks: non-loopback 403, missing CSRF 403, bad ticker 400, >16 tickers 400.
+    // 5. Subscribe security checks: non-loopback 403, missing CSRF 403, bad ticker 400, >32 tickers 400.
     let (st_lan, _) = http_req(
         port,
         "POST",
@@ -510,8 +510,8 @@ fn orderbook_l2_ws_delta_resync_rest_fallback_sse_and_security() {
     );
     assert_eq!(st_bad_sub, 400);
 
-    let too_many: Vec<String> = (1..=17).map(|i| format!("KXBTC15M-M{i}")).collect();
-    let (st_17, _) = http_req(
+    let too_many: Vec<String> = (1..=33).map(|i| format!("KXBTC15M-M{i}")).collect();
+    let (st_33, _) = http_req(
         port,
         "POST",
         "/api/orderbook/subscribe",
@@ -520,7 +520,7 @@ fn orderbook_l2_ws_delta_resync_rest_fallback_sse_and_security() {
         &serde_json::json!({ "tickers": too_many }).to_string(),
         Some("application/json"),
     );
-    assert_eq!(st_17, 400);
+    assert_eq!(st_33, 400);
 
     // 6. Connect SSE client to /api/stream (verifying /api/stream alias & event: orderbook).
     let mut sse_stream = TcpStream::connect(("127.0.0.1", port)).unwrap();

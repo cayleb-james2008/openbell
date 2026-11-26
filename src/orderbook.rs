@@ -12,8 +12,8 @@
 use crate::{kalshi_live, tape_hub, App};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::{Read, Write};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -21,9 +21,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const MAX_SUBSCRIBED_TICKERS: usize = 16;
+pub const MAX_SUBSCRIBED_TICKERS: usize = 32;
 pub const DEFAULT_STALE_AFTER_MS: i64 = 15_000;
 const SSE_THROTTLE_MS: i64 = 250; // <= 4 Hz per ticker
+const RUNNER_NOTIFY_THROTTLE_MS: i64 = 250; // <= 4 Hz coalesced runner wakeup
+const SYNC_RATE_WINDOW_MS: i64 = 5_000;
+const MAX_HISTORY_LIMIT: usize = 500;
 const REST_POLL_INTERVAL_MS: u64 = 1_500;
 const WS_RECONNECT_MAX_MS: u64 = 30_000;
 const MAX_WS_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -93,6 +96,12 @@ pub struct OrderbookSnapshotPayload {
     pub stale: bool,
     pub needs_resync: bool,
     pub queue_by_level: Vec<QueueLevelSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_trade_cents: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_trade_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_trade_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +115,32 @@ pub struct OrderbookStreamStatus {
     pub delta_count: u64,
     pub resync_count: u64,
     pub walk_fallback_count: u64,
+    pub auto_subscribed_count: usize,
+    pub active_l2_tickers: Vec<String>,
+    pub last_trade_ms: Option<i64>,
+    pub tape_sync_rate_hz: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderbookHistoryRecord {
+    pub ts_ms: i64,
+    pub ticker: String,
+    pub seq: u64,
+    pub source: String,
+    pub yes_bids: Vec<[u64; 2]>,
+    pub no_bids: Vec<[u64; 2]>,
+    #[serde(default)]
+    pub best_yes_bid: Option<u8>,
+    #[serde(default)]
+    pub best_yes_ask: Option<u8>,
+    #[serde(default)]
+    pub spread_cents: Option<i32>,
+    #[serde(default)]
+    pub mid_cents: Option<f64>,
+    #[serde(default)]
+    pub yes_depth: u64,
+    #[serde(default)]
+    pub no_depth: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +154,7 @@ struct TickerBook {
     has_snapshot: bool,
     last_trade_cents: Option<u8>,
     last_trade_size: Option<u64>,
+    last_trade_ms: Option<i64>,
     last_sse_emit_ms: i64,
 }
 
@@ -134,6 +170,7 @@ impl Default for TickerBook {
             has_snapshot: false,
             last_trade_cents: None,
             last_trade_size: None,
+            last_trade_ms: None,
             last_sse_emit_ms: 0,
         }
     }
@@ -378,13 +415,28 @@ impl TickerBook {
             stale: self.is_stale(now, stale_after_ms),
             needs_resync: self.needs_resync,
             queue_by_level,
+            last_trade_cents: self.last_trade_cents,
+            last_trade_size: self.last_trade_size,
+            last_trade_ms: self.last_trade_ms,
         }
     }
+
+    fn top_of_book(&self) -> TopOfBook {
+        (
+            self.yes_bids.iter().next_back().map(|(&p, &q)| (p, q)),
+            self.no_bids.iter().next_back().map(|(&p, &q)| (p, q)),
+        )
+    }
 }
+
+type TopOfBook = (Option<(u8, u64)>, Option<(u8, u64)>);
+type RunnerNotifyHook = Arc<dyn Fn() + Send + Sync>;
 
 struct OrderbookInner {
     books: HashMap<String, TickerBook>,
     subscribed_tickers: Vec<String>,
+    ui_pinned_tickers: Vec<String>,
+    auto_subscribed_tickers: BTreeSet<String>,
     ws_connected: bool,
     mode: String,
     last_error: Option<String>,
@@ -392,6 +444,33 @@ struct OrderbookInner {
     resync_count: u64,
     stale_after_ms: i64,
     sub_version: u64,
+    last_trade_ms: Option<i64>,
+    sync_event_ms: VecDeque<i64>,
+    last_runner_notify_ms: i64,
+    runner_notify: Option<RunnerNotifyHook>,
+}
+
+impl OrderbookInner {
+    fn record_sync_event(&mut self, now: i64) {
+        let cutoff = now.saturating_sub(SYNC_RATE_WINDOW_MS);
+        while self.sync_event_ms.front().is_some_and(|&t| t < cutoff) {
+            self.sync_event_ms.pop_front();
+        }
+        if self.sync_event_ms.len() >= 512 {
+            self.sync_event_ms.pop_front();
+        }
+        self.sync_event_ms.push_back(now);
+    }
+
+    fn take_runner_notify(&mut self, now: i64) -> Option<RunnerNotifyHook> {
+        let cb = self.runner_notify.as_ref()?;
+        if now.saturating_sub(self.last_runner_notify_ms) >= RUNNER_NOTIFY_THROTTLE_MS {
+            self.last_runner_notify_ms = now;
+            Some(cb.clone())
+        } else {
+            None
+        }
+    }
 }
 
 pub struct OrderbookStore {
@@ -413,6 +492,8 @@ impl OrderbookStore {
             inner: Mutex::new(OrderbookInner {
                 books: HashMap::new(),
                 subscribed_tickers: Vec::new(),
+                ui_pinned_tickers: Vec::new(),
+                auto_subscribed_tickers: BTreeSet::new(),
                 ws_connected: false,
                 mode: "offline".to_string(),
                 last_error: None,
@@ -420,11 +501,23 @@ impl OrderbookStore {
                 resync_count: 0,
                 stale_after_ms: stale_after_ms.max(1),
                 sub_version: 0,
+                last_trade_ms: None,
+                sync_event_ms: VecDeque::with_capacity(64),
+                last_runner_notify_ms: 0,
+                runner_notify: None,
             }),
             cv: Condvar::new(),
             walk_fallback_count: AtomicU64::new(0),
             revision: AtomicU64::new(0),
         }
+    }
+
+    pub fn set_runner_notify<F>(&self, cb: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        st.runner_notify = Some(Arc::new(cb));
     }
 
     pub fn set_stale_after_ms(&self, stale_after_ms: i64) {
@@ -449,9 +542,14 @@ impl OrderbookStore {
         st.subscribed_tickers.clone()
     }
 
-    /// Subscribe to up to `MAX_SUBSCRIBED_TICKERS` (16) validated market tickers.
-    /// When `replace` is true (e.g. `{ tickers: [...] }`), replaces the list (rejecting > 16).
-    /// When `replace` is false (single `{ ticker: "..." }`), appends/moves to most-recent and evicts oldest if at cap.
+    pub fn pinned_tickers(&self) -> Vec<String> {
+        let st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        st.ui_pinned_tickers.clone()
+    }
+
+    /// Subscribe to up to `MAX_SUBSCRIBED_TICKERS` (32) validated market tickers.
+    /// When `replace` is true (e.g. `{ tickers: [...] }`), replaces the list (rejecting > 32).
+    /// When `replace` is false (single `{ ticker: "..." }`), appends/moves to most-recent and evicts oldest auto-subscribed (then oldest pinned) if at cap.
     pub fn subscribe_tickers(&self, raw_tickers: &[String], replace: bool) -> Result<Vec<String>, String> {
         if raw_tickers.is_empty() {
             return Err("at least one ticker is required".to_string());
@@ -471,12 +569,27 @@ impl OrderbookStore {
         let out = {
             let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if replace {
+                st.ui_pinned_tickers = clean.clone();
                 st.subscribed_tickers = clean;
+                st.auto_subscribed_tickers.clear();
             } else {
                 for t in clean {
+                    st.ui_pinned_tickers.retain(|x| x != &t);
+                    while st.ui_pinned_tickers.len() >= MAX_SUBSCRIBED_TICKERS {
+                        st.ui_pinned_tickers.remove(0);
+                    }
+                    st.ui_pinned_tickers.push(t.clone());
+
                     st.subscribed_tickers.retain(|x| x != &t);
+                    st.auto_subscribed_tickers.remove(&t);
                     while st.subscribed_tickers.len() >= MAX_SUBSCRIBED_TICKERS {
-                        st.subscribed_tickers.remove(0);
+                        let evict_idx = st
+                            .subscribed_tickers
+                            .iter()
+                            .position(|cand| st.auto_subscribed_tickers.contains(cand))
+                            .unwrap_or(0);
+                        let removed = st.subscribed_tickers.remove(evict_idx);
+                        st.auto_subscribed_tickers.remove(&removed);
                     }
                     st.subscribed_tickers.push(t);
                 }
@@ -486,6 +599,58 @@ impl OrderbookStore {
         };
         self.cv.notify_all();
         Ok(out)
+    }
+
+    /// Synchronize active open markets while preserving explicit UI-pinned tickers within `MAX_SUBSCRIBED_TICKERS`.
+    pub fn sync_active_markets(
+        &self,
+        active_markets: &[String],
+        pinned_tickers: &[String],
+    ) -> Vec<String> {
+        let mut changed = false;
+        let out = {
+            let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let mut pinned_clean: Vec<String> = Vec::new();
+            for raw in pinned_tickers.iter().chain(st.ui_pinned_tickers.iter()) {
+                if pinned_clean.len() >= MAX_SUBSCRIBED_TICKERS {
+                    break;
+                }
+                if let Ok(valid) = kalshi_live::validate_ticker(raw) {
+                    if !pinned_clean.iter().any(|x| x == valid) {
+                        pinned_clean.push(valid.to_string());
+                    }
+                }
+            }
+
+            let mut next_subs = pinned_clean;
+            let mut next_auto = BTreeSet::new();
+            for raw in active_markets {
+                if next_subs.len() >= MAX_SUBSCRIBED_TICKERS {
+                    break;
+                }
+                if let Ok(valid) = kalshi_live::validate_ticker(raw) {
+                    if !next_subs.iter().any(|x| x == valid) {
+                        let s = valid.to_string();
+                        next_auto.insert(s.clone());
+                        next_subs.push(s);
+                    }
+                }
+            }
+
+            if st.subscribed_tickers != next_subs || st.auto_subscribed_tickers != next_auto {
+                changed = st.subscribed_tickers != next_subs;
+                st.subscribed_tickers = next_subs;
+                st.auto_subscribed_tickers = next_auto;
+                if changed {
+                    st.sub_version = st.sub_version.saturating_add(1);
+                }
+            }
+            st.subscribed_tickers.clone()
+        };
+        if changed {
+            self.cv.notify_all();
+        }
+        out
     }
 
     /// Inject or apply a full L2 orderbook snapshot (`yes_bids`, `no_bids` as `[price_cents, qty]`).
@@ -520,7 +685,7 @@ impl OrderbookStore {
         }
 
         let need_disk = !self.data_dir.as_os_str().is_empty() && src != "empty";
-        let (changed, disk_vecs, sse_payload) = {
+        let (changed, disk_vecs, sse_payload, notify_cb) = {
             let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let stale_after = st.stale_after_ms;
             let is_subscribed = st.subscribed_tickers.iter().any(|t| t == clean_ticker);
@@ -535,33 +700,47 @@ impl OrderbookStore {
                     st.books.remove(&k);
                 }
             }
-            let book = st.books.entry(clean_ticker.to_string()).or_default();
-            let changed = book.yes_bids != next_yes || book.no_bids != next_no || !book.has_snapshot;
-            let disk_vecs = if changed && need_disk {
-                let yv: Vec<[u64; 2]> = next_yes.iter().rev().map(|(&p, &q)| [p as u64, q]).collect();
-                let nv: Vec<[u64; 2]> = next_no.iter().rev().map(|(&p, &q)| [p as u64, q]).collect();
-                Some((yv, nv))
-            } else {
-                None
-            };
-            book.yes_bids = next_yes;
-            book.no_bids = next_no;
-            book.last_seq = seq;
-            book.updated_ms = now;
-            book.source = src.clone();
-            let crossed = book.is_crossed();
-            book.needs_resync = crossed;
-            book.has_snapshot = true;
+            let (changed, disk_vecs, sse, bbo_changed, crossed) = {
+                let book = st.books.entry(clean_ticker.to_string()).or_default();
+                let prev_has = book.has_snapshot;
+                let prev_top = book.top_of_book();
+                let changed = book.yes_bids != next_yes || book.no_bids != next_no || !book.has_snapshot;
+                let disk_vecs = if changed && need_disk {
+                    let yv: Vec<[u64; 2]> = next_yes.iter().rev().map(|(&p, &q)| [p as u64, q]).collect();
+                    let nv: Vec<[u64; 2]> = next_no.iter().rev().map(|(&p, &q)| [p as u64, q]).collect();
+                    Some((yv, nv))
+                } else {
+                    None
+                };
+                book.yes_bids = next_yes;
+                book.no_bids = next_no;
+                book.last_seq = seq;
+                book.updated_ms = now;
+                book.source = src.clone();
+                let crossed = book.is_crossed();
+                book.needs_resync = crossed;
+                book.has_snapshot = true;
+                let bbo_changed = !crossed && (!prev_has || prev_top != book.top_of_book());
 
-            let mut sse = None;
-            if is_subscribed && now.saturating_sub(book.last_sse_emit_ms) >= SSE_THROTTLE_MS {
-                book.last_sse_emit_ms = now;
-                sse = Some(book.to_payload(clean_ticker, now, stale_after));
-            }
+                let mut sse = None;
+                if is_subscribed && now.saturating_sub(book.last_sse_emit_ms) >= SSE_THROTTLE_MS {
+                    book.last_sse_emit_ms = now;
+                    sse = Some(book.to_payload(clean_ticker, now, stale_after));
+                }
+                (changed, disk_vecs, sse, bbo_changed, crossed)
+            };
             if crossed {
                 st.resync_count = st.resync_count.saturating_add(1);
             }
-            (changed, disk_vecs, sse)
+            if src != "empty" {
+                st.record_sync_event(now);
+            }
+            let notify_cb = if bbo_changed {
+                st.take_runner_notify(now)
+            } else {
+                None
+            };
+            (changed, disk_vecs, sse, notify_cb)
         };
 
         self.revision.fetch_add(1, Ordering::Relaxed);
@@ -574,6 +753,9 @@ impl OrderbookStore {
             if let Ok(json) = serde_json::to_string(&payload) {
                 tape_hub().publish_event("orderbook", json);
             }
+        }
+        if let Some(cb) = notify_cb {
+            cb();
         }
     }
 
@@ -599,7 +781,7 @@ impl OrderbookStore {
         }
         let now = now_ms();
 
-        let (applied, sse_payload) = {
+        let (applied, sse_payload, notify_cb) = {
             let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let stale_after = st.stale_after_ms;
             let is_subscribed = st.subscribed_tickers.iter().any(|t| t == clean_ticker);
@@ -613,18 +795,19 @@ impl OrderbookStore {
                 st.resync_count = st.resync_count.saturating_add(1);
                 return false;
             }
-            let (applied, sse) = {
+            let (applied, sse, bbo_changed) = {
                 let book = st.books.get_mut(clean_ticker).unwrap();
                 if !book.has_snapshot || book.needs_resync {
                     book.needs_resync = true;
-                    (false, None)
+                    (false, None, false)
                 } else if seq <= book.last_seq {
                     // Duplicate or already superseded delta: ignore cleanly without flagging gap.
                     return false;
                 } else if seq != book.last_seq + 1 {
                     book.needs_resync = true;
-                    (false, None)
+                    (false, None, false)
                 } else {
+                    let prev_top = book.top_of_book();
                     let map = if side_lc == "yes" {
                         &mut book.yes_bids
                     } else {
@@ -646,8 +829,9 @@ impl OrderbookStore {
                     book.source = "ws".to_string();
                     if book.is_crossed() {
                         book.needs_resync = true;
-                        (false, None)
+                        (false, None, false)
                     } else {
+                        let bbo_changed = prev_top != book.top_of_book();
                         let sse = if is_subscribed
                             && now.saturating_sub(book.last_sse_emit_ms) >= SSE_THROTTLE_MS
                         {
@@ -656,16 +840,23 @@ impl OrderbookStore {
                         } else {
                             None
                         };
-                        (true, sse)
+                        (true, sse, bbo_changed)
                     }
                 }
             };
-            if applied {
+            let notify_cb = if applied {
                 st.delta_count = st.delta_count.saturating_add(1);
+                st.record_sync_event(now);
+                if bbo_changed {
+                    st.take_runner_notify(now)
+                } else {
+                    None
+                }
             } else {
                 st.resync_count = st.resync_count.saturating_add(1);
-            }
-            (applied, sse)
+                None
+            };
+            (applied, sse, notify_cb)
         };
 
         if applied {
@@ -675,6 +866,9 @@ impl OrderbookStore {
                     tape_hub().publish_event("orderbook", json);
                 }
             }
+            if let Some(cb) = notify_cb {
+                cb();
+            }
         }
         applied
     }
@@ -683,10 +877,31 @@ impl OrderbookStore {
         let Ok(clean_ticker) = kalshi_live::validate_ticker(ticker) else {
             return;
         };
-        let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(book) = st.books.get_mut(clean_ticker) {
-            book.last_trade_cents = Some(price_cents);
-            book.last_trade_size = Some(size);
+        if !(1..=99).contains(&price_cents) {
+            return;
+        }
+        let now = now_ms();
+        let notify_cb = {
+            let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            st.last_trade_ms = Some(now);
+            st.record_sync_event(now);
+            if let Some(book) = st.books.get_mut(clean_ticker) {
+                book.last_trade_cents = Some(price_cents);
+                book.last_trade_size = Some(size);
+                book.last_trade_ms = Some(now);
+            } else if st.books.len() < MAX_CACHED_BOOKS {
+                let b = TickerBook {
+                    last_trade_cents: Some(price_cents),
+                    last_trade_size: Some(size),
+                    last_trade_ms: Some(now),
+                    ..Default::default()
+                };
+                st.books.insert(clean_ticker.to_string(), b);
+            }
+            st.take_runner_notify(now)
+        };
+        if let Some(cb) = notify_cb {
+            cb();
         }
     }
 
@@ -765,13 +980,69 @@ impl OrderbookStore {
                 Ok(())
             }
             "trade" => {
-                if let (Some(ticker), Some(price), Some(count)) = (
-                    msg.get("market_ticker").and_then(|v| v.as_str()),
-                    msg.get("yes_price").and_then(|v| v.as_u64()),
-                    msg.get("count").and_then(|v| v.as_u64()),
-                ) {
+                let raw_ticker = msg
+                    .get("market_ticker")
+                    .or_else(|| msg.get("ticker"))
+                    .and_then(|v| v.as_str());
+                let price_opt = msg
+                    .get("yes_price")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| {
+                        msg.get("yes_price_dollars")
+                            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                            .filter(|d| d.is_finite() && *d >= 0.01 && *d <= 0.99)
+                            .map(|d| (d * 100.0).round() as u64)
+                    });
+                let count_opt = msg
+                    .get("count")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| {
+                        msg.get("count_fp")
+                            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                            .filter(|d| d.is_finite() && *d >= 0.0 && *d <= MAX_LEVEL_QTY as f64)
+                            .map(|d| d.round() as u64)
+                    });
+                if let (Some(ticker), Some(price), Some(count)) = (raw_ticker, price_opt, count_opt) {
                     if (1..=99).contains(&price) {
                         self.record_trade(ticker, price as u8, count);
+                    }
+                }
+                Ok(())
+            }
+            "ticker" => {
+                if let Some(raw_ticker) = msg
+                    .get("market_ticker")
+                    .or_else(|| msg.get("ticker"))
+                    .and_then(|v| v.as_str())
+                {
+                    if let Ok(clean_ticker) = kalshi_live::validate_ticker(raw_ticker) {
+                        let price_opt = msg
+                            .get("price")
+                            .or_else(|| msg.get("last_price"))
+                            .and_then(|v| v.as_u64())
+                            .or_else(|| {
+                                msg.get("price_dollars")
+                                    .or_else(|| msg.get("last_price_dollars"))
+                                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                                    .filter(|d| d.is_finite() && *d >= 0.01 && *d <= 0.99)
+                                    .map(|d| (d * 100.0).round() as u64)
+                            })
+                            .filter(|p| (1..=99).contains(p))
+                            .map(|p| p as u8);
+                        let now = now_ms();
+                        let notify_cb = {
+                            let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                            st.record_sync_event(now);
+                            if let (Some(price_c), Some(book)) =
+                                (price_opt, st.books.get_mut(clean_ticker))
+                            {
+                                book.last_trade_cents = Some(price_c);
+                            }
+                            st.take_runner_notify(now)
+                        };
+                        if let Some(cb) = notify_cb {
+                            cb();
+                        }
                     }
                 }
                 Ok(())
@@ -800,13 +1071,33 @@ impl OrderbookStore {
 
     pub fn stream_status(&self) -> OrderbookStreamStatus {
         let now = now_ms();
-        let st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let cutoff = now.saturating_sub(SYNC_RATE_WINDOW_MS);
+        while st.sync_event_ms.front().is_some_and(|&t| t < cutoff) {
+            st.sync_event_ms.pop_front();
+        }
+        let tape_sync_rate_hz = if st.sync_event_ms.is_empty() {
+            0.0
+        } else {
+            let span_ms = now
+                .saturating_sub(*st.sync_event_ms.front().unwrap())
+                .clamp(1_000, SYNC_RATE_WINDOW_MS);
+            let hz = (st.sync_event_ms.len() as f64) / (span_ms as f64 / 1_000.0);
+            (hz * 100.0).round() / 100.0
+        };
         let active_books = st.books.values().filter(|b| b.has_snapshot).count();
         let stale_books = st
             .books
             .values()
             .filter(|b| b.has_snapshot && b.is_stale(now, st.stale_after_ms))
             .count();
+        let mut active_l2_tickers: Vec<String> = st
+            .books
+            .iter()
+            .filter(|(_, b)| b.has_snapshot && !b.is_stale(now, st.stale_after_ms))
+            .map(|(t, _)| t.clone())
+            .collect();
+        active_l2_tickers.sort();
         OrderbookStreamStatus {
             ws_connected: st.ws_connected,
             mode: st.mode.clone(),
@@ -817,7 +1108,148 @@ impl OrderbookStore {
             delta_count: st.delta_count,
             resync_count: st.resync_count,
             walk_fallback_count: self.walk_fallback_count(),
+            auto_subscribed_count: st.auto_subscribed_tickers.len(),
+            active_l2_tickers,
+            last_trade_ms: st.last_trade_ms,
+            tape_sync_rate_hz,
         }
+    }
+
+    /// Read up to `limit` (clamped `<= 500`) persisted L2 snapshot records for `ticker` from `orderbooks.jsonl`
+    /// with strict path confinement and bounded streaming scan.
+    pub fn read_history(&self, ticker: &str, limit: usize) -> Result<Vec<OrderbookHistoryRecord>, String> {
+        let clean_ticker = kalshi_live::validate_ticker(ticker)?;
+        if limit == 0 || self.data_dir.as_os_str().is_empty() {
+            return Ok(Vec::new());
+        }
+        let eff_limit = limit.min(MAX_HISTORY_LIMIT);
+        let dir_meta = match std::fs::symlink_metadata(&self.data_dir) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("cannot stat data directory: {e}")),
+        };
+        if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
+            return Err("data_dir must be a regular directory".to_string());
+        }
+        let path = self.data_dir.join("orderbooks.jsonl");
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("cannot stat orderbooks.jsonl: {e}")),
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            return Err("orderbooks.jsonl must be a confined regular file".to_string());
+        }
+        if !crate::is_confined_regular_file(&self.data_dir, &path) {
+            return Err("orderbooks.jsonl failed directory confinement check".to_string());
+        }
+
+        let mut file = std::fs::File::open(&path).map_err(|e| format!("open orderbooks.jsonl: {e}"))?;
+        let mut skip_first_partial = false;
+        if meta.len() > MAX_ORDERBOOKS_JSONL_BYTES {
+            let start = meta.len().saturating_sub(MAX_ORDERBOOKS_JSONL_BYTES);
+            file.seek(SeekFrom::Start(start))
+                .map_err(|e| format!("seek orderbooks.jsonl: {e}"))?;
+            skip_first_partial = true;
+        }
+
+        #[derive(Deserialize)]
+        struct RawOrderbookLine {
+            ts_ms: i64,
+            ticker: String,
+            seq: u64,
+            source: String,
+            #[serde(default)]
+            yes_bids: Vec<[u64; 2]>,
+            #[serde(default)]
+            no_bids: Vec<[u64; 2]>,
+        }
+
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut out: VecDeque<OrderbookHistoryRecord> = VecDeque::with_capacity(eff_limit.min(128));
+        const MAX_SCAN_LINES: usize = 50_000;
+        let mut scanned = 0usize;
+        loop {
+            if scanned >= MAX_SCAN_LINES {
+                break;
+            }
+            line.clear();
+            let n = match reader.read_line(&mut line) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if n == 0 {
+                break;
+            }
+            if skip_first_partial {
+                skip_first_partial = false;
+                continue;
+            }
+            scanned += 1;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(raw) = serde_json::from_str::<RawOrderbookLine>(trimmed) else {
+                continue;
+            };
+            if raw.ticker != clean_ticker {
+                continue;
+            }
+            let best_yes_bid = raw
+                .yes_bids
+                .iter()
+                .filter(|&&[p, q]| (1..=99).contains(&p) && q > 0)
+                .map(|&[p, _]| p as u8)
+                .max();
+            let best_no_bid = raw
+                .no_bids
+                .iter()
+                .filter(|&&[p, q]| (1..=99).contains(&p) && q > 0)
+                .map(|&[p, _]| p as u8)
+                .max();
+            let best_yes_ask = best_no_bid.map(|n| 100u8.saturating_sub(n));
+            let spread_cents = match (best_yes_bid, best_yes_ask) {
+                (Some(b), Some(a)) => Some((a as i32) - (b as i32)),
+                _ => None,
+            };
+            let mid_cents = match (best_yes_bid, best_yes_ask) {
+                (Some(b), Some(a)) => Some(((b as f64) + (a as f64)) * 0.5),
+                _ => None,
+            };
+            let yes_depth: u64 = raw
+                .yes_bids
+                .iter()
+                .filter(|&&[p, q]| (1..=99).contains(&p) && q > 0)
+                .map(|&[_, q]| q)
+                .fold(0u64, u64::saturating_add);
+            let no_depth: u64 = raw
+                .no_bids
+                .iter()
+                .filter(|&&[p, q]| (1..=99).contains(&p) && q > 0)
+                .map(|&[_, q]| q)
+                .fold(0u64, u64::saturating_add);
+
+            if out.len() >= eff_limit {
+                out.pop_front();
+            }
+            out.push_back(OrderbookHistoryRecord {
+                ts_ms: raw.ts_ms,
+                ticker: raw.ticker,
+                seq: raw.seq,
+                source: raw.source,
+                yes_bids: raw.yes_bids,
+                no_bids: raw.no_bids,
+                best_yes_bid,
+                best_yes_ask,
+                spread_cents,
+                mid_cents,
+                yes_depth,
+                no_depth,
+            });
+        }
+        Ok(out.into_iter().collect())
     }
 
     /// Walk the opposite-side bids (normalized asks) on `side` (`"yes"` | `"no"`) for `qty` contracts.
@@ -856,7 +1288,9 @@ impl OrderbookStore {
         let side_lc = side.trim().to_ascii_lowercase();
         let st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let book = st.books.get(ticker)?;
-        if book.is_stale(now, st.stale_after_ms) {
+        if book.is_stale(now, st.stale_after_ms)
+            || (book.yes_bids.is_empty() && book.no_bids.is_empty())
+        {
             return None;
         }
         Some(book.queue_ahead_at(&side_lc, price_cents))
@@ -1484,7 +1918,7 @@ pub fn start_background_orderbook(app: Arc<App>) {
                                 "id": 1,
                                 "cmd": "subscribe",
                                 "params": {
-                                    "channels": ["orderbook_delta"],
+                                    "channels": ["orderbook_delta", "ticker", "trade"],
                                     "market_tickers": tickers,
                                 }
                             });
@@ -1511,7 +1945,7 @@ pub fn start_background_orderbook(app: Arc<App>) {
                                             "id": 2,
                                             "cmd": "subscribe",
                                             "params": {
-                                                "channels": ["orderbook_delta"],
+                                                "channels": ["orderbook_delta", "ticker", "trade"],
                                                 "market_tickers": cur_tickers,
                                             }
                                         });
@@ -1696,18 +2130,28 @@ mod tests {
     #[test]
     fn subscription_bounds_and_ws_message_envelope_parsing() {
         let store = OrderbookStore::new(PathBuf::new());
-        let too_many: Vec<String> = (1..=17).map(|i| format!("KXBTC15M-T{i}")).collect();
+        let too_many: Vec<String> = (1..=33).map(|i| format!("KXBTC15M-T{i}")).collect();
         assert!(store.subscribe_tickers(&too_many, true).is_err());
         assert!(store
             .subscribe_tickers(&["bad/ticker".to_string()], false)
             .is_err());
 
-        for i in 1..=18 {
+        for i in 1..=35 {
             let res = store.subscribe_tickers(&[format!("KXBTC15M-T{i}")], false);
             assert!(res.is_ok());
             assert!(res.unwrap().len() <= MAX_SUBSCRIBED_TICKERS);
         }
-        assert_eq!(store.subscribed_tickers().len(), 16);
+        assert_eq!(store.subscribed_tickers().len(), 32);
+
+        // sync_active_markets preserves explicit pinned tickers while filling active open markets up to 32.
+        let store2 = OrderbookStore::new(PathBuf::new());
+        let active: Vec<String> = (1..=36).map(|i| format!("KXETH15M-A{i}")).collect();
+        let synced = store2.sync_active_markets(&active, &["KXSOL15M-PIN1".to_string()]);
+        assert_eq!(synced.len(), MAX_SUBSCRIBED_TICKERS);
+        assert!(synced.iter().any(|t| t == "KXSOL15M-PIN1"));
+        assert!(synced.iter().any(|t| t == "KXETH15M-A1"));
+        assert!(!synced.iter().any(|t| t == "KXETH15M-A36"));
+        assert_eq!(store2.stream_status().auto_subscribed_count, 31);
 
         let ws_snap = serde_json::json!({
             "type": "orderbook_snapshot",
