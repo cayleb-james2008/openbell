@@ -2934,7 +2934,7 @@ struct App {
     /// Cached OOS strategy tournament, 12x12 correlation & regime heatmap payloads
     /// (multi-slippage) under RwLock + singleflight (`GET /api/analytics/tournament`).
     tournament_cache: std::sync::RwLock<Vec<TournamentCacheEntry>>,
-    tournament_compute_lock: std::sync::Mutex<()>,
+    tournament_compute_locks: [std::sync::Mutex<()>; 8],
     /// Pre-extracted tape observations & depth for `$500/day` scale planner so
     /// unique slider/seed requests never reload strategies or re-scan 100k ticks.
     scale_ctx_cache: std::sync::RwLock<Option<ScaleCtxCacheEntry>>,
@@ -3014,7 +3014,7 @@ impl App {
             tournament_ctx_cache: std::sync::RwLock::new(None),
             tournament_ctx_compute_lock: std::sync::Mutex::new(()),
             tournament_cache: std::sync::RwLock::new(Vec::new()),
-            tournament_compute_lock: std::sync::Mutex::new(()),
+            tournament_compute_locks: std::array::from_fn(|_| std::sync::Mutex::new(())),
             scale_ctx_cache: std::sync::RwLock::new(None),
             scale_ctx_compute_lock: std::sync::Mutex::new(()),
             scale_plan_cache: std::sync::RwLock::new(Vec::new()),
@@ -3682,8 +3682,8 @@ impl App {
                 return e.json.clone();
             }
         }
-        let _compute_guard = self
-            .tournament_compute_lock
+        let stripe = (slippage.round() as usize) & 7;
+        let _compute_guard = self.tournament_compute_locks[stripe]
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         {
@@ -3726,7 +3726,11 @@ impl App {
         };
         let mut guard = self.tournament_cache.write().unwrap_or_else(|p| p.into_inner());
         guard.retain(|e| {
-            !(e.path == dpath && (e.len != len || e.mtime != mtime || e.key != key))
+            !(e.path == dpath
+                && (e.len != len
+                    || e.mtime != mtime
+                    || e.key != key
+                    || (e.dataset == dataset && e.slippage_bits == slippage_bits)))
         });
         if guard.len() >= SLIPPAGE_CACHE_CAP {
             guard.remove(0);
