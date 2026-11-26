@@ -780,7 +780,9 @@ fn evaluate_split_candidates(
         let exec_q_entry = audit.and_then(|h| h.quarantine_state.find_entry(&meta.name));
 
         if n == 0 {
-            let reason = if let Some(qe) = exec_q_entry.filter(|e| e.status == "quarantined") {
+            let reason = if let Some(qe) =
+                exec_q_entry.filter(|e| e.status == "quarantined" || e.throttle_mult <= 0.0)
+            {
                 format!(
                     "execution quarantine: {}",
                     if qe.reason.is_empty() {

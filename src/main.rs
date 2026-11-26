@@ -8309,6 +8309,7 @@ pub(crate) fn reconcile_live_venue(
         let pos_exposure: f64 = positions
             .iter()
             .map(|p| p.market_exposure_dollars.abs())
+            .filter(|v| v.is_finite())
             .sum();
         let resting_buy_exposure: f64 = orders
             .iter()
@@ -8332,7 +8333,7 @@ pub(crate) fn reconcile_live_venue(
         let bd = st.executions.utc_day_breakdown(today);
         let pos_loss: f64 = positions
             .iter()
-            .filter(|p| p.realized_pnl_dollars < 0.0)
+            .filter(|p| p.realized_pnl_dollars.is_finite() && p.realized_pnl_dollars < 0.0)
             .map(|p| -p.realized_pnl_dollars)
             .sum();
         let prev_same_day_loss = if st.rails.utc_day_num == today {

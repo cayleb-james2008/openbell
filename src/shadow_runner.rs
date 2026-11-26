@@ -433,12 +433,30 @@ fn normalize_slot(slot: &RunnerSlotConfig) -> Result<RunnerSlotConfig, String> {
 }
 
 fn load_ledger_events(path: &Path) -> Vec<LedgerEvent> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    use std::io::{BufRead, BufReader};
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
         return Vec::new();
     };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Vec::new();
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::with_capacity(512);
     let mut out = Vec::new();
-    for line in raw.lines() {
-        let trimmed = line.trim();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let Ok(line_str) = std::str::from_utf8(&buf) else {
+            continue;
+        };
+        let trimmed = line_str.trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -1017,9 +1035,15 @@ impl ShadowRunner {
                         .take(MAX_RUNNER_SLOTS)
                         .filter_map(|sl| normalize_slot(sl).ok())
                         .collect();
-                    let bankroll = if s.bankroll_dollars.is_finite() && s.bankroll_dollars > 0.0 {
+                    let bankroll = if s.bankroll_dollars.is_finite()
+                        && s.bankroll_dollars > 0.0
+                        && s.bankroll_dollars <= 10_000_000.0
+                    {
                         s.bankroll_dollars
-                    } else if default_bankroll.is_finite() && default_bankroll > 0.0 {
+                    } else if default_bankroll.is_finite()
+                        && default_bankroll > 0.0
+                        && default_bankroll <= 10_000_000.0
+                    {
                         default_bankroll
                     } else {
                         DEFAULT_BANKROLL_DOLLARS
@@ -1172,7 +1196,11 @@ impl ShadowRunner {
                         (
                             ps.paused,
                             ps.pause_reason.clone(),
-                            ps.peak_realized_pnl_dollars.max(peak),
+                            if ps.peak_realized_pnl_dollars.is_finite() {
+                                ps.peak_realized_pnl_dollars.max(peak)
+                            } else {
+                                peak
+                            },
                         )
                     } else if persisted_slot_states.is_empty() {
                         if let Some(reason) = ledger_paused.get(&cfg.slot_id) {
@@ -1391,80 +1419,77 @@ impl ShadowRunner {
             .map(|m| m.trim().to_ascii_lowercase())
             .filter(|m| m == "maker" || m == "taker");
 
+        let raw_bankroll = bankroll_override.unwrap_or(report.starting_bankroll);
+        let bankroll_valid = raw_bankroll.is_finite() && raw_bankroll > 0.0;
+        let bankroll = if bankroll_valid {
+            raw_bankroll.clamp(0.01, 10_000_000.0)
+        } else {
+            0.0
+        };
+
         let mut slots_out: Vec<RunnerSlotConfig> = Vec::new();
         let mut next_slot_id = 1usize;
-        for w in &report.active_winners {
-            if slots_out.len() >= MAX_RUNNER_SLOTS {
-                break;
-            }
-            if quarantine.is_quarantined(&w.strategy) || w.execution_status == "quarantined" {
-                if !excluded_quarantined.contains(&w.strategy) {
-                    excluded_quarantined.push(w.strategy.clone());
+        if bankroll_valid {
+            for w in &report.active_winners {
+                if slots_out.len() >= MAX_RUNNER_SLOTS {
+                    break;
                 }
-                continue;
-            }
-            let mult = quarantine.throttle_mult(&w.strategy);
-            if mult <= 0.0 {
-                if !excluded_quarantined.contains(&w.strategy) {
-                    excluded_quarantined.push(w.strategy.clone());
-                }
-                continue;
-            }
-            let rail_cap = rails.max_order_contracts.clamp(1, 10_000);
-            let raw_contracts = w.rail_clamped_contracts.min(rail_cap);
-            if raw_contracts == 0 {
-                continue;
-            }
-            let max_contracts = if mult < 1.0 {
-                ((raw_contracts as f64) * mult).floor().max(1.0) as u32
-            } else {
-                raw_contracts
-            }
-            .min(rail_cap)
-            .clamp(1, 10_000);
-
-            let series = match series_by_strat.get(w.strategy.as_str()) {
-                Some(s) if !s.is_empty() => vec![(*s).to_string()],
-                _ => Vec::new(),
-            };
-            let exec_mode = exec_override
-                .clone()
-                .unwrap_or_else(|| {
-                    if w.execution_mode == "taker" {
-                        "taker".to_string()
-                    } else {
-                        "maker".to_string()
+                if quarantine.is_quarantined(&w.strategy) || w.execution_status == "quarantined" {
+                    if !excluded_quarantined.contains(&w.strategy) {
+                        excluded_quarantined.push(w.strategy.clone());
                     }
-                });
-            let auto_pause_drawdown = (rails.max_daily_loss_dollars
-                * (w.allocated_pct / 100.0).max(0.1))
-            .clamp(5.0, rails.max_daily_loss_dollars.max(5.0));
-
-            let slot = normalize_slot(&RunnerSlotConfig {
-                slot_id: next_slot_id,
-                strategy: w.strategy.clone(),
-                series,
-                max_contracts,
-                execution_mode: exec_mode,
-                auto_pause_drawdown_dollars: auto_pause_drawdown,
-                enabled: true,
-            })?;
-            slots_out.push(slot);
-            next_slot_id += 1;
-        }
-
-        let bankroll = bankroll_override
-            .filter(|b| b.is_finite() && *b > 0.0 && *b <= 10_000_000.0)
-            .unwrap_or_else(|| {
-                if report.starting_bankroll.is_finite()
-                    && report.starting_bankroll > 0.0
-                    && report.starting_bankroll <= 10_000_000.0
-                {
-                    report.starting_bankroll
-                } else {
-                    DEFAULT_BANKROLL_DOLLARS
+                    continue;
                 }
-            });
+                let mult = quarantine.throttle_mult(&w.strategy);
+                if mult <= 0.0 {
+                    if !excluded_quarantined.contains(&w.strategy) {
+                        excluded_quarantined.push(w.strategy.clone());
+                    }
+                    continue;
+                }
+                let rail_cap = rails.max_order_contracts.clamp(1, 10_000);
+                let raw_contracts = w.rail_clamped_contracts.min(rail_cap);
+                if raw_contracts == 0 {
+                    continue;
+                }
+                let max_contracts = if mult < 1.0 {
+                    ((raw_contracts as f64) * mult).floor().max(1.0) as u32
+                } else {
+                    raw_contracts
+                }
+                .min(rail_cap)
+                .clamp(1, 10_000);
+
+                let series = match series_by_strat.get(w.strategy.as_str()) {
+                    Some(s) if !s.is_empty() => vec![(*s).to_string()],
+                    _ => Vec::new(),
+                };
+                let exec_mode = exec_override
+                    .clone()
+                    .unwrap_or_else(|| {
+                        if w.execution_mode == "taker" {
+                            "taker".to_string()
+                        } else {
+                            "maker".to_string()
+                        }
+                    });
+                let auto_pause_drawdown = (rails.max_daily_loss_dollars
+                    * (w.allocated_pct / 100.0).max(0.1))
+                .clamp(5.0, rails.max_daily_loss_dollars.max(5.0));
+
+                let slot = normalize_slot(&RunnerSlotConfig {
+                    slot_id: next_slot_id,
+                    strategy: w.strategy.clone(),
+                    series,
+                    max_contracts,
+                    execution_mode: exec_mode,
+                    auto_pause_drawdown_dollars: auto_pause_drawdown,
+                    enabled: true,
+                })?;
+                slots_out.push(slot);
+                next_slot_id += 1;
+            }
+        }
 
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
         // Safety invariant: sync_from_allocator NEVER sets RunnerMode::LiveAuto.
@@ -1473,6 +1498,24 @@ impl ShadowRunner {
         }
         st.bankroll_dollars = bankroll;
         st.quarantine_state = quarantine.clone();
+        // Cancel any resting shadow quotes for quarantined strategies (or all when synced slots are empty).
+        let now = now_unix();
+        let existing_quotes = std::mem::take(&mut st.open_quotes);
+        let mut kept_quotes = Vec::with_capacity(existing_quotes.len());
+        let mut canceled_quotes = Vec::new();
+        for rq in existing_quotes {
+            if rq.order.mode == "shadow"
+                && (slots_out.is_empty() || quarantine.is_quarantined(&rq.order.strategy))
+            {
+                canceled_quotes.push(rq.order);
+            } else {
+                kept_quotes.push(rq);
+            }
+        }
+        st.open_quotes = kept_quotes;
+        for q in canceled_quotes {
+            st.emit_quote_canceled(&q, now, "allocator_sync_cleared");
+        }
         st.slots = slots_out
             .iter()
             .cloned()
@@ -3603,6 +3646,137 @@ pub fn entry_quote(yes_ask, no_ask, secs_to_close) { Some(0.55) }
             .filter(|e| e.event == "WindowSettled")
             .collect();
         assert_eq!(settles.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cycle3_hardening_sync_from_allocator_zero_bankroll_and_all_quarantined() {
+        let dir = std::env::temp_dir().join(format!("ob-runner-c3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. Corrupt runner_state.json boots fail-closed (Stopped, never LiveAuto)
+        std::fs::write(state_path(&dir), r#"{"mode":"live_auto","slots":[{"#).unwrap();
+        let runner = ShadowRunner::load(&dir, 500.0);
+        let boot_snap = runner.status(false, false);
+        assert_eq!(boot_snap.mode, "stopped");
+        assert!(!boot_snap.live_armed);
+
+        // 2. Tampered mode="live_auto" in valid JSON still boots Stopped and sanitizes disk
+        std::fs::write(
+            state_path(&dir),
+            r#"{"mode":"live_auto","tick_interval_ms":250,"cancel_before_close_secs":30,"bankroll_dollars":500.0,"slots":[]}"#,
+        )
+        .unwrap();
+        let runner2 = ShadowRunner::load(&dir, 500.0);
+        let boot_snap2 = runner2.status(false, false);
+        assert_eq!(boot_snap2.mode, "stopped");
+        assert!(!boot_snap2.live_armed);
+
+        // Build a baseline AutoAllocatorReport with one active winner
+        let ctx = crate::tournament::TournamentTapeContext {
+            strategies: Vec::new(),
+            windows_settled_total: 0,
+            windows_settled_is: 0,
+            windows_settled_oos: 0,
+            windows_conflicted: 0,
+            split_epoch: None,
+            observed_series: vec!["KXBTC15M".to_string()],
+            entries: Vec::new(),
+            window_vol_scores: HashMap::new(),
+            window_spread_cents: HashMap::new(),
+            window_depth_contracts: HashMap::new(),
+        };
+        let rails = risk_rails::RiskRailsConfig::default();
+        let mut rep = crate::auto_allocator::compute_auto_allocator_report_with_audit(
+            &ctx,
+            &crate::auto_allocator::AutoAllocatorRequest::default(),
+            &rails,
+            false,
+            false,
+            None,
+            None,
+        );
+        let dummy_stress = crate::auto_allocator::StressProfile {
+            extra_slippage_0c_cents: 2.0,
+            extra_slippage_1c_cents: 1.0,
+            extra_slippage_2c_cents: 0.0,
+            folds_positive: 3,
+            folds_total: 3,
+            worst_fold_expectancy_cents: Some(1.0),
+            stress_resilient: true,
+        };
+        rep.active_winners.push(crate::auto_allocator::AllocatedWinner {
+            strategy: "winner-a".to_string(),
+            side: "yes".to_string(),
+            execution_mode: "maker".to_string(),
+            is_net_expectancy_cents: Some(2.0),
+            oos_trades: 20,
+            oos_win_rate: 0.6,
+            oos_avg_entry_price: 0.50,
+            taker_fee_cents: 1.75,
+            maker_fee_cents: 0.44,
+            gross_expectancy_cents: 3.0,
+            fee_drag_cents: 0.44,
+            oos_net_expectancy_cents: 2.56,
+            full_kelly_pct: 10.0,
+            breakeven_fill_rate_pct: 50.0,
+            regime_throttle_mult: 1.0,
+            execution_throttle_mult: 1.0,
+            execution_status: "active".to_string(),
+            allocated_pct: 10.0,
+            allocated_dollars: 50.0,
+            rail_clamped_contracts: 5,
+            max_abs_corr: None,
+            status: "ACTIVE_WINNER".to_string(),
+            stress: dummy_stress,
+        });
+
+        // Put runner into LiveAuto transiently to verify sync_from_allocator NEVER leaves it LiveAuto
+        runner2.start("live_auto", true, true, false).unwrap();
+        let q_empty = crate::execution_audit::QuarantineStateFile::default();
+
+        // 3. Bankroll == 0.0 -> leaves slots empty, bankroll 0.0, and forces mode != live_auto
+        let (slots0, _, snap0) = runner2
+            .sync_from_allocator(&rep, &rails, &q_empty, Some(0.0), None, false, false)
+            .unwrap();
+        assert!(slots0.is_empty(), "bankroll=0 must leave synced slots empty");
+        assert!(snap0.active_slots.is_empty());
+        assert_eq!(snap0.bankroll_dollars, 0.0);
+        assert_ne!(snap0.mode, "live_auto");
+        assert!(!snap0.live_armed);
+
+        // Report starting_bankroll == 0.0 with no override -> also leaves slots empty
+        let mut rep_zero = rep.clone();
+        rep_zero.starting_bankroll = 0.0;
+        let (slots0b, _, snap0b) = runner2
+            .sync_from_allocator(&rep_zero, &rails, &q_empty, None, None, false, false)
+            .unwrap();
+        assert!(slots0b.is_empty());
+        assert!(snap0b.active_slots.is_empty());
+        assert_ne!(snap0b.mode, "live_auto");
+
+        // 4. All strategies quarantined -> leaves slots empty, excludes winner-a, never touches LiveAuto
+        let mut q_all = crate::execution_audit::QuarantineStateFile::default();
+        q_all.strategies.insert(
+            "winner-a".to_string(),
+            crate::execution_audit::StrategyQuarantineEntry {
+                status: "quarantined".to_string(),
+                throttle_mult: 0.0,
+                reason: "adverse markout".to_string(),
+                ..Default::default()
+            },
+        );
+        runner2.start("live_auto", true, true, false).unwrap();
+        let (slots_q, excluded_q, snap_q) = runner2
+            .sync_from_allocator(&rep, &rails, &q_all, Some(500.0), None, false, false)
+            .unwrap();
+        assert!(slots_q.is_empty(), "all-quarantined must leave slots empty");
+        assert!(snap_q.active_slots.is_empty());
+        assert!(excluded_q.contains(&"winner-a".to_string()));
+        assert_ne!(snap_q.mode, "live_auto");
+        assert!(!snap_q.live_armed);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
