@@ -168,6 +168,7 @@ export function App() {
   const [ticketPostOnly, setTicketPostOnly] = useState<boolean | null>(null);
 
   const searchRef = useRef<HTMLInputElement>(null);
+  const liveActionLockRef = useRef(false);
   const { reads, stream, load: reload } = useDesk(dataset);
   const upd = useUpdates();
 
@@ -344,7 +345,8 @@ export function App() {
   );
 
   const handleArmLive = useCallback(async () => {
-    if (liveBusy) return;
+    if (liveActionLockRef.current || liveBusy) return;
+    liveActionLockRef.current = true;
     setLiveBusy(true);
     try {
       await armLiveTrading(home);
@@ -354,12 +356,14 @@ export function App() {
     } catch (e) {
       toast.error(`Arm live failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
+      liveActionLockRef.current = false;
       setLiveBusy(false);
     }
   }, [liveBusy, home, refreshLive]);
 
   const handleDisarmLive = useCallback(async () => {
-    if (liveBusy) return;
+    if (liveActionLockRef.current || liveBusy) return;
+    liveActionLockRef.current = true;
     setLiveBusy(true);
     try {
       await disarmLiveTrading(home);
@@ -369,13 +373,15 @@ export function App() {
     } catch (e) {
       toast.error(`Disarm failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
+      liveActionLockRef.current = false;
       setLiveBusy(false);
     }
   }, [liveBusy, home, refreshLive]);
 
   const handleSubmitLiveOrder = useCallback(
     async (payload: LiveOrderPayload) => {
-      if (liveBusy) return;
+      if (liveActionLockRef.current || liveBusy) return;
+      liveActionLockRef.current = true;
       setLiveBusy(true);
       try {
         const res = await submitLiveOrder(payload, home);
@@ -386,6 +392,7 @@ export function App() {
       } catch (e) {
         toast.error(`Order rejected: ${e instanceof Error ? e.message : String(e)}`);
       } finally {
+        liveActionLockRef.current = false;
         setLiveBusy(false);
       }
     },
@@ -394,7 +401,8 @@ export function App() {
 
   const handleCancelLiveOrder = useCallback(
     async (orderId: string) => {
-      if (liveBusy) return;
+      if (liveActionLockRef.current || liveBusy) return;
+      liveActionLockRef.current = true;
       setLiveBusy(true);
       try {
         await cancelLiveOrder(orderId, home);
@@ -403,6 +411,7 @@ export function App() {
       } catch (e) {
         toast.error(`Cancel failed: ${e instanceof Error ? e.message : String(e)}`);
       } finally {
+        liveActionLockRef.current = false;
         setLiveBusy(false);
       }
     },
@@ -410,7 +419,8 @@ export function App() {
   );
 
   const handleKillSwitch = useCallback(async () => {
-    if (liveBusy) return;
+    if (liveActionLockRef.current || liveBusy) return;
+    liveActionLockRef.current = true;
     setLiveBusy(true);
     try {
       const res = await triggerKillSwitch(home);
@@ -423,6 +433,7 @@ export function App() {
     } catch (e) {
       toast.error(`Kill switch error: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
+      liveActionLockRef.current = false;
       setLiveBusy(false);
     }
   }, [liveBusy, home, refreshLive]);

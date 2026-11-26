@@ -1720,7 +1720,7 @@ export function AutoAllocatorPanel({
                 <div className="mt-0.5 font-semibold text-ink">{report.forward_envelope.active_preset_label}</div>
               </div>
               <div>
-                <div className="text-ink-3">Paper vs P5–P50 Envelope</div>
+                <div className="text-ink-3">Paper vs P5-P50 Envelope</div>
                 <div className="mono mt-0.5 font-semibold text-ink">
                   {money(report.forward_envelope.observed_paper_equity)}{" "}
                   <span className="text-ink-3">

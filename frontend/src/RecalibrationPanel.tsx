@@ -241,7 +241,7 @@ export function RecalibrationPanel({
                       {recal.buckets.map((b, i) => (
                         <TableRow key={i}>
                           <TableCell className="mono text-xs text-ink">
-                            {Math.round(b.low * 100)}–{Math.round(b.high * 100)}%
+                            {Math.round(b.low * 100)}-{Math.round(b.high * 100)}%
                           </TableCell>
                           <TableCell className="mono text-right text-xs text-ink-2">
                             {b.n} / {b.wins}

@@ -2,8 +2,8 @@
 // Renders paired YES Bids & YES Asks with proportional horizontal depth bars,
 // cumulative depth, spread & microprice header, WS/REST live/stale status pill,
 // clickable price rows, and live book-walk VWAP + slippage estimate.
-import { useMemo } from "react";
-import { Activity, Layers, RefreshCw } from "lucide-react";
+import { useCallback, useMemo } from "react";
+import { Activity, AlertTriangle, Layers, RefreshCw } from "lucide-react";
 import { Badge, Button, StatusPill } from "@/components/ui";
 import {
   type OrderbookLevel,
@@ -11,6 +11,7 @@ import {
   type OrderbookStreamStatus,
   computeMicropriceCents,
   deriveSideBookLevels,
+  isOrderbookCrossed,
   walkBookLevels,
 } from "@/lib/orderbook";
 
@@ -55,15 +56,17 @@ function LadderSideColumn({
   sideKind,
   levels,
   maxCumQty,
-  selectedPriceCents,
-  onSelectPrice,
+  ticketSide,
+  selectedYesPriceCents,
+  onSelectYesLevel,
 }: {
   title: string;
   sideKind: "bid" | "ask";
   levels: OrderbookLevel[];
   maxCumQty: number;
-  selectedPriceCents?: number | null;
-  onSelectPrice?: (priceCents: number) => void;
+  ticketSide: "yes" | "no";
+  selectedYesPriceCents?: number | null;
+  onSelectYesLevel?: (yesPriceCents: number) => void;
 }) {
   const isBid = sideKind === "bid";
   return (
@@ -79,7 +82,8 @@ function LadderSideColumn({
         <div role="list" aria-label={title} className="space-y-1">
           {levels.map((lvl) => {
             const pct = maxCumQty > 0 ? Math.min(100, Math.max(4, Math.round((lvl.cumulative_qty / maxCumQty) * 100))) : 0;
-            const selected = selectedPriceCents === lvl.price_cents;
+            const selected = selectedYesPriceCents === lvl.price_cents;
+            const targetPrice = ticketSide === "no" ? 100 - lvl.price_cents : lvl.price_cents;
             const rowCls =
               "relative grid w-full grid-cols-3 items-center gap-2 overflow-hidden rounded-md border px-2 text-xs tabular-nums " +
               (selected
@@ -110,7 +114,7 @@ function LadderSideColumn({
               </>
             );
 
-            if (onSelectPrice) {
+            if (onSelectYesLevel) {
               return (
                 <button
                   key={`${sideKind}-${lvl.price_cents}`}
@@ -119,8 +123,12 @@ function LadderSideColumn({
                   data-orderbook-level
                   data-side={sideKind}
                   data-price-cents={lvl.price_cents}
-                  aria-label={`Set limit price to ${lvl.price_cents} cents (${lvl.qty} contracts)`}
-                  onClick={() => onSelectPrice(lvl.price_cents)}
+                  aria-label={
+                    ticketSide === "no"
+                      ? `Set NO limit price to ${targetPrice} cents from YES ${lvl.price_cents} cents (${lvl.qty} contracts)`
+                      : `Set limit price to ${lvl.price_cents} cents (${lvl.qty} contracts)`
+                  }
+                  onClick={() => onSelectYesLevel(lvl.price_cents)}
                   className={
                     rowCls +
                     " min-h-11 cursor-pointer outline-none transition-[border-color,background-color] duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
@@ -183,8 +191,29 @@ export function OrderbookLadder({
   const walk = useMemo(() => walkBookLevels(walkLevels, qty), [walkLevels, qty]);
   const microprice = useMemo(() => computeMicropriceCents(snapshot), [snapshot]);
   const statusInfo = statusBadgeInfo(snapshot, streamStatus);
+  const isCrossed = isOrderbookCrossed(snapshot);
+  const isStale = Boolean(snapshot?.stale);
   const hasDepth = bids.length > 0 || asks.length > 0;
   const cleanTicker = ticker.trim().toUpperCase();
+
+  const selectedYesPriceCents = useMemo(() => {
+    if (selectedPriceCents === null || selectedPriceCents === undefined || !Number.isFinite(selectedPriceCents)) {
+      return null;
+    }
+    const p = Math.round(selectedPriceCents);
+    if (p < 1 || p > 99) return null;
+    return side === "no" ? 100 - p : p;
+  }, [selectedPriceCents, side]);
+
+  const handleStagePrice = useCallback(
+    (yesPriceCents: number) => {
+      if (!onSelectPrice || !Number.isFinite(yesPriceCents)) return;
+      const rawTarget = side === "no" ? 100 - yesPriceCents : yesPriceCents;
+      const clamped = Math.min(99, Math.max(1, Math.round(rawTarget)));
+      onSelectPrice(clamped);
+    },
+    [onSelectPrice, side],
+  );
 
   return (
     <section
@@ -247,9 +276,17 @@ export function OrderbookLadder({
         </div>
         <div>
           <dt className="text-ink-3">Spread</dt>
-          <dd data-orderbook-spread className="mono mt-0.5 font-semibold text-ink">
+          <dd
+            data-orderbook-spread
+            className={
+              "mono mt-0.5 font-semibold " +
+              (isCrossed ? "text-destructive-foreground" : "text-ink")
+            }
+          >
             {snapshot?.spread_cents !== null && snapshot?.spread_cents !== undefined
-              ? `${snapshot.spread_cents}c`
+              ? isCrossed
+                ? `${snapshot.spread_cents}c (crossed)`
+                : `${snapshot.spread_cents}c`
               : "-"}
           </dd>
         </div>
@@ -300,6 +337,57 @@ export function OrderbookLadder({
         )}
       </div>
 
+      {/* Stale / Crossed / Feed Warning Banners */}
+      {isCrossed && (
+        <div
+          role="alert"
+          data-orderbook-crossed-banner
+          className="mb-2.5 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dot-red/50 bg-board/60 px-3 py-2 text-xs text-destructive-foreground"
+        >
+          <span className="flex items-center gap-1.5 font-medium">
+            <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
+            <span>
+              Crossed L2 book (YES bid {snapshot?.best_yes_bid}c &gt; YES ask {snapshot?.best_yes_ask}c). Resync depth before staging orders.
+            </span>
+          </span>
+          {onRefresh && (
+            <button
+              type="button"
+              onClick={onRefresh}
+              className="min-h-11 cursor-pointer rounded border border-hairline bg-surface px-2.5 text-xs font-medium text-ink hover:bg-canvas sm:min-h-7"
+            >
+              Resync
+            </button>
+          )}
+        </div>
+      )}
+
+      {(isStale || (Boolean(error) && hasDepth)) && (
+        <div
+          role="status"
+          data-orderbook-stale-banner
+          className="mb-2.5 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dot-amber/50 bg-board/60 px-3 py-2 text-xs text-warning-foreground"
+        >
+          <span className="flex items-center gap-1.5 font-medium">
+            <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
+            <span>
+              {error
+                ? `Orderbook refresh delayed (${error}). Showing cached depth.`
+                : "Orderbook snapshot is stale. Quotes and VWAP may lag venue L2."}
+            </span>
+          </span>
+          {onRefresh && (
+            <button
+              type="button"
+              onClick={onRefresh}
+              className="min-h-11 cursor-pointer rounded border border-hairline bg-surface px-2.5 text-xs font-medium text-ink hover:bg-canvas sm:min-h-7"
+            >
+              Resubscribe
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Main Content: Loading / Degraded / Paired DOM Columns */}
       {loading && !snapshot ? (
         <div className="space-y-2 py-2">
@@ -309,12 +397,17 @@ export function OrderbookLadder({
         </div>
       ) : error && !hasDepth ? (
         <div
-          role="status"
+          role="alert"
           data-orderbook-empty
           className="rounded-lg border border-hairline bg-board/50 p-4 text-center text-xs text-ink-2"
         >
           <p className="font-medium text-ink">Orderbook feed unavailable</p>
           <p className="mt-1 text-ink-3">{error}</p>
+          {onRefresh && (
+            <Button variant="outline" size="sm" onClick={onRefresh} className="mt-2.5">
+              Retry
+            </Button>
+          )}
         </div>
       ) : !hasDepth ? (
         <div
@@ -334,23 +427,27 @@ export function OrderbookLadder({
             sideKind="bid"
             levels={bids}
             maxCumQty={maxCumQty}
-            selectedPriceCents={side === "yes" ? selectedPriceCents : null}
-            onSelectPrice={onSelectPrice}
+            ticketSide={side}
+            selectedYesPriceCents={selectedYesPriceCents}
+            onSelectYesLevel={onSelectPrice ? handleStagePrice : undefined}
           />
           <LadderSideColumn
             title="YES Asks"
             sideKind="ask"
             levels={asks}
             maxCumQty={maxCumQty}
-            selectedPriceCents={side === "yes" ? selectedPriceCents : null}
-            onSelectPrice={onSelectPrice}
+            ticketSide={side}
+            selectedYesPriceCents={selectedYesPriceCents}
+            onSelectYesLevel={onSelectPrice ? handleStagePrice : undefined}
           />
         </div>
       )}
 
       {onSelectPrice && hasDepth && (
         <p className="mt-2 text-xs text-ink-3">
-          Click any bid or ask row to populate the ticket limit price.
+          {side === "no"
+            ? "Click any YES row to stage the complement NO limit price (100 - YES)."
+            : "Click any bid or ask row to populate the ticket limit price."}
         </p>
       )}
     </section>

@@ -1,7 +1,7 @@
 // OpenBell Shadow & Fail-Closed Auto-Live Runner Control Deck & Persistent Ledger UI.
 // Supports mode control (Stopped / Shadow / confirmation-gated Live Auto), slot config,
 // live resting quotes with queue-ahead bar & fill ETA, strategy stats rollup, and filterable ledger.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Play,
@@ -40,6 +40,7 @@ import {
 import type { LiveStatus } from "@/lib/live";
 import {
   AVAILABLE_SERIES,
+  RunnerApiError,
   type RunnerMode,
   type RunnerSlotConfig,
   type RunnerStatus,
@@ -86,20 +87,24 @@ function LiveAutoConfirmModal({
   open,
   onOpenChange,
   liveStatus,
+  liveAutoAllowed,
   busy,
   onConfirm,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   liveStatus: LiveStatus;
+  liveAutoAllowed: boolean;
   busy: boolean;
   onConfirm: () => void;
 }) {
   const [checked, setChecked] = useState(false);
+  const confirmLockRef = useRef(false);
 
   useEffect(() => {
     if (!open) {
       setChecked(false);
+      confirmLockRef.current = false;
       return;
     }
     const onKey = (e: KeyboardEvent) => {
@@ -195,9 +200,11 @@ function LiveAutoConfirmModal({
           <Button
             id="runner-confirm-live-btn"
             variant="default"
-            disabled={!checked || busy}
+            disabled={!checked || busy || !liveAutoAllowed}
             className="min-h-11 gap-1.5 text-xs sm:min-h-9"
             onClick={() => {
+              if (confirmLockRef.current || busy || !checked || !liveAutoAllowed) return;
+              confirmLockRef.current = true;
               onConfirm();
               onOpenChange(false);
             }}
@@ -262,6 +269,8 @@ export function ShadowRunnerPanel({
   const [ledgerStrategyFilter, setLedgerStrategyFilter] = useState<string>("all");
   const [ledgerModeFilter, setLedgerModeFilter] = useState<"all" | "shadow" | "live">("all");
   const [lastSseEvent, setLastSseEvent] = useState<string | null>(null);
+  const [runnerError, setRunnerError] = useState<{ status: number | null; message: string } | null>(null);
+  const actionLockRef = useRef(false);
 
   const serverSupported = supportsShadowRunner(home);
 
@@ -339,21 +348,62 @@ export function ShadowRunnerPanel({
 
   // Subscribe to SSE `event: runner` updates when the server runner is active.
   useEffect(() => {
-    const unsub = subscribeRunnerStream(serverSupported && dataset !== "fixture", (ev) => {
-      setLastSseEvent(ev.kind);
-      void refreshAll(false);
-    });
+    const unsub = subscribeRunnerStream(
+      serverSupported && dataset !== "fixture",
+      (ev) => {
+        setLastSseEvent(ev.kind);
+        void refreshAll(false);
+      },
+      () => {
+        void refreshAll(false);
+      },
+    );
     return unsub;
   }, [serverSupported, dataset, refreshAll]);
 
-  const effectiveLiveArmed = status.source === "server" ? status.live_armed : liveStatus.liveArmed;
-  const effectiveKilled = status.source === "server" ? status.killed : liveStatus.killed;
+  const effectiveLiveArmed =
+    status.source === "server" ? status.live_armed && liveStatus.liveArmed : liveStatus.liveArmed;
+  const effectiveKilled =
+    status.source === "server" ? status.killed || liveStatus.killed : liveStatus.killed;
   const liveAutoAllowed = effectiveLiveArmed && !effectiveKilled;
   const modeMeta = modeBadgeProps(status.mode, effectiveKilled);
 
+  useEffect(() => {
+    if (!liveAutoAllowed && liveConfirmOpen) {
+      setLiveConfirmOpen(false);
+    }
+  }, [liveAutoAllowed, liveConfirmOpen]);
+
+  const handleRunnerMutationError = useCallback(
+    (actionLabel: string, err: unknown) => {
+      const httpStatus = err instanceof RunnerApiError ? err.status : null;
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      let displayMsg = `${actionLabel} failed: ${rawMsg}`;
+      if (httpStatus === 403) {
+        displayMsg = `Blocked (403 Forbidden): ${rawMsg}. Live Auto stays locked until live trading is armed and kill switch is clear.`;
+      } else if (httpStatus === 409) {
+        displayMsg = `State conflict (409 Conflict): ${rawMsg}. Runner status re-synced with server.`;
+      }
+      setRunnerError({ status: httpStatus, message: displayMsg });
+      toast.error(displayMsg);
+      if (httpStatus === 403 || httpStatus === 409) {
+        void refreshAll(false);
+      }
+    },
+    [refreshAll],
+  );
+
   const handleSaveConfig = async () => {
-    if (busy) return;
+    if (actionLockRef.current || busy) return;
+    if (draftSlots.length === 0) {
+      const msg = "Configure at least one runner slot before saving.";
+      setRunnerError({ status: 400, message: msg });
+      toast.error(msg);
+      return;
+    }
+    actionLockRef.current = true;
     setBusy(true);
+    setRunnerError(null);
     try {
       const payload = {
         slots: draftSlots.map((s, idx) => ({
@@ -363,7 +413,7 @@ export function ShadowRunnerPanel({
           auto_pause_drawdown_dollars: Math.max(1, Number(s.auto_pause_drawdown_dollars) || 10),
           series: s.series.length > 0 ? s.series : ["KXBTC15M"],
         })),
-        cancel_before_close_secs: Math.max(5, Math.round(Number(cancelBeforeCloseSecs) || 30)),
+        cancel_before_close_secs: Math.min(300, Math.max(5, Math.round(Number(cancelBeforeCloseSecs) || 30))),
         bankroll_dollars: Math.max(10, Number(bankrollDollars) || 250),
       };
       const next = await saveRunnerConfig(payload, home);
@@ -372,15 +422,18 @@ export function ShadowRunnerPanel({
       onRunnerStatusChange?.(next);
       toast.success(`Saved runner config (${next.active_slots.length} slots).`);
     } catch (e) {
-      toast.error(`Save runner config failed: ${e instanceof Error ? e.message : String(e)}`);
+      handleRunnerMutationError("Save runner config", e);
     } finally {
+      actionLockRef.current = false;
       setBusy(false);
     }
   };
 
   const handleStartShadow = async () => {
-    if (busy) return;
+    if (actionLockRef.current || busy || effectiveKilled) return;
+    actionLockRef.current = true;
     setBusy(true);
+    setRunnerError(null);
     try {
       const next = await startRunner({ mode: "shadow" }, home, status);
       setStatus(next);
@@ -388,15 +441,18 @@ export function ShadowRunnerPanel({
       toast.success("Shadow runner started.");
       if (serverSupported) void refreshAll(false);
     } catch (e) {
-      toast.error(`Start shadow failed: ${e instanceof Error ? e.message : String(e)}`);
+      handleRunnerMutationError("Start shadow", e);
     } finally {
+      actionLockRef.current = false;
       setBusy(false);
     }
   };
 
   const handleStartLiveAuto = async () => {
-    if (busy || !liveAutoAllowed) return;
+    if (actionLockRef.current || busy || !liveAutoAllowed) return;
+    actionLockRef.current = true;
     setBusy(true);
+    setRunnerError(null);
     try {
       const next = await startRunner({ mode: "live_auto", confirm_auto_live: true }, home, {
         ...status,
@@ -408,15 +464,18 @@ export function ShadowRunnerPanel({
       toast.success("Live Auto runner started under hard risk rails.");
       if (serverSupported) void refreshAll(false);
     } catch (e) {
-      toast.error(`Start Live Auto failed: ${e instanceof Error ? e.message : String(e)}`);
+      handleRunnerMutationError("Start Live Auto", e);
     } finally {
+      actionLockRef.current = false;
       setBusy(false);
     }
   };
 
   const handleStopRunner = async () => {
-    if (busy) return;
+    if (actionLockRef.current || busy) return;
+    actionLockRef.current = true;
     setBusy(true);
+    setRunnerError(null);
     try {
       const next = await stopRunner({ cancel_resting: true }, home, status);
       setStatus(next);
@@ -424,8 +483,9 @@ export function ShadowRunnerPanel({
       toast.success("Runner stopped and resting quotes canceled.");
       if (serverSupported) void refreshAll(false);
     } catch (e) {
-      toast.error(`Stop runner failed: ${e instanceof Error ? e.message : String(e)}`);
+      handleRunnerMutationError("Stop runner", e);
     } finally {
+      actionLockRef.current = false;
       setBusy(false);
     }
   };
@@ -577,13 +637,60 @@ export function ShadowRunnerPanel({
               size="icon"
               aria-label="Refresh runner status"
               disabled={busy}
-              onClick={() => void refreshAll(false)}
+              onClick={() => {
+                setRunnerError(null);
+                void refreshAll(false);
+              }}
               className="size-11 sm:size-8"
             >
               <RefreshCw className={`size-3.5 ${busy ? "animate-spin" : ""}`} strokeWidth={1.5} aria-hidden />
             </Button>
           </div>
         </div>
+
+        {(runnerError || status.last_error) && (
+          <div
+            id="runner-error-banner"
+            role="alert"
+            className="flex flex-wrap items-center justify-between gap-2 border-b border-dot-red/40 bg-board/70 px-4 py-2.5 text-xs text-destructive-foreground"
+          >
+            <span className="flex items-center gap-1.5 font-medium">
+              <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
+              <span>{runnerError ? runnerError.message : status.last_error}</span>
+            </span>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {runnerError?.status === 403 && !liveAutoAllowed && onRequestArm && (
+                <button
+                  type="button"
+                  onClick={onRequestArm}
+                  className="min-h-11 cursor-pointer rounded border border-hairline bg-surface px-2.5 text-xs font-medium text-ink hover:bg-canvas sm:min-h-7"
+                >
+                  Arm Live
+                </button>
+              )}
+              <button
+                type="button"
+                id="runner-error-sync-btn"
+                onClick={() => {
+                  setRunnerError(null);
+                  void refreshAll(true);
+                }}
+                className="min-h-11 cursor-pointer rounded border border-hairline bg-surface px-2.5 text-xs font-medium text-ink hover:bg-canvas sm:min-h-7"
+              >
+                Sync Status
+              </button>
+              {runnerError && (
+                <button
+                  type="button"
+                  onClick={() => setRunnerError(null)}
+                  className="min-h-11 cursor-pointer rounded border border-hairline bg-surface px-2.5 text-xs font-medium text-ink-2 hover:text-ink sm:min-h-7"
+                >
+                  Dismiss
+                </button>
+              )}
+            </div>
+          </div>
+        )}
 
         {!liveAutoAllowed && (
           <div
@@ -1202,6 +1309,7 @@ export function ShadowRunnerPanel({
         open={liveConfirmOpen}
         onOpenChange={setLiveConfirmOpen}
         liveStatus={liveStatus}
+        liveAutoAllowed={liveAutoAllowed}
         busy={busy}
         onConfirm={() => void handleStartLiveAuto()}
       />

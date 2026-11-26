@@ -199,7 +199,7 @@ export function normalizeOrderbookSnapshot(raw: unknown, fallbackTicker = ""): O
     pickNum(o, ["best_yes_ask", "best_yes_ask_cents"]) ?? (yesAsks[0]?.price_cents ?? null);
   const spreadCents =
     pickNum(o, ["spread_cents"]) ??
-    (bestYesBid !== null && bestYesAsk !== null ? Math.max(0, bestYesAsk - bestYesBid) : null);
+    (bestYesBid !== null && bestYesAsk !== null ? bestYesAsk - bestYesBid : null);
   const midCents =
     pickNum(o, ["mid_cents"]) ??
     (bestYesBid !== null && bestYesAsk !== null
@@ -370,15 +370,30 @@ export async function subscribeOrderbook(
   };
 }
 
+export function isOrderbookCrossed(snapshot: OrderbookSnapshot | null): boolean {
+  if (!snapshot) return false;
+  if (
+    snapshot.best_yes_bid !== null &&
+    snapshot.best_yes_ask !== null &&
+    snapshot.best_yes_bid > snapshot.best_yes_ask
+  ) {
+    return true;
+  }
+  return snapshot.spread_cents !== null && snapshot.spread_cents < 0;
+}
+
 export function subscribeOrderbookStream(
   enabled: boolean,
   onSnapshot: (snap: OrderbookSnapshot) => void,
+  opts?: { onReconnect?: () => void; onError?: (err: string) => void },
 ): () => void {
   if (!enabled || typeof EventSource === "undefined") {
     return () => {};
   }
   let closed = false;
-  const es = new EventSource("/api/tape/stream");
+  let attempt = 0;
+  let reconnectTimer: number | null = null;
+  let es: EventSource | null = null;
 
   const handleOrderbookEvent = (msg: MessageEvent<string>) => {
     if (closed) return;
@@ -395,16 +410,48 @@ export function subscribeOrderbookStream(
     }
   };
 
-  es.addEventListener("orderbook", handleOrderbookEvent as EventListener);
-  es.onerror = () => {
+  const connect = () => {
     if (closed) return;
-    es.close();
-    closed = true;
+    const source = new EventSource("/api/tape/stream");
+    es = source;
+
+    source.onopen = () => {
+      if (closed) return;
+      const wasReconnect = attempt > 0;
+      attempt = 0;
+      if (wasReconnect) {
+        opts?.onReconnect?.();
+      }
+    };
+
+    source.addEventListener("orderbook", handleOrderbookEvent as EventListener);
+    source.onerror = () => {
+      source.close();
+      if (es === source) es = null;
+      if (closed) return;
+      const delayMs = Math.min(15000, 1000 * 2 ** Math.min(attempt, 4));
+      attempt += 1;
+      opts?.onError?.(`Orderbook SSE interrupted; retrying in ${Math.round(delayMs / 1000)}s`);
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, delayMs);
+    };
   };
+
+  connect();
 
   return () => {
     closed = true;
-    es.close();
+    if (reconnectTimer !== null) {
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (es) {
+      es.close();
+      es = null;
+    }
   };
 }
 
@@ -420,25 +467,31 @@ export function useOrderbook(
   const [error, setError] = useState<string | null>(null);
   const seqRef = useRef(0);
 
-  const refresh = useCallback(async () => {
-    if (!enabled || !cleanTicker) return;
-    const reqId = ++seqRef.current;
-    try {
-      const [book, st] = await Promise.all([
-        fetchOrderbook(cleanTicker),
-        fetchOrderbookStreamStatus().catch(() => null),
-      ]);
-      if (reqId !== seqRef.current) return;
-      setSnapshot(book);
-      if (st) setStreamStatus(st);
-      setError(null);
-    } catch (e) {
-      if (reqId !== seqRef.current) return;
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      if (reqId === seqRef.current) setLoading(false);
-    }
-  }, [enabled, cleanTicker]);
+  const refresh = useCallback(
+    async (withResubscribe = false) => {
+      if (!enabled || !cleanTicker) return;
+      const reqId = ++seqRef.current;
+      try {
+        if (withResubscribe) {
+          await subscribeOrderbook(cleanTicker).catch(() => null);
+        }
+        const [book, st] = await Promise.all([
+          fetchOrderbook(cleanTicker),
+          fetchOrderbookStreamStatus().catch(() => null),
+        ]);
+        if (reqId !== seqRef.current) return;
+        setSnapshot(book);
+        if (st) setStreamStatus(st);
+        setError(null);
+      } catch (e) {
+        if (reqId !== seqRef.current) return;
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (reqId === seqRef.current) setLoading(false);
+      }
+    },
+    [enabled, cleanTicker],
+  );
 
   useEffect(() => {
     if (!enabled || !cleanTicker) {
@@ -452,10 +505,10 @@ export function useOrderbook(
     setLoading(true);
     setError(null);
     void subscribeOrderbook(cleanTicker).catch(() => null);
-    void refresh();
+    void refresh(false);
 
     const pollId = window.setInterval(() => {
-      if (alive) void refresh();
+      if (alive) void refresh(false);
     }, Math.max(1000, pollMs));
 
     return () => {
@@ -466,20 +519,32 @@ export function useOrderbook(
 
   useEffect(() => {
     if (!enabled || !cleanTicker || !sseEnabled) return;
-    return subscribeOrderbookStream(true, (snap) => {
-      if (snap.ticker === cleanTicker) {
-        setSnapshot(snap);
-        setError(null);
-        setLoading(false);
-      }
-    });
-  }, [enabled, cleanTicker, sseEnabled]);
+    return subscribeOrderbookStream(
+      true,
+      (snap) => {
+        if (snap.ticker === cleanTicker) {
+          setSnapshot(snap);
+          setError(null);
+          setLoading(false);
+        }
+      },
+      {
+        onReconnect: () => {
+          void refresh(true);
+        },
+      },
+    );
+  }, [enabled, cleanTicker, sseEnabled, refresh]);
+
+  const manualRefresh = useCallback(() => {
+    void refresh(true);
+  }, [refresh]);
 
   return {
     snapshot,
     streamStatus,
     loading,
     error,
-    refresh,
+    refresh: manualRefresh,
   };
 }

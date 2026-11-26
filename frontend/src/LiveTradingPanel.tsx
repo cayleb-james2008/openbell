@@ -1,7 +1,7 @@
 // OpenBell v0.8.0 Live Kalshi v2 Account Strip, Paper/Live Mode Switcher, Arm Confirmation Modal,
 // Live Order Ticket with Real-Time Hard Risk Rails, Positions/Orders/Fills tables, Kill Switch,
 // and Settings API & Risk Rails configuration panel. NEVER echoes private key PEM bytes.
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertOctagon,
   AlertTriangle,
@@ -526,6 +526,7 @@ export function LiveDeskWorkspace({
   const [postOnly, setPostOnly] = useState<boolean>(true);
   const [subTab, setSubTab] = useState<"orders" | "positions" | "fills">("orders");
   const [submitting, setSubmitting] = useState(false);
+  const submitLockRef = useRef(false);
 
   useEffect(() => {
     if (prefillTicker) setTicker(prefillTicker);
@@ -583,7 +584,8 @@ export function LiveDeskWorkspace({
   }, [markets]);
 
   const doSubmitOrder = async () => {
-    if (!railEval.allPassed || submitting) return;
+    if (!railEval.allPassed || submitting || submitLockRef.current) return;
+    submitLockRef.current = true;
     setSubmitting(true);
     try {
       await onSubmitOrder({
@@ -596,6 +598,7 @@ export function LiveDeskWorkspace({
         client_order_id: `ob-${Date.now()}`,
       });
     } finally {
+      submitLockRef.current = false;
       setSubmitting(false);
     }
   };
@@ -722,7 +725,7 @@ export function LiveDeskWorkspace({
 
             <div>
               <label htmlFor="live-ticket-price" className="text-xs text-ink-3">
-                Limit Price (1–99c)
+                Limit Price (1-99c)
               </label>
               <input
                 id="live-ticket-price"
@@ -869,7 +872,12 @@ export function LiveDeskWorkspace({
           selectedPriceCents={Number.isInteger(parsedPrice) ? parsedPrice : null}
           loading={orderbook.loading}
           error={orderbook.error}
-          onSelectPrice={(priceCents) => setPriceInput(String(priceCents))}
+          onSelectPrice={(priceCents) => {
+            if (Number.isFinite(priceCents)) {
+              const clamped = Math.min(99, Math.max(1, Math.round(priceCents)));
+              setPriceInput(String(clamped));
+            }
+          }}
           onRefresh={orderbook.refresh}
         />
 

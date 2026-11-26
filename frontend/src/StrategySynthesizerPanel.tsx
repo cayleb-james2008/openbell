@@ -1,6 +1,6 @@
 // Walk-Forward Edge Synthesizer UI for discovering, filtering (BH-FDR + Deflated Sharpe),
 // previewing, testing, and saving v2 strategy scripts. Strictly paper-only.
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { BookmarkPlus, CheckCircle2, Code2, FlaskConical, Play, Sparkles, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -74,6 +74,22 @@ export function StrategySynthesizerPanel({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [survivorsOnly, setSurvivorsOnly] = useState(false);
 
+  const synthSeqRef = useRef(0);
+  const runLockRef = useRef(false);
+  const saveLockRef = useRef(false);
+
+  // Clear stale candidates and invalidate in-flight synthesis across dataset switches.
+  useEffect(() => {
+    synthSeqRef.current += 1;
+    runLockRef.current = false;
+    setResult(null);
+    setSelectedId(null);
+    setErrorMsg("");
+    setSavingName(null);
+    setSurvivorsOnly(false);
+    setRunning(false);
+  }, [dataset]);
+
   const selectedCandidate: SynthCandidate | null = useMemo(() => {
     if (!result || result.candidates.length === 0) return null;
     if (selectedId) {
@@ -90,13 +106,24 @@ export function StrategySynthesizerPanel({
   }, [result, survivorsOnly]);
 
   const handleSynthesize = async () => {
+    if (runLockRef.current || running) return;
     const parsedAlpha = Number(fdrAlphaInput);
-    const fdrAlpha = Number.isFinite(parsedAlpha) ? Math.min(0.5, Math.max(0.005, parsedAlpha)) : 0.05;
+    if (!fdrAlphaInput.trim() || !Number.isFinite(parsedAlpha) || parsedAlpha < 0.005 || parsedAlpha > 0.5) {
+      const msg = "BH-FDR Alpha must be a number between 0.005 and 0.50.";
+      setErrorMsg(msg);
+      toast.error(msg);
+      return;
+    }
     const parsedMax = Number(maxCandidatesInput);
-    const maxCandidates = Number.isFinite(parsedMax) ? Math.min(100, Math.max(1, Math.round(parsedMax))) : 12;
+    if (!maxCandidatesInput.trim() || !Number.isInteger(parsedMax) || parsedMax < 1 || parsedMax > 100) {
+      const msg = "Max Candidates must be an integer between 1 and 100.";
+      setErrorMsg(msg);
+      toast.error(msg);
+      return;
+    }
 
-    setFdrAlphaInput(String(fdrAlpha));
-    setMaxCandidatesInput(String(maxCandidates));
+    runLockRef.current = true;
+    const reqSeq = ++synthSeqRef.current;
     setRunning(true);
     setErrorMsg("");
 
@@ -105,13 +132,14 @@ export function StrategySynthesizerPanel({
         {
           family,
           execution_mode: executionMode,
-          fdr_alpha: fdrAlpha,
-          max_candidates: maxCandidates,
+          fdr_alpha: parsedAlpha,
+          max_candidates: parsedMax,
           dataset,
         },
         home,
         { markets, slots, strategies },
       );
+      if (reqSeq !== synthSeqRef.current) return;
       setResult(res);
       const top = res.candidates.find((c) => c.passedAllGates) ?? res.candidates[0] ?? null;
       setSelectedId(top ? top.id : null);
@@ -119,16 +147,21 @@ export function StrategySynthesizerPanel({
         `Evaluated ${res.candidatesEvaluated} candidates: ${res.survivorCount} survivor${res.survivorCount === 1 ? "" : "s"} passed BH-FDR and DSR.`,
       );
     } catch (e) {
+      if (reqSeq !== synthSeqRef.current) return;
       const msg = e instanceof Error ? e.message : String(e);
       setErrorMsg(msg);
       toast.error(`Synthesis failed: ${msg}`);
     } finally {
-      setRunning(false);
+      if (reqSeq === synthSeqRef.current) {
+        runLockRef.current = false;
+        setRunning(false);
+      }
     }
   };
 
   const handleSaveCandidate = async (cand: SynthCandidate) => {
-    if (savingName) return;
+    if (saveLockRef.current || savingName) return;
+    saveLockRef.current = true;
     setSavingName(cand.name);
     setErrorMsg("");
     try {
@@ -143,6 +176,7 @@ export function StrategySynthesizerPanel({
       setErrorMsg(msg);
       toast.error(`Save failed: ${msg}`);
     } finally {
+      saveLockRef.current = false;
       setSavingName(null);
     }
   };
@@ -277,10 +311,19 @@ export function StrategySynthesizerPanel({
         <div
           id="synth-error"
           role="alert"
-          className="mt-3 flex items-start gap-2 rounded-lg border border-dot-red/50 bg-board px-3 py-2 text-xs text-destructive-foreground"
+          className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dot-red/50 bg-board px-3 py-2 text-xs text-destructive-foreground"
         >
-          <TriangleAlert className="mt-0.5 size-4 shrink-0" strokeWidth={1.5} aria-hidden />
-          <span>{errorMsg}</span>
+          <span className="flex items-start gap-2">
+            <TriangleAlert className="mt-0.5 size-4 shrink-0" strokeWidth={1.5} aria-hidden />
+            <span>{errorMsg}</span>
+          </span>
+          <button
+            type="button"
+            onClick={() => setErrorMsg("")}
+            className="min-h-11 cursor-pointer rounded border border-hairline bg-surface px-2.5 text-xs font-medium text-ink-2 hover:text-ink sm:min-h-7"
+          >
+            Dismiss
+          </button>
         </div>
       )}
 

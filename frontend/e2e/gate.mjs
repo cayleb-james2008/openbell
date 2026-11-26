@@ -1643,6 +1643,223 @@ for (const m of measures) {
   await ctx.close()
 }
 
+// 5b. E1-E3 Hardening: Double-click prevention, 403/409/415/400 recovery, stale/crossed/empty L2 book, NO complement staging, delete modal, dataset switch reset
+{
+  const { ctx, p } = await open(1440, 900)
+  p.__allow = /400|403|409|415/
+  let runnerStartCount = 0
+  let runnerStatusCount = 0
+  let killCount = 0
+  let startBehavior = 'delay200'
+  let configBehavior = 'ok'
+  let bookMode = 'normal'
+  let saveBehavior = 'ok'
+  let synthBehavior = 'ok'
+  let saveCalls = 0
+  let runnerState = {
+    mode: 'stopped',
+    live_armed: false,
+    killed: false,
+    tick_interval_ms: 2000,
+    cancel_before_close_secs: 30,
+    bankroll_dollars: 250,
+    active_slots: [
+      {
+        slot_id: 1,
+        strategy: 'late-favourite-edge',
+        series: ['KXBTC15M'],
+        max_contracts: 10,
+        execution_mode: 'maker',
+        auto_pause_drawdown_dollars: 25,
+        enabled: true,
+        paused: false,
+        pause_reason: null,
+        realized_pnl_dollars: 0,
+        drawdown_dollars: 0,
+        quotes_posted: 0,
+        fills: 0,
+        open_quotes_count: 0,
+        last_signal_epoch: null,
+      },
+    ],
+    open_quotes: [],
+    stats: { quotes_posted: 0, fills: 0, fill_rate_pct: 0, realized_pnl_dollars: 0, unrealized_exposure_dollars: 0, avg_fill_slippage_cents: 0, avg_queue_wait_secs: 0 },
+    last_error: null,
+  }
+
+  await p.route('**/api/home*', async r => {
+    const res = await r.fetch()
+    const j = await res.json()
+    j.version = '0.28.0'
+    j.capabilities = ['sse', 'sandbox', 'live_kalshi', 'risk_rails', 'shadow_runner', 'strategy_v2', 'strategy_crud', 'synthesizer']
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
+  })
+  await p.route('**/api/live/status*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ configured: true, environment: 'demo', connected: true, mode: 'paper', live_armed: false, killed: false, rails: { max_order_contracts: 25, max_order_dollars: 25, max_daily_loss_dollars: 50, max_open_exposure_dollars: 100, allowed_ticker_prefix: 'KX' } }),
+  }))
+  await p.route('**/api/live/account*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"configured":true,"connected":true,"balance_dollars":1000}' }))
+  await p.route('**/api/live/positions*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"market_positions":[]}' }))
+  await p.route('**/api/live/orders*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"orders":[]}' }))
+  await p.route('**/api/live/fills*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"fills":[]}' }))
+  await p.route('**/api/live/kill-switch*', async r => {
+    killCount += 1
+    await new Promise(res => setTimeout(res, 120))
+    runnerState = { ...runnerState, mode: 'stopped', live_armed: false, killed: true, open_quotes: [] }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, cancelled_count: 0, status: { configured: true, environment: 'demo', connected: true, mode: 'paper', live_armed: false, killed: true, kill_reason: 'operator_kill_switch' } }) })
+  })
+  await p.route('**/api/runner/status*', r => {
+    runnerStatusCount += 1
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(runnerState) })
+  })
+  await p.route('**/api/runner/ledger*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"entries":[],"summary_by_strategy":[]}' }))
+  await p.route('**/api/runner/config*', r => {
+    if (configBehavior === '403') {
+      return r.fulfill({ status: 403, contentType: 'application/json', body: JSON.stringify({ error: 'runner config requires loopback CSRF' }) })
+    }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, status: runnerState }) })
+  })
+  await p.route('**/api/runner/start*', async r => {
+    runnerStartCount += 1
+    if (startBehavior === 'delay200') {
+      await new Promise(res => setTimeout(res, 160))
+      runnerState = { ...runnerState, mode: 'shadow' }
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, status: runnerState }) })
+    }
+    if (startBehavior === '409') {
+      runnerState = { ...runnerState, mode: 'stopped' }
+      return r.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: 'runner already transitioning' }) })
+    }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, status: runnerState }) })
+  })
+  await p.route('**/api/runner/stop*', r => {
+    runnerState = { ...runnerState, mode: 'stopped' }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, status: runnerState }) })
+  })
+  await p.unroute(/\/api\/orderbook(\/.*|\?.*)?$/)
+  await p.route(/\/api\/orderbook(\/.*|\?.*)?$/, r => {
+    const u = new URL(r.request().url())
+    if (u.pathname.endsWith('/stream-status')) {
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ws_connected: bookMode === 'normal', mode: bookMode === 'normal' ? 'ws' : 'rest', subscribed_tickers: ['KXBTC15M-MOCK'], active_books: bookMode === 'empty' ? 0 : 1, stale_books: bookMode === 'crossed_stale' ? 1 : 0, last_error: null, delta_count: 5, resync_count: 1 }) })
+    }
+    if (u.pathname.endsWith('/subscribe')) {
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, subscribed_tickers: ['KXBTC15M-MOCK'] }) })
+    }
+    if (bookMode === 'empty') {
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: false, ticker: 'KXBTC15M-MOCK', yes_bids: [], no_bids: [], yes_asks: [], no_asks: [], best_yes_bid: null, best_yes_ask: null, spread_cents: null, mid_cents: null, vwap_10: null, last_seq: 1, updated_ms: 0, source: 'empty', stale: false }) })
+    }
+    if (bookMode === 'crossed_stale') {
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, ticker: 'KXBTC15M-MOCK', yes_bids: [{ price_cents: 60, qty: 20, cumulative_qty: 20 }], yes_asks: [{ price_cents: 55, qty: 15, cumulative_qty: 15 }], no_bids: [], no_asks: [], best_yes_bid: 60, best_yes_ask: 55, spread_cents: -5, mid_cents: 57.5, vwap_10: 55, last_seq: 22, updated_ms: Date.now() - 30000, source: 'ws', stale: true }) })
+    }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, ticker: 'KXBTC15M-MOCK', yes_bids: [{ price_cents: 54, qty: 40, cumulative_qty: 40 }], yes_asks: [{ price_cents: 56, qty: 10, cumulative_qty: 10 }], no_bids: [{ price_cents: 44, qty: 10, cumulative_qty: 10 }], no_asks: [{ price_cents: 46, qty: 40, cumulative_qty: 40 }], best_yes_bid: 54, best_yes_ask: 56, spread_cents: 2, mid_cents: 55, vwap_10: 56, last_seq: 10, updated_ms: Date.now(), source: 'ws', stale: false }) })
+  })
+  await p.route('**/api/strategies/save*', r => {
+    saveCalls += 1
+    if (saveBehavior === '415') return r.fulfill({ status: 415, contentType: 'application/json', body: JSON.stringify({ error: 'Content-Type must be application/json' }) })
+    if (saveBehavior === '403') return r.fulfill({ status: 403, contentType: 'application/json', body: JSON.stringify({ error: 'CSRF header required' }) })
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, name: 'hardened-script', file: 'hardened-script.rn', side: 'yes', version: 'v2', causal_canary_passed: true, message: 'Saved hardened-script.rn' }) })
+  })
+  await p.route('**/api/research/synthesize*', r => {
+    if (synthBehavior === '400') return r.fulfill({ status: 400, contentType: 'application/json', body: JSON.stringify({ error: 'invalid fdr_alpha parameter' }) })
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ family: 'all', execution_mode: 'maker', fdr_alpha: 0.05, max_candidates: 12, candidates_evaluated: 1, survivor_count: 1, is_windows: 60, oos_windows: 40, honesty_note: 'Mock', candidates: [{ id: 'cand-1', name: 'cand-1', family: 'mean_reversion_pav', side: 'yes', execution_mode: 'maker', post_only: true, is_trades: 30, oos_trades: 20, is_win_rate_pct: 75, oos_win_rate_pct: 70, oos_net_expectancy_cents: 2.1, oos_net_pnl_dollars: 4.2, oos_sharpe: 1.4, deflated_sharpe: 0.9, p_value: 0.01, bh_adjusted_p_value: 0.01, max_corr_with_library: 0.2, survived_fdr: true, passed_dsr: true, passed_corr_cap: true, passed_all_gates: true, causal_canary_passed: true, description: 'Mock candidate', source: 'pub fn name() { "cand-1" }\npub fn side() { "yes" }\npub fn evaluate(ctx) { #{ enter: false, side: "yes", limit_cents: 0, post_only: true } }' }], elapsed_ms: 2 }) })
+  })
+
+  await p.goto(BASE); await ready(p); await p.waitForTimeout(300)
+  await p.locator('#tab-live').click(); await p.waitForTimeout(250)
+
+  // Check 1: Double-click prevention on Start Shadow & Kill Switch
+  await p.locator('#runner-start-shadow-btn').dblclick().catch(() => {})
+  await p.waitForTimeout(260)
+  const startCallsSingle = runnerStartCount === 1
+  await p.locator('#runner-stop-btn').click(); await p.waitForTimeout(150)
+
+  // Check 2: 409/403 error recovery in ShadowRunnerPanel
+  startBehavior = '409'
+  const statusBefore409 = runnerStatusCount
+  await p.locator('#runner-start-shadow-btn').click(); await p.waitForTimeout(250)
+  const banner409 = await p.locator('#runner-error-banner').innerText().catch(() => '')
+  const syncedAfter409 = runnerStatusCount > statusBefore409
+  configBehavior = '403'
+  await p.locator('#runner-save-config-btn').click(); await p.waitForTimeout(250)
+  const banner403 = await p.locator('#runner-error-banner').innerText().catch(() => '')
+
+  // Kill Switch double-click prevention
+  await p.locator('#kill-switch-btn').dblclick().catch(() => {})
+  await p.waitForTimeout(220)
+  ok('E1 ShadowRunnerPanel prevents double-click duplicate start/kill requests while in-flight',
+    startCallsSingle && killCount === 1,
+    `starts=${runnerStartCount} kills=${killCount}`)
+  ok('E1 ShadowRunnerPanel surfaces 409/403 recovery banners and re-syncs runner status',
+    banner409.includes('409') && syncedAfter409 && banner403.includes('403'),
+    `409=${banner409.slice(0, 40)} synced=${syncedAfter409} 403=${banner403.slice(0, 40)}`)
+
+  // Check 3: OrderbookLadder NO complement price-click + crossed/stale + empty states
+  await p.locator('#live-ticket-ticker').fill('KXBTC15M-MOCK'); await p.waitForTimeout(200)
+  await p.locator('[data-order-side="no"]').click(); await p.waitForTimeout(80)
+  await p.locator('#live-trading-workspace [data-orderbook-level][data-price-cents="54"]').click(); await p.waitForTimeout(80)
+  const noComplementPrice = await p.locator('#live-ticket-price').inputValue()
+  bookMode = 'crossed_stale'
+  await p.locator('#live-trading-workspace [aria-label="Refresh L2 orderbook"]').click(); await p.waitForTimeout(200)
+  const crossedVisible = await p.locator('#live-trading-workspace [data-orderbook-crossed-banner]').isVisible()
+  const staleVisible = await p.locator('#live-trading-workspace [data-orderbook-stale-banner]').isVisible()
+  const crossedSpread = (await p.locator('#live-trading-workspace [data-orderbook-spread]').innerText()).trim()
+  bookMode = 'empty'
+  await p.locator('#live-trading-workspace [aria-label="Refresh L2 orderbook"]').click(); await p.waitForTimeout(200)
+  const emptyVisible = await p.locator('#live-trading-workspace [data-orderbook-empty]').isVisible()
+  ok('E2 OrderbookLadder handles NO complement price-click staging, crossed/stale banners & empty L2 state',
+    noComplementPrice === '46' && crossedVisible && staleVisible && crossedSpread.includes('-5c') && emptyVisible,
+    `noPrice=${noComplementPrice} crossed=${crossedVisible} stale=${staleVisible} spread=${crossedSpread} empty=${emptyVisible}`)
+
+  // Check 4 & 5: RuneSandbox validation feedback, delete modal guard, and 415/403/400 error surfacing
+  await p.locator('#tab-strategies').click(); await p.waitForTimeout(150)
+  await p.locator('#open-sandbox-btn').click(); await p.waitForTimeout(150)
+  await p.locator('#sandbox-strategy-name').fill('../Bad Name!')
+  const badNameInline = await p.locator('#sandbox-name-error').isVisible()
+  await p.locator('#sandbox-save-btn').click(); await p.waitForTimeout(100)
+  const badNameCrud = (await p.locator('#sandbox-crud-error').innerText()).includes('traversal')
+  await p.locator('#sandbox-strategy-name').fill('late-favourite-edge')
+  const origSource = await p.locator('#rune-editor').inputValue()
+  await p.locator('#rune-editor').fill('   ')
+  await p.locator('#sandbox-validate-btn').click(); await p.waitForTimeout(100)
+  const emptySourceDiag = (await p.locator('#sandbox-diagnostics').innerText()).includes('cannot be empty')
+  await p.locator('#rune-editor').fill(origSource)
+  await p.locator('#sandbox-delete-btn').click(); await p.waitForTimeout(100)
+  const deleteModalOpen = await p.locator('#sandbox-delete-confirm-bar[role="dialog"]').isVisible()
+  await p.keyboard.press('Escape'); await p.waitForTimeout(100)
+  const deleteModalClosed = (await p.locator('#sandbox-delete-confirm-bar').count()) === 0
+  ok('E3 RuneSandbox validates invalid script names/empty source inline and guards delete behind Escape-dismissible modal',
+    badNameInline && badNameCrud && saveCalls === 0 && emptySourceDiag && deleteModalOpen && deleteModalClosed,
+    `badName=${badNameInline}/${badNameCrud} saveCalls=${saveCalls} emptySrc=${emptySourceDiag} modal=${deleteModalOpen}/${deleteModalClosed}`)
+
+  saveBehavior = '415'
+  await p.locator('#sandbox-save-btn').click(); await p.waitForTimeout(180)
+  const err415 = (await p.locator('#sandbox-crud-error').innerText()).includes('415')
+  saveBehavior = '403'
+  await p.locator('#sandbox-save-btn').click(); await p.waitForTimeout(180)
+  const err403 = (await p.locator('#sandbox-crud-error').innerText()).includes('403')
+  synthBehavior = '400'
+  await p.locator('#synth-run-btn').click(); await p.waitForTimeout(180)
+  const err400 = (await p.locator('#synth-error').innerText()).includes('400')
+  ok('E3 RuneSandbox and StrategySynthesizerPanel surface 415, 403, and 400 API errors cleanly',
+    err415 && err403 && err400,
+    `415=${err415} 403=${err403} 400=${err400}`)
+
+  // Check 6: Zero stale candidate state across dataset switch (fixture -> live)
+  synthBehavior = 'ok'
+  await p.goto(FX); await ready(p); await p.waitForTimeout(250)
+  await p.locator('#tab-strategies').click(); await p.waitForTimeout(150)
+  await p.locator('#synth-run-btn').click(); await p.waitForTimeout(220)
+  const hasCandidatesBeforeSwitch = (await p.locator('#synth-table [data-synth-row]').count()) >= 1
+  await p.getByRole('button', { name: 'Return to live tape', exact: true }).click(); await p.waitForTimeout(250)
+  const clearedAfterSwitch = (await p.locator('#synth-table').count()) === 0 && (await p.locator('#synth-preview').count()) === 0
+  ok('E3 StrategySynthesizerPanel clears stale candidate state across dataset switches',
+    hasCandidatesBeforeSwitch && clearedAfterSwitch,
+    `before=${hasCandidatesBeforeSwitch} cleared=${clearedAfterSwitch}`)
+
+  await ctx.close()
+}
+
 // 6. Error, empty, and loading states
 {
   const { ctx, p } = await open(1440, 900)

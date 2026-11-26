@@ -1352,6 +1352,18 @@ export async function validateRuneStrategy(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ source }),
       });
+      if (r.status === 403 || r.status === 415) {
+        const body = (await r.json().catch(() => ({}))) as { error?: string; message?: string };
+        const detail = body.error || body.message || (r.status === 403 ? "Request denied" : "Requires application/json");
+        return {
+          valid: false,
+          name: "custom-strategy",
+          side: "unknown",
+          diagnostics: [{ level: "error", message: `${r.status === 403 ? "403 Forbidden" : "415 Unsupported Media Type"}: ${detail}` }],
+          elapsedMs: 1,
+          source: "server",
+        };
+      }
       if (r.ok || r.status === 400 || r.status === 422) {
         const raw = (await r.json().catch(() => null)) as Record<string, unknown> | null;
         if (raw && typeof raw === "object") {
@@ -1429,6 +1441,32 @@ export async function runRuneBacktest(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ source, dataset }),
       });
+      if (r.status === 403 || r.status === 415) {
+        const body = (await r.json().catch(() => ({}))) as { error?: string; message?: string };
+        const detail = body.error || body.message || (r.status === 403 ? "Request denied" : "Requires application/json");
+        return {
+          valid: false,
+          strategy: "custom-strategy",
+          side: "unknown",
+          diagnostics: [{ level: "error", message: `${r.status === 403 ? "403 Forbidden" : "415 Unsupported Media Type"}: ${detail}` }],
+          summary: {
+            netPnlDollars: 0,
+            sharpe: null,
+            sortino: null,
+            maxDrawdownPct: 0,
+            brierScore: null,
+            ece: null,
+            winRatePct: 0,
+            windowsTraded: 0,
+            meanCentsPerContract: 0,
+            feeDragPct: 0,
+          },
+          equityCurve: [],
+          trades: [],
+          elapsedMs: 1,
+          source: "server",
+        };
+      }
       if (r.ok || r.status === 400 || r.status === 422) {
         const raw = (await r.json().catch(() => null)) as Record<string, unknown> | null;
         if (raw && typeof raw === "object") {

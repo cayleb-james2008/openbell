@@ -219,25 +219,69 @@ export function extractStrategyNameFromSource(source: string): string | null {
   return check.ok ? check.slug : null;
 }
 
+export class ResearchApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ResearchApiError";
+    this.status = status;
+  }
+}
+
+export function validateStrategySource(
+  source: string,
+): { ok: true; source: string } | { ok: false; error: string } {
+  if (typeof source !== "string" || source.trim().length === 0) {
+    return { ok: false, error: "Strategy source cannot be empty. Enter or load a strategy script first." };
+  }
+  if (source.includes("\0")) {
+    return { ok: false, error: "Strategy source cannot contain null bytes." };
+  }
+  if (source.length > 65536) {
+    return { ok: false, error: "Strategy source exceeds the 64 KB script limit." };
+  }
+  return { ok: true, source };
+}
+
+function formatStatusError(status: number, detail: string, fallback: string): string {
+  const msg = detail.trim() || fallback;
+  if (status === 403) {
+    return /403|forbidden/i.test(msg) ? msg : `403 Forbidden: ${msg}`;
+  }
+  if (status === 415) {
+    return /415|unsupported media/i.test(msg) ? msg : `415 Unsupported Media Type: ${msg}`;
+  }
+  if (status === 400) {
+    return /400|bad request/i.test(msg) ? msg : `400 Bad Request: ${msg}`;
+  }
+  return msg;
+}
+
 async function parseErrorBody(r: Response, fallback: string): Promise<string> {
   const text = await r.text().catch(() => "");
   if (text) {
     try {
       const parsed = JSON.parse(text) as { error?: unknown; message?: unknown; diagnostics?: unknown };
-      if (typeof parsed.error === "string" && parsed.error.trim()) return parsed.error.trim();
-      if (typeof parsed.message === "string" && parsed.message.trim()) return parsed.message.trim();
+      if (typeof parsed.error === "string" && parsed.error.trim()) {
+        return formatStatusError(r.status, parsed.error, fallback);
+      }
+      if (typeof parsed.message === "string" && parsed.message.trim()) {
+        return formatStatusError(r.status, parsed.message, fallback);
+      }
       if (Array.isArray(parsed.diagnostics) && parsed.diagnostics.length > 0) {
         const first = parsed.diagnostics[0];
-        if (typeof first === "string") return first;
+        if (typeof first === "string") return formatStatusError(r.status, first, fallback);
         if (first && typeof first === "object" && typeof (first as { message?: unknown }).message === "string") {
-          return String((first as { message: string }).message);
+          return formatStatusError(r.status, String((first as { message: string }).message), fallback);
         }
       }
     } catch {
-      if (text.trim().length > 0 && text.trim().length < 240) return text.trim();
+      if (text.trim().length > 0 && text.trim().length < 240) {
+        return formatStatusError(r.status, text, fallback);
+      }
     }
   }
-  return fallback;
+  return formatStatusError(r.status, "", fallback);
 }
 
 export async function saveStrategyScript(
@@ -246,7 +290,11 @@ export async function saveStrategyScript(
 ): Promise<SaveStrategyResponse> {
   const slugCheck = validateStrategySlug(req.name);
   if (!slugCheck.ok) {
-    throw new Error(slugCheck.error);
+    throw new ResearchApiError(400, slugCheck.error);
+  }
+  const sourceCheck = validateStrategySource(req.source);
+  if (!sourceCheck.ok) {
+    throw new ResearchApiError(400, sourceCheck.error);
   }
   const cleanName = slugCheck.slug;
 
@@ -261,11 +309,11 @@ export async function saveStrategyScript(
   });
 
   if ((r.status === 404 || r.status === 405) && !supportsStrategyResearchV2(home)) {
-    throw new Error("Server strategy save endpoint is unavailable on this backend version.");
+    throw new ResearchApiError(r.status, "Server strategy save endpoint is unavailable on this backend version.");
   }
 
   if (!r.ok) {
-    throw new Error(await parseErrorBody(r, `Could not save strategy script (${r.status}).`));
+    throw new ResearchApiError(r.status, await parseErrorBody(r, `Could not save strategy script (${r.status}).`));
   }
 
   const raw = (await r.json().catch(() => ({}))) as Record<string, unknown>;
@@ -290,7 +338,7 @@ export async function deleteStrategyScript(
 ): Promise<DeleteStrategyResponse> {
   const slugCheck = validateStrategySlug(name);
   if (!slugCheck.ok) {
-    throw new Error(slugCheck.error);
+    throw new ResearchApiError(400, slugCheck.error);
   }
   const cleanName = slugCheck.slug;
 
@@ -300,11 +348,11 @@ export async function deleteStrategyScript(
   });
 
   if ((r.status === 404 || r.status === 405) && !supportsStrategyResearchV2(home)) {
-    throw new Error("Server strategy delete endpoint is unavailable on this backend version.");
+    throw new ResearchApiError(r.status, "Server strategy delete endpoint is unavailable on this backend version.");
   }
 
   if (!r.ok) {
-    throw new Error(await parseErrorBody(r, `Could not delete strategy script (${r.status}).`));
+    throw new ResearchApiError(r.status, await parseErrorBody(r, `Could not delete strategy script (${r.status}).`));
   }
 
   const raw = (await r.json().catch(() => ({}))) as Record<string, unknown>;
@@ -691,12 +739,12 @@ export async function synthesizeStrategies(
     }
 
     if (!r.ok) {
-      throw new Error(await parseErrorBody(r, `Synthesizer answered ${r.status}.`));
+      throw new ResearchApiError(r.status, await parseErrorBody(r, `Synthesizer answered ${r.status}.`));
     }
 
     const raw = (await r.json().catch(() => null)) as Record<string, unknown> | null;
     if (!raw || typeof raw !== "object") {
-      throw new Error("Synthesizer answered with an unexpected payload.");
+      throw new ResearchApiError(502, "Synthesizer answered with an unexpected payload.");
     }
 
     const rawList = Array.isArray(raw.candidates)

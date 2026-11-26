@@ -186,7 +186,7 @@ export function ScalePlannerPanel({
 
         <div className="flex flex-col gap-1">
           <label htmlFor="scale-slippage" className="text-xs text-ink-3">
-            Slippage (0–5c)
+            Slippage (0-5c)
           </label>
           <input
             id="scale-slippage"

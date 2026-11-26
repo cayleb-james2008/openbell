@@ -636,7 +636,7 @@ export function CalibrationReliabilityChart({
         {active ? (
           <>
             <span className="font-medium text-ink">
-              Bin {Math.round(active.low * 100)}–{Math.round(active.high * 100)}% (n={active.count})
+              Bin {Math.round(active.low * 100)}-{Math.round(active.high * 100)}% (n={active.count})
             </span>
             <span className="text-ink-2">Pred {(active.meanPredicted * 100).toFixed(1)}%</span>
             <span className="font-medium text-info-foreground">
@@ -1131,7 +1131,7 @@ export function IsotonicRecalibrationChart({
         {active ? (
           <>
             <span className="font-medium text-ink">
-              {Math.round(active.low * 100)}–{Math.round(active.high * 100)}% (n={active.n})
+              {Math.round(active.low * 100)}-{Math.round(active.high * 100)}% (n={active.n})
             </span>
             <span className="text-ink-2">Raw {(active.meanPredP * 100).toFixed(1)}%</span>
             <span className="text-success-foreground">Real {(active.realisedRate * 100).toFixed(1)}%</span>
@@ -1502,7 +1502,7 @@ export function RegimeHeatmapChart({
               <span className="text-ink-2">
                 Win {activeCell.winRatePct !== null ? `${activeCell.winRatePct.toFixed(1)}%` : "-"}
                 {activeCell.wilsonLowPct !== null && activeCell.wilsonHighPct !== null
-                  ? ` [${Math.round(activeCell.wilsonLowPct)}–${Math.round(activeCell.wilsonHighPct)}%]`
+                  ? ` [${Math.round(activeCell.wilsonLowPct)}-${Math.round(activeCell.wilsonHighPct)}%]`
                   : ""}
               </span>
               <span className="text-ink-3">
@@ -1662,7 +1662,7 @@ export function RegimeHeatmapChart({
                       >
                         {cell.n > 0 && exp !== null
                           ? `${exp >= 0 ? "+" : ""}${exp.toFixed(1)}c`
-                          : "—"}
+                          : "-"}
                       </text>
                       <text
                         x={rx + cellW / 2}
