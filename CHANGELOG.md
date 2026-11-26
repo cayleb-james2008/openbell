@@ -4,6 +4,13 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.23.0 - 2026-11-25
+
+- Added an execution-ready dry-run order plan and fee/spread sanity audit (`compute_dry_run_order_plan`, `DryRunOrderPlan`, `DryRunOrderPlanLeg`) in `src/auto_allocator.rs` backed by pre-settlement bid-ask spread tracking (`window_spread_cents` in `src/tournament.rs`) that computes exact whole-cent Kalshi maker (`0.0175 * p * (1 - p)`) and taker (`0.07 * p * (1 - p)`) fee drag, maker vs taker spread crossing cost, minimum contract threshold (`1..=250`) to clear whole-cent rounding with positive net OOS expectancy after slippage, and correlated cluster cap enforcement while keeping `live_armed: false`.
+- Wired the `#allocator-dry-run-plan` read-only card and Copy Dry-Run Plan JSON action (`#allocator-copy-dry-run-btn`) into `frontend/src/AutoAllocatorPanel.tsx` alongside `DryRunOrderPlan` normalization, `makeOfflineDryRunPlan` parity, and `buildBriefingPayload` integration in `frontend/src/lib/allocator.ts`.
+- Eliminated `serde_json::json!` value allocations from `collector_status_json`, `collector_health`, `/api/live/{account,positions,orders,fills}`, and kill-switch SSE events in `src/main.rs` via typed `serde::Serialize` structs and static empty responses, and removed unused `Deserialize` derives from read-only report structs in `src/auto_allocator.rs` (`5.84 MiB` / `6,124,896 B` release binary, `6.17 ms` cold boot, `17.52 MB` / `17,944 KB` Peak `VmHWM`, `4,662.3 req/s` `4.85 ms` p95 across 16 workers and 5 SSE streams).
+- Updated `README.md` and refreshed light and dark `docs/screenshots/*.png`, verified `127/127` Rust tests, `25/25` raw-TCP security fuzz checks, `gate 101/101`, `replay 18/18`, and `sloplint 0/0/0`.
+
 ## 0.22.0 - 2026-11-25
 
 - Added a causal correlated regime drawdown and exposure concentration ceiling guard in `src/auto_allocator.rs` (`apply_diversification_guard`, `DiversificationGuardReport`, `SessionBriefingReport`) that groups correlated winners across both multi-asset and same-asset strategy pairs (`|r| >= 0.55` cross-asset or `r >= 0.35` same-asset), computes a causal High-Vol loss-streak multiplier (`hv_regime_mult`), and caps cluster exposure at `regime_drawdown_ceiling_pct` bounded by `rails.max_daily_loss_dollars` while keeping `live_armed: false`.

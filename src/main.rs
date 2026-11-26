@@ -1040,15 +1040,11 @@ fn collect_once_detailed(data_dir: &Path) -> Result<CollectPassReport, (String, 
         return Err((msg, any_rate_limited));
     }
     append_tape(&path, &buf).map_err(|e| (e.to_string(), any_rate_limited))?;
-    let event = serde_json::json!({
-        "type": "collect",
-        "snapshots_written": written,
-        "deduplicated": deduplicated,
-        "series_failed": errors.len(),
-        "rate_limited": any_rate_limited,
-        "ts": now_unix(),
-    })
-    .to_string();
+    let event = format!(
+        "{{\"type\":\"collect\",\"snapshots_written\":{written},\"deduplicated\":{deduplicated},\"series_failed\":{},\"rate_limited\":{any_rate_limited},\"ts\":{}}}",
+        errors.len(),
+        now_unix(),
+    );
     tape_hub().publish(event);
     Ok(CollectPassReport {
         written,
@@ -2424,8 +2420,8 @@ fn daily_report(app: &App) -> String {
         ),
     };
     let health = collector_health(app);
-    let collecting = health["collecting"].as_bool().unwrap_or(false);
-    let age = health["newest_snapshot_age_secs"].as_i64();
+    let collecting = health.collecting;
+    let age = health.newest_snapshot_age_secs;
     let age_text = match age {
         Some(a) if a < 90 => format!("{a}s old"),
         Some(a) if a < 5400 => format!("{}m old", a / 60),
@@ -2437,8 +2433,8 @@ fn daily_report(app: &App) -> String {
         format!(
             "As of {} — everything below is cumulative over the collected tape ({} snapshots, {} distinct markets).",
             iso_z(now_unix()),
-            health["snapshots_on_disk"],
-            health["markets_seen"]
+            health.snapshots_on_disk,
+            health.markets_seen
         ),
         format!(
             "Balance (venue): {} · Open positions (venue): {}",
@@ -2454,28 +2450,24 @@ fn daily_report(app: &App) -> String {
         format!(
             "Collector: {} — {} snapshots on disk across {} markets, {} distinct settled windows; newest snapshot {}.{}",
             if collecting { "collecting" } else { "NOT collecting" },
-            health["snapshots_on_disk"],
-            health["markets_seen"],
-            health["settled_windows"],
+            health.snapshots_on_disk,
+            health.markets_seen,
+            health.settled_windows,
             age_text,
-            match health["series_failed_last_pass"].as_u64() {
-                Some(n) if n > 0 => {
-                    let names: Vec<&str> = health["series_failed_names"]
-                        .as_array()
-                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                        .unwrap_or_default();
-                    let named = if names.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {}", names.join(", "))
-                    };
-                    format!(
-                        " {n} of {} market reads failed on the last pass ({} series, open and settled){named}.",
-                        health["series_total"],
-                        SERIES.len()
-                    )
-                }
-                _ => String::new(),
+            if health.series_failed_last_pass > 0 {
+                let named = if health.series_failed_names.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", health.series_failed_names.join(", "))
+                };
+                format!(
+                    " {} of {} market reads failed on the last pass ({} series, open and settled){named}.",
+                    health.series_failed_last_pass,
+                    health.series_total,
+                    SERIES.len()
+                )
+            } else {
+                String::new()
             }
         ),
     ];
@@ -3666,7 +3658,7 @@ impl App {
     }
 
     /// Snapshot of auto-collector schedule, adaptive 429 backoff & 200-window readiness progress.
-    fn collector_status_json(&self) -> serde_json::Value {
+    fn collector_status_json(&self) -> String {
         let tape_path = self.data_dir.join("snapshots.jsonl");
         let view = self.tape(&tape_path);
         let st = self.collector_scheduler.snapshot();
@@ -3677,31 +3669,58 @@ impl App {
         let progress_pct =
             ((view.settled_windows as f64 / READINESS_TARGET_WINDOWS as f64) * 100.0).min(100.0);
         let progress_pct = (progress_pct * 10.0).round() / 10.0;
-        serde_json::json!({
-            "enabled": st.enabled,
-            "interval_secs": st.interval_secs,
-            "effective_interval_secs": st.effective_interval_secs(),
-            "min_interval_secs": AUTO_COLLECT_MIN_SECS,
-            "max_interval_secs": AUTO_COLLECT_MAX_SECS,
-            "backoff_secs": st.backoff_secs,
-            "rate_limited": st.rate_limited,
-            "consecutive_errors": st.consecutive_errors,
-            "in_flight": st.in_flight || PASSES_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0,
-            "runs_total": st.runs_total,
-            "last_run_epoch": st.last_run_epoch,
-            "next_run_epoch": st.next_run_epoch,
-            "next_run_in_secs": next_run_in_secs,
-            "last_written": st.last_written,
-            "last_deduped": st.last_deduped,
-            "last_error": st.last_error,
-            "settled_windows": view.settled_windows,
-            "readiness_target_windows": READINESS_TARGET_WINDOWS,
-            "readiness_progress_pct": progress_pct,
-            "snapshots_on_disk": view.snaps_count,
-            "markets_seen": view.markets,
-            "series": active_series(),
-            "mode": "public_readonly_get",
+        #[derive(serde::Serialize)]
+        struct CollectorStatus {
+            enabled: bool,
+            interval_secs: u64,
+            effective_interval_secs: u64,
+            min_interval_secs: u64,
+            max_interval_secs: u64,
+            backoff_secs: u64,
+            rate_limited: bool,
+            consecutive_errors: u32,
+            in_flight: bool,
+            runs_total: u64,
+            last_run_epoch: Option<i64>,
+            next_run_epoch: Option<i64>,
+            next_run_in_secs: Option<u64>,
+            last_written: usize,
+            last_deduped: usize,
+            last_error: Option<String>,
+            settled_windows: usize,
+            readiness_target_windows: usize,
+            readiness_progress_pct: f64,
+            snapshots_on_disk: usize,
+            markets_seen: usize,
+            series: Vec<String>,
+            mode: &'static str,
+        }
+        serde_json::to_string(&CollectorStatus {
+            enabled: st.enabled,
+            interval_secs: st.interval_secs,
+            effective_interval_secs: st.effective_interval_secs(),
+            min_interval_secs: AUTO_COLLECT_MIN_SECS,
+            max_interval_secs: AUTO_COLLECT_MAX_SECS,
+            backoff_secs: st.backoff_secs,
+            rate_limited: st.rate_limited,
+            consecutive_errors: st.consecutive_errors,
+            in_flight: st.in_flight || PASSES_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            runs_total: st.runs_total,
+            last_run_epoch: st.last_run_epoch,
+            next_run_epoch: st.next_run_epoch,
+            next_run_in_secs,
+            last_written: st.last_written,
+            last_deduped: st.last_deduped,
+            last_error: st.last_error,
+            settled_windows: view.settled_windows,
+            readiness_target_windows: READINESS_TARGET_WINDOWS,
+            readiness_progress_pct: progress_pct,
+            snapshots_on_disk: view.snaps_count,
+            markets_seen: view.markets,
+            series: active_series(),
+            mode: "public_readonly_get",
         })
+        .unwrap_or_else(|_| "{}".to_string())
     }
 
     /// Singleflight cached `ScaleTapeContext` built once per `(tape, strategies)`
@@ -4169,9 +4188,30 @@ fn extend_tape(mut e: TapeEntry, path: &Path, len: u64, mtime: u64) -> Option<Ta
     Some(e)
 }
 
+#[derive(serde::Serialize)]
+struct CollectorHealth {
+    snapshots_on_disk: usize,
+    lines_on_disk: usize,
+    dropped_lines: usize,
+    markets_seen: usize,
+    settled_windows: usize,
+    conflicting_settlements: usize,
+    newest_snapshot_age_secs: Option<i64>,
+    collect_interval_secs: u64,
+    collecting: bool,
+    series_failed_last_pass: usize,
+    series_failed_names: Vec<String>,
+    series_total: usize,
+    auto_collect_enabled: bool,
+    auto_collect_interval_secs: u64,
+    auto_collect_backoff_secs: u64,
+    readiness_target_windows: usize,
+    readiness_progress_pct: f64,
+}
+
 /// Collector health, computed from the tape itself — the same numbers
 /// an independent count of the file gives.
-fn collector_health(app: &App) -> serde_json::Value {
+fn collector_health(app: &App) -> CollectorHealth {
     let tape_path = app.data_dir.join("snapshots.jsonl");
     // One consistent view of the tape's current state: total lines,
     // parsed snapshots and the health aggregates all come from the
@@ -4193,25 +4233,25 @@ fn collector_health(app: &App) -> serde_json::Value {
     let progress_pct =
         ((view.settled_windows as f64 / READINESS_TARGET_WINDOWS as f64) * 100.0).min(100.0);
     let progress_pct = (progress_pct * 10.0).round() / 10.0;
-    serde_json::json!({
-        "snapshots_on_disk": view.snaps_count,
-        "lines_on_disk": view.total_lines,
-        "dropped_lines": view.total_lines.saturating_sub(view.snaps_count),
-        "markets_seen": view.markets,
-        "settled_windows": view.settled_windows,
-        "conflicting_settlements": view.conflicting_settlements,
-        "newest_snapshot_age_secs": age,
-        "collect_interval_secs": app.collect_secs,
-        "collecting": collecting,
-        "series_failed_last_pass": SERIES_FAILED_LAST_PASS.load(std::sync::atomic::Ordering::Relaxed),
-        "series_failed_names": SERIES_FAILED_NAMES.lock().unwrap_or_else(|p| p.into_inner()).clone(),
-        "series_total": active_series().len() * 2,
-        "auto_collect_enabled": sched.enabled,
-        "auto_collect_interval_secs": sched.interval_secs,
-        "auto_collect_backoff_secs": sched.backoff_secs,
-        "readiness_target_windows": READINESS_TARGET_WINDOWS,
-        "readiness_progress_pct": progress_pct,
-    })
+    CollectorHealth {
+        snapshots_on_disk: view.snaps_count,
+        lines_on_disk: view.total_lines,
+        dropped_lines: view.total_lines.saturating_sub(view.snaps_count),
+        markets_seen: view.markets,
+        settled_windows: view.settled_windows,
+        conflicting_settlements: view.conflicting_settlements,
+        newest_snapshot_age_secs: age,
+        collect_interval_secs: app.collect_secs,
+        collecting,
+        series_failed_last_pass: SERIES_FAILED_LAST_PASS.load(std::sync::atomic::Ordering::Relaxed),
+        series_failed_names: SERIES_FAILED_NAMES.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+        series_total: active_series().len() * 2,
+        auto_collect_enabled: sched.enabled,
+        auto_collect_interval_secs: sched.interval_secs,
+        auto_collect_backoff_secs: sched.backoff_secs,
+        readiness_target_windows: READINESS_TARGET_WINDOWS,
+        readiness_progress_pct: progress_pct,
+    }
 }
 
 /// Resolve the `dataset=` query parameter to a tape file in the data
@@ -4847,14 +4887,14 @@ fn export_report_md(app: &App, dpath: &Path, dataset: &str) -> String {
          - **Collector:** {} ({} snapshots on disk, {} markets, {} settled windows)\n\n",
         fmt_money(sim.paper_equity_dollars),
         fmt_money(sim.paper_pot_start),
-        if health["collecting"].as_bool().unwrap_or(false) {
+        if health.collecting {
             "collecting"
         } else {
             "NOT collecting"
         },
-        health["snapshots_on_disk"].as_u64().unwrap_or(0),
-        health["markets_seen"].as_u64().unwrap_or(0),
-        health["settled_windows"].as_u64().unwrap_or(0),
+        health.snapshots_on_disk,
+        health.markets_seen,
+        health.settled_windows,
     ));
     out.push_str("## Slots (Paper)\n\n| Slot | Strategy | Status | Strikes | Stint Windows | Stint P&L | Slot P&L | Equity |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n");
     for s in &sim.slots {
@@ -4910,12 +4950,12 @@ fn export_report_csv(app: &App, dpath: &Path, dataset: &str) -> String {
     ));
     out.push_str(&format!(
         "collector,tape,,{},,,,,{}\n",
-        health["settled_windows"].as_u64().unwrap_or(0),
+        health.settled_windows,
         csv_escape(&format!(
             "collecting={} snapshots={} markets={}",
-            health["collecting"].as_bool().unwrap_or(false),
-            health["snapshots_on_disk"].as_u64().unwrap_or(0),
-            health["markets_seen"].as_u64().unwrap_or(0),
+            health.collecting,
+            health.snapshots_on_disk,
+            health.markets_seen,
         ))
     ));
     out.push_str(&format!(
@@ -4987,15 +5027,25 @@ fn serve_sse_stream(stream: &mut std::net::TcpStream, app: &App) {
         .filter(|m| m.result.is_empty() && matches!(m.status.as_ref(), "open" | "active"))
         .take(25)
         .collect();
-    let initial = serde_json::json!({
-        "type": "snapshot",
-        "version": env!("CARGO_PKG_VERSION"),
-        "collector": health,
-        "open_markets": open_markets,
-        "series": active_series(),
-        "ts": now_unix(),
+    #[derive(serde::Serialize)]
+    struct SseSnapshot<'a> {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        version: &'static str,
+        collector: &'a CollectorHealth,
+        open_markets: &'a [&'a Snapshot],
+        series: Vec<String>,
+        ts: i64,
+    }
+    let initial = serde_json::to_string(&SseSnapshot {
+        kind: "snapshot",
+        version: env!("CARGO_PKG_VERSION"),
+        collector: &health,
+        open_markets: &open_markets,
+        series: active_series(),
+        ts: now_unix(),
     })
-    .to_string();
+    .unwrap_or_else(|_| "{}".to_string());
     if stream
         .write_all(format!("event: snapshot\ndata: {initial}\n\n").as_bytes())
         .is_err()
@@ -5132,7 +5182,7 @@ fn home_json_body(app: &App) -> String {
     #[derive(Serialize)]
     struct HomeBody<'a> {
         account: AccountState,
-        collector: serde_json::Value,
+        collector: CollectorHealth,
         live: risk_rails::LiveStatusSnapshot,
         stage_target: StageProgress,
         library_errors: Vec<LibErrRef<'a>>,
@@ -5690,23 +5740,33 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let _ = app.collector_scheduler.record_pass_result(&res);
             match res {
                 Ok(rep) => {
-                    let mut payload = serde_json::json!({ "snapshots_written": rep.written });
-                    if rep.deduplicated > 0 {
-                        payload["deduplicated"] = serde_json::json!(rep.deduplicated);
+                    #[derive(serde::Serialize)]
+                    struct CollectResp {
+                        snapshots_written: usize,
+                        #[serde(skip_serializing_if = "is_zero_usize")]
+                        deduplicated: usize,
+                        #[serde(skip_serializing_if = "Vec::is_empty")]
+                        errors: Vec<String>,
+                        #[serde(skip_serializing_if = "std::ops::Not::not")]
+                        rate_limited: bool,
                     }
-                    if !rep.errors.is_empty() {
-                        payload["errors"] = serde_json::json!(rep.errors);
+                    fn is_zero_usize(n: &usize) -> bool {
+                        *n == 0
                     }
-                    if rep.rate_limited {
-                        payload["rate_limited"] = serde_json::json!(true);
-                    }
-                    json_response(200, &payload.to_string())
+                    let body = serde_json::to_string(&CollectResp {
+                        snapshots_written: rep.written,
+                        deduplicated: rep.deduplicated,
+                        errors: rep.errors,
+                        rate_limited: rep.rate_limited,
+                    })
+                    .unwrap_or_else(|_| "{}".to_string());
+                    json_response(200, &body)
                 }
                 Err((e, _)) => json_err_response(502, &e),
             }
         }
         ("GET", "/api/collector/status") => {
-            json_response(200, &app.collector_status_json().to_string())
+            json_response(200, &app.collector_status_json())
         }
         ("POST", "/api/collector/schedule") => {
             let parsed: serde_json::Value = match serde_json::from_str::<serde_json::Value>(body) {
@@ -5758,17 +5818,16 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 );
             }
             let st = app.collector_scheduler.update_schedule(enabled, interval_secs);
-            let event = serde_json::json!({
-                "type": "schedule",
-                "enabled": st.enabled,
-                "interval_secs": st.interval_secs,
-                "effective_interval_secs": st.effective_interval_secs(),
-                "backoff_secs": st.backoff_secs,
-                "ts": now_unix(),
-            })
-            .to_string();
+            let event = format!(
+                "{{\"type\":\"schedule\",\"enabled\":{},\"interval_secs\":{},\"effective_interval_secs\":{},\"backoff_secs\":{},\"ts\":{}}}",
+                st.enabled,
+                st.interval_secs,
+                st.effective_interval_secs(),
+                st.backoff_secs,
+                now_unix(),
+            );
             tape_hub().publish(event);
-            json_response(200, &app.collector_status_json().to_string())
+            json_response(200, &app.collector_status_json())
         }
         ("GET", "/api/strategies") => {
             let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
@@ -6126,17 +6185,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             if !cfg.is_configured() {
                 return json_response(
                     200,
-                    &serde_json::json!({
-                        "configured": false,
-                        "connected": false,
-                        "balance_cents": null,
-                        "balance_dollars": null,
-                        "portfolio_value_cents": null,
-                        "portfolio_value_dollars": null,
-                        "daily_pnl_dollars": null,
-                        "note": "Configure Kalshi v2 API credentials in Desk Settings to connect your account.",
-                    })
-                    .to_string(),
+                    "{\"configured\":false,\"connected\":false,\"balance_cents\":null,\"balance_dollars\":null,\"portfolio_value_cents\":null,\"portfolio_value_dollars\":null,\"daily_pnl_dollars\":null,\"note\":\"Configure Kalshi v2 API credentials in Desk Settings to connect your account.\"}",
                 );
             }
             let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
@@ -6155,20 +6204,29 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         st.connected = true;
                         st.rails.last_error = None;
                     }
-                    json_response(
-                        200,
-                        &serde_json::json!({
-                            "configured": true,
-                            "connected": true,
-                            "balance_cents": bal.balance_cents,
-                            "balance_dollars": bal.balance_dollars,
-                            "portfolio_value_cents": bal.portfolio_value_cents,
-                            "portfolio_value_dollars": bal.portfolio_value_dollars,
-                            "payout_cents": bal.payout_cents,
-                            "note": "Connected to Kalshi v2 REST portfolio.",
-                        })
-                        .to_string(),
-                    )
+                    #[derive(serde::Serialize)]
+                    struct AccountResp {
+                        configured: bool,
+                        connected: bool,
+                        balance_cents: i64,
+                        balance_dollars: f64,
+                        portfolio_value_cents: i64,
+                        portfolio_value_dollars: f64,
+                        payout_cents: Option<i64>,
+                        note: &'static str,
+                    }
+                    let body = serde_json::to_string(&AccountResp {
+                        configured: true,
+                        connected: true,
+                        balance_cents: bal.balance_cents,
+                        balance_dollars: bal.balance_dollars,
+                        portfolio_value_cents: bal.portfolio_value_cents,
+                        portfolio_value_dollars: bal.portfolio_value_dollars,
+                        payout_cents: bal.payout_cents,
+                        note: "Connected to Kalshi v2 REST portfolio.",
+                    })
+                    .unwrap_or_else(|_| "{}".to_string());
+                    json_response(200, &body)
                 }
                 Err(e) => {
                     {
@@ -6188,14 +6246,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             if !cfg.is_configured() {
                 return json_response(
                     200,
-                    &serde_json::json!({
-                        "configured": false,
-                        "connected": false,
-                        "positions": [],
-                        "total_exposure_dollars": 0.0,
-                        "note": "Configure Kalshi v2 API credentials in Desk Settings to load positions.",
-                    })
-                    .to_string(),
+                    "{\"configured\":false,\"connected\":false,\"positions\":[],\"total_exposure_dollars\":0.0,\"note\":\"Configure Kalshi v2 API credentials in Desk Settings to load positions.\"}",
                 );
             }
             let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
@@ -6219,16 +6270,21 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         st.rails.last_error = None;
                         st.rails.sync_venue_metrics(total_exposure, realized_loss);
                     }
-                    json_response(
-                        200,
-                        &serde_json::json!({
-                            "configured": true,
-                            "connected": true,
-                            "positions": positions,
-                            "total_exposure_dollars": total_exposure,
-                        })
-                        .to_string(),
-                    )
+                    #[derive(serde::Serialize)]
+                    struct PositionsResp<'a, T: serde::Serialize> {
+                        configured: bool,
+                        connected: bool,
+                        positions: &'a [T],
+                        total_exposure_dollars: f64,
+                    }
+                    let body = serde_json::to_string(&PositionsResp {
+                        configured: true,
+                        connected: true,
+                        positions: &positions,
+                        total_exposure_dollars: total_exposure,
+                    })
+                    .unwrap_or_else(|_| "{}".to_string());
+                    json_response(200, &body)
                 }
                 Err(e) => {
                     {
@@ -6248,13 +6304,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             if !cfg.is_configured() {
                 return json_response(
                     200,
-                    &serde_json::json!({
-                        "configured": false,
-                        "connected": false,
-                        "orders": [],
-                        "note": "Configure Kalshi v2 API credentials in Desk Settings to load orders.",
-                    })
-                    .to_string(),
+                    "{\"configured\":false,\"connected\":false,\"orders\":[],\"note\":\"Configure Kalshi v2 API credentials in Desk Settings to load orders.\"}",
                 );
             }
             let status_filter = query_param(query, "status");
@@ -6269,15 +6319,19 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         st.connected = true;
                         st.rails.last_error = None;
                     }
-                    json_response(
-                        200,
-                        &serde_json::json!({
-                            "configured": true,
-                            "connected": true,
-                            "orders": orders,
-                        })
-                        .to_string(),
-                    )
+                    #[derive(serde::Serialize)]
+                    struct OrdersResp<'a, T: serde::Serialize> {
+                        configured: bool,
+                        connected: bool,
+                        orders: &'a [T],
+                    }
+                    let body = serde_json::to_string(&OrdersResp {
+                        configured: true,
+                        connected: true,
+                        orders: &orders,
+                    })
+                    .unwrap_or_else(|_| "{}".to_string());
+                    json_response(200, &body)
                 }
                 Err(e) => {
                     {
@@ -6297,13 +6351,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             if !cfg.is_configured() {
                 return json_response(
                     200,
-                    &serde_json::json!({
-                        "configured": false,
-                        "connected": false,
-                        "fills": [],
-                        "note": "Configure Kalshi v2 API credentials in Desk Settings to load fills.",
-                    })
-                    .to_string(),
+                    "{\"configured\":false,\"connected\":false,\"fills\":[],\"note\":\"Configure Kalshi v2 API credentials in Desk Settings to load fills.\"}",
                 );
             }
             let limit = query_param(query, "limit")
@@ -6321,15 +6369,19 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         st.connected = true;
                         st.rails.last_error = None;
                     }
-                    json_response(
-                        200,
-                        &serde_json::json!({
-                            "configured": true,
-                            "connected": true,
-                            "fills": fills,
-                        })
-                        .to_string(),
-                    )
+                    #[derive(serde::Serialize)]
+                    struct FillsResp<'a, T: serde::Serialize> {
+                        configured: bool,
+                        connected: bool,
+                        fills: &'a [T],
+                    }
+                    let body = serde_json::to_string(&FillsResp {
+                        configured: true,
+                        connected: true,
+                        fills: &fills,
+                    })
+                    .unwrap_or_else(|_| "{}".to_string());
+                    json_response(200, &body)
                 }
                 Err(e) => {
                     {
@@ -6804,14 +6856,11 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 }
                 st.rails.status_snapshot(&st.config, st.connected)
             };
-            let ev = serde_json::json!({
-                "type": "kill_switch",
-                "disarmed": true,
-                "killed": true,
-                "cancelled_count": report.cancelled_count,
-                "ts": now_unix(),
-            })
-            .to_string();
+            let ev = format!(
+                "{{\"type\":\"kill_switch\",\"disarmed\":true,\"killed\":true,\"cancelled_count\":{},\"ts\":{}}}",
+                report.cancelled_count,
+                now_unix()
+            );
             tape_hub().publish(ev);
             #[derive(serde::Serialize)]
             struct KillResp<'a> {

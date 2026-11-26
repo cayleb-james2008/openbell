@@ -316,8 +316,34 @@ export function AutoAllocatorPanel({
       slippage_cushion_status: report.slippage_cushion_status ?? "NO_DATA",
       slippage_ladder: report.slippage_ladder ?? [],
       diversification: report.diversification,
+      dry_run_plan: report.dry_run_plan,
       daily_target: report.daily_target,
     };
+  }, [dataset, report]);
+
+  const copyDryRunPlanJson = useCallback(async () => {
+    if (!report?.dry_run_plan) return;
+    const payload = {
+      generated_at: new Date().toISOString(),
+      dataset,
+      live_armed: false,
+      dry_run_plan: {
+        ...report.dry_run_plan,
+        live_armed: false,
+      },
+      correlation_ceiling: {
+        ceiling_status: report.diversification?.ceiling_status ?? "NO_DATA",
+        regime_drawdown_ceiling_pct: report.diversification?.regime_drawdown_ceiling_pct ?? 0,
+        worst_correlated_cluster_heat_pct:
+          report.diversification?.worst_correlated_cluster_heat_pct ?? 0,
+      },
+    };
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
+      toast.success("Copied Dry-Run Plan JSON (live_armed: false).");
+    } catch {
+      toast.info("Clipboard unavailable for Dry-Run Plan JSON.");
+    }
   }, [dataset, report]);
 
   const copyBriefingJson = useCallback(async () => {
@@ -1219,6 +1245,175 @@ export function AutoAllocatorPanel({
             </div>
           )}
           <p className="text-xs text-ink-2">{report.session_briefing.summary}</p>
+        </div>
+      )}
+
+      {/* Execution-Ready Dry-Run Trade Ticket & Fee/Spread Sanity Audit */}
+      {report?.dry_run_plan && (
+        <div
+          id="allocator-dry-run-plan"
+          role="region"
+          aria-label="Execution-ready dry-run order plan preview"
+          className="mt-3.5 space-y-2.5 rounded-[10px] border border-hairline bg-board/50 p-3.5"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="font-semibold text-ink">Dry-Run Order Plan Preview</span>
+              <StatusPill
+                id="allocator-dry-run-plan-status"
+                tone={
+                  report.dry_run_plan.status === "PLAN_PASS"
+                    ? "success"
+                    : report.dry_run_plan.status === "PLAN_BLOCKED"
+                      ? "warning"
+                      : "neutral"
+                }
+              >
+                {report.dry_run_plan.status === "PLAN_PASS"
+                  ? "PLAN PASS"
+                  : report.dry_run_plan.status === "PLAN_BLOCKED"
+                    ? "PLAN BLOCKED"
+                    : "NO DATA"}
+              </StatusPill>
+              <Badge variant="outline" className="mono text-xs text-ink-2">
+                live_armed=false · {report.dry_run_plan.execution_mode}
+              </Badge>
+              <StatusPill tone={ceilingTone(report.dry_run_plan.correlation_ceiling_status)}>
+                {report.dry_run_plan.correlation_ceiling_status.replaceAll("_", " ")}
+              </StatusPill>
+            </div>
+            <Button
+              id="allocator-copy-dry-run-btn"
+              variant="outline"
+              size="sm"
+              disabled={report.dry_run_plan.legs.length === 0}
+              onClick={() => void copyDryRunPlanJson()}
+            >
+              <Copy className="size-3.5" aria-hidden />
+              <span>Copy Dry-Run Plan JSON</span>
+            </Button>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">Planned Contracts</div>
+              <div className="mono mt-0.5 font-semibold text-ink">
+                {report.dry_run_plan.total_contracts} cts ({report.dry_run_plan.legs.length} leg(s))
+              </div>
+            </div>
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">Notional / Exact Fee</div>
+              <div className="mono mt-0.5 font-semibold text-ink">
+                {money(report.dry_run_plan.total_notional_dollars)} ·{" "}
+                <span className="text-ink-2">
+                  {money(report.dry_run_plan.total_exact_fee_dollars)} fee
+                </span>
+              </div>
+            </div>
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">Net OOS EV After All</div>
+              <div
+                className={
+                  "mono mt-0.5 font-semibold " +
+                  ((report.dry_run_plan.weighted_net_oos_ev_after_all_cents ?? 0) > 0
+                    ? "text-success-foreground"
+                    : "text-destructive-foreground")
+                }
+              >
+                {fmtCents(report.dry_run_plan.weighted_net_oos_ev_after_all_cents)}/ct
+              </div>
+            </div>
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">Correlation Cap Guard</div>
+              <div className="mono mt-0.5 font-semibold text-ink">
+                {report.dry_run_plan.legs.some((l) => l.correlation_cap_applied)
+                  ? "Capped"
+                  : "Within Cap"}{" "}
+                <span className="text-ink-3">
+                  ({fmtPct(report.diversification?.regime_drawdown_ceiling_pct ?? 0, 1)})
+                </span>
+              </div>
+            </div>
+          </div>
+          {report.dry_run_plan.legs.length > 0 && (
+            <div className="overflow-x-auto rounded-lg border border-hairline bg-surface">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Slot / Series</TableHead>
+                    <TableHead className="text-right">Limit Order</TableHead>
+                    <TableHead className="text-right">Maker vs Taker Fee</TableHead>
+                    <TableHead className="text-right">Spread + Slip</TableHead>
+                    <TableHead className="text-right">Min Fill</TableHead>
+                    <TableHead className="text-right">Net OOS EV</TableHead>
+                    <TableHead className="text-right">Sanity</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {report.dry_run_plan.legs.map((leg) => (
+                    <TableRow key={leg.strategy} data-dry-run-leg={leg.strategy}>
+                      <TableCell className="m-grow text-xs">
+                        <div className="font-medium text-ink">{leg.strategy}</div>
+                        <div className="mono text-ink-3">
+                          {leg.series} · {leg.side.toUpperCase()} · {leg.post_only ? "post_only" : "taker"}
+                        </div>
+                      </TableCell>
+                      <TableCell className="mono text-right text-xs text-ink">
+                        {leg.target_contracts} cts @ {leg.max_limit_cents}c ({money(leg.notional_dollars)})
+                      </TableCell>
+                      <TableCell className="mono text-right text-xs text-ink-2">
+                        {leg.maker_fee_per_ct_cents.toFixed(2)}c vs {leg.taker_fee_per_ct_cents.toFixed(2)}c
+                        <div className="text-ink-3">{money(leg.exact_order_fee_dollars)} total</div>
+                      </TableCell>
+                      <TableCell className="mono text-right text-xs text-ink-2">
+                        {leg.spread_cross_cost_cents.toFixed(2)}c + {leg.slippage_cost_cents.toFixed(2)}c
+                      </TableCell>
+                      <TableCell className="mono text-right text-xs text-ink-2">
+                        {leg.min_fill_contracts_for_positive_ev > 0
+                          ? `>=${leg.min_fill_contracts_for_positive_ev} cts`
+                          : "No edge"}
+                      </TableCell>
+                      <TableCell
+                        className={
+                          "mono text-right text-xs font-semibold " +
+                          (leg.net_oos_ev_after_all_cents > 0
+                            ? "text-success-foreground"
+                            : "text-destructive-foreground")
+                        }
+                      >
+                        {fmtCents(leg.net_oos_ev_after_all_cents)}
+                      </TableCell>
+                      <TableCell className="m-right text-right text-xs">
+                        <div className="inline-flex items-center justify-end gap-1.5">
+                          <StatusPill tone={leg.sanity_passed ? "success" : "warning"}>
+                            {leg.verdict === "EXEC_READY_PAPER" ? "READY" : leg.verdict.replaceAll("_", " ")}
+                          </StatusPill>
+                          {onStageOrder && (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={leg.target_contracts < 1}
+                              onClick={() =>
+                                onStageOrder({
+                                  ticker: activeOpenTicker,
+                                  side: leg.side === "no" ? "no" : "yes",
+                                  count: Math.max(1, leg.target_contracts),
+                                  priceCents: leg.max_limit_cents,
+                                  postOnly: leg.post_only,
+                                })
+                              }
+                            >
+                              Stage
+                            </Button>
+                          )}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+          <p className="text-xs text-ink-2">{report.dry_run_plan.summary}</p>
         </div>
       )}
 

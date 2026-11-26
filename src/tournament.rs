@@ -150,10 +150,11 @@ pub struct TournamentTapeContext {
     pub observed_series: Vec<String>,
     pub entries: Vec<TournamentEntry>,
     pub window_vol_scores: HashMap<String, f64>,
+    pub window_spread_cents: HashMap<String, f64>,
 }
 
-/// Compute observable pre-settlement microstructure turbulence (mean quote spread + price range in cents).
-fn compute_window_vol_score(snaps: &[Snapshot]) -> f64 {
+/// Compute observable pre-settlement microstructure turbulence `(vol_score, mean_spread_cents)`.
+fn compute_window_vol_and_spread(snaps: &[Snapshot]) -> (f64, f64) {
     let mut spread_sum = 0.0f64;
     let mut spread_n = 0usize;
     let mut min_mid = f64::INFINITY;
@@ -191,7 +192,7 @@ fn compute_window_vol_score(snaps: &[Snapshot]) -> f64 {
     } else {
         0.0
     };
-    mean_spread + 0.35 * price_range
+    (mean_spread + 0.35 * price_range, mean_spread)
 }
 
 /// Per-series (BTC/ETH/SOL/XRP) OOS performance breakdown for one strategy.
@@ -561,8 +562,12 @@ pub fn build_tournament_context(
         .collect();
 
     let mut window_vol_scores = HashMap::with_capacity(settled_windows.len());
+    let mut window_spread_cents = HashMap::with_capacity(settled_windows.len());
     for w in &settled_windows {
-        window_vol_scores.insert(w.ticker.to_string(), compute_window_vol_score(w.snaps));
+        let (vol, spread) = compute_window_vol_and_spread(w.snaps);
+        let t = w.ticker.to_string();
+        window_vol_scores.insert(t.clone(), vol);
+        window_spread_cents.insert(t, spread);
     }
 
     TournamentTapeContext {
@@ -575,6 +580,7 @@ pub fn build_tournament_context(
         observed_series: series_set.into_iter().collect(),
         entries,
         window_vol_scores,
+        window_spread_cents,
     }
 }
 
@@ -1448,6 +1454,7 @@ mod tests {
             observed_series: series_set.into_iter().collect(),
             entries,
             window_vol_scores: HashMap::new(),
+            window_spread_cents: HashMap::new(),
         }
     }
 
@@ -1751,6 +1758,7 @@ mod tests {
             observed_series: Vec::new(),
             entries: Vec::new(),
             window_vol_scores: HashMap::new(),
+            window_spread_cents: HashMap::new(),
         };
         let empty_rep = compute_tournament_from_context(&empty_ctx, 1.0);
         assert_eq!(empty_rep.rankings.len(), 1);

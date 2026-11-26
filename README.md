@@ -1,8 +1,8 @@
 # OpenBell
 
-![version](https://img.shields.io/badge/version-v0.22.0-0969da?style=flat-square)
+![version](https://img.shields.io/badge/version-v0.23.0-0969da?style=flat-square)
 ![stack](https://img.shields.io/badge/stack-Rust%20%2B%20React%2019-111827?style=flat-square)
-![tests](https://img.shields.io/badge/tests-126%2F126%20pass-16a34a?style=flat-square)
+![tests](https://img.shields.io/badge/tests-127%2F127%20pass-16a34a?style=flat-square)
 ![binary](https://img.shields.io/badge/release%20binary-5.84%20MiB-0969da?style=flat-square)
 ![safety](https://img.shields.io/badge/live__armed-false%20on%20boot-16a34a?style=flat-square)
 
@@ -11,7 +11,7 @@ OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction marke
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/hero-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/hero-light.png">
-  <img alt="OpenBell v0.22.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
+  <img alt="OpenBell v0.23.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
 </picture>
 
 ## Feature gallery
@@ -19,17 +19,17 @@ OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction marke
 <table>
   <tr>
     <td width="50%" valign="top">
-      <strong>Causal Edge Quality Screener &amp; Basket Preflight</strong><br>
-      <sub>Ranks strategies and 15-minute Kalshi series by maker net expectancy, fee savings, break-even queue fill headroom, walk-forward fold consistency, and <code>$500/day</code> contribution share with dry-run basket preflight.</sub>
+      <strong>Causal Edge Quality Screener &amp; Dry-Run Order Plan</strong><br>
+      <sub>Ranks strategies and 15-minute Kalshi series by maker net expectancy, fee savings, break-even queue fill headroom, walk-forward fold consistency, and <code>$500/day</code> contribution share alongside per-leg whole-cent fee, spread-crossing, and minimum-fill dry-run verification.</sub>
       <br><br>
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/screener-dark.png">
         <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/screener-light.png">
-        <img alt="Causal Edge Quality Screener" src="docs/screenshots/screener-light.png">
+        <img alt="Causal Edge Quality Screener and Dry-Run Order Plan Preview" src="docs/screenshots/screener-light.png">
       </picture>
     </td>
     <td width="50%" valign="top">
-      <strong>30-Day Bootstrap Simulator, Slippage Ladder &amp; Preset Leaderboard</strong><br>
+      <strong>30-Day Bootstrap Simulator, Slippage Ladder &amp; Session Briefing</strong><br>
       <sub>Resamples 1,000 deterministic 30-day trajectories across 96 windows per day, measures causal degradation from <code>+0c</code> through <code>+3c</code> with break-even slippage cushion (<code>THIN &lt;1c</code>, <code>SAFE &gt;=2c</code>), validates Calm vs High-Vol regime stability, and checks every preset against a <code>0.0%</code> daily rail-breach gate.</sub>
       <br><br>
       <picture>
@@ -49,24 +49,24 @@ flowchart LR
   S --> Q["PAV Isotonic Recalibration & Tournament (|r| <= 0.65)"]
   Q --> A["Fractional-Kelly Post-Only Auto-Allocator + Slippage Ladder (+0c..+3c)"]
   A --> B["1,000-Trial 30d Bootstrap Stress (+0c / +1c)"]
-  B --> P["1-Click Dry-Run Basket Preflight (live_armed = false)"]
+  B --> P["Dry-Run Order Plan Preview + Fee/Spread Audit (live_armed = false)"]
   P --> R{"7 Hard Risk Rails + X-OpenBell-CSRF + Loopback-Only"}
   R -- "Fail Closed (403)" --> D["Disarmed Paper Mode / Emergency Kill Switch"]
   R -- "confirm_arm = true" --> K["Kalshi Trade API v2 (RSA-PSS SHA-256)"]
 ```
 
-## Verified benchmarks (`v0.22.0` vs `v0.10.0`)
+## Verified benchmarks (`v0.23.0` vs `v0.10.0`)
 
 Measured on a 100k-tick, 2,000-window 15-minute tape via `scale-audit` under `#154` (`taskset -c 24-31`, 16 workers, 5 SSE subscribers, and 25 raw-TCP fuzz checks):
 
-| Metric | `v0.10.0` Baseline | `v0.22.0` Verified | Delta |
+| Metric | `v0.10.0` Baseline | `v0.23.0` Verified | Delta |
 | --- | --- | --- | --- |
-| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`5.84 MiB`** (`6,128,992 B`) | **`-45.2%`** |
-| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`95,074 B`** / **`21,931 B`** (`21` `/chunks/*`) | **`-94.8%` wire bytes** |
-| Cold boot to first `HTTP 200` | `9.11 ms` | **`7.36 ms`** | **`-19.2%`** |
-| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`17.49 MB`** (`17,908 KB`) | **`-86.1%`** |
-| Concurrent HTTP throughput (16w, `5/5` SSE) | `4,921.3 req/s` (30w) | **`3,239.5 req/s`** (`4.66 ms` p50, `7.37 ms` p95, `0` errors) | **`2.75x` vs `1,178` v0.9.0** |
-| Security and test verification | `49/49` fuzz | **`126/126` Rust tests**, `25/25` raw-TCP fuzz, `gate 101/101`, `replay 18/18`, `sloplint 0 FAIL/WARN`, `RAILS OK`, `EQUITY OK` | Clean |
+| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`5.84 MiB`** (`6,124,896 B`) | **`-45.2%`** |
+| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`95,074 B`** / **`21,930 B`** (`21` `/chunks/*`) | **`-94.8%` wire bytes** |
+| Cold boot to first `HTTP 200` | `9.11 ms` | **`6.17 ms`** | **`-32.3%`** |
+| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`17.52 MB`** (`17,944 KB`) | **`-86.0%`** |
+| Concurrent HTTP throughput (16w, `5/5` SSE) | `4,921.3 req/s` (30w) | **`4,662.3 req/s`** (`3.19 ms` p50, `4.85 ms` p95, `0` errors) | **`3.96x` vs `1,178` v0.9.0** |
+| Security and test verification | `49/49` fuzz | **`127/127` Rust tests**, `25/25` raw-TCP fuzz, `gate 101/101`, `replay 18/18`, `sloplint 0 FAIL/WARN`, `RAILS OK`, `EQUITY OK` | Clean |
 
 ## Quick start (synthetic paper mode)
 
@@ -98,7 +98,7 @@ Static assets (`assets/index.html.gz` and 21 embedded `/chunks/*` routes) stay g
 ### Verification suite
 
 - `cargo clippy --all-targets -- -D warnings`
-- `cargo test` (`126` unit and integration tests across `analytics`, `auto_allocator`, `edge_audit`, `kalshi_live`, `recalibration`, `risk_rails`, `scaling`, `tournament`, `update`, and HTTP/SSE/CWE-59 suites)
+- `cargo test` (`127` unit and integration tests across `analytics`, `auto_allocator`, `edge_audit`, `kalshi_live`, `recalibration`, `risk_rails`, `scaling`, `tournament`, `update`, and HTTP/SSE/CWE-59 suites)
 - `cargo check --target x86_64-pc-windows-msvc`
 - `bash .loop/checks/rails.sh && bash .loop/checks/equity.sh`
 - `cd frontend && npm run check:ui -- --skip-build --lints` (`gate 101/101`, `replay 18/18`, Hallmark `sloplint --scope app --render`)

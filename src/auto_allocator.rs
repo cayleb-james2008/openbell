@@ -205,7 +205,7 @@ impl AutoAllocatorRequest {
 }
 
 /// Chronological walk-forward fold consistency and `+0c/+1c/+2c` adverse-fill stress profile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StressProfile {
     pub extra_slippage_0c_cents: f64,
     pub extra_slippage_1c_cents: f64,
@@ -217,7 +217,7 @@ pub struct StressProfile {
 }
 
 /// Fee-vs-gross expectancy attribution for one entry-price regime across active winners.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RegimeEdgeBucket {
     pub regime: String,
     pub trades: usize,
@@ -228,7 +228,7 @@ pub struct RegimeEdgeBucket {
 }
 
 /// Maker fill-rate sensitivity row evaluating queue adverse selection across fill tiers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FillRateSensitivityPoint {
     pub fill_rate_pct: f64,
     pub adverse_haircut_cents: f64,
@@ -238,7 +238,7 @@ pub struct FillRateSensitivityPoint {
 }
 
 /// Paper IS / baseline vs trailing OOS live-shadow expectancy drift telemetry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DriftGauge {
     pub paper_expectancy_cents: Option<f64>,
     pub shadow_expectancy_cents: Option<f64>,
@@ -248,7 +248,7 @@ pub struct DriftGauge {
 }
 
 /// Strictly causal multi-market spread, fee, fill-headroom, and $500/day edge screener row.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EdgeScreenerRow {
     pub rank: usize,
     pub strategy: String,
@@ -275,7 +275,7 @@ pub struct EdgeScreenerRow {
 }
 
 /// Guarded dry-run preflight basket assembled from top causal screener winners (live_armed stays false).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BestBasketPlan {
     pub legs: Vec<PlannedAllocatorIntent>,
     pub total_contracts: u32,
@@ -287,7 +287,7 @@ pub struct BestBasketPlan {
 }
 
 /// Daily percentile checkpoint (`day 0..=30`) from 1,000 causal OOS bootstrap trials.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BootstrapEquityPoint {
     pub day: u32,
     pub p5_equity: f64,
@@ -297,7 +297,7 @@ pub struct BootstrapEquityPoint {
 }
 
 /// 1,000-trial causal bootstrap equity & drawdown stress simulator (`+0c` vs `+1c` adverse fill).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BootstrapStressSummary {
     pub trials: usize,
     pub horizon_days: u32,
@@ -320,7 +320,7 @@ pub struct BootstrapStressSummary {
 }
 
 /// One strategy passing OOS depth, positive-EV, stress, and correlation gates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AllocatedWinner {
     pub strategy: String,
     pub side: String,
@@ -346,7 +346,7 @@ pub struct AllocatedWinner {
 }
 
 /// One strategy assigned `0%` weight due to insufficient OOS depth, negative EV, or correlation conflict.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct QuarantinedStrategy {
     pub strategy: String,
     pub side: String,
@@ -356,7 +356,7 @@ pub struct QuarantinedStrategy {
 }
 
 /// Chronological equity checkpoint comparing Legacy 1/N Taker vs Auto-Allocator.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ComparisonPoint {
     pub close_epoch: i64,
     pub legacy_equity: f64,
@@ -364,7 +364,7 @@ pub struct ComparisonPoint {
 }
 
 /// OOS counterfactual replay comparing legacy 1/N equal-split taker vs auto-allocator.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AllocatorComparison {
     pub selection_basis: String,
     pub legacy_equal_taker_end_equity: f64,
@@ -381,7 +381,7 @@ pub struct AllocatorComparison {
 }
 
 /// Concrete limit-order intent bounded by current `RiskRailsConfig`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PlannedAllocatorIntent {
     pub strategy: String,
     pub side: String,
@@ -393,8 +393,48 @@ pub struct PlannedAllocatorIntent {
     pub note: String,
 }
 
+/// Execution-ready dry-run leg with exact Kalshi maker/taker fees, observable spread cost,
+/// minimum fill size for positive post-fee edge, and correlation cap audit (`live_armed: false`).
+#[derive(Debug, Clone, Serialize)]
+pub struct DryRunOrderPlanLeg {
+    pub strategy: String,
+    pub side: String,
+    pub series: String,
+    pub post_only: bool,
+    pub target_contracts: u32,
+    pub max_limit_cents: u8,
+    pub notional_dollars: f64,
+    pub maker_fee_per_ct_cents: f64,
+    pub taker_fee_per_ct_cents: f64,
+    pub exact_order_fee_dollars: f64,
+    pub spread_cross_cost_cents: f64,
+    pub slippage_cost_cents: f64,
+    pub gross_oos_ev_cents: f64,
+    pub net_oos_ev_after_all_cents: f64,
+    pub min_fill_contracts_for_positive_ev: u32,
+    pub correlation_cap_applied: bool,
+    pub sanity_passed: bool,
+    pub verdict: String,
+    pub blockers: Vec<String>,
+}
+
+/// Read-only execution-ready dry-run trade ticket & fee/spread sanity audit (`live_armed: false`).
+#[derive(Debug, Clone, Serialize)]
+pub struct DryRunOrderPlan {
+    pub status: String,
+    pub live_armed: bool,
+    pub execution_mode: String,
+    pub total_contracts: u32,
+    pub total_notional_dollars: f64,
+    pub total_exact_fee_dollars: f64,
+    pub weighted_net_oos_ev_after_all_cents: Option<f64>,
+    pub correlation_ceiling_status: String,
+    pub legs: Vec<DryRunOrderPlanLeg>,
+    pub summary: String,
+}
+
 /// Honest $500/day capital-readiness verdict derived from fee-adjusted OOS expectancy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DailyTargetVerdict {
     pub target_daily_profit_dollars: f64,
     pub verdict: String,
@@ -407,7 +447,7 @@ pub struct DailyTargetVerdict {
 }
 
 /// One rung on the causal adverse-fill slippage sensitivity ladder (`+0c`..`+3c`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SlippageLadderStep {
     pub extra_slippage_cents: f64,
     pub net_expectancy_cents: Option<f64>,
@@ -420,7 +460,7 @@ pub struct SlippageLadderStep {
 }
 
 /// Zero-config strategy preset ranked across OOS + `+1c` adverse-fill bootstrap trials.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StrategyPresetCandidate {
     pub id: String,
     pub label: String,
@@ -451,7 +491,7 @@ pub struct StrategyPresetCandidate {
 }
 
 /// Causal chronological Calm vs High-Vol / Wide-Spread walk-forward regime stability report.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RegimeStabilityReport {
     pub status: String,
     pub causal_percentile_pct: f64,
@@ -468,7 +508,7 @@ pub struct RegimeStabilityReport {
 /// Paper forward-test envelope monitor comparing realized OOS expectancy & slippage
 /// against the active preset's predicted bootstrap P5-P50 trajectory and selecting
 /// the next 0%-rail-breach safe rotation preset (`live_armed: false`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ForwardEnvelopeMonitor {
     pub status: String,
     pub active_preset_id: Option<String>,
@@ -490,7 +530,7 @@ pub struct ForwardEnvelopeMonitor {
 }
 
 /// Connected cross-asset correlation cluster (`|r| >= 0.55`) and cluster heat cap telemetry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AssetClusterRisk {
     pub cluster_id: String,
     pub assets: Vec<String>,
@@ -501,7 +541,7 @@ pub struct AssetClusterRisk {
 }
 
 /// Cross-asset (`BTC`/`ETH`/`SOL`/`XRP`/`DOGE`) & strategy cluster exposure ceiling guard report.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DiversificationGuardReport {
     pub enabled: bool,
     pub status: String,
@@ -522,7 +562,7 @@ pub struct DiversificationGuardReport {
 }
 
 /// Concise session briefing & slippage attribution report for 1-click copy/download (`live_armed: false`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionBriefingReport {
     pub status: String,
     pub live_armed: bool,
@@ -551,7 +591,7 @@ pub struct SessionBriefingReport {
 }
 
 /// Complete response payload for `GET /api/allocator` and `POST /api/allocator/plan`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AutoAllocatorReport {
     pub execution_mode: String,
     pub sizing_mode: String,
@@ -591,6 +631,7 @@ pub struct AutoAllocatorReport {
     pub session_briefing: SessionBriefingReport,
     pub comparison: AllocatorComparison,
     pub planned_intents: Vec<PlannedAllocatorIntent>,
+    pub dry_run_plan: DryRunOrderPlan,
     pub daily_target: DailyTargetVerdict,
     pub honesty_notes: Vec<String>,
 }
@@ -1283,6 +1324,17 @@ pub fn compute_auto_allocator_report(
             1_000,
         );
 
+    let dry_run_plan = compute_dry_run_order_plan(
+        ctx,
+        &req,
+        &oos_by_strat,
+        &active_winners,
+        &diversification,
+        is_maker,
+        killed,
+        live_armed,
+    );
+
     // Compute $500/day net expectancy readiness verdict with concrete blockers.
     let daily_target = compute_daily_target_verdict(
         ctx,
@@ -1411,6 +1463,7 @@ pub fn compute_auto_allocator_report(
         session_briefing,
         comparison,
         planned_intents,
+        dry_run_plan,
         daily_target,
         honesty_notes,
     }
@@ -1525,6 +1578,7 @@ fn dominant_series_for_entries(entries: Option<&Vec<&TournamentEntry>>) -> Strin
         .unwrap_or_else(|| "KXBTC15M".to_string())
 }
 
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn compute_edge_screener_and_basket(
     ctx: &TournamentTapeContext,
@@ -1721,6 +1775,215 @@ fn compute_edge_screener_and_basket(
     };
 
     (rows, basket)
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn compute_dry_run_order_plan(
+    ctx: &TournamentTapeContext,
+    req: &AutoAllocatorRequest,
+    oos_by_strat: &[Vec<&TournamentEntry>],
+    winners: &[AllocatedWinner],
+    diversification: &DiversificationGuardReport,
+    is_maker: bool,
+    killed: bool,
+    live_armed: bool,
+) -> DryRunOrderPlan {
+    if winners.is_empty() {
+        return DryRunOrderPlan {
+            status: "NO_DATA".to_string(),
+            live_armed,
+            execution_mode: req.execution_mode.clone(),
+            total_contracts: 0,
+            total_notional_dollars: 0.0,
+            total_exact_fee_dollars: 0.0,
+            weighted_net_oos_ev_after_all_cents: None,
+            correlation_ceiling_status: diversification.ceiling_status.clone(),
+            legs: Vec::new(),
+            summary: "No active OOS winners available for a dry-run order plan.".to_string(),
+        };
+    }
+
+    let idx_by_name: HashMap<&str, usize> = ctx
+        .strategies
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.as_str(), i))
+        .collect();
+    let corr_capped = diversification.heat_trimmed_pct > 1e-6
+        || diversification.ceiling_trimmed_pct > 1e-6
+        || diversification.ceiling_status == "CEILING_CLAMPED";
+    let slip_cents = if is_maker { 0.0 } else { req.slippage_cents };
+
+    let mut legs = Vec::with_capacity(winners.len());
+    let mut total_contracts: u32 = 0;
+    let mut total_notional = 0.0f64;
+    let mut total_fee = 0.0f64;
+    let mut ev_num = 0.0f64;
+    let mut ev_den = 0.0f64;
+
+    for w in winners {
+        let strat_idx = idx_by_name.get(w.strategy.as_str()).copied();
+        let strat_entries = strat_idx.and_then(|i| oos_by_strat.get(i));
+        let top_series = dominant_series_for_entries(strat_entries);
+        let mean_spread_cents = match strat_entries {
+            Some(list) if !list.is_empty() => {
+                let sum: f64 = list
+                    .iter()
+                    .map(|e| ctx.window_spread_cents.get(&e.ticker).copied().unwrap_or(2.0))
+                    .sum();
+                finite_or(sum / (list.len() as f64), 2.0)
+            }
+            _ => 2.0,
+        };
+        let spread_cross_cost_cents = if is_maker {
+            0.0
+        } else {
+            finite_or((0.5 * mean_spread_cents).max(0.0), 0.0)
+        };
+
+        let max_limit_cents =
+            ((w.oos_avg_entry_price * 100.0).round() as i64).clamp(1, 99) as u8;
+        let p = (max_limit_cents as f64) / 100.0;
+        let target_contracts = w.rail_clamped_contracts;
+        let notional_dollars = finite_or((target_contracts as f64) * p, 0.0);
+        let maker_fee_per_ct_cents = finite_or(maker_fee(p) * 100.0, 0.0);
+        let taker_fee_per_ct_cents = finite_or(fee(p) * 100.0, 0.0);
+        let exact_order_fee_dollars = if target_contracts > 0 {
+            finite_or(kalshi_order_fee_dollars(target_contracts, p, is_maker), 0.0)
+        } else {
+            0.0
+        };
+        let exact_fee_per_ct_cents = if target_contracts > 0 {
+            finite_or((exact_order_fee_dollars * 100.0) / (target_contracts as f64), 0.0)
+        } else if is_maker {
+            maker_fee_per_ct_cents
+        } else {
+            taker_fee_per_ct_cents
+        };
+
+        // `gross_expectancy_cents` is already before fees/slippage; deduct exact rounded Kalshi fee,
+        // observable half-spread crossing cost (taker), and configured slippage.
+        let gross_oos_ev_cents = finite_or(w.gross_expectancy_cents, 0.0);
+        let net_oos_ev_after_all_cents = finite_or(
+            gross_oos_ev_cents - exact_fee_per_ct_cents - spread_cross_cost_cents - slip_cents,
+            0.0,
+        );
+
+        let mut min_fill_contracts_for_positive_ev: u32 = 0;
+        for c in 1u32..=250u32 {
+            let fee_c = (kalshi_order_fee_dollars(c, p, is_maker) * 100.0) / (c as f64);
+            if gross_oos_ev_cents - fee_c - spread_cross_cost_cents - slip_cents > 0.0 {
+                min_fill_contracts_for_positive_ev = c;
+                break;
+            }
+        }
+
+        let mut blockers = Vec::new();
+        if killed {
+            blockers.push("Emergency kill switch is latched".to_string());
+        }
+        if diversification.ceiling_status == "UNPROTECTED_BREACH" {
+            blockers.push("Correlated cluster exceeds regime drawdown ceiling while guard is off".to_string());
+        }
+        if target_contracts == 0 {
+            blockers.push("Rail-clamped budget below 1 contract".to_string());
+        } else if min_fill_contracts_for_positive_ev == 0 {
+            blockers.push("Negative OOS EV after exact fees, spread, and slippage".to_string());
+        } else if target_contracts < min_fill_contracts_for_positive_ev {
+            blockers.push(format!(
+                "Size {target_contracts} cts below {min_fill_contracts_for_positive_ev} ct minimum to clear whole-cent Kalshi fee rounding"
+            ));
+        } else if net_oos_ev_after_all_cents <= 0.0 {
+            blockers.push("Post-fee, spread, and slippage OOS expectancy <= 0.0c".to_string());
+        }
+
+        let sanity_passed = blockers.is_empty();
+        let verdict = if killed {
+            "KILLED"
+        } else if diversification.ceiling_status == "UNPROTECTED_BREACH" {
+            "UNPROTECTED_CLUSTER"
+        } else if target_contracts == 0 || (min_fill_contracts_for_positive_ev > 0 && target_contracts < min_fill_contracts_for_positive_ev) {
+            "SIZE_BELOW_MIN"
+        } else if !sanity_passed {
+            "EDGE_BLOCKED"
+        } else {
+            "EXEC_READY_PAPER"
+        }
+        .to_string();
+
+        total_contracts = total_contracts.saturating_add(target_contracts);
+        total_notional += notional_dollars;
+        total_fee += exact_order_fee_dollars;
+        let w_weight = if notional_dollars > 1e-9 {
+            notional_dollars
+        } else {
+            w.allocated_pct.max(0.01)
+        };
+        ev_num += net_oos_ev_after_all_cents * w_weight;
+        ev_den += w_weight;
+
+        legs.push(DryRunOrderPlanLeg {
+            strategy: w.strategy.clone(),
+            side: w.side.clone(),
+            series: top_series,
+            post_only: is_maker,
+            target_contracts,
+            max_limit_cents,
+            notional_dollars,
+            maker_fee_per_ct_cents,
+            taker_fee_per_ct_cents,
+            exact_order_fee_dollars,
+            spread_cross_cost_cents,
+            slippage_cost_cents: slip_cents,
+            gross_oos_ev_cents,
+            net_oos_ev_after_all_cents,
+            min_fill_contracts_for_positive_ev,
+            correlation_cap_applied: corr_capped,
+            sanity_passed,
+            verdict,
+            blockers,
+        });
+    }
+
+    let weighted_net_oos_ev_after_all_cents = if ev_den > 1e-9 {
+        finite_opt(ev_num / ev_den)
+    } else {
+        None
+    };
+    let ready_count = legs.iter().filter(|l| l.sanity_passed).count();
+    let status = if !killed
+        && ready_count > 0
+        && diversification.ceiling_status != "UNPROTECTED_BREACH"
+        && weighted_net_oos_ev_after_all_cents.is_some_and(|v| v > 0.0)
+    {
+        "PLAN_PASS"
+    } else {
+        "PLAN_BLOCKED"
+    }
+    .to_string();
+
+    let ev_str = weighted_net_oos_ev_after_all_cents
+        .map(|v| format!("{v:+.2}c/ct"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let summary = format!(
+        "{status}: {ready_count}/{} slot(s) ready, {total_contracts} cts (${total_notional:.2} notional, ${total_fee:.2} exact fee), net EV {ev_str}, ceiling {}, live_armed={live_armed}",
+        legs.len(),
+        diversification.ceiling_status
+    );
+
+    DryRunOrderPlan {
+        status,
+        live_armed,
+        execution_mode: req.execution_mode.clone(),
+        total_contracts,
+        total_notional_dollars: finite_or(total_notional, 0.0),
+        total_exact_fee_dollars: finite_or(total_fee, 0.0),
+        weighted_net_oos_ev_after_all_cents,
+        correlation_ceiling_status: diversification.ceiling_status.clone(),
+        legs,
+        summary,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2397,6 +2660,7 @@ fn canonical_asset_from_series(series: &str) -> String {
     }
 }
 
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn apply_diversification_guard(
     entries_by_strat: &[Vec<&TournamentEntry>],
@@ -3327,6 +3591,7 @@ fn build_causal_replay_weights(
     }
 }
 
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn compute_preset_leaderboard(
     ctx: &TournamentTapeContext,
@@ -3852,6 +4117,7 @@ mod tests {
             observed_series: vec!["KXBTC15M".to_string()],
             entries,
             window_vol_scores: HashMap::new(),
+            window_spread_cents: HashMap::new(),
         }
     }
 
@@ -5166,5 +5432,119 @@ mod tests {
                 < 1e-9,
             "causal regime drawdown ceiling replay leaked future outcome"
         );
+    }
+
+    #[test]
+    fn dry_run_order_plan_audits_fees_spread_min_fill_and_stays_disarmed() {
+        let strats = vec![
+            StrategyMeta {
+                name: "strong-maker".into(),
+                side: "yes".into(),
+            },
+            StrategyMeta {
+                name: "thin-rounding-edge".into(),
+                side: "yes".into(),
+            },
+        ];
+        // Build 100 windows:
+        // - strong-maker: 75% WR at 55c -> +20c gross EV, clears even at 1 contract.
+        // - thin-rounding-edge: 33/40 = 82.5% WR in OOS at 81.75c -> +0.75c gross EV (> 0.26c raw maker fee,
+        //   but at C=1 Kalshi rounds 0.26c UP to 1.00c so net EV = -0.25c! Needs C >= 2 contracts for 0.50c/ct!).
+        let mut entries = Vec::new();
+        let mut spread_map = HashMap::new();
+        for w in 0..100i64 {
+            let epoch = 1_775_000_000 + w * 900;
+            let ticker = format!("KXBTC15M-DR{w:03}");
+            spread_map.insert(ticker.clone(), 4.0); // 4.0c bid-ask spread -> 2.0c taker cross, 0.0c maker
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker: ticker.clone(),
+                series: "KXBTC15M".into(),
+                strategy_idx: 0,
+                strategy: "strong-maker".into(),
+                side: "yes".into(),
+                entry_price: 0.55,
+                secs_to_close: 240,
+                won: w % 4 != 0,
+            });
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker,
+                series: "KXBTC15M".into(),
+                strategy_idx: 1,
+                strategy: "thin-rounding-edge".into(),
+                side: "yes".into(),
+                entry_price: 0.8175,
+                secs_to_close: 240,
+                won: (w % 40) < 33,
+            });
+        }
+        let ctx = TournamentTapeContext {
+            window_spread_cents: spread_map,
+            ..make_ctx(strats, entries, 100, 40, 1_775_000_000 + 60 * 900)
+        };
+        let rails = RiskRailsConfig {
+            max_order_contracts: 50,
+            max_order_dollars: 50.0,
+            max_daily_loss_dollars: 500.0,
+            ..RiskRailsConfig::default()
+        };
+
+        let maker_req = AutoAllocatorRequest {
+            execution_mode: "maker".into(),
+            sizing_mode: "quarter_kelly".into(),
+            maker_fill_rate: 1.0,
+            min_oos_trades: 20,
+            max_slot_risk_pct: 10.0,
+            max_total_heat_pct: 30.0,
+            starting_bankroll: 1_000.0,
+            require_stress_resilience: false,
+            enable_regime_throttle: false,
+            enable_diversification_guard: true,
+            ..AutoAllocatorRequest::default()
+        };
+        let m_rep = compute_auto_allocator_report(&ctx, &maker_req, &rails, false, false);
+        assert!(!m_rep.dry_run_plan.live_armed);
+        assert_eq!(m_rep.dry_run_plan.status, "PLAN_PASS");
+        let strong = m_rep
+            .dry_run_plan
+            .legs
+            .iter()
+            .find(|l| l.strategy == "strong-maker")
+            .expect("strong-maker leg");
+        assert_eq!(strong.spread_cross_cost_cents, 0.0);
+        assert_eq!(strong.min_fill_contracts_for_positive_ev, 1);
+        assert!(strong.sanity_passed);
+        assert!((strong.taker_fee_per_ct_cents - 4.0 * strong.maker_fee_per_ct_cents).abs() < 1e-6);
+
+        let thin = m_rep
+            .dry_run_plan
+            .legs
+            .iter()
+            .find(|l| l.strategy == "thin-rounding-edge")
+            .expect("thin-rounding-edge leg");
+        assert!(
+            thin.min_fill_contracts_for_positive_ev >= 2,
+            "thin 0.75c edge must require >=2 contracts to clear 1c Kalshi min fee rounding, got {}",
+            thin.min_fill_contracts_for_positive_ev
+        );
+
+        // Taker mode adds 0.5 * 4.0c = 2.0c spread crossing + taker fee + slippage.
+        let taker_req = AutoAllocatorRequest {
+            execution_mode: "taker".into(),
+            slippage_cents: 1.0,
+            ..maker_req
+        };
+        let t_rep = compute_auto_allocator_report(&ctx, &taker_req, &rails, false, false);
+        assert!(!t_rep.dry_run_plan.live_armed);
+        let t_strong = t_rep
+            .dry_run_plan
+            .legs
+            .iter()
+            .find(|l| l.strategy == "strong-maker")
+            .expect("taker strong-maker");
+        assert!((t_strong.spread_cross_cost_cents - 2.0).abs() < 1e-6);
+        assert_eq!(t_strong.slippage_cost_cents, 1.0);
+        assert!(t_strong.net_oos_ev_after_all_cents < strong.net_oos_ev_after_all_cents);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "openbell-rs"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2021"
 
 [profile.release]
@@ -20,7 +20,7 @@ opt-level = "z"
 opt-level = "z"
 
 [profile.release.package.memchr]
-opt-level = 3
+opt-level = "z"
 
 [profile.release.package.itoa]
 opt-level = "z"

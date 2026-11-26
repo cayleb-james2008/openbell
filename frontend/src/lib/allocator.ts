@@ -315,6 +315,41 @@ export type PlannedAllocatorIntent = {
   note: string;
 };
 
+export type DryRunOrderPlanLeg = {
+  strategy: string;
+  side: "yes" | "no" | string;
+  series: string;
+  post_only: boolean;
+  target_contracts: number;
+  max_limit_cents: number;
+  notional_dollars: number;
+  maker_fee_per_ct_cents: number;
+  taker_fee_per_ct_cents: number;
+  exact_order_fee_dollars: number;
+  spread_cross_cost_cents: number;
+  slippage_cost_cents: number;
+  gross_oos_ev_cents: number;
+  net_oos_ev_after_all_cents: number;
+  min_fill_contracts_for_positive_ev: number;
+  correlation_cap_applied: boolean;
+  sanity_passed: boolean;
+  verdict: string;
+  blockers: string[];
+};
+
+export type DryRunOrderPlan = {
+  status: "PLAN_PASS" | "PLAN_BLOCKED" | "NO_DATA" | string;
+  live_armed: boolean;
+  execution_mode: string;
+  total_contracts: number;
+  total_notional_dollars: number;
+  total_exact_fee_dollars: number;
+  weighted_net_oos_ev_after_all_cents: number | null;
+  correlation_ceiling_status: string;
+  legs: DryRunOrderPlanLeg[];
+  summary: string;
+};
+
 export type DailyTargetVerdict = {
   target_daily_profit_dollars: number;
   verdict: "GO_500_DAY" | "NO_GO_PAPER" | string;
@@ -365,6 +400,7 @@ export type AutoAllocatorReport = {
   session_briefing: SessionBriefingReport;
   comparison: AllocatorComparison;
   planned_intents: PlannedAllocatorIntent[];
+  dry_run_plan: DryRunOrderPlan;
   daily_target: DailyTargetVerdict;
   honesty_notes: string[];
   source?: "server" | "client";
@@ -474,6 +510,8 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
   const divClustersRaw = Array.isArray(divRaw.clusters) ? divRaw.clusters : [];
   const briefRaw = (o.session_briefing && typeof o.session_briefing === "object" ? o.session_briefing : {}) as Record<string, unknown>;
   const intentsRaw = Array.isArray(o.planned_intents) ? o.planned_intents : [];
+  const dryPlanRaw = (o.dry_run_plan && typeof o.dry_run_plan === "object" ? o.dry_run_plan : {}) as Record<string, unknown>;
+  const dryLegsRaw = Array.isArray(dryPlanRaw.legs) ? dryPlanRaw.legs : [];
   const notesRaw = Array.isArray(o.honesty_notes) ? o.honesty_notes : [];
   const compRaw = (o.comparison && typeof o.comparison === "object" ? o.comparison : {}) as Record<string, unknown>;
   const curveRaw = Array.isArray(compRaw.equity_curve) ? compRaw.equity_curve : [];
@@ -839,6 +877,48 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
         rail_ready: Boolean(it.rail_ready),
         note: strOr(it.note, ""),
       })),
+    dry_run_plan: {
+      status: strOr(dryPlanRaw.status, "NO_DATA"),
+      live_armed: Boolean(dryPlanRaw.live_armed),
+      execution_mode: strOr(dryPlanRaw.execution_mode, strOr(o.execution_mode, "maker")),
+      total_contracts: Math.max(0, Math.round(finiteOr(dryPlanRaw.total_contracts, 0))),
+      total_notional_dollars: finiteOr(dryPlanRaw.total_notional_dollars, 0),
+      total_exact_fee_dollars: finiteOr(dryPlanRaw.total_exact_fee_dollars, 0),
+      weighted_net_oos_ev_after_all_cents: finiteOpt(dryPlanRaw.weighted_net_oos_ev_after_all_cents),
+      correlation_ceiling_status: strOr(
+        dryPlanRaw.correlation_ceiling_status,
+        strOr(divRaw.ceiling_status, "NO_DATA"),
+      ),
+      legs: dryLegsRaw
+        .filter((lg): lg is Record<string, unknown> => !!lg && typeof lg === "object")
+        .map((lg) => ({
+          strategy: strOr(lg.strategy, "unnamed"),
+          side: strOr(lg.side, "yes"),
+          series: strOr(lg.series, "KXBTC15M"),
+          post_only: Boolean(lg.post_only),
+          target_contracts: Math.max(0, Math.round(finiteOr(lg.target_contracts, 0))),
+          max_limit_cents: Math.min(99, Math.max(1, Math.round(finiteOr(lg.max_limit_cents, 50)))),
+          notional_dollars: finiteOr(lg.notional_dollars, 0),
+          maker_fee_per_ct_cents: finiteOr(lg.maker_fee_per_ct_cents, 0),
+          taker_fee_per_ct_cents: finiteOr(lg.taker_fee_per_ct_cents, 0),
+          exact_order_fee_dollars: finiteOr(lg.exact_order_fee_dollars, 0),
+          spread_cross_cost_cents: finiteOr(lg.spread_cross_cost_cents, 0),
+          slippage_cost_cents: finiteOr(lg.slippage_cost_cents, 0),
+          gross_oos_ev_cents: finiteOr(lg.gross_oos_ev_cents, 0),
+          net_oos_ev_after_all_cents: finiteOr(lg.net_oos_ev_after_all_cents, 0),
+          min_fill_contracts_for_positive_ev: Math.max(
+            0,
+            Math.round(finiteOr(lg.min_fill_contracts_for_positive_ev, 0)),
+          ),
+          correlation_cap_applied: Boolean(lg.correlation_cap_applied),
+          sanity_passed: Boolean(lg.sanity_passed),
+          verdict: strOr(lg.verdict, "EDGE_BLOCKED"),
+          blockers: Array.isArray(lg.blockers)
+            ? lg.blockers.filter((b): b is string => typeof b === "string" && b.trim().length > 0)
+            : [],
+        })),
+      summary: strOr(dryPlanRaw.summary, "No active OOS winners available for a dry-run order plan."),
+    },
     daily_target: {
       target_daily_profit_dollars: finiteOr(dtRaw.target_daily_profit_dollars, 500),
       verdict: strOr(dtRaw.verdict, "NO_GO_PAPER"),
@@ -959,6 +1039,95 @@ function makeOfflineSessionBriefing(
   };
 }
 
+function makeOfflineDryRunPlan(
+  params: AutoAllocatorRequest,
+  winners: AllocatedWinner[],
+): DryRunOrderPlan {
+  if (winners.length === 0) {
+    return {
+      status: "NO_DATA",
+      live_armed: false,
+      execution_mode: params.execution_mode,
+      total_contracts: 0,
+      total_notional_dollars: 0,
+      total_exact_fee_dollars: 0,
+      weighted_net_oos_ev_after_all_cents: null,
+      correlation_ceiling_status: "NO_DATA",
+      legs: [],
+      summary: "No active OOS winners available for a dry-run order plan.",
+    };
+  }
+  const isMaker = params.execution_mode === "maker";
+  const slip = isMaker ? 0 : params.slippage_cents;
+  const spreadCross = isMaker ? 0 : 1.0;
+  let totalContracts = 0;
+  let totalNotional = 0;
+  let totalFee = 0;
+  let evNum = 0;
+  let evDen = 0;
+  const legs: DryRunOrderPlanLeg[] = winners.map((w) => {
+    const limitCents = Math.min(99, Math.max(1, Math.round(w.oos_avg_entry_price * 100)));
+    const p = limitCents / 100;
+    const cts = w.rail_clamped_contracts;
+    const notional = Number((cts * p).toFixed(2));
+    const rate = isMaker ? 0.0175 : 0.07;
+    const exactFee = cts > 0 ? Math.ceil(rate * cts * p * (1 - p) * 100) / 100 : 0;
+    const feePerCtCents = cts > 0 ? (exactFee * 100) / cts : isMaker ? w.maker_fee_cents : w.taker_fee_cents;
+    const netEv = Number((w.gross_expectancy_cents - feePerCtCents - spreadCross - slip).toFixed(2));
+    let minFill = 0;
+    for (let c = 1; c <= 250; c++) {
+      const f = (Math.ceil(rate * c * p * (1 - p) * 100) / c);
+      if (w.gross_expectancy_cents - f - spreadCross - slip > 0) {
+        minFill = c;
+        break;
+      }
+    }
+    const sanity = cts >= 1 && minFill >= 1 && cts >= minFill && netEv > 0;
+    totalContracts += cts;
+    totalNotional += notional;
+    totalFee += exactFee;
+    const wt = Math.max(0.01, notional);
+    evNum += netEv * wt;
+    evDen += wt;
+    return {
+      strategy: w.strategy,
+      side: w.side,
+      series: "KXBTC15M",
+      post_only: isMaker,
+      target_contracts: cts,
+      max_limit_cents: limitCents,
+      notional_dollars: notional,
+      maker_fee_per_ct_cents: w.maker_fee_cents,
+      taker_fee_per_ct_cents: w.taker_fee_cents,
+      exact_order_fee_dollars: Number(exactFee.toFixed(2)),
+      spread_cross_cost_cents: spreadCross,
+      slippage_cost_cents: slip,
+      gross_oos_ev_cents: w.gross_expectancy_cents,
+      net_oos_ev_after_all_cents: netEv,
+      min_fill_contracts_for_positive_ev: minFill,
+      correlation_cap_applied: false,
+      sanity_passed: sanity,
+      verdict: sanity ? "EXEC_READY_PAPER" : cts < minFill || cts === 0 ? "SIZE_BELOW_MIN" : "EDGE_BLOCKED",
+      blockers: sanity ? [] : ["Check minimum fill size or post-fee net expectancy"],
+    };
+  });
+  const weightedEv = evDen > 0 ? Number((evNum / evDen).toFixed(2)) : null;
+  const readyCount = legs.filter((l) => l.sanity_passed).length;
+  const status = readyCount > 0 && (weightedEv ?? 0) > 0 ? "PLAN_PASS" : "PLAN_BLOCKED";
+  return {
+    status,
+    live_armed: false,
+    execution_mode: params.execution_mode,
+    total_contracts: totalContracts,
+    total_notional_dollars: Number(totalNotional.toFixed(2)),
+    total_exact_fee_dollars: Number(totalFee.toFixed(2)),
+    weighted_net_oos_ev_after_all_cents: weightedEv,
+    correlation_ceiling_status: "WITHIN_CEILING",
+    legs,
+    summary: `${status}: ${readyCount}/${legs.length} offline preview leg(s), ${totalContracts} cts, live_armed=false`,
+  };
+}
+
 export function computeClientFallbackReport(
   params: AutoAllocatorRequest,
   slots: Slots | null,
@@ -1065,6 +1234,7 @@ export function computeClientFallbackReport(
         equity_curve: [],
       },
       planned_intents: [],
+      dry_run_plan: makeOfflineDryRunPlan(params, []),
       daily_target: {
         target_daily_profit_dollars: 500,
         verdict: "NO_GO_PAPER",
@@ -1399,6 +1569,7 @@ export function computeClientFallbackReport(
       equity_curve: curve,
     },
     planned_intents,
+    dry_run_plan: makeOfflineDryRunPlan(params, rawWinners),
     daily_target: {
       target_daily_profit_dollars: 500,
       verdict: "NO_GO_PAPER",
