@@ -21,6 +21,11 @@ export type RunnerSlotConfig = {
   execution_mode: RunnerExecutionMode;
   auto_pause_drawdown_dollars: number;
   enabled: boolean;
+  reprice_cooldown_secs?: number;
+  max_replaces_per_window?: number;
+  take_profit_cents?: number;
+  stop_loss_cents?: number;
+  exit_before_close_secs?: number;
 };
 
 export type RunnerSlotState = RunnerSlotConfig & {
@@ -40,12 +45,14 @@ export type VirtualOrLiveOrder = {
   strategy: string;
   ticker: string;
   series: string;
+  action: "buy" | "sell";
   side: "yes" | "no";
   mode: "shadow" | "live";
   execution_mode: RunnerExecutionMode;
   limit_cents: number;
   contracts: number;
   remaining_contracts: number;
+  replace_count: number;
   queue_ahead_initial: number;
   queue_ahead_remaining: number;
   est_fill_eta_secs: number | null;
@@ -96,7 +103,9 @@ export type RunnerStopPayload = {
 export type LedgerEventType =
   | "QuotePosted"
   | "QuoteCanceled"
+  | "OrderAmended"
   | "OrderFilled"
+  | "PositionExited"
   | "WindowSettled"
   | "SlotPaused";
 
@@ -114,11 +123,13 @@ export type LedgerEvent = {
   order_id?: string | null;
   live_order_id?: string | null;
   execution_mode?: RunnerExecutionMode | null;
+  action?: "buy" | "sell" | null;
   side: "yes" | "no" | null;
   price_cents: number | null;
   limit_cents: number | null;
   fill_cents: number | null;
   contracts: number | null;
+  replace_count?: number | null;
   fee_dollars: number | null;
   pnl_dollars: number | null;
   slippage_cents: number | null;
@@ -152,7 +163,9 @@ export type RunnerLedgerResponse = {
 
 export type RunnerSseEventKind =
   | "quote_posted"
+  | "order_amended"
   | "quote_filled"
+  | "position_exited"
   | "quote_canceled"
   | "window_settled"
   | "slot_auto_paused"
@@ -284,9 +297,20 @@ function normalizeSeriesList(raw: unknown): string[] {
   return ["KXBTC15M"];
 }
 
+function optNonNegInt(o: Record<string, unknown>, keys: string[]): number | undefined {
+  const v = pickNum(o, keys);
+  if (v === null || !Number.isFinite(v)) return undefined;
+  return Math.max(0, Math.round(v));
+}
+
 function normalizeSlotState(raw: unknown, idx: number): RunnerSlotState | null {
   if (!raw || typeof raw !== "object") return null;
   const o = raw as Record<string, unknown>;
+  const repriceCooldown = optNonNegInt(o, ["reprice_cooldown_secs"]);
+  const maxReplaces = optNonNegInt(o, ["max_replaces_per_window"]);
+  const takeProfit = optNonNegInt(o, ["take_profit_cents"]);
+  const stopLoss = optNonNegInt(o, ["stop_loss_cents"]);
+  const exitBeforeClose = optNonNegInt(o, ["exit_before_close_secs"]);
   return {
     slot_id: Math.max(1, Math.round(pickNum(o, ["slot_id", "slot"]) ?? idx + 1)),
     strategy: cleanStr(o.strategy, `slot-${idx + 1}`),
@@ -298,6 +322,11 @@ function normalizeSlotState(raw: unknown, idx: number): RunnerSlotState | null {
       pickNum(o, ["auto_pause_drawdown_dollars", "auto_pause_dd_dollars"]) ?? 25,
     ),
     enabled: o.enabled === undefined ? true : Boolean(o.enabled),
+    ...(repriceCooldown !== undefined ? { reprice_cooldown_secs: repriceCooldown } : {}),
+    ...(maxReplaces !== undefined ? { max_replaces_per_window: maxReplaces } : {}),
+    ...(takeProfit !== undefined && takeProfit > 0 ? { take_profit_cents: Math.min(99, takeProfit) } : {}),
+    ...(stopLoss !== undefined && stopLoss > 0 ? { stop_loss_cents: Math.min(99, stopLoss) } : {}),
+    ...(exitBeforeClose !== undefined ? { exit_before_close_secs: exitBeforeClose } : {}),
     paused: Boolean(o.paused),
     pause_reason: typeof o.pause_reason === "string" && o.pause_reason.trim() ? o.pause_reason.trim() : null,
     realized_pnl_dollars: pickNum(o, ["realized_pnl_dollars", "pnl_dollars"]) ?? 0,
@@ -313,6 +342,7 @@ function normalizeOpenQuote(raw: unknown, idx: number): VirtualOrLiveOrder | nul
   if (!raw || typeof raw !== "object") return null;
   const o = raw as Record<string, unknown>;
   const sideRaw = String(o.side ?? "yes").toLowerCase();
+  const actionRaw = String(o.action ?? "buy").toLowerCase();
   const modeRaw = String(o.mode ?? "shadow").toLowerCase();
   const contracts = Math.max(1, Math.round(pickNum(o, ["contracts", "count"]) ?? 1));
   const remaining = Math.max(0, Math.round(pickNum(o, ["remaining_contracts", "remaining_count"]) ?? contracts));
@@ -324,12 +354,14 @@ function normalizeOpenQuote(raw: unknown, idx: number): VirtualOrLiveOrder | nul
     strategy: cleanStr(o.strategy, "unnamed"),
     ticker: cleanStr(o.ticker, "KXBTC15M"),
     series: cleanStr(o.series, cleanStr(o.ticker, "KXBTC15M").split("-")[0] || "KXBTC15M"),
+    action: actionRaw === "sell" ? "sell" : "buy",
     side: sideRaw === "no" ? "no" : "yes",
     mode: modeRaw === "live" || modeRaw === "live_auto" ? "live" : "shadow",
     execution_mode: normalizeExecMode(o.execution_mode),
     limit_cents: Math.min(99, Math.max(1, Math.round(pickNum(o, ["limit_cents", "price_cents"]) ?? 50))),
     contracts,
     remaining_contracts: remaining,
+    replace_count: Math.max(0, Math.round(pickNum(o, ["replace_count", "replaces"]) ?? 0)),
     queue_ahead_initial: Math.max(qInit, qRem),
     queue_ahead_remaining: qRem,
     est_fill_eta_secs: pickNum(o, ["est_fill_eta_secs", "fill_eta_secs"]),
@@ -387,6 +419,7 @@ function normalizeLedgerEvent(raw: unknown, idx: number): LedgerEvent | null {
         ? new Date(tsEpoch * 1000).toISOString()
         : "";
   const sideRaw = typeof o.side === "string" ? o.side.toLowerCase() : "";
+  const actionRaw = typeof o.action === "string" ? o.action.trim().toLowerCase() : "";
   const modeRaw = String(o.mode ?? "shadow").toLowerCase();
   const seq = pickNum(o, ["seq"]);
   const limitCents = pickNum(o, ["limit_cents"]);
@@ -406,11 +439,13 @@ function normalizeLedgerEvent(raw: unknown, idx: number): LedgerEvent | null {
     order_id: typeof o.order_id === "string" && o.order_id.trim() ? o.order_id.trim() : null,
     live_order_id: typeof o.live_order_id === "string" && o.live_order_id.trim() ? o.live_order_id.trim() : null,
     execution_mode: typeof o.execution_mode === "string" ? normalizeExecMode(o.execution_mode) : null,
+    action: actionRaw === "sell" ? "sell" : actionRaw === "buy" ? "buy" : null,
     side: sideRaw === "yes" ? "yes" : sideRaw === "no" ? "no" : null,
     price_cents: priceCents,
     limit_cents: limitCents,
     fill_cents: fillCents,
     contracts: pickNum(o, ["contracts", "count"]),
+    replace_count: optNonNegInt(o, ["replace_count", "replaces"]) ?? null,
     fee_dollars: pickNum(o, ["fee_dollars"]),
     pnl_dollars: pickNum(o, ["realized_pnl_dollars", "pnl_dollars"]),
     slippage_cents: pickNum(o, ["slippage_cents"]),
@@ -493,6 +528,11 @@ export function buildPreviewRunnerState(
       execution_mode: "maker",
       auto_pause_drawdown_dollars: 25,
       enabled: true,
+      reprice_cooldown_secs: 15,
+      max_replaces_per_window: 3,
+      take_profit_cents: 12,
+      stop_loss_cents: 8,
+      exit_before_close_secs: 45,
       paused: false,
       pause_reason: null,
       realized_pnl_dollars: 4.18,
@@ -510,6 +550,11 @@ export function buildPreviewRunnerState(
       execution_mode: "maker",
       auto_pause_drawdown_dollars: 20,
       enabled: true,
+      reprice_cooldown_secs: 20,
+      max_replaces_per_window: 2,
+      take_profit_cents: 10,
+      stop_loss_cents: 6,
+      exit_before_close_secs: 30,
       paused: false,
       pause_reason: null,
       realized_pnl_dollars: 1.65,
@@ -545,12 +590,14 @@ export function buildPreviewRunnerState(
       strategy: s1,
       ticker: t1,
       series: "KXBTC15M",
+      action: "buy",
       side: "yes",
       mode: "shadow",
       execution_mode: "maker",
       limit_cents: 68,
       contracts: 12,
       remaining_contracts: 12,
+      replace_count: 1,
       queue_ahead_initial: 140,
       queue_ahead_remaining: 38,
       est_fill_eta_secs: 42,
@@ -564,12 +611,14 @@ export function buildPreviewRunnerState(
       strategy: s2,
       ticker: t2,
       series: "KXETH15M",
+      action: "sell",
       side: "no",
       mode: "shadow",
       execution_mode: "maker",
       limit_cents: 44,
       contracts: 10,
       remaining_contracts: 10,
+      replace_count: 0,
       queue_ahead_initial: 90,
       queue_ahead_remaining: 54,
       est_fill_eta_secs: 95,
@@ -589,6 +638,7 @@ export function buildPreviewRunnerState(
       slot_id: 2,
       strategy: s2,
       ticker: t2,
+      action: "sell",
       side: "no",
       price_cents: 44,
       limit_cents: 44,
@@ -601,6 +651,28 @@ export function buildPreviewRunnerState(
       reason: "Post-only limit resting at 44c",
     },
     {
+      id: "led-p-5",
+      ts_epoch: nowSec - 55,
+      ts_iso: new Date((nowSec - 55) * 1000).toISOString(),
+      event: "OrderAmended",
+      mode: "shadow",
+      slot_id: 1,
+      strategy: s1,
+      ticker: t1,
+      action: "buy",
+      side: "yes",
+      price_cents: 68,
+      limit_cents: 68,
+      fill_cents: null,
+      contracts: 12,
+      replace_count: 1,
+      fee_dollars: 0,
+      pnl_dollars: null,
+      slippage_cents: null,
+      queue_wait_secs: null,
+      reason: "Repriced maker bid to 68c",
+    },
+    {
       id: "led-p-2",
       ts_epoch: nowSec - 190,
       ts_iso: new Date((nowSec - 190) * 1000).toISOString(),
@@ -609,6 +681,7 @@ export function buildPreviewRunnerState(
       slot_id: 1,
       strategy: s1,
       ticker: t1,
+      action: "buy",
       side: "yes",
       price_cents: 71,
       limit_cents: 71,
@@ -619,6 +692,27 @@ export function buildPreviewRunnerState(
       slippage_cents: 0.0,
       queue_wait_secs: 38,
       reason: "Queue depleted on resting bid",
+    },
+    {
+      id: "led-p-6",
+      ts_epoch: nowSec - 310,
+      ts_iso: new Date((nowSec - 310) * 1000).toISOString(),
+      event: "PositionExited",
+      mode: "shadow",
+      slot_id: 1,
+      strategy: s1,
+      ticker: "KXBTC15M-PREVIEW-EXIT",
+      action: "sell",
+      side: "yes",
+      price_cents: 84,
+      limit_cents: 84,
+      fill_cents: 84,
+      contracts: 12,
+      fee_dollars: 0.04,
+      pnl_dollars: 1.52,
+      slippage_cents: 0.0,
+      queue_wait_secs: 14,
+      reason: "Take-profit target reached (+12c)",
     },
     {
       id: "led-p-3",
@@ -1250,6 +1344,11 @@ export async function syncAllocatorToRunner(
       execution_mode: s.execution_mode,
       auto_pause_drawdown_dollars: s.auto_pause_drawdown_dollars,
       enabled: s.enabled,
+      ...(isNum(s.reprice_cooldown_secs) ? { reprice_cooldown_secs: s.reprice_cooldown_secs } : {}),
+      ...(isNum(s.max_replaces_per_window) ? { max_replaces_per_window: s.max_replaces_per_window } : {}),
+      ...(isNum(s.take_profit_cents) ? { take_profit_cents: s.take_profit_cents } : {}),
+      ...(isNum(s.stop_loss_cents) ? { stop_loss_cents: s.stop_loss_cents } : {}),
+      ...(isNum(s.exit_before_close_secs) ? { exit_before_close_secs: s.exit_before_close_secs } : {}),
     }));
   const rawSkipped = Array.isArray(body.skipped_quarantined)
     ? body.skipped_quarantined

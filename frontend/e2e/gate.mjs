@@ -2883,6 +2883,271 @@ for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light'
   await ctx.close()
 }
 
+// 6c. Cycle 4 E1: Order Amend, 1-Click Position Flatten & Slot Reprice/TP/SL Lifecycle UI
+{
+  const { ctx, p } = await open(1440, 900, 'light')
+  p.__allow = /403/
+  await p.route('**/api/home*', async r => {
+    const res = await r.fetch()
+    const j = await res.json()
+    j.version = '0.33.0'
+    j.capabilities = ['sse', 'live_kalshi', 'risk_rails', 'shadow_runner', 'live_reconcile', 'execution_health']
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
+  })
+
+  let armed = false
+  let amendPosts = 0
+  let lastAmendBody = null
+  let lastAmendCsrf = null
+  let flattenPosts = 0
+  let lastFlattenBody = null
+  let lastFlattenCsrf = null
+  let savedRunnerSlots = null
+
+  let ordersState = [
+    { order_id: 'ord-e1-1', client_order_id: 'c-e1-1', ticker: 'KXBTC15M-E1', action: 'buy', side: 'yes', status: 'resting', count: 10, remaining_count: 10, price_cents: 55, created_time: '2026-11-26T17:00:00Z' },
+  ]
+  const positionsState = [
+    { ticker: 'KXBTC15M-E1', side: 'yes', position: 8, market_exposure_dollars: 4.4, realized_pnl_dollars: 0.65, resting_orders_count: 1, total_traded_dollars: 4.4 },
+    { ticker: 'KXETH15M-E1', side: 'no', position: 4, market_exposure_dollars: 1.8, realized_pnl_dollars: -0.2, resting_orders_count: 0, total_traded_dollars: 1.8 },
+  ]
+  let runnerState = {
+    mode: 'shadow',
+    live_armed: false,
+    killed: false,
+    tick_interval_ms: 2000,
+    cancel_before_close_secs: 30,
+    bankroll_dollars: 250,
+    active_slots: [
+      {
+        slot_id: 1,
+        strategy: 'late-favourite-edge',
+        series: ['KXBTC15M'],
+        max_contracts: 12,
+        execution_mode: 'maker',
+        auto_pause_drawdown_dollars: 25,
+        enabled: true,
+        reprice_cooldown_secs: 15,
+        max_replaces_per_window: 3,
+        take_profit_cents: 12,
+        stop_loss_cents: 8,
+        exit_before_close_secs: 45,
+        paused: false,
+        pause_reason: null,
+        realized_pnl_dollars: 2.4,
+        drawdown_dollars: 0.5,
+        quotes_posted: 6,
+        fills: 4,
+        open_quotes_count: 2,
+      },
+    ],
+    open_quotes: [
+      {
+        order_id: 'q-e1-buy',
+        slot_id: 1,
+        strategy: 'late-favourite-edge',
+        ticker: 'KXBTC15M-E1',
+        series: 'KXBTC15M',
+        action: 'buy',
+        side: 'yes',
+        mode: 'shadow',
+        execution_mode: 'maker',
+        limit_cents: 62,
+        contracts: 10,
+        remaining_contracts: 10,
+        replace_count: 2,
+        queue_ahead_initial: 80,
+        queue_ahead_remaining: 20,
+        est_fill_eta_secs: 25,
+        posted_epoch: 1764153000,
+        status: 'resting',
+      },
+      {
+        order_id: 'q-e1-sell',
+        slot_id: 1,
+        strategy: 'late-favourite-edge',
+        ticker: 'KXBTC15M-E1',
+        series: 'KXBTC15M',
+        action: 'sell',
+        side: 'yes',
+        mode: 'shadow',
+        execution_mode: 'maker',
+        limit_cents: 74,
+        contracts: 8,
+        remaining_contracts: 8,
+        replace_count: 0,
+        queue_ahead_initial: 40,
+        queue_ahead_remaining: 15,
+        est_fill_eta_secs: 18,
+        posted_epoch: 1764153020,
+        status: 'resting',
+      },
+    ],
+    stats: { quotes_posted: 6, fills: 4, fill_rate_pct: 66.7, realized_pnl_dollars: 2.4, unrealized_exposure_dollars: 6.2, avg_fill_slippage_cents: 0.1, avg_queue_wait_secs: 22 },
+  }
+
+  const liveStatusPayload = () => ({
+    configured: true,
+    environment: 'demo',
+    connected: true,
+    mode: armed ? 'live' : 'paper',
+    live_armed: armed,
+    killed: false,
+    kill_reason: null,
+    last_venue_sync_epoch: 1764153000,
+    venue_sync_stale: false,
+    daily_realized_loss_dollars: 0,
+    open_exposure_dollars: 6.2,
+    rails: { max_order_contracts: 25, max_order_dollars: 25, max_daily_loss_dollars: 50, max_open_exposure_dollars: 100, allowed_ticker_prefix: 'KX' },
+  })
+
+  await p.route('**/api/live/status*', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(liveStatusPayload()) }))
+  await p.route('**/api/live/account*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"configured":true,"connected":true,"balance_dollars":500,"portfolio_value_dollars":506.2}' }))
+  await p.route('**/api/live/positions*', r => {
+    if (r.request().url().includes('/flatten')) return r.continue()
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ market_positions: positionsState }) })
+  })
+  await p.route('**/api/live/orders*', r => {
+    if (r.request().url().includes('/amend')) return r.continue()
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ orders: ordersState }) })
+  })
+  await p.route('**/api/live/fills*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"fills":[]}' }))
+  await p.route('**/api/live/arm*', r => {
+    armed = true
+    runnerState = { ...runnerState, live_armed: true }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(liveStatusPayload()) })
+  })
+  await p.route(/\/api\/live\/orders\/[^/]+\/amend(\?.*)?$/, async r => {
+    amendPosts += 1
+    lastAmendCsrf = r.request().headers()['x-openbell-csrf'] || null
+    lastAmendBody = r.request().postDataJSON()
+    await new Promise(res => setTimeout(res, 200))
+    ordersState = [{ ...ordersState[0], price_cents: lastAmendBody.price_cents, count: lastAmendBody.count ?? ordersState[0].count, remaining_count: lastAmendBody.count ?? ordersState[0].remaining_count }]
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, order: ordersState[0] }) })
+  })
+  await p.route(/\/api\/live\/positions\/[^/]+\/flatten(\?.*)?$/, async r => {
+    const u = new URL(r.request().url())
+    if (u.pathname.includes('KXETH15M-E1')) {
+      return r.fulfill({ status: 403, contentType: 'application/json', body: JSON.stringify({ error: 'Fail-closed: ETH position exit blocked by policy' }) })
+    }
+    flattenPosts += 1
+    lastFlattenCsrf = r.request().headers()['x-openbell-csrf'] || null
+    lastFlattenBody = r.request().postDataJSON()
+    await new Promise(res => setTimeout(res, 200))
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, order_id: 'ord-flat-1', ticker: 'KXBTC15M-E1', side: 'yes', status: 'executed', count: 8, price_cents: 60 }),
+    })
+  })
+  await p.route('**/api/runner/status*', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(runnerState) }))
+  await p.route('**/api/runner/config*', async r => {
+    const body = r.request().postDataJSON()
+    savedRunnerSlots = body.slots
+    runnerState = {
+      ...runnerState,
+      cancel_before_close_secs: body.cancel_before_close_secs,
+      bankroll_dollars: body.bankroll_dollars,
+      active_slots: body.slots.map((s, idx) => ({ ...runnerState.active_slots[idx], ...s })),
+    }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, status: runnerState }) })
+  })
+  await p.route('**/api/runner/ledger*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      entries: [
+        { id: 'led-e1-1', ts_epoch: 1764153010, event: 'OrderAmended', mode: 'shadow', slot_id: 1, strategy: 'late-favourite-edge', ticker: 'KXBTC15M-E1', action: 'buy', side: 'yes', price_cents: 62, limit_cents: 62, contracts: 10, replace_count: 2, reason: 'Repriced bid 60c -> 62c' },
+        { id: 'led-e1-2', ts_epoch: 1764153030, event: 'PositionExited', mode: 'shadow', slot_id: 1, strategy: 'late-favourite-edge', ticker: 'KXBTC15M-E1', action: 'sell', side: 'yes', price_cents: 74, limit_cents: 74, fill_cents: 74, contracts: 8, fee_dollars: 0.03, pnl_dollars: 0.93, reason: 'Take-profit +12c' },
+      ],
+      summary_by_strategy: [],
+    }),
+  }))
+
+  await p.goto(FX); await ready(p); await p.waitForTimeout(250)
+  await p.locator('#tab-live').click(); await p.waitForTimeout(250)
+
+  // Check 1: Disarmed guard + Armed Order Amend with reduced count & double-submit lock
+  const disarmedAmendDisabled = await p.locator('[data-amend-order="ord-e1-1"]').isDisabled()
+  const guardBannerTxt = await p.locator('#live-lifecycle-guard-banner').innerText().catch(() => '')
+  await p.locator('[data-live-subtab="positions"]').click(); await p.waitForTimeout(100)
+  const disarmedFlattenDisabled = await p.locator('[data-flatten-position="KXBTC15M-E1"]').isDisabled()
+  await p.locator('[data-live-subtab="orders"]').click(); await p.waitForTimeout(100)
+
+  await p.locator('#trading-mode-live').click(); await p.waitForTimeout(150)
+  await p.locator('#arm-live-checkbox').click()
+  await p.locator('#confirm-arm-live-btn').click(); await p.waitForTimeout(250)
+
+  await p.locator('[data-amend-order="ord-e1-1"]').click(); await p.waitForTimeout(100)
+  const amendPopoverOpen = await p.locator('[data-amend-popover="ord-e1-1"]').isVisible()
+  await p.locator('[data-amend-price="ord-e1-1"]').fill('58')
+  await p.locator('[data-amend-count="ord-e1-1"]').fill('6')
+  const amendM = await p.evaluate(MEASURE)
+  await p.evaluate(() => {
+    const btn = document.querySelector('[data-confirm-amend="ord-e1-1"]')
+    if (btn) { btn.click(); btn.click() }
+  })
+  await p.waitForTimeout(350)
+  const amendedRowTxt = await p.locator('[data-live-order-row="ord-e1-1"]').innerText().catch(() => '')
+  ok('C4E1 Order Amend respects disarmed guard, submits CSRF-protected amend once under lock & updates row cleanly',
+    disarmedAmendDisabled && disarmedFlattenDisabled && guardBannerTxt.includes('live_armed: false') &&
+      amendPopoverOpen && amendPosts === 1 && lastAmendCsrf === '1' &&
+      lastAmendBody?.price_cents === 58 && lastAmendBody?.count === 6 &&
+      amendedRowTxt.includes('58c') && amendedRowTxt.includes('6/6') && !/\bNaN\b/.test(amendedRowTxt) &&
+      amendM.docOverflow <= 0 && amendM.smallTargets === 0 && amendM.lowContrast === 0,
+    `disarmed=${disarmedAmendDisabled}/${disarmedFlattenDisabled} posts=${amendPosts} body=${JSON.stringify(lastAmendBody)} row=${amendedRowTxt.replace(/\s+/g, ' ')}`)
+
+  // Check 2: 1-Click Position Flatten + 403 fail-closed error surfacing
+  await p.locator('[data-live-subtab="positions"]').click(); await p.waitForTimeout(150)
+  await p.evaluate(() => {
+    const btn = document.querySelector('[data-flatten-position="KXBTC15M-E1"]')
+    if (btn) { btn.click(); btn.click() }
+  })
+  await p.waitForTimeout(350)
+  const flattenOkTxt = await p.locator('#live-flatten-feedback').innerText().catch(() => '')
+  await p.locator('[data-flatten-position="KXETH15M-E1"]').click(); await p.waitForTimeout(200)
+  const flatten403Txt = await p.locator('#live-flatten-feedback').innerText().catch(() => '')
+  ok('C4E1 1-Click Flatten enforces double-submit lock with CSRF header and surfaces 403 fail-closed errors',
+    flattenPosts === 1 && lastFlattenCsrf === '1' && lastFlattenBody?.side === 'yes' &&
+      flattenOkTxt.includes('KXBTC15M-E1') && flatten403Txt.includes('Fail-closed') && !/\bNaN\b/.test(flatten403Txt),
+    `posts=${flattenPosts} ok=${flattenOkTxt.slice(0, 40)} err403=${flatten403Txt.slice(0, 50)}`)
+
+  // Check 3: Runner slot reprice/TP/SL/exit config controls, BUY/SELL & replace_count badges, OrderAmended/PositionExited ledger badges
+  await p.locator('[data-slot-reprice-cooldown="1"]').fill('20')
+  await p.locator('[data-slot-max-replaces="1"]').fill('4')
+  await p.locator('[data-slot-take-profit="1"]').fill('15')
+  await p.locator('[data-slot-stop-loss="1"]').fill('7')
+  await p.locator('[data-slot-exit-before-close="1"]').fill('60')
+  await p.locator('#runner-save-config-btn').click(); await p.waitForTimeout(250)
+
+  const slotBadgesTxt = await p.locator('[data-slot-lifecycle-badges="1"]').innerText().catch(() => '')
+  const buyBadgeTxt = await p.locator('[data-quote-action="q-e1-buy"]').innerText().catch(() => '')
+  const sellBadgeTxt = await p.locator('[data-quote-action="q-e1-sell"]').innerText().catch(() => '')
+  const replaceBadgeTxt = await p.locator('[data-quote-replace-count="q-e1-buy"]').innerText().catch(() => '')
+  const amendedLedgerVisible = await p.locator('[data-ledger-event="OrderAmended"]').isVisible()
+  const exitedLedgerVisible = await p.locator('[data-ledger-event="PositionExited"]').isVisible()
+  const desktopM = await p.evaluate(MEASURE)
+  await p.setViewportSize({ width: 390, height: 844 }); await p.waitForTimeout(200)
+  const mobileM = await p.evaluate(MEASURE)
+  const runnerTxt = await p.locator('#shadow-runner-deck').innerText()
+  const savedSlot = savedRunnerSlots?.[0]
+
+  ok('C4E1 Runner slot reprice/TP/SL/exit controls, BUY/SELL & replace_count badges & OrderAmended/PositionExited ledger pass 1440/390',
+    savedSlot?.reprice_cooldown_secs === 20 &&
+      savedSlot?.max_replaces_per_window === 4 &&
+      savedSlot?.take_profit_cents === 15 &&
+      savedSlot?.stop_loss_cents === 7 &&
+      savedSlot?.exit_before_close_secs === 60 &&
+      slotBadgesTxt.includes('Reprice 20s') && slotBadgesTxt.includes('TP +15c') && slotBadgesTxt.includes('SL -7c') &&
+      buyBadgeTxt.trim() === 'BUY' && sellBadgeTxt.trim() === 'SELL' && replaceBadgeTxt.includes('2x') &&
+      amendedLedgerVisible && exitedLedgerVisible &&
+      !/\bNaN\b|\bRune\b|\bRHL\b/.test(runnerTxt) &&
+      desktopM.docOverflow <= 0 && desktopM.lowContrast === 0 && desktopM.smallTargets === 0 &&
+      mobileM.docOverflow <= 0 && mobileM.lowContrast === 0 && mobileM.smallTargets === 0,
+    `saved=${JSON.stringify(savedSlot)} badges=${slotBadgesTxt.replace(/\s+/g, '|')} quotes=${buyBadgeTxt}/${sellBadgeTxt}/${replaceBadgeTxt} dOv=${desktopM.docOverflow} mOv=${mobileM.docOverflow} mLow=${mobileM.lowContrast} mSmall=${mobileM.smallTargets}`)
+  await ctx.close()
+}
+
 // 7. Update strip (loopback + non-loopback shared host, BANNER-FIX-BRIEF)
 {
   const { ctx, p } = await open(1440, 900)
