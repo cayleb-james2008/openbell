@@ -37,6 +37,7 @@ import {
   type LiveStatus,
   evaluateOrderRails,
 } from "@/lib/live";
+import type { RunnerMode } from "@/lib/runner";
 
 function shortTs(iso: string): string {
   if (!iso) return "-";
@@ -240,6 +241,7 @@ export function LiveAccountStrip({
   bundle,
   busy,
   workspaceOpen,
+  runnerMode,
   onToggleWorkspace,
   onArmConfirm,
   onDisarm,
@@ -250,6 +252,7 @@ export function LiveAccountStrip({
   bundle: LiveDeskBundle;
   busy: boolean;
   workspaceOpen: boolean;
+  runnerMode?: RunnerMode;
   onToggleWorkspace: () => void;
   onArmConfirm: () => void;
   onDisarm: () => void;
@@ -337,6 +340,33 @@ export function LiveAccountStrip({
                       : "Kalshi API not configured"}
               </span>
             </StatusPill>
+
+            {runnerMode && (
+              <StatusPill
+                id="live-runner-mode-pill"
+                tone={
+                  status.killed
+                    ? "error"
+                    : runnerMode === "live_auto"
+                      ? "warning"
+                      : runnerMode === "shadow"
+                        ? "info"
+                        : "neutral"
+                }
+                className="min-h-7 px-2.5 py-0.5 text-xs text-ink-2"
+              >
+                <span className="mono">
+                  Runner:{" "}
+                  {status.killed
+                    ? "Halted"
+                    : runnerMode === "live_auto"
+                      ? "Live Auto"
+                      : runnerMode === "shadow"
+                        ? "Shadow"
+                        : "Stopped"}
+                </span>
+              </StatusPill>
+            )}
           </div>
 
           {/* Center: Live Kalshi Account KPIs */}

@@ -336,6 +336,15 @@ for (const m of measures) {
     (await p.locator('#live-order-ticket').isVisible()) &&
     (await p.locator('#live-risk-rails-check [data-risk-rail]').count()) === 7
   ok('Live & Rails view renders Account Strip, Order Ticket, 7 Hard Risk Rails & Emergency Kill Switch', liveTicketOk)
+  const runnerDeckOk =
+    (await p.locator('#shadow-runner-deck').isVisible()) &&
+    (await p.locator('#runner-mode-badge').isVisible()) &&
+    (await p.locator('#runner-slots-card [data-runner-slot-row]').count()) >= 1 &&
+    (await p.locator('#runner-open-quotes-card [role="progressbar"]').count()) >= 1 &&
+    (await p.locator('#runner-strategy-stats-card [data-runner-stat-strategy]').count()) >= 1 &&
+    (await p.locator('#runner-ledger-card [data-runner-ledger-row]').count()) >= 1 &&
+    (await p.locator('#runner-start-live-btn').isDisabled())
+  ok('ShadowRunnerPanel renders mode badge, slot config, queue-ahead quotes, strategy rollup, ledger & fail-closed Live Auto gate', runnerDeckOk)
   await p.screenshot({ path: `${OUT}/live-desk-1440-light.png` })
   await p.locator('#tab-tape').click(); await p.waitForTimeout(200)
 
@@ -656,11 +665,90 @@ for (const m of measures) {
     series: ['KXBTC15M', 'KXETH15M', 'KXSOL15M', 'KXXRP15M'],
     mode: 'public_readonly_get',
   }
+  let runnerState = {
+    mode: 'stopped',
+    live_armed: false,
+    killed: false,
+    tick_interval_ms: 2000,
+    cancel_before_close_secs: 30,
+    bankroll_dollars: 250,
+    active_slots: [
+      {
+        slot_id: 1,
+        strategy: 'late-favourite-edge',
+        series: ['KXBTC15M', 'KXETH15M'],
+        max_contracts: 10,
+        execution_mode: 'maker',
+        auto_pause_drawdown_dollars: 25,
+        enabled: true,
+        paused: false,
+        pause_reason: null,
+        realized_pnl_dollars: 3.45,
+        drawdown_dollars: 0.4,
+        quotes_posted: 8,
+        fills: 5,
+        open_quotes_count: 1,
+        last_signal_epoch: 1700000900,
+      },
+    ],
+    open_quotes: [],
+    stats: {
+      quotes_posted: 8,
+      fills: 5,
+      fill_rate_pct: 62.5,
+      realized_pnl_dollars: 3.45,
+      unrealized_exposure_dollars: 0,
+      avg_fill_slippage_cents: 0.0,
+      avg_queue_wait_secs: 31,
+    },
+  }
+  const runnerLedgerEntries = [
+    {
+      id: 'run-led-1',
+      seq: 1,
+      ts: 1700000800,
+      event: 'OrderFilled',
+      mode: 'shadow',
+      slot_id: 1,
+      strategy: 'late-favourite-edge',
+      ticker: 'KXBTC15M-MOCK',
+      series: 'KXBTC15M',
+      order_id: 'shd-1',
+      side: 'yes',
+      execution_mode: 'maker',
+      limit_cents: 66,
+      fill_cents: 66,
+      contracts: 10,
+      slippage_cents: 0.0,
+      queue_wait_secs: 31,
+      fee_dollars: 0.04,
+      realized_pnl_dollars: 3.45,
+      result: 'yes',
+      reason: 'Queue depleted',
+    },
+  ]
+  const runnerSummary = [
+    {
+      strategy: 'late-favourite-edge',
+      quotes_posted: 8,
+      quotes_canceled: 2,
+      fills: 5,
+      windows_settled: 5,
+      fill_rate_pct: 62.5,
+      wins: 4,
+      losses: 1,
+      realized_pnl_dollars: 3.45,
+      total_fees_dollars: 0.2,
+      avg_fill_slippage_cents: 0.0,
+      avg_queue_wait_secs: 31,
+      paused_count: 0,
+    },
+  ]
   await p.route('**/api/home', async r => {
     const res = await r.fetch()
     const j = await res.json()
     j.version = '0.9.0'
-    j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan', 'tournament', 'auto_collector', 'live_kalshi', 'risk_rails', 'edge_audit']
+    j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan', 'tournament', 'auto_collector', 'live_kalshi', 'risk_rails', 'edge_audit', 'shadow_runner']
     j.collector = {
       ...j.collector,
       auto_collect_enabled: schedState.enabled,
@@ -747,12 +835,14 @@ for (const m of measures) {
     checkCsrf(r)
     hits.add('live-arm')
     liveState = { ...liveState, live_armed: true, killed: false, mode: 'live' }
+    runnerState = { ...runnerState, live_armed: true, killed: false }
     return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(liveState) })
   })
   await p.route('**/api/live/disarm*', r => {
     checkCsrf(r)
     hits.add('live-disarm')
     liveState = { ...liveState, live_armed: false, mode: 'paper' }
+    runnerState = { ...runnerState, live_armed: false, mode: runnerState.mode === 'live_auto' ? 'stopped' : runnerState.mode }
     return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(liveState) })
   })
   await p.route('**/api/live/order', r => {
@@ -780,7 +870,87 @@ for (const m of measures) {
     const n = liveOrders.length
     liveOrders = []
     liveState = { ...liveState, live_armed: false, killed: true, kill_reason: 'operator_kill_switch', mode: 'paper' }
+    runnerState = { ...runnerState, mode: 'stopped', live_armed: false, killed: true, open_quotes: [] }
     return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, disarmed: true, cancelled_count: n, errors: [], status: liveState }) })
+  })
+  await p.route('**/api/runner/status*', r => {
+    hits.add('runner-status')
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(runnerState) })
+  })
+  await p.route('**/api/runner/config*', r => {
+    checkCsrf(r)
+    hits.add('runner-config')
+    const b = JSON.parse(r.request().postData() || '{}')
+    runnerState = {
+      ...runnerState,
+      cancel_before_close_secs: Number(b.cancel_before_close_secs) || 30,
+      bankroll_dollars: Number(b.bankroll_dollars) || 250,
+      active_slots: Array.isArray(b.slots) ? b.slots.map((s, i) => ({
+        ...s,
+        paused: false,
+        pause_reason: null,
+        realized_pnl_dollars: runnerState.active_slots[i]?.realized_pnl_dollars ?? 0,
+        drawdown_dollars: 0,
+        quotes_posted: runnerState.active_slots[i]?.quotes_posted ?? 0,
+        fills: runnerState.active_slots[i]?.fills ?? 0,
+        open_quotes_count: 0,
+        last_signal_epoch: null,
+      })) : runnerState.active_slots,
+    }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(runnerState) })
+  })
+  await p.route('**/api/runner/start*', r => {
+    checkCsrf(r)
+    hits.add('runner-start')
+    const b = JSON.parse(r.request().postData() || '{}')
+    if (b.mode === 'live_auto' && (!liveState.live_armed || liveState.killed || !b.confirm_auto_live)) {
+      return r.fulfill({ status: 403, contentType: 'application/json', body: JSON.stringify({ error: 'live_auto requires armed state and confirm_auto_live' }) })
+    }
+    runnerState = {
+      ...runnerState,
+      mode: b.mode === 'live_auto' ? 'live_auto' : 'shadow',
+      open_quotes: [
+        {
+          order_id: b.mode === 'live_auto' ? 'live-q-1' : 'shd-q-1',
+          slot_id: 1,
+          strategy: 'late-favourite-edge',
+          ticker: 'KXBTC15M-MOCK',
+          series: 'KXBTC15M',
+          side: 'yes',
+          mode: b.mode === 'live_auto' ? 'live' : 'shadow',
+          execution_mode: 'maker',
+          limit_cents: 68,
+          contracts: 10,
+          remaining_contracts: 10,
+          queue_ahead_initial: 100,
+          queue_ahead_remaining: 25,
+          est_fill_eta_secs: 35,
+          posted_epoch: 1700000900,
+          close_epoch: 1700001200,
+          status: 'resting',
+        },
+      ],
+    }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(runnerState) })
+  })
+  await p.route('**/api/runner/stop*', r => {
+    checkCsrf(r)
+    hits.add('runner-stop')
+    const b = JSON.parse(r.request().postData() || '{}')
+    runnerState = {
+      ...runnerState,
+      mode: 'stopped',
+      open_quotes: b.cancel_resting === false ? runnerState.open_quotes : [],
+    }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(runnerState) })
+  })
+  await p.route('**/api/runner/ledger*', r => {
+    hits.add('runner-ledger')
+    const u = new URL(r.request().url())
+    const strat = u.searchParams.get('strategy')
+    const mode = u.searchParams.get('mode')
+    const entries = runnerLedgerEntries.filter(e => (!strat || e.strategy === strat) && (!mode || e.mode === mode))
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ entries, summary_by_strategy: runnerSummary }) })
   })
   await p.route('**/api/collector/status*', r => {
     hits.add('collector-status')
@@ -1015,7 +1185,7 @@ for (const m of measures) {
     return r.fulfill({
       status: 200,
       headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
-      body: 'event: tape\ndata: {"snapshots_written":1}\n\n',
+      body: 'event: tape\ndata: {"snapshots_written":1}\n\nevent: runner\ndata: {"kind":"quote_posted","slot_id":1,"strategy":"late-favourite-edge","ticker":"KXBTC15M-MOCK"}\n\n',
     })
   })
   await p.route('**/api/analytics/calibration*', r => {
@@ -1103,10 +1273,23 @@ for (const m of measures) {
   await p.locator('#tab-live').click(); await p.waitForTimeout(250)
   const balanceShown = (await p.locator('#live-balance-val').innerText()).includes('$1250.00') ||
     (await p.locator('#live-balance-val').innerText()).includes('$1,250.00')
+  const runnerLockedBeforeArm = await p.locator('#runner-start-live-btn').isDisabled()
+  await p.locator('#runner-save-config-btn').click(); await p.waitForTimeout(250)
+  await p.locator('#runner-start-shadow-btn').click(); await p.waitForTimeout(250)
+  const runnerShadowActive =
+    (await p.locator('#runner-mode-badge').innerText()).includes('Shadow') &&
+    (await p.locator('#runner-open-quotes-card [role="progressbar"]').count()) >= 1
+  await p.locator('#runner-ledger-strategy-filter').selectOption('late-favourite-edge'); await p.waitForTimeout(200)
+  await p.locator('[data-runner-ledger-mode="shadow"]').click(); await p.waitForTimeout(200)
+  await p.locator('#runner-stop-btn').click(); await p.waitForTimeout(250)
   await p.locator('#trading-mode-live').click(); await p.waitForTimeout(300)
   await p.locator('#arm-live-checkbox').check()
   await p.locator('#confirm-arm-live-btn').click(); await p.waitForTimeout(400)
   const armedPillOk = (await p.locator('#live-mode-pill').innerText()).includes('ARMED')
+  await p.locator('#runner-start-live-btn').click(); await p.waitForTimeout(250)
+  await p.locator('#runner-live-confirm-checkbox').check()
+  await p.locator('#runner-confirm-live-btn').click(); await p.waitForTimeout(300)
+  const runnerLiveActive = (await p.locator('#runner-mode-badge').innerText()).includes('Live Auto')
   await p.locator('#live-ticket-ticker').fill('KXBTC15M-MOCK')
   await p.locator('#live-ticket-count').fill('5')
   await p.locator('#live-ticket-price').fill('55')
@@ -1116,6 +1299,11 @@ for (const m of measures) {
   await p.locator('[data-cancel-order="ord-demo-1"]').click(); await p.waitForTimeout(250)
   await p.locator('#kill-switch-btn').click(); await p.waitForTimeout(300)
   const disarmedAfterKill = /KILLED|DISARMED/.test(await p.locator('#live-mode-pill').innerText())
+  const runnerHaltedAfterKill = /Halted|Stopped/.test(await p.locator('#runner-mode-badge').innerText())
+  ok('Shadow Runner API wire contract & SSE runner stream enforce fail-closed Live Auto gating, config/start/stop/ledger & kill-switch halt',
+    ['runner-status', 'runner-config', 'runner-start', 'runner-stop', 'runner-ledger'].every(k => hits.has(k)) &&
+      runnerLockedBeforeArm && runnerShadowActive && runnerLiveActive && runnerHaltedAfterKill,
+    `locked=${runnerLockedBeforeArm} shadow=${runnerShadowActive} live=${runnerLiveActive} halt=${runnerHaltedAfterKill}`)
   await p.locator('#tab-tape').click(); await p.waitForTimeout(200)
 
   await p.locator('#auto-collector-strip [data-collector-mode="60"]').click(); await p.waitForTimeout(250)
