@@ -169,10 +169,63 @@ export type RunnerSseEvent = {
   raw: Record<string, unknown>;
 };
 
-const MUTATION_HEADERS: HeadersInit = {
-  "Content-Type": "application/json",
-  "X-OpenBell-CSRF": "1",
+export type ExecutionHealthStatus = "active" | "throttled" | "quarantined";
+
+export type ExecutionHealthStrategy = {
+  strategy: string;
+  status: ExecutionHealthStatus;
+  throttle_mult: number;
+  reason: string;
+  rolling_fills: number;
+  markout_10s_cents: number | null;
+  markout_30s_cents: number | null;
+  markout_60s_cents: number | null;
+  settlement_markout_cents: number | null;
+  predicted_prob: number | null;
+  realized_win_rate: number | null;
+  assumed_fill_rate_pct: number | null;
+  realized_fill_rate_pct: number | null;
+  expected_slippage_cents: number | null;
+  realized_slippage_cents: number | null;
+  rolling_net_pnl_dollars: number;
 };
+
+export type ExecutionHealthOverall = {
+  active_count: number;
+  throttled_count: number;
+  quarantined_count: number;
+  rolling_fills: number;
+  avg_markout_30s_cents: number | null;
+  avg_slippage_residual_cents: number | null;
+  rolling_net_pnl_dollars: number;
+};
+
+export type ExecutionHealthResponse = {
+  ok: boolean;
+  strategies: ExecutionHealthStrategy[];
+  overall: ExecutionHealthOverall;
+  source: "server" | "preview";
+};
+
+export type SyncAllocatorResult = {
+  ok: boolean;
+  live_armed: boolean;
+  mode: RunnerMode;
+  synced_slots: RunnerSlotConfig[];
+  skipped_quarantined: string[];
+  status: RunnerStatus | null;
+  message: string;
+  source: "server" | "preview";
+};
+
+function mutationHeaders(csrfToken?: string): HeadersInit {
+  return {
+    "Content-Type": "application/json",
+    "X-OpenBell-CSRF": csrfToken && csrfToken.trim() ? csrfToken.trim() : "1",
+  };
+}
+
+const MUTATION_HEADERS: HeadersInit = mutationHeaders();
 
 export const AVAILABLE_SERIES = [
   "KXBTC15M",
@@ -939,5 +992,279 @@ export function subscribeRunnerStream(
       es.close();
       es = null;
     }
+  };
+}
+
+function normalizeHealthStatus(raw: unknown): ExecutionHealthStatus {
+  const s = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (s === "quarantined") return "quarantined";
+  if (s === "throttled") return "throttled";
+  return "active";
+}
+
+function finiteOrNull(v: unknown): number | null {
+  return isNum(v) && Number.isFinite(v) ? v : null;
+}
+
+function normalizeHealthStrategy(raw: unknown, idx: number): ExecutionHealthStrategy | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  const status = normalizeHealthStatus(o.status);
+  const rawMult = pickNum(o, ["throttle_mult"]);
+  const throttleMult =
+    rawMult !== null && Number.isFinite(rawMult)
+      ? Math.max(0, Math.min(1, rawMult))
+      : status === "quarantined"
+        ? 0
+        : status === "throttled"
+          ? 0.5
+          : 1;
+  return {
+    strategy: cleanStr(o.strategy, `strategy-${idx + 1}`),
+    status,
+    throttle_mult: throttleMult,
+    reason: typeof o.reason === "string" ? o.reason.trim() : "",
+    rolling_fills: Math.max(0, Math.round(pickNum(o, ["rolling_fills", "fills"]) ?? 0)),
+    markout_10s_cents: finiteOrNull(o.markout_10s_cents),
+    markout_30s_cents: finiteOrNull(o.markout_30s_cents),
+    markout_60s_cents: finiteOrNull(o.markout_60s_cents),
+    settlement_markout_cents: finiteOrNull(o.settlement_markout_cents),
+    predicted_prob: finiteOrNull(o.predicted_prob),
+    realized_win_rate: finiteOrNull(o.realized_win_rate),
+    assumed_fill_rate_pct: finiteOrNull(o.assumed_fill_rate_pct),
+    realized_fill_rate_pct: finiteOrNull(o.realized_fill_rate_pct),
+    expected_slippage_cents: finiteOrNull(o.expected_slippage_cents),
+    realized_slippage_cents: finiteOrNull(o.realized_slippage_cents),
+    rolling_net_pnl_dollars: pickNum(o, ["rolling_net_pnl_dollars", "net_pnl_dollars"]) ?? 0,
+  };
+}
+
+function computeOverallHealth(
+  strategies: ExecutionHealthStrategy[],
+  rawOverall?: Record<string, unknown>,
+): ExecutionHealthOverall {
+  let active = 0;
+  let throttled = 0;
+  let quarantined = 0;
+  let rollingFills = 0;
+  let netPnl = 0;
+  const m30: number[] = [];
+  const slipRes: number[] = [];
+
+  for (const s of strategies) {
+    if (s.status === "quarantined") quarantined += 1;
+    else if (s.status === "throttled") throttled += 1;
+    else active += 1;
+    rollingFills += s.rolling_fills;
+    netPnl += s.rolling_net_pnl_dollars;
+    if (s.markout_30s_cents !== null) m30.push(s.markout_30s_cents);
+    if (s.realized_slippage_cents !== null && s.expected_slippage_cents !== null) {
+      slipRes.push(s.realized_slippage_cents - s.expected_slippage_cents);
+    }
+  }
+
+  const avg30 =
+    finiteOrNull(rawOverall?.avg_markout_30s_cents) ??
+    (m30.length > 0 ? Number((m30.reduce((a, b) => a + b, 0) / m30.length).toFixed(2)) : null);
+  const avgRes =
+    finiteOrNull(rawOverall?.avg_slippage_residual_cents) ??
+    (slipRes.length > 0 ? Number((slipRes.reduce((a, b) => a + b, 0) / slipRes.length).toFixed(2)) : null);
+
+  return {
+    active_count: Math.max(0, Math.round(finiteOrNull(rawOverall?.active_count) ?? active)),
+    throttled_count: Math.max(0, Math.round(finiteOrNull(rawOverall?.throttled_count) ?? throttled)),
+    quarantined_count: Math.max(0, Math.round(finiteOrNull(rawOverall?.quarantined_count) ?? quarantined)),
+    rolling_fills: Math.max(0, Math.round(finiteOrNull(rawOverall?.rolling_fills) ?? rollingFills)),
+    avg_markout_30s_cents: avg30,
+    avg_slippage_residual_cents: avgRes,
+    rolling_net_pnl_dollars: finiteOrNull(rawOverall?.rolling_net_pnl_dollars) ?? Number(netPnl.toFixed(2)),
+  };
+}
+
+export function normalizeExecutionHealth(
+  raw: unknown,
+  source: "server" | "preview" = "server",
+): ExecutionHealthResponse {
+  const o = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const listRaw = Array.isArray(o.strategies) ? o.strategies : [];
+  const strategies = listRaw
+    .map((item, idx) => normalizeHealthStrategy(item, idx))
+    .filter((item): item is ExecutionHealthStrategy => item !== null);
+  const rawOverall =
+    o.overall && typeof o.overall === "object" ? (o.overall as Record<string, unknown>) : undefined;
+  return {
+    ok: o.ok === undefined ? true : Boolean(o.ok),
+    strategies,
+    overall: computeOverallHealth(strategies, rawOverall),
+    source,
+  };
+}
+
+export function buildPreviewExecutionHealth(strategies: Strategy[] = []): ExecutionHealthResponse {
+  const names = strategies.map((s) => cleanStr(s?.strategy, "")).filter((s) => s.length > 0);
+  const s1 = names[0] || "late-favourite-edge";
+  const s2 = names[1] || "mid-band-reversion";
+  const s3 = names[2] || "spread-squeeze-no";
+  const rows: ExecutionHealthStrategy[] = [
+    {
+      strategy: s1,
+      status: "active",
+      throttle_mult: 1.0,
+      reason: "Positive +30s markout and fill rate within expected bounds",
+      rolling_fills: 18,
+      markout_10s_cents: 0.65,
+      markout_30s_cents: 1.42,
+      markout_60s_cents: 1.88,
+      settlement_markout_cents: 2.35,
+      predicted_prob: 0.78,
+      realized_win_rate: 0.778,
+      assumed_fill_rate_pct: 75.0,
+      realized_fill_rate_pct: 72.0,
+      expected_slippage_cents: 0.5,
+      realized_slippage_cents: 0.42,
+      rolling_net_pnl_dollars: 5.4,
+    },
+    {
+      strategy: s2,
+      status: "throttled",
+      throttle_mult: 0.5,
+      reason: "Realized fill rate 18.0pp below assumed maker target",
+      rolling_fills: 14,
+      markout_10s_cents: 0.12,
+      markout_30s_cents: -0.35,
+      markout_60s_cents: -0.48,
+      settlement_markout_cents: -0.2,
+      predicted_prob: 0.64,
+      realized_win_rate: 0.571,
+      assumed_fill_rate_pct: 70.0,
+      realized_fill_rate_pct: 52.0,
+      expected_slippage_cents: 0.5,
+      realized_slippage_cents: 0.95,
+      rolling_net_pnl_dollars: -0.45,
+    },
+    {
+      strategy: s3,
+      status: "quarantined",
+      throttle_mult: 0.0,
+      reason: "Adverse +30s markout (-1.65c) and negative rolling net PnL",
+      rolling_fills: 12,
+      markout_10s_cents: -0.9,
+      markout_30s_cents: -1.65,
+      markout_60s_cents: -2.1,
+      settlement_markout_cents: -2.4,
+      predicted_prob: 0.58,
+      realized_win_rate: 0.417,
+      assumed_fill_rate_pct: 65.0,
+      realized_fill_rate_pct: 38.0,
+      expected_slippage_cents: 0.5,
+      realized_slippage_cents: 1.45,
+      rolling_net_pnl_dollars: -3.15,
+    },
+  ];
+  return {
+    ok: true,
+    strategies: rows,
+    overall: computeOverallHealth(rows),
+    source: "preview",
+  };
+}
+
+export async function fetchExecutionHealth(
+  dataset?: Dataset,
+  strategies?: Strategy[],
+): Promise<ExecutionHealthResponse> {
+  const qs = dataset === "fixture" ? "?dataset=fixture" : "";
+  try {
+    const r = await fetch(`/api/analytics/execution-health${qs}`);
+    if (r.ok) {
+      return normalizeExecutionHealth(await r.json(), "server");
+    }
+  } catch {
+    /* fallback to deterministic preview */
+  }
+  return buildPreviewExecutionHealth(strategies);
+}
+
+export async function overrideQuarantine(
+  strategy: string,
+  action: "reset" | "quarantine",
+  csrfToken?: string,
+  reason?: string,
+): Promise<ExecutionHealthResponse> {
+  const cleanStrategy = strategy.trim();
+  if (!cleanStrategy) {
+    throw new RunnerApiError(400, "Strategy name is required for quarantine override.");
+  }
+  const r = await fetch("/api/analytics/quarantine/override", {
+    method: "POST",
+    headers: mutationHeaders(csrfToken),
+    body: JSON.stringify({
+      strategy: cleanStrategy,
+      action,
+      ...(reason && reason.trim() ? { reason: reason.trim() } : {}),
+    }),
+  });
+  if (!r.ok) {
+    throw new RunnerApiError(r.status, await parseRunnerError(r, `Quarantine override answered ${r.status}`));
+  }
+  const body = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+  if (Array.isArray(body.strategies)) {
+    return normalizeExecutionHealth(body, "server");
+  }
+  if (body.execution_health && typeof body.execution_health === "object") {
+    return normalizeExecutionHealth(body.execution_health, "server");
+  }
+  return fetchExecutionHealth();
+}
+
+export async function syncAllocatorToRunner(
+  csrfToken?: string,
+  params?: Record<string, unknown>,
+): Promise<SyncAllocatorResult> {
+  const r = await fetch("/api/runner/sync-allocator", {
+    method: "POST",
+    headers: mutationHeaders(csrfToken),
+    body: JSON.stringify(params ?? {}),
+  });
+  if (!r.ok) {
+    throw new RunnerApiError(r.status, await parseRunnerError(r, `Sync allocator answered ${r.status}`));
+  }
+  const body = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+  const hasStatus = Boolean(body.status && typeof body.status === "object") || Array.isArray(body.active_slots);
+  const status = hasStatus ? normalizeRunnerStatus(unwrapRunnerStatus(body), "server") : null;
+  const rawSlots = Array.isArray(body.synced_slots)
+    ? body.synced_slots
+    : Array.isArray(body.slots)
+      ? body.slots
+      : status?.active_slots ?? [];
+  const syncedSlots: RunnerSlotConfig[] = rawSlots
+    .map((s, idx) => normalizeSlotState(s, idx))
+    .filter((s): s is RunnerSlotState => s !== null)
+    .map((s) => ({
+      slot_id: s.slot_id,
+      strategy: s.strategy,
+      series: s.series,
+      max_contracts: s.max_contracts,
+      execution_mode: s.execution_mode,
+      auto_pause_drawdown_dollars: s.auto_pause_drawdown_dollars,
+      enabled: s.enabled,
+    }));
+  const skippedQuarantined = Array.isArray(body.skipped_quarantined)
+    ? body.skipped_quarantined.filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+    : [];
+  const safeMode: RunnerMode =
+    status?.mode === "shadow" || normalizeMode(body.mode) === "shadow" ? "shadow" : "stopped";
+  return {
+    ok: body.ok === undefined ? true : Boolean(body.ok),
+    live_armed: false,
+    mode: safeMode,
+    synced_slots: syncedSlots,
+    skipped_quarantined: skippedQuarantined,
+    status: status ? { ...status, live_armed: false, mode: safeMode } : null,
+    message:
+      typeof body.message === "string" && body.message.trim()
+        ? body.message.trim()
+        : `Synced ${syncedSlots.length} allocator slot${syncedSlots.length === 1 ? "" : "s"} to Runner (live_armed: false).`,
+    source: "server",
   };
 }

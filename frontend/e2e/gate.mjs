@@ -215,6 +215,75 @@ async function open(w, h, theme = 'light', extra = {}) {
       }),
     })
   })
+  await p.route(/\/api\/analytics\/execution-health(\?.*)?$/, async r => {
+    try {
+      const res = await r.fetch()
+      if (res.status() !== 404) return r.fulfill({ response: res })
+    } catch {}
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        strategies: [
+          {
+            strategy: 'late-favourite-edge',
+            status: 'active',
+            throttle_mult: 1.0,
+            reason: 'Positive +30s markout and fill rate within expected bounds',
+            rolling_fills: 18,
+            markout_10s_cents: 0.65,
+            markout_30s_cents: 1.42,
+            markout_60s_cents: 1.88,
+            settlement_markout_cents: 2.35,
+            predicted_prob: 0.78,
+            realized_win_rate: 0.778,
+            assumed_fill_rate_pct: 75.0,
+            realized_fill_rate_pct: 72.0,
+            expected_slippage_cents: 0.5,
+            realized_slippage_cents: 0.42,
+            rolling_net_pnl_dollars: 5.4,
+          },
+          {
+            strategy: 'mid-band-reversion',
+            status: 'throttled',
+            throttle_mult: 0.5,
+            reason: 'Realized fill rate below assumed maker target',
+            rolling_fills: 14,
+            markout_10s_cents: 0.12,
+            markout_30s_cents: -0.35,
+            markout_60s_cents: -0.48,
+            settlement_markout_cents: -0.2,
+            predicted_prob: 0.64,
+            realized_win_rate: 0.571,
+            assumed_fill_rate_pct: 70.0,
+            realized_fill_rate_pct: 52.0,
+            expected_slippage_cents: 0.5,
+            realized_slippage_cents: 0.95,
+            rolling_net_pnl_dollars: -0.45,
+          },
+          {
+            strategy: 'spread-squeeze-no',
+            status: 'quarantined',
+            throttle_mult: 0.0,
+            reason: 'Adverse +30s markout (-1.65c) and negative rolling net PnL',
+            rolling_fills: 12,
+            markout_10s_cents: -0.9,
+            markout_30s_cents: -1.65,
+            markout_60s_cents: -2.1,
+            settlement_markout_cents: -2.4,
+            predicted_prob: 0.58,
+            realized_win_rate: 0.417,
+            assumed_fill_rate_pct: 65.0,
+            realized_fill_rate_pct: 38.0,
+            expected_slippage_cents: 0.5,
+            realized_slippage_cents: 1.45,
+            rolling_net_pnl_dollars: -3.15,
+          },
+        ],
+      }),
+    })
+  })
   await p.route(/\/api\/orderbook(\/.*|\?.*)?$/, async r => {
     try {
       const res = await r.fetch()
@@ -805,6 +874,65 @@ for (const m of measures) {
       avg_queue_wait_secs: 31,
     },
   }
+  let execHealthState = {
+    ok: true,
+    strategies: [
+      {
+        strategy: 'late-favourite-edge',
+        status: 'active',
+        throttle_mult: 1.0,
+        reason: 'Positive +30s markout and fill rate within expected bounds',
+        rolling_fills: 18,
+        markout_10s_cents: 0.65,
+        markout_30s_cents: 1.42,
+        markout_60s_cents: 1.88,
+        settlement_markout_cents: 2.35,
+        predicted_prob: 0.78,
+        realized_win_rate: 0.778,
+        assumed_fill_rate_pct: 75.0,
+        realized_fill_rate_pct: 72.0,
+        expected_slippage_cents: 0.5,
+        realized_slippage_cents: 0.42,
+        rolling_net_pnl_dollars: 5.4,
+      },
+      {
+        strategy: 'mid-band-reversion',
+        status: 'throttled',
+        throttle_mult: 0.5,
+        reason: 'Realized fill rate 18.0pp below assumed maker target',
+        rolling_fills: 14,
+        markout_10s_cents: 0.12,
+        markout_30s_cents: -0.35,
+        markout_60s_cents: -0.48,
+        settlement_markout_cents: -0.2,
+        predicted_prob: 0.64,
+        realized_win_rate: 0.571,
+        assumed_fill_rate_pct: 70.0,
+        realized_fill_rate_pct: 52.0,
+        expected_slippage_cents: 0.5,
+        realized_slippage_cents: 0.95,
+        rolling_net_pnl_dollars: -0.45,
+      },
+      {
+        strategy: 'spread-squeeze-no',
+        status: 'quarantined',
+        throttle_mult: 0.0,
+        reason: 'Adverse +30s markout (-1.65c) and negative rolling net PnL',
+        rolling_fills: 12,
+        markout_10s_cents: -0.9,
+        markout_30s_cents: -1.65,
+        markout_60s_cents: -2.1,
+        settlement_markout_cents: -2.4,
+        predicted_prob: 0.58,
+        realized_win_rate: 0.417,
+        assumed_fill_rate_pct: 65.0,
+        realized_fill_rate_pct: 38.0,
+        expected_slippage_cents: 0.5,
+        realized_slippage_cents: 1.45,
+        rolling_net_pnl_dollars: -3.15,
+      },
+    ],
+  }
   const runnerLedgerEntries = [
     {
       id: 'run-led-1',
@@ -1189,6 +1317,109 @@ for (const m of measures) {
     const mode = u.searchParams.get('mode')
     const entries = runnerLedgerEntries.filter(e => (!strat || e.strategy === strat) && (!mode || e.mode === mode))
     return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ entries, summary_by_strategy: runnerSummary }) })
+  })
+  await p.route('**/api/runner/sync-allocator*', r => {
+    checkCsrf(r)
+    hits.add('runner-sync-allocator')
+    const syncedSlots = [
+      {
+        slot_id: 1,
+        strategy: 'late-favourite-edge',
+        series: ['KXBTC15M', 'KXETH15M'],
+        max_contracts: 12,
+        execution_mode: 'maker',
+        auto_pause_drawdown_dollars: 25,
+        enabled: true,
+        paused: false,
+        pause_reason: null,
+        realized_pnl_dollars: 3.45,
+        drawdown_dollars: 0.4,
+        quotes_posted: 8,
+        fills: 5,
+        open_quotes_count: 0,
+        last_signal_epoch: 1700000900,
+      },
+      {
+        slot_id: 2,
+        strategy: 'mid-band-reversion',
+        series: ['KXSOL15M'],
+        max_contracts: 5,
+        execution_mode: 'maker',
+        auto_pause_drawdown_dollars: 20,
+        enabled: true,
+        paused: false,
+        pause_reason: null,
+        realized_pnl_dollars: 0,
+        drawdown_dollars: 0,
+        quotes_posted: 0,
+        fills: 0,
+        open_quotes_count: 0,
+        last_signal_epoch: null,
+      },
+    ]
+    runnerState = {
+      ...runnerState,
+      live_armed: false,
+      mode: runnerState.mode === 'live_auto' ? 'stopped' : runnerState.mode,
+      active_slots: syncedSlots,
+    }
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        live_armed: false,
+        mode: runnerState.mode,
+        synced_slots: syncedSlots,
+        skipped_quarantined: ['spread-squeeze-no'],
+        status: runnerState,
+      }),
+    })
+  })
+  await p.unroute(/\/api\/analytics\/execution-health(\?.*)?$/)
+  await p.route('**/api/analytics/execution-health*', r => {
+    hits.add('execution-health-get')
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(execHealthState) })
+  })
+  await p.route('**/api/analytics/quarantine/override*', r => {
+    checkCsrf(r)
+    const b = JSON.parse(r.request().postData() || '{}')
+    if (b.strategy && (b.action === 'reset' || b.action === 'quarantine')) {
+      hits.add(`quarantine-override-${b.action}`)
+    }
+    execHealthState = {
+      ...execHealthState,
+      strategies: execHealthState.strategies.map(s => {
+        if (s.strategy !== b.strategy) return s
+        if (b.action === 'quarantine') {
+          return {
+            ...s,
+            status: 'quarantined',
+            throttle_mult: 0.0,
+            reason: b.reason || 'Operator manual quarantine override',
+          }
+        }
+        return {
+          ...s,
+          status: 'active',
+          throttle_mult: 1.0,
+          reason: 'Operator reset to active',
+        }
+      }),
+    }
+    runnerState = {
+      ...runnerState,
+      active_slots: runnerState.active_slots.map(sl =>
+        sl.strategy === b.strategy
+          ? {
+              ...sl,
+              paused: b.action === 'quarantine',
+              pause_reason: b.action === 'quarantine' ? 'Quarantined by operator override' : null,
+            }
+          : sl,
+      ),
+    }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(execHealthState) })
   })
   await p.route('**/api/collector/status*', r => {
     hits.add('collector-status')
@@ -1721,6 +1952,32 @@ for (const m of measures) {
     ['runner-status', 'runner-config', 'runner-start', 'runner-stop', 'runner-ledger'].every(k => hits.has(k)) &&
       runnerLockedBeforeArm && runnerShadowActive && runnerLiveActive && runnerHaltedAfterKill,
     `locked=${runnerLockedBeforeArm} shadow=${runnerShadowActive} live=${runnerLiveActive} halt=${runnerHaltedAfterKill}`)
+
+  // v0.31.0 Execution Health & Markout + Quarantine/Reset override wire contract on Live tab
+  const execHealthVisible = await p.locator('#execution-health-panel[data-testid="execution-health-panel"]').isVisible()
+  const execHealthTxt = await p.locator('#execution-health-panel').innerText()
+  const badgesNonMono = await p.locator('#execution-health-panel [data-health-status-badge]').evaluateAll(els =>
+    els.length >= 3 && els.every(el => !getComputedStyle(el).fontFamily.toLowerCase().includes('mono')),
+  )
+  await p.locator('#execution-health-panel [data-quarantine-btn="late-favourite-edge"]').click(); await p.waitForTimeout(250)
+  const badgeAfterQuarantine = (await p.locator('#execution-health-panel [data-health-status-badge="late-favourite-edge"]').innerText()).trim()
+  const slotPauseReasonTxt = (await p.locator('#runner-slots-card [data-slot-pause-reason="1"]').innerText().catch(() => '')).trim()
+  await p.locator('#execution-health-panel [data-reset-quarantine-btn="late-favourite-edge"]').click(); await p.waitForTimeout(250)
+  const badgeAfterReset = (await p.locator('#execution-health-panel [data-health-status-badge="late-favourite-edge"]').innerText()).trim()
+  ok('Execution Health & Markout panel renders markout curves, residuals, persistent slot pause_reason, non-mono status badges & Quarantine/Reset overrides',
+    hits.has('execution-health-get') &&
+      hits.has('quarantine-override-quarantine') &&
+      hits.has('quarantine-override-reset') &&
+      execHealthVisible &&
+      badgesNonMono &&
+      execHealthTxt.includes('+1.42c') &&
+      execHealthTxt.includes('78.0% / 77.8%') &&
+      execHealthTxt.includes('75.0% / 72.0%') &&
+      badgeAfterQuarantine === 'Quarantined' &&
+      slotPauseReasonTxt.includes('Quarantined by operator override') &&
+      badgeAfterReset === 'Active',
+    `visible=${execHealthVisible} nonMono=${badgesNonMono} q=${badgeAfterQuarantine} pause=${slotPauseReasonTxt} reset=${badgeAfterReset}`)
+
   await p.locator('#tab-tape').click(); await p.waitForTimeout(200)
   const tapeL2PillTxt = (await p.locator('#tape-l2-feed-pill').innerText()).trim()
   const stripL2PillTxt = (await p.locator('#l2-feed-pill').innerText()).trim()
@@ -1797,7 +2054,23 @@ for (const m of measures) {
       savedScripts.has('synth-pav-custom') &&
       deletedScripts.has('synth-pav-custom-copy'),
     `saved=${[...savedScripts.keys()].join(',')} deleted=${[...deletedScripts].join(',')}`)
-  await p.locator('#tab-slots').click(); await p.waitForTimeout(200)
+  await p.locator('#tab-slots').click(); await p.waitForTimeout(250)
+  const syncBtnVisible = await p.locator('#sync-allocator-runner-btn').isVisible()
+  await p.locator('#sync-allocator-runner-btn').click(); await p.waitForTimeout(250)
+  const syncBannerTxt = (await p.locator('#allocator-runner-sync-banner').innerText().catch(() => '')).trim()
+  if ((await p.locator('#auto-allocator-panel [data-allocator-decay-badge]').count()) === 0) {
+    await p.locator('#allocator-quarantine-toggle').click(); await p.waitForTimeout(150)
+  }
+  const allocBadgesNonMono = await p.locator('#allocator-sync-status-pill, #auto-allocator-panel [data-allocator-decay-badge]').evaluateAll(els =>
+    els.length >= 1 && els.every(el => !getComputedStyle(el).fontFamily.toLowerCase().includes('mono')),
+  )
+  ok('AutoAllocatorPanel Sync to Runner posts with CSRF, keeps live_armed: false, and shows non-mono decay badges +30s markout',
+    hits.has('runner-sync-allocator') &&
+      syncBtnVisible &&
+      syncBannerTxt.includes('Runner Synced') &&
+      syncBannerTxt.includes('live_armed: false') &&
+      allocBadgesNonMono,
+    `btn=${syncBtnVisible} nonMono=${allocBadgesNonMono} banner=${syncBannerTxt.slice(0, 100)}`)
   await Promise.all([p.waitForEvent('download'), p.locator('#export-report-md').click()])
   await p.locator('#run-edge-audit-btn').click(); await p.waitForTimeout(450)
   const scorecardText = await p.locator('#readiness-scorecard').innerText()
@@ -2157,6 +2430,118 @@ for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light'
       mPanel.docOverflow <= 0 && mPanel.clipped.length === 0 && mPanel.textClipped.length === 0 && mPanel.smallTargets === 0 && mPanel.lowContrast === 0 &&
       mModal.docOverflow <= 0 && mModal.clipped.length === 0 && mModal.textClipped.length === 0 && mModal.smallTargets === 0 && mModal.lowContrast === 0,
     `panel=${panelOk} modal=${modalVisible} clean=${noForbiddenTerms} pOv=${mPanel.docOverflow} pClip=${mPanel.clipped.join('|')} pTClip=${mPanel.textClipped.join('|')} pLow=${mPanel.lowContrast}(${mPanel.lowSample.join('|')}) pSmall=${mPanel.smallTargets}(${mPanel.smallSample.join('|')}) mOv=${mModal.docOverflow} mClip=${mModal.clipped.join('|')} mTClip=${mModal.textClipped.join('|')} mLow=${mModal.lowContrast}(${mModal.lowSample.join('|')}) mSmall=${mModal.smallTargets}(${mModal.smallSample.join('|')})`,
+  )
+  await ctx.close()
+}
+
+// 5d. v0.31.0 Execution Health & Allocator Sync across 1440x900 & 390x844 Light & Dark: 0px overflow, contrast, touch, zero Rune/RHL, non-mono status badges
+for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light', 390, 844], ['dark', 390, 844]]) {
+  const { ctx, p } = await open(w, h, theme)
+  await p.route('**/api/home*', async r => {
+    const res = await r.fetch()
+    const j = await res.json()
+    j.version = '0.31.0'
+    j.capabilities = ['sse', 'live_kalshi', 'risk_rails', 'shadow_runner', 'live_reconcile', 'execution_health']
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
+  })
+  await p.route('**/api/runner/status*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      mode: 'shadow',
+      live_armed: false,
+      killed: false,
+      tick_interval_ms: 2000,
+      cancel_before_close_secs: 30,
+      bankroll_dollars: 250,
+      active_slots: [
+        {
+          slot_id: 1,
+          strategy: 'late-favourite-edge',
+          series: ['KXBTC15M'],
+          max_contracts: 12,
+          execution_mode: 'maker',
+          auto_pause_drawdown_dollars: 25,
+          enabled: true,
+          paused: false,
+          pause_reason: null,
+          realized_pnl_dollars: 4.18,
+          drawdown_dollars: 0.4,
+          quotes_posted: 14,
+          fills: 9,
+          open_quotes_count: 1,
+          last_signal_epoch: 1700000900,
+        },
+        {
+          slot_id: 2,
+          strategy: 'spread-squeeze-no',
+          series: ['KXDOGE15M'],
+          max_contracts: 8,
+          execution_mode: 'taker',
+          auto_pause_drawdown_dollars: 15,
+          enabled: true,
+          paused: true,
+          pause_reason: 'Auto-quarantined: -1.65c +30s markout decay',
+          realized_pnl_dollars: -3.15,
+          drawdown_dollars: 3.15,
+          quotes_posted: 12,
+          fills: 6,
+          open_quotes_count: 0,
+          last_signal_epoch: 1700000500,
+        },
+      ],
+      open_quotes: [],
+      stats: { quotes_posted: 26, fills: 15, fill_rate_pct: 57.7, realized_pnl_dollars: 1.03, unrealized_exposure_dollars: 0, avg_fill_slippage_cents: 0.25, avg_queue_wait_secs: 32 },
+      last_error: null,
+    }),
+  }))
+  await p.route('**/api/runner/ledger*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"entries":[],"summary_by_strategy":[]}' }))
+  await p.route('**/api/runner/sync-allocator*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ok: true,
+      live_armed: false,
+      mode: 'shadow',
+      synced_slots: [
+        { slot_id: 1, strategy: 'late-favourite-edge', series: ['KXBTC15M'], max_contracts: 12, execution_mode: 'maker', auto_pause_drawdown_dollars: 25, enabled: true },
+      ],
+      skipped_quarantined: ['spread-squeeze-no'],
+    }),
+  }))
+
+  await p.goto(FX); await ready(p); await p.waitForTimeout(300)
+  await p.locator('#tab-slots').click(); await p.waitForTimeout(300)
+  await p.locator('#sync-allocator-runner-btn').click(); await p.waitForTimeout(200)
+  const slotsM = await p.evaluate(MEASURE)
+  const slotsTxt = await p.evaluate(() => document.body.innerText)
+  const slotsSyncOk = (await p.locator('#allocator-runner-sync-banner').isVisible()) && (await p.locator('#auto-allocator-panel [data-allocator-decay-badge]').count()) >= 1
+  const slotsNonMono = await p.locator('#allocator-sync-status-pill, #auto-allocator-panel [data-allocator-decay-badge]').evaluateAll(els =>
+    els.length >= 2 && els.every(el => !getComputedStyle(el).fontFamily.toLowerCase().includes('mono')),
+  )
+
+  await p.locator('#tab-live').click(); await p.waitForTimeout(300)
+  const liveM = await p.evaluate(MEASURE)
+  const liveTxt = await p.evaluate(() => document.body.innerText)
+  const healthOk =
+    (await p.locator('#execution-health-panel[data-testid="execution-health-panel"]').isVisible()) &&
+    (await p.locator('#runner-slots-card [data-slot-pause-reason="2"]').isVisible()) &&
+    (await p.locator('#execution-health-panel [data-quarantine-btn]').count()) >= 1 &&
+    (await p.locator('#execution-health-panel [data-reset-quarantine-btn]').count()) >= 1
+  const healthNonMono = await p.locator('#exec-health-summary-pill, #execution-health-panel [data-health-status-badge]').evaluateAll(els =>
+    els.length >= 4 && els.every(el => !getComputedStyle(el).fontFamily.toLowerCase().includes('mono')),
+  )
+  const noForbidden = !/\bRune\b/i.test(slotsTxt) && !/\bRHL\b/.test(slotsTxt) && !/\bRune\b/i.test(liveTxt) && !/\bRHL\b/.test(liveTxt)
+  ok(
+    `Execution Health, Sync to Runner & Quarantine badges pass ${w}x${h} ${theme} (0px overflow, contrast, touch, non-mono, zero Rune/RHL)`,
+    slotsSyncOk &&
+      slotsNonMono &&
+      healthOk &&
+      healthNonMono &&
+      noForbidden &&
+      slotsM.docOverflow <= 0 && slotsM.clipped.length === 0 && slotsM.textClipped.length === 0 && slotsM.smallTargets === 0 && slotsM.lowContrast === 0 && slotsM.svgBad === 0 &&
+      liveM.docOverflow <= 0 && liveM.clipped.length === 0 && liveM.textClipped.length === 0 && liveM.smallTargets === 0 && liveM.lowContrast === 0 && liveM.svgBad === 0,
+    `sync=${slotsSyncOk} sNonMono=${slotsNonMono} health=${healthOk} hNonMono=${healthNonMono} clean=${noForbidden} sOv=${slotsM.docOverflow} sLow=${slotsM.lowContrast}(${slotsM.lowSample.join('|')}) sSmall=${slotsM.smallTargets}(${slotsM.smallSample.join('|')}) lOv=${liveM.docOverflow} lLow=${liveM.lowContrast}(${liveM.lowSample.join('|')}) lSmall=${liveM.smallTargets}(${liveM.smallSample.join('|')})`,
   )
   await ctx.close()
 }

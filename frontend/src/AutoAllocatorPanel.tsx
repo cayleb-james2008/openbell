@@ -4,7 +4,7 @@
 // $500/day Go/No-Go verdict, custom zero-bloat SVG equity comparison, and 1-click ticket staging
 // gated behind fail-closed Hard Risk Rails (live_armed: false on boot).
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { CheckCircle2, ChevronDown, Copy, Download, RefreshCw, ShieldAlert, ShieldCheck, ShieldOff, SlidersHorizontal, TrendingUp } from "lucide-react";
+import { ArrowRightLeft, CheckCircle2, ChevronDown, Copy, Download, RefreshCw, ShieldAlert, ShieldCheck, ShieldOff, SlidersHorizontal, TrendingUp } from "lucide-react";
 import { toast } from "sonner";
 import {
   Badge,
@@ -31,9 +31,15 @@ import {
   type AllocatorSizingMode,
   type AutoAllocatorReport,
   type AutoAllocatorRequest,
+  type ExecutionHealthResponse,
+  type ExecutionHealthStatus,
+  type ExecutionHealthStrategy,
   type StrategyPresetCandidate,
+  type SyncAllocatorResult,
   DEFAULT_ALLOCATOR_REQUEST,
   fetchAllocatorReport,
+  fetchExecutionHealth,
+  syncAllocatorToRunner,
 } from "@/lib/allocator";
 import {
   type LiveOrderPreflightResult,
@@ -90,6 +96,20 @@ function ceilingTone(status: string | undefined): "success" | "warning" | "error
   return "neutral";
 }
 
+function decayBadgeMeta(status: ExecutionHealthStatus | string | undefined): {
+  label: "Active" | "Throttled" | "Quarantined";
+  tone: "success" | "warning" | "error";
+} {
+  if (status === "quarantined") return { label: "Quarantined", tone: "error" };
+  if (status === "throttled") return { label: "Throttled", tone: "warning" };
+  return { label: "Active", tone: "success" };
+}
+
+function fmtSignedPp(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return "n/a";
+  return `${v >= 0 ? "+" : ""}${v.toFixed(1)}pp`;
+}
+
 export type StagedOrderDraft = {
   ticker: string;
   side: "yes" | "no";
@@ -135,7 +155,11 @@ export function AutoAllocatorPanel({
     DEFAULT_ALLOCATOR_REQUEST.enable_diversification_guard,
   );
   const [report, setReport] = useState<AutoAllocatorReport | null>(null);
+  const [executionHealth, setExecutionHealth] = useState<ExecutionHealthResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [syncResult, setSyncResult] = useState<SyncAllocatorResult | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const [quarantineOpen, setQuarantineOpen] = useState(false);
   const [preflightBusy, setPreflightBusy] = useState<string | null>(null);
   const [preflightState, setPreflightState] = useState<{
@@ -174,8 +198,12 @@ export function AutoAllocatorPanel({
   const loadInitial = useCallback(async () => {
     setLoading(true);
     try {
-      const next = await fetchAllocatorReport(dataset, undefined, { slots, markets });
+      const [next, health] = await Promise.all([
+        fetchAllocatorReport(dataset, undefined, { slots, markets }),
+        fetchExecutionHealth(dataset),
+      ]);
       setReport(next);
+      setExecutionHealth(health);
     } finally {
       setLoading(false);
     }
@@ -192,12 +220,16 @@ export function AutoAllocatorPanel({
     ) => {
       setLoading(true);
       try {
-        const next = await fetchAllocatorReport(
-          dataset,
-          buildRequest(exec, sizing, stressGuard, regimeThrottle, diversificationGuard),
-          { slots, markets },
-        );
+        const [next, health] = await Promise.all([
+          fetchAllocatorReport(
+            dataset,
+            buildRequest(exec, sizing, stressGuard, regimeThrottle, diversificationGuard),
+            { slots, markets },
+          ),
+          fetchExecutionHealth(dataset),
+        ]);
         setReport(next);
+        setExecutionHealth(health);
         if (notify) {
           toast.success(
             `Edge pipeline complete (${EXEC_LABELS[exec]}, ${SIZING_LABELS[sizing]}): ${next.active_winners.length} winner${next.active_winners.length === 1 ? "" : "s"}, ${next.daily_target.verdict === "GO_500_DAY" ? "GO $500/day" : "Paper only"}.`,
@@ -398,7 +430,54 @@ export function AutoAllocatorPanel({
     toast.success(`Exported allocator audit JSON for ${dataset}.`);
   }, [dataset, report]);
 
+  const handleSyncToRunner = useCallback(async () => {
+    if (syncBusy) return;
+    setSyncBusy(true);
+    setSyncError(null);
+    try {
+      const res = await syncAllocatorToRunner(
+        "1",
+        buildRequest(
+          executionMode,
+          sizingMode,
+          requireStressResilience,
+          enableRegimeThrottle,
+          enableDiversificationGuard,
+        ),
+      );
+      setSyncResult(res);
+      toast.success(
+        `Synced ${res.synced_slots.length} slot${res.synced_slots.length === 1 ? "" : "s"} to Runner (live_armed: false, mode: ${res.mode}).`,
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setSyncError(msg);
+      toast.error(`Sync to Runner failed: ${msg}`);
+    } finally {
+      setSyncBusy(false);
+    }
+  }, [
+    syncBusy,
+    buildRequest,
+    executionMode,
+    sizingMode,
+    requireStressResilience,
+    enableRegimeThrottle,
+    enableDiversificationGuard,
+  ]);
+
   const q = search.trim().toLowerCase();
+
+  const healthByStrategy = useMemo(() => {
+    const map = new Map<string, ExecutionHealthStrategy>();
+    for (const s of report?.execution_health?.strategies ?? []) {
+      map.set(s.strategy, s);
+    }
+    for (const s of executionHealth?.strategies ?? []) {
+      map.set(s.strategy, s);
+    }
+    return map;
+  }, [report?.execution_health?.strategies, executionHealth?.strategies]);
 
   const filteredWinners = useMemo(() => {
     if (!report) return [];
@@ -753,6 +832,16 @@ export function AutoAllocatorPanel({
             </Button>
           )}
           <Button
+            id="sync-allocator-runner-btn"
+            variant="outline"
+            size="sm"
+            disabled={syncBusy || loading}
+            onClick={() => void handleSyncToRunner()}
+          >
+            <ArrowRightLeft className="size-3.5" strokeWidth={1.5} aria-hidden />
+            <span>{syncBusy ? "Syncing Runner…" : "Sync to Runner"}</span>
+          </Button>
+          <Button
             id="allocator-recalculate-btn"
             variant="default"
             size="sm"
@@ -773,6 +862,54 @@ export function AutoAllocatorPanel({
           </Button>
         </div>
       </div>
+
+      {(syncResult || syncError) && (
+        <div
+          id="allocator-runner-sync-banner"
+          role={syncError ? "alert" : "status"}
+          className="mt-3 border-y border-hairline bg-board/50 px-3.5 py-2.5 text-xs"
+        >
+          {syncError ? (
+            <div className="flex flex-wrap items-center justify-between gap-2 text-destructive-foreground">
+              <span>Sync to Runner failed: {syncError}</span>
+              <Button size="sm" variant="ghost" onClick={() => setSyncError(null)}>
+                Dismiss
+              </Button>
+            </div>
+          ) : (
+            syncResult && (
+              <div className="space-y-1.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <StatusPill id="allocator-sync-status-pill" tone="success">
+                      Runner Synced
+                    </StatusPill>
+                    <span className="mono tabular-nums text-ink-2">
+                      {syncResult.synced_slots.length} slot{syncResult.synced_slots.length === 1 ? "" : "s"}, live_armed: false, mode: {syncResult.mode}
+                    </span>
+                  </div>
+                  <Button size="sm" variant="ghost" onClick={() => setSyncResult(null)}>
+                    Dismiss
+                  </Button>
+                </div>
+                <div id="allocator-runner-sync-slots" className="mono tabular-nums text-ink-2">
+                  {syncResult.synced_slots.length > 0
+                    ? syncResult.synced_slots
+                        .map((s) => `#${s.slot_id} ${s.strategy} (${s.max_contracts} cts, ${s.execution_mode})`)
+                        .join(", ")
+                    : "No eligible active slots to sync."}
+                  {syncResult.skipped_quarantined.length > 0 && (
+                    <span className="text-destructive-foreground">
+                      {" "}
+                      (Excluded quarantined: {syncResult.skipped_quarantined.join(", ")})
+                    </span>
+                  )}
+                </div>
+              </div>
+            )
+          )}
+        </div>
+      )}
 
       {/* KPI Strip */}
       <div className="mt-3.5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -2048,6 +2185,7 @@ export function AutoAllocatorPanel({
                 <TableHead>Strategy</TableHead>
                 <TableHead>Side</TableHead>
                 <TableHead className="text-right">OOS Trades / WR</TableHead>
+                <TableHead className="text-right">+30s Markout / Fill Δ</TableHead>
                 <TableHead className="text-right">IS / OOS EV (Gross-Drag)</TableHead>
                 <TableHead className="text-right">WF Folds / +1c</TableHead>
                 <TableHead className="text-right">Maker vs Taker</TableHead>
@@ -2061,6 +2199,14 @@ export function AutoAllocatorPanel({
                 const intent = intentByStrategy.get(w.strategy);
                 const limitCents = intent?.max_limit_cents ?? Math.min(99, Math.max(1, Math.round(w.oos_avg_entry_price * 100)));
                 const targetCts = Math.max(1, w.rail_clamped_contracts || 1);
+                const health = healthByStrategy.get(w.strategy);
+                const execStatus = health?.status ?? w.execution_status ?? "active";
+                const decayMeta = decayBadgeMeta(execStatus);
+                const markout30 = health?.markout_30s_cents ?? w.markout_30s_cents ?? null;
+                const assumedFill = health?.assumed_fill_rate_pct ?? w.assumed_fill_rate_pct ?? null;
+                const realizedFill = health?.realized_fill_rate_pct ?? w.realized_fill_rate_pct ?? null;
+                const fillDelta =
+                  assumedFill !== null && realizedFill !== null ? realizedFill - assumedFill : null;
                 return (
                   <TableRow key={w.strategy} data-allocator-winner={w.strategy}>
                     <TableCell className="m-grow max-w-[230px] break-all font-medium text-ink">
@@ -2069,11 +2215,40 @@ export function AutoAllocatorPanel({
                         <StatusPill tone="success" className="min-h-6 px-2 py-0.5 text-xs text-success-foreground">
                           Winner
                         </StatusPill>
+                        <span data-allocator-decay-badge={w.strategy} className="inline-flex">
+                          <StatusPill
+                            tone={decayMeta.tone}
+                            className="min-h-6 px-2 py-0.5 text-xs"
+                          >
+                            {decayMeta.label}
+                          </StatusPill>
+                        </span>
+                        {execStatus === "throttled" && health && (
+                          <span className="mono tabular-nums text-xs text-warning-foreground">
+                            {health.throttle_mult.toFixed(2)}x
+                          </span>
+                        )}
                       </div>
                     </TableCell>
                     <TableCell className="mono text-xs text-ink-2">{w.side.toUpperCase()}</TableCell>
                     <TableCell className="mono text-right text-xs text-ink-2">
                       {w.oos_trades} ({(w.oos_win_rate * 100).toFixed(1)}%)
+                    </TableCell>
+                    <TableCell className="mono tabular-nums text-right text-xs">
+                      <div
+                        className={
+                          markout30 === null
+                            ? "text-ink-3"
+                            : markout30 >= 0
+                              ? "font-semibold text-success-foreground"
+                              : "font-semibold text-destructive-foreground"
+                        }
+                      >
+                        {fmtCents(markout30)}
+                      </div>
+                      <div className="text-ink-2">
+                        Fill {fmtSignedPp(fillDelta)}
+                      </div>
                     </TableCell>
                     <TableCell className="mono text-right text-xs">
                       <div className="font-semibold text-success-foreground">
@@ -2178,18 +2353,54 @@ export function AutoAllocatorPanel({
                     <TableHead>Strategy</TableHead>
                     <TableHead>Side</TableHead>
                     <TableHead className="text-right">OOS Trades</TableHead>
+                    <TableHead className="text-right">+30s Markout / Fill Δ</TableHead>
                     <TableHead className="text-right">OOS Net EV / ct</TableHead>
                     <TableHead>Refusal Reason</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {filteredQuarantined.map((item) => (
+                  {filteredQuarantined.map((item) => {
+                    const health = healthByStrategy.get(item.strategy);
+                    const decayMeta = decayBadgeMeta(health?.status ?? "quarantined");
+                    const markout30 = health?.markout_30s_cents ?? null;
+                    const fillDelta =
+                      health?.assumed_fill_rate_pct !== null &&
+                      health?.assumed_fill_rate_pct !== undefined &&
+                      health?.realized_fill_rate_pct !== null &&
+                      health?.realized_fill_rate_pct !== undefined
+                        ? health.realized_fill_rate_pct - health.assumed_fill_rate_pct
+                        : null;
+                    return (
                     <TableRow key={item.strategy} data-allocator-quarantined={item.strategy}>
                       <TableCell className="m-grow max-w-[220px] break-all font-medium text-ink">
-                        {item.strategy}
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span>{item.strategy}</span>
+                          <span data-allocator-decay-badge={item.strategy} className="inline-flex">
+                            <StatusPill
+                              tone={decayMeta.tone}
+                              className="min-h-6 px-2 py-0.5 text-xs"
+                            >
+                              {decayMeta.label}
+                            </StatusPill>
+                          </span>
+                        </div>
                       </TableCell>
                       <TableCell className="mono text-xs text-ink-2">{item.side.toUpperCase()}</TableCell>
                       <TableCell className="mono text-right text-xs text-ink-2">{item.oos_trades}</TableCell>
+                      <TableCell className="mono tabular-nums text-right text-xs">
+                        <div
+                          className={
+                            markout30 === null
+                              ? "text-ink-3"
+                              : markout30 >= 0
+                                ? "font-semibold text-success-foreground"
+                                : "font-semibold text-destructive-foreground"
+                          }
+                        >
+                          {fmtCents(markout30)}
+                        </div>
+                        <div className="text-ink-2">Fill {fmtSignedPp(fillDelta)}</div>
+                      </TableCell>
                       <TableCell
                         className={
                           "mono text-right text-xs font-medium " +
@@ -2202,7 +2413,8 @@ export function AutoAllocatorPanel({
                       </TableCell>
                       <TableCell className="text-xs text-ink-2">{item.reason}</TableCell>
                     </TableRow>
-                  ))}
+                    );
+                  })}
                 </TableBody>
               </Table>
             )}

@@ -2,6 +2,26 @@
 // Aligned with GET /api/allocator and POST /api/allocator/plan (X-OpenBell-CSRF: 1).
 import { type Dataset, type Market, type Slots, isNum } from "@/lib/desk";
 import { kalshiFeeDollars } from "@/lib/fees";
+import {
+  type ExecutionHealthOverall,
+  type ExecutionHealthResponse,
+  type ExecutionHealthStatus,
+  type ExecutionHealthStrategy,
+  type SyncAllocatorResult,
+  fetchExecutionHealth,
+  normalizeExecutionHealth,
+  overrideQuarantine,
+  syncAllocatorToRunner,
+} from "@/lib/runner";
+
+export type {
+  ExecutionHealthOverall,
+  ExecutionHealthResponse,
+  ExecutionHealthStatus,
+  ExecutionHealthStrategy,
+  SyncAllocatorResult,
+};
+export { fetchExecutionHealth, overrideQuarantine, syncAllocatorToRunner };
 
 export type AllocatorSizingMode = "quarter_kelly" | "half_kelly" | "equal_winners";
 export type AllocatorExecutionMode = "maker" | "taker";
@@ -272,6 +292,10 @@ export type AllocatedWinner = {
   rail_clamped_contracts: number;
   max_abs_corr: number | null;
   status: string;
+  execution_status?: ExecutionHealthStatus;
+  markout_30s_cents?: number | null;
+  assumed_fill_rate_pct?: number | null;
+  realized_fill_rate_pct?: number | null;
   stress: StressProfile;
 };
 
@@ -441,6 +465,7 @@ export type AutoAllocatorReport = {
   dry_run_plan: DryRunOrderPlan;
   liquidity_capacity: LiquidityCapacityReport;
   daily_target: DailyTargetVerdict;
+  execution_health?: ExecutionHealthResponse | null;
   honesty_notes: string[];
   source?: "server" | "client";
 };
@@ -624,6 +649,17 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
           rail_clamped_contracts: Math.max(0, Math.round(finiteOr(w.rail_clamped_contracts, 0))),
           max_abs_corr: finiteOpt(w.max_abs_corr),
           status: strOr(w.status, "ACTIVE_WINNER"),
+          execution_status:
+            typeof w.execution_status === "string"
+              ? ((w.execution_status.toLowerCase() === "quarantined"
+                  ? "quarantined"
+                  : w.execution_status.toLowerCase() === "throttled"
+                    ? "throttled"
+                    : "active") as ExecutionHealthStatus)
+              : undefined,
+          markout_30s_cents: finiteOpt(w.markout_30s_cents),
+          assumed_fill_rate_pct: finiteOpt(w.assumed_fill_rate_pct),
+          realized_fill_rate_pct: finiteOpt(w.realized_fill_rate_pct),
           stress: {
             extra_slippage_0c_cents: finiteOr(stRaw.extra_slippage_0c_cents, exp),
             extra_slippage_1c_cents: finiteOr(stRaw.extra_slippage_1c_cents, exp - 1),
@@ -1012,6 +1048,10 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
         ? dtRaw.blockers.filter((b): b is string => typeof b === "string" && b.trim().length > 0)
         : [],
     },
+    execution_health:
+      o.execution_health && typeof o.execution_health === "object"
+        ? normalizeExecutionHealth(o.execution_health, "server")
+        : null,
     honesty_notes: notesRaw.filter((n): n is string => typeof n === "string" && n.trim().length > 0),
     source: "server",
   };
