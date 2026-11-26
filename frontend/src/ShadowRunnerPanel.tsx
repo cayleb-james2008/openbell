@@ -7,8 +7,10 @@ import {
   Play,
   Plus,
   RefreshCw,
+  RotateCcw,
   Save,
   ShieldAlert,
+  ShieldBan,
   Square,
   Trash2,
   X,
@@ -40,14 +42,19 @@ import {
 import type { LiveStatus } from "@/lib/live";
 import {
   AVAILABLE_SERIES,
+  type ExecutionHealthResponse,
+  type ExecutionHealthStatus,
   RunnerApiError,
   type RunnerMode,
   type RunnerSlotConfig,
   type RunnerStatus,
   type RunnerLedgerResponse,
+  buildPreviewExecutionHealth,
   buildPreviewRunnerState,
+  fetchExecutionHealth,
   fetchRunnerLedger,
   fetchRunnerStatus,
+  overrideQuarantine,
   saveRunnerConfig,
   startRunner,
   stopRunner,
@@ -81,6 +88,87 @@ function modeBadgeProps(mode: RunnerMode, killed: boolean): {
   if (mode === "live_auto") return { label: "Live Auto", tone: "warning" };
   if (mode === "shadow") return { label: "Shadow", tone: "info" };
   return { label: "Stopped", tone: "neutral" };
+}
+
+function healthStatusProps(status: ExecutionHealthStatus): {
+  label: "Active" | "Throttled" | "Quarantined";
+  tone: "success" | "warning" | "error";
+} {
+  if (status === "quarantined") return { label: "Quarantined", tone: "error" };
+  if (status === "throttled") return { label: "Throttled", tone: "warning" };
+  return { label: "Active", tone: "success" };
+}
+
+function fmtOptCents(v: number | null | undefined): string {
+  if (!isNum(v) || !Number.isFinite(v)) return "n/a";
+  return `${v >= 0 ? "+" : ""}${v.toFixed(2)}c`;
+}
+
+function fmtOptProbPct(v: number | null | undefined): string {
+  if (!isNum(v) || !Number.isFinite(v)) return "n/a";
+  const pct = v >= 0 && v <= 1 ? v * 100 : v;
+  return `${pct.toFixed(1)}%`;
+}
+
+function fmtOptPct(v: number | null | undefined): string {
+  if (!isNum(v) || !Number.isFinite(v)) return "n/a";
+  return `${v.toFixed(1)}%`;
+}
+
+function fmtOptPp(v: number | null | undefined): string {
+  if (!isNum(v) || !Number.isFinite(v)) return "n/a";
+  return `${v >= 0 ? "+" : ""}${v.toFixed(1)}pp`;
+}
+
+function MarkoutSparkline({
+  m10,
+  m30,
+  m60,
+}: {
+  m10: number | null;
+  m30: number | null;
+  m60: number | null;
+}) {
+  const vals = [m10 ?? 0, m30 ?? m10 ?? 0, m60 ?? m30 ?? m10 ?? 0];
+  const minV = Math.min(-1, ...vals);
+  const maxV = Math.max(1, ...vals);
+  const span = Math.max(0.5, maxV - minV);
+  const mapY = (v: number) => 20 - ((v - minV) / span) * 16;
+  const zeroY = mapY(0);
+  const pts = `4,${mapY(vals[0]).toFixed(1)} 28,${mapY(vals[1]).toFixed(1)} 52,${mapY(vals[2]).toFixed(1)}`;
+  const last = vals[2];
+  const strokeCls = last >= 0 ? "text-success-foreground" : "text-destructive-foreground";
+  return (
+    <svg
+      width={56}
+      height={24}
+      viewBox="0 0 56 24"
+      aria-hidden="true"
+      className={`shrink-0 ${strokeCls}`}
+    >
+      <line
+        x1={2}
+        y1={zeroY}
+        x2={54}
+        y2={zeroY}
+        stroke="currentColor"
+        strokeOpacity={0.25}
+        strokeDasharray="2 2"
+        strokeWidth={1}
+      />
+      <polyline
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={1.75}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        points={pts}
+      />
+      <circle cx={4} cy={mapY(vals[0])} r={1.8} fill="currentColor" />
+      <circle cx={28} cy={mapY(vals[1])} r={1.8} fill="currentColor" />
+      <circle cx={52} cy={mapY(vals[2])} r={2.2} fill="currentColor" />
+    </svg>
+  );
 }
 
 function LiveAutoConfirmModal({
@@ -270,6 +358,11 @@ export function ShadowRunnerPanel({
   const [ledgerModeFilter, setLedgerModeFilter] = useState<"all" | "shadow" | "live">("all");
   const [lastSseEvent, setLastSseEvent] = useState<string | null>(null);
   const [runnerError, setRunnerError] = useState<{ status: number | null; message: string } | null>(null);
+  const [executionHealth, setExecutionHealth] = useState<ExecutionHealthResponse>(() =>
+    buildPreviewExecutionHealth(strategies),
+  );
+  const [overrideBusy, setOverrideBusy] = useState<string | null>(null);
+  const [overrideError, setOverrideError] = useState<string | null>(null);
   const actionLockRef = useRef(false);
 
   const serverSupported = supportsShadowRunner(home);
@@ -312,16 +405,18 @@ export function ShadowRunnerPanel({
         killed: liveStatus.killed,
         dataset,
       };
-      const [nextStatus, nextLedger] = await Promise.all([
+      const [nextStatus, nextLedger, nextHealth] = await Promise.all([
         fetchRunnerStatus(home, fb),
         fetchRunnerLedger(
           home,
           { limit: 200, strategy: ledgerStrategyFilter, mode: ledgerModeFilter },
           fb,
         ),
+        fetchExecutionHealth(dataset, strategies),
       ]);
       setStatus(nextStatus);
       setLedger(nextLedger);
+      setExecutionHealth(nextHealth);
       onRunnerStatusChange?.(nextStatus);
       if (syncConfig || !configDirty) {
         syncDraftFromStatus(nextStatus);
@@ -562,6 +657,41 @@ export function ShadowRunnerPanel({
     }
     return map;
   }, [status.active_slots]);
+
+  const filteredHealthRows = useMemo(() => {
+    return executionHealth.strategies.filter(
+      (s) =>
+        !q ||
+        s.strategy.toLowerCase().includes(q) ||
+        s.status.toLowerCase().includes(q) ||
+        s.reason.toLowerCase().includes(q),
+    );
+  }, [executionHealth.strategies, q]);
+
+  const handleOverrideQuarantine = useCallback(
+    async (strategy: string, action: "reset" | "quarantine") => {
+      if (overrideBusy) return;
+      setOverrideBusy(strategy);
+      setOverrideError(null);
+      try {
+        const nextHealth = await overrideQuarantine(strategy, action, "1");
+        setExecutionHealth(nextHealth);
+        toast.success(
+          action === "quarantine"
+            ? `Quarantined ${strategy}: runner slot paused and allocator weight zeroed.`
+            : `Reset ${strategy} back to active execution.`,
+        );
+        void refreshAll(false);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setOverrideError(msg);
+        toast.error(`Quarantine override failed: ${msg}`);
+      } finally {
+        setOverrideBusy(null);
+      }
+    },
+    [overrideBusy, refreshAll],
+  );
 
   return (
     <section
@@ -856,23 +986,37 @@ export function ShadowRunnerPanel({
               const isPaused = Boolean(runtime?.paused);
               return (
                 <TableRow key={`slot-${slot.slot_id}-${idx}`} data-runner-slot-row={slot.slot_id}>
-                  <TableCell className="mono text-xs font-semibold text-ink">
-                    <div className="flex items-center gap-1.5">
-                      <span>#{slot.slot_id}</span>
+                  <TableCell className="text-xs font-semibold text-ink">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="mono tabular-nums">#{slot.slot_id}</span>
                       {isPaused ? (
-                        <Badge variant="error" className="text-xs" title={runtime?.pause_reason || "Auto-paused"}>
-                          Paused
-                        </Badge>
+                        <span data-slot-paused-badge={slot.slot_id} className="inline-flex">
+                          <StatusPill
+                            tone="error"
+                            className="min-h-6 px-2 py-0.5 text-xs"
+                            title={runtime?.pause_reason || "Auto-paused"}
+                          >
+                            Paused
+                          </StatusPill>
+                        </span>
                       ) : slot.enabled ? (
-                        <Badge variant="success" className="text-xs">
+                        <StatusPill tone="success" className="min-h-6 px-2 py-0.5 text-xs">
                           Active
-                        </Badge>
+                        </StatusPill>
                       ) : (
-                        <Badge variant="secondary" className="text-xs">
+                        <StatusPill tone="neutral" className="min-h-6 px-2 py-0.5 text-xs">
                           Off
-                        </Badge>
+                        </StatusPill>
                       )}
                     </div>
+                    {runtime?.pause_reason && (
+                      <div
+                        data-slot-pause-reason={slot.slot_id}
+                        className="mt-1 text-xs font-normal text-destructive-foreground"
+                      >
+                        {runtime.pause_reason}
+                      </div>
+                    )}
                   </TableCell>
                   <TableCell className="m-grow">
                     <select
@@ -1010,6 +1154,293 @@ export function ShadowRunnerPanel({
             })}
           </TableBody>
         </Table>
+      </div>
+
+      {/* Execution Health & Adverse-Selection Markout Telemetry */}
+      <div
+        id="execution-health-panel"
+        data-testid="execution-health-panel"
+        className="overflow-hidden rounded-[10px] border border-hairline bg-surface"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-board/50 px-4 py-3">
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-sm font-semibold text-ink">Execution Health &amp; Markout</h3>
+              <StatusPill
+                id="exec-health-summary-pill"
+                tone={
+                  executionHealth.overall.quarantined_count > 0
+                    ? "error"
+                    : executionHealth.overall.throttled_count > 0
+                      ? "warning"
+                      : "success"
+                }
+              >
+                {executionHealth.overall.quarantined_count > 0
+                  ? `${executionHealth.overall.quarantined_count} Quarantined`
+                  : executionHealth.overall.throttled_count > 0
+                    ? `${executionHealth.overall.throttled_count} Throttled`
+                    : "Healthy"}
+              </StatusPill>
+            </div>
+            <p className="mt-0.5 text-xs text-ink-2">
+              Post-fill +10s/+30s/+60s markout curves, predicted vs realized win and fill residuals, and quarantine overrides.
+            </p>
+          </div>
+          <Button
+            id="exec-health-refresh-btn"
+            variant="outline"
+            size="sm"
+            disabled={busy || overrideBusy !== null}
+            onClick={() => void refreshAll(false)}
+          >
+            <RefreshCw className={`size-3.5 ${busy ? "animate-spin" : ""}`} strokeWidth={1.5} aria-hidden />
+            <span>Refresh Health</span>
+          </Button>
+        </div>
+
+        <dl className="grid grid-cols-2 divide-y divide-hairline border-b border-hairline bg-board/25 text-xs sm:grid-cols-4 sm:divide-x sm:divide-y-0">
+          <div className="px-4 py-2.5">
+            <dt className="text-ink-2">Strategy Health</dt>
+            <dd id="exec-health-counts" className="mono mt-0.5 text-sm font-semibold tabular-nums text-ink">
+              {executionHealth.overall.active_count}A / {executionHealth.overall.throttled_count}T / {executionHealth.overall.quarantined_count}Q
+            </dd>
+          </div>
+          <div className="px-4 py-2.5">
+            <dt className="text-ink-2">Rolling Fills</dt>
+            <dd id="exec-health-fills" className="mono mt-0.5 text-sm font-semibold tabular-nums text-ink">
+              {executionHealth.overall.rolling_fills}
+            </dd>
+          </div>
+          <div className="px-4 py-2.5">
+            <dt className="text-ink-2">Avg +30s Markout</dt>
+            <dd
+              id="exec-health-avg-markout"
+              className={
+                "mono mt-0.5 text-sm font-semibold tabular-nums " +
+                ((executionHealth.overall.avg_markout_30s_cents ?? 0) >= 0
+                  ? "text-success-foreground"
+                  : "text-destructive-foreground")
+              }
+            >
+              {fmtOptCents(executionHealth.overall.avg_markout_30s_cents)}
+            </dd>
+          </div>
+          <div className="px-4 py-2.5">
+            <dt className="text-ink-2">Avg Slippage Residual</dt>
+            <dd
+              id="exec-health-avg-slip-res"
+              className={
+                "mono mt-0.5 text-sm font-semibold tabular-nums " +
+                ((executionHealth.overall.avg_slippage_residual_cents ?? 0) <= 0
+                  ? "text-success-foreground"
+                  : "text-destructive-foreground")
+              }
+            >
+              {fmtOptCents(executionHealth.overall.avg_slippage_residual_cents)}
+            </dd>
+          </div>
+        </dl>
+
+        {overrideError && (
+          <div
+            id="exec-health-error"
+            role="alert"
+            className="border-b border-hairline bg-board px-4 py-2.5 text-xs text-destructive-foreground"
+          >
+            Quarantine override failed: {overrideError}
+          </div>
+        )}
+
+        {filteredHealthRows.length === 0 ? (
+          <p role="status" className="p-4 text-xs text-ink-2">
+            No execution health telemetry recorded for the current filter yet.
+          </p>
+        ) : (
+          <Table className="stack">
+            <TableHeader>
+              <TableRow>
+                <TableHead>Strategy</TableHead>
+                <TableHead className="text-right">Win Rate (Pred / Real)</TableHead>
+                <TableHead className="text-right">Fill Rate (Assumed / Actual)</TableHead>
+                <TableHead className="text-right">Slippage (Exp / Real / Res)</TableHead>
+                <TableHead>Markout (+10s / +30s / +60s)</TableHead>
+                <TableHead className="text-right">Fills / Net PnL</TableHead>
+                <TableHead className="text-right">Override</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {filteredHealthRows.map((row) => {
+                const badgeMeta = healthStatusProps(row.status);
+                const winPredPct =
+                  row.predicted_prob !== null
+                    ? row.predicted_prob <= 1
+                      ? row.predicted_prob * 100
+                      : row.predicted_prob
+                    : null;
+                const winRealPct =
+                  row.realized_win_rate !== null
+                    ? row.realized_win_rate <= 1
+                      ? row.realized_win_rate * 100
+                      : row.realized_win_rate
+                    : null;
+                const winDeltaPp =
+                  winPredPct !== null && winRealPct !== null ? winRealPct - winPredPct : null;
+                const fillDeltaPp =
+                  row.assumed_fill_rate_pct !== null && row.realized_fill_rate_pct !== null
+                    ? row.realized_fill_rate_pct - row.assumed_fill_rate_pct
+                    : null;
+                const slipResidual =
+                  row.expected_slippage_cents !== null && row.realized_slippage_cents !== null
+                    ? row.realized_slippage_cents - row.expected_slippage_cents
+                    : null;
+                const rowBusy = overrideBusy === row.strategy;
+                return (
+                  <TableRow key={row.strategy} data-health-row={row.strategy}>
+                    <TableCell className="m-grow max-w-[240px] text-xs">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-semibold text-ink break-all">{row.strategy}</span>
+                        <span data-health-status-badge={row.strategy} className="inline-flex">
+                          <StatusPill
+                            tone={badgeMeta.tone}
+                            className="min-h-6 px-2 py-0.5 text-xs"
+                          >
+                            {badgeMeta.label}
+                          </StatusPill>
+                        </span>
+                        {row.status === "throttled" && (
+                          <span className="mono tabular-nums text-xs text-warning-foreground">
+                            {row.throttle_mult.toFixed(2)}x
+                          </span>
+                        )}
+                      </div>
+                      {row.reason && (
+                        <div className="mt-0.5 text-xs text-ink-2">{row.reason}</div>
+                      )}
+                    </TableCell>
+                    <TableCell className="mono tabular-nums text-right text-xs">
+                      <div className="text-ink">
+                        {fmtOptProbPct(row.predicted_prob)} / {fmtOptProbPct(row.realized_win_rate)}
+                      </div>
+                      <div
+                        className={
+                          winDeltaPp === null
+                            ? "text-ink-3"
+                            : winDeltaPp >= 0
+                              ? "text-success-foreground"
+                              : "text-destructive-foreground"
+                        }
+                      >
+                        {fmtOptPp(winDeltaPp)}
+                      </div>
+                    </TableCell>
+                    <TableCell className="mono tabular-nums text-right text-xs">
+                      <div className="text-ink">
+                        {fmtOptPct(row.assumed_fill_rate_pct)} / {fmtOptPct(row.realized_fill_rate_pct)}
+                      </div>
+                      <div
+                        className={
+                          fillDeltaPp === null
+                            ? "text-ink-3"
+                            : fillDeltaPp >= -5
+                              ? "text-success-foreground"
+                              : "text-destructive-foreground"
+                        }
+                      >
+                        {fmtOptPp(fillDeltaPp)}
+                      </div>
+                    </TableCell>
+                    <TableCell className="mono tabular-nums text-right text-xs">
+                      <div className="text-ink">
+                        {fmtOptCents(row.expected_slippage_cents)} / {fmtOptCents(row.realized_slippage_cents)}
+                      </div>
+                      <div
+                        className={
+                          slipResidual === null
+                            ? "text-ink-3"
+                            : slipResidual <= 0
+                              ? "text-success-foreground"
+                              : "text-destructive-foreground"
+                        }
+                      >
+                        Res {fmtOptCents(slipResidual)}
+                      </div>
+                    </TableCell>
+                    <TableCell className="m-full text-xs">
+                      <div className="flex items-center gap-2">
+                        <MarkoutSparkline
+                          m10={row.markout_10s_cents}
+                          m30={row.markout_30s_cents}
+                          m60={row.markout_60s_cents}
+                        />
+                        <div className="mono tabular-nums space-y-0.5">
+                          <div className="text-ink">
+                            {fmtOptCents(row.markout_10s_cents)} /{" "}
+                            <span
+                              className={
+                                (row.markout_30s_cents ?? 0) >= 0
+                                  ? "font-semibold text-success-foreground"
+                                  : "font-semibold text-destructive-foreground"
+                              }
+                            >
+                              {fmtOptCents(row.markout_30s_cents)}
+                            </span>{" "}
+                            / {fmtOptCents(row.markout_60s_cents)}
+                          </div>
+                          {row.settlement_markout_cents !== null && (
+                            <div className="text-ink-2">
+                              Settle {fmtOptCents(row.settlement_markout_cents)}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </TableCell>
+                    <TableCell className="mono tabular-nums text-right text-xs">
+                      <div className="text-ink-2">{row.rolling_fills} fills</div>
+                      <div
+                        className={
+                          row.rolling_net_pnl_dollars >= 0
+                            ? "font-semibold text-success-foreground"
+                            : "font-semibold text-destructive-foreground"
+                        }
+                      >
+                        {moneySigned(row.rolling_net_pnl_dollars)}
+                      </div>
+                    </TableCell>
+                    <TableCell className="m-right text-right">
+                      <div className="inline-flex flex-wrap items-center justify-end gap-1.5">
+                        {row.status !== "active" && (
+                          <Button
+                            data-reset-quarantine-btn={row.strategy}
+                            variant="outline"
+                            size="sm"
+                            disabled={rowBusy}
+                            onClick={() => void handleOverrideQuarantine(row.strategy, "reset")}
+                          >
+                            <RotateCcw className="size-3.5" strokeWidth={1.5} aria-hidden />
+                            <span>Reset</span>
+                          </Button>
+                        )}
+                        {row.status !== "quarantined" && (
+                          <Button
+                            data-quarantine-btn={row.strategy}
+                            variant="danger"
+                            size="sm"
+                            disabled={rowBusy}
+                            onClick={() => void handleOverrideQuarantine(row.strategy, "quarantine")}
+                          >
+                            <ShieldBan className="size-3.5" strokeWidth={1.5} aria-hidden />
+                            <span>Quarantine</span>
+                          </Button>
+                        )}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        )}
       </div>
 
       {/* Live Resting Quotes with Queue-Ahead Bar & Fill ETA */}
