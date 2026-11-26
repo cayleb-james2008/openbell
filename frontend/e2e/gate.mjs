@@ -776,7 +776,7 @@ for (const m of measures) {
   await p.route('**/api/home', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.27.0'
+    j.version = '0.28.0'
     j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan', 'tournament', 'auto_collector', 'live_kalshi', 'risk_rails', 'edge_audit', 'shadow_runner', 'strategy_v2', 'strategy_crud', 'synthesizer']
     j.collector = {
       ...j.collector,
@@ -1818,7 +1818,7 @@ for (const m of measures) {
   const badNameInline = await p.locator('#sandbox-name-error').isVisible()
   await p.locator('#sandbox-save-btn').click(); await p.waitForTimeout(100)
   const badNameCrud = (await p.locator('#sandbox-crud-error').innerText()).includes('traversal')
-  await p.locator('#sandbox-strategy-name').fill('late-favourite-edge')
+  await p.locator('#sandbox-strategy-name').fill('favourite-late')
   const origSource = await p.locator('#rune-editor').inputValue()
   await p.locator('#rune-editor').fill('   ')
   await p.locator('#sandbox-validate-btn').click(); await p.waitForTimeout(100)
