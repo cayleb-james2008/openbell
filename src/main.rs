@@ -20,6 +20,7 @@ mod recalibration;
 mod risk_rails;
 mod scaling;
 mod shadow_runner;
+mod spot_feed;
 mod strategy_v2;
 mod synthesizer;
 mod tournament;
@@ -470,6 +471,21 @@ struct Snapshot {
     yes_bid_size: f32,
     #[serde(default, skip_serializing_if = "is_zero_f32")]
     no_bid_size: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    floor_strike: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cap_strike: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spot_price: Option<f64>,
+}
+
+fn opt_finite_f64(v: &serde_json::Value, key: &str, positive_only: bool) -> Option<f64> {
+    v.get(key)
+        .and_then(|x| {
+            x.as_f64()
+                .or_else(|| x.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+        })
+        .filter(|n| n.is_finite() && (!positive_only || *n > 0.0))
 }
 
 fn dollars(v: &serde_json::Value, key: &str) -> OptPrice {
@@ -640,6 +656,9 @@ fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize, bo
                 last_price: dollars(m, "last_price_dollars"),
                 yes_bid_size: depth_size(m, &["yes_bid_size_fp", "yes_bid_size"]),
                 no_bid_size: depth_size(m, &["no_bid_size_fp", "no_bid_size", "yes_ask_size_fp"]),
+                floor_strike: opt_finite_f64(m, "floor_strike", false),
+                cap_strike: opt_finite_f64(m, "cap_strike", false),
+                spot_price: opt_finite_f64(m, "spot_price", true),
             });
         }
         return Ok((snaps, skipped, hit_rate_limit));
@@ -980,6 +999,7 @@ fn prioritized_open_tickers(snaps: &[Snapshot]) -> Vec<String> {
 fn collect_once_detailed(
     data_dir: &Path,
     orderbook: Option<&orderbook::OrderbookStore>,
+    spot_feed: Option<&spot_feed::SpotFeedStore>,
 ) -> Result<CollectPassReport, (String, bool)> {
     let _guard = COLLECT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let _pass = PassGuard::new();
@@ -1021,7 +1041,14 @@ fn collect_once_detailed(
                             failed_series.push(series.clone());
                         }
                     }
-                    for snap in snaps {
+                    for mut snap in snaps {
+                        if snap.spot_price.is_none() {
+                            if let Some(sf) = spot_feed {
+                                if let Some(st) = sf.latest_fresh_for_series(snap.series.as_str()) {
+                                    snap.spot_price = st.price;
+                                }
+                            }
+                        }
                         let key = (snap.ticker, snap.status, snap.result);
                         if seen_in_pass.insert(key) {
                             pass_snaps.push(snap);
@@ -1114,7 +1141,7 @@ fn collect_once_detailed(
 /// the API can say so instead of returning a cheerful 200 with 0.
 #[allow(dead_code)]
 fn collect_once(data_dir: &Path) -> Result<(usize, usize, Vec<String>), String> {
-    collect_once_detailed(data_dir, None)
+    collect_once_detailed(data_dir, None, None)
         .map(|r| (r.written, r.deduplicated, r.errors))
         .map_err(|(e, _)| e)
 }
@@ -1623,6 +1650,11 @@ impl Strategy {
                 slot_avg_entry_cents: 0.0,
                 slot_unrealized_pnl_cents: 0.0,
                 slot_resting_cents: 0,
+                spot_price: 0.0,
+                strike_price: 0.0,
+                spot_distance_bps: 0.0,
+                spot_delta_30s_bps: 0.0,
+                spot_vol_bps: 0.0,
             };
             if let Some(dec) = self.evaluate_v2(&ctx) {
                 return Some((dec.limit_cents as f64) / 100.0);
@@ -1716,6 +1748,11 @@ impl Strategy {
                         slot_avg_entry_cents: 0.0,
                         slot_unrealized_pnl_cents: 0.0,
                         slot_resting_cents: 0,
+                        spot_price: 0.0,
+                        strike_price: 0.0,
+                        spot_distance_bps: 0.0,
+                        spot_delta_30s_bps: 0.0,
+                        spot_vol_bps: 0.0,
                     };
                     &owned_fallback
                 }
@@ -1791,6 +1828,9 @@ fn window_fingerprint(snaps: &[Snapshot]) -> u64 {
         s.no_bid.get().map(f64::to_bits).hash(&mut h);
         s.yes_bid_size.to_bits().hash(&mut h);
         s.no_bid_size.to_bits().hash(&mut h);
+        s.floor_strike.map(f64::to_bits).hash(&mut h);
+        s.cap_strike.map(f64::to_bits).hash(&mut h);
+        s.spot_price.map(f64::to_bits).hash(&mut h);
         s.series.hash(&mut h);
         s.close_time.hash(&mut h);
     }
@@ -3147,6 +3187,8 @@ struct App {
     runner: Arc<shadow_runner::ShadowRunner>,
     /// Live L2 Orderbook Depth Store, WebSocket/REST stream & book-walking engine.
     orderbook: Arc<orderbook::OrderbookStore>,
+    /// External public crypto spot price & strike oracle feed (defaults to offline).
+    spot_feed: Arc<spot_feed::SpotFeedStore>,
     tape_cache: std::sync::RwLock<Option<TapeEntry>>,
     /// Serializes cold tape parses so 30+ concurrent readers share one 100k-line parse.
     tape_compute_lock: std::sync::Mutex<()>,
@@ -3235,6 +3277,11 @@ impl App {
         orderbook.set_runner_notify(move || {
             runner_for_ob.notify_tick();
         });
+        let spot_feed = Arc::new(spot_feed::SpotFeedStore::new(data_dir.clone()));
+        let runner_for_spot = runner.clone();
+        spot_feed.set_runner_notify(move || {
+            runner_for_spot.notify_tick();
+        });
         let live_snapshots_path = data_dir.join("snapshots.jsonl");
         Self {
             data_dir,
@@ -3258,6 +3305,7 @@ impl App {
             reconcile_wake: Arc::new((Mutex::new(0), Condvar::new())),
             runner,
             orderbook,
+            spot_feed,
             tape_cache: std::sync::RwLock::new(None),
             tape_compute_lock: std::sync::Mutex::new(()),
             analysis_cache: std::sync::RwLock::new(None),
@@ -6101,6 +6149,7 @@ fn try_handle_inline_get(
         || path.starts_with("/api/tape/stream")
         || path.starts_with("/api/stream")
         || path.starts_with("/api/orderbook")
+        || path.starts_with("/api/spot")
         || path.starts_with("/api/analytics/execution-health")
         || path.starts_with("/api/analytics/quarantine")
     {
@@ -6192,7 +6241,11 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
         }
         ("POST", "/api/collect") => {
             app.collector_scheduler.mark_in_flight(true);
-            let res = collect_once_detailed(&app.data_dir, Some(&app.orderbook));
+            let res = collect_once_detailed(
+                &app.data_dir,
+                Some(&app.orderbook),
+                Some(&app.spot_feed),
+            );
             let _ = app.collector_scheduler.record_pass_result(&res);
             match res {
                 Ok(rep) => {
@@ -8361,6 +8414,32 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let status = app.orderbook.stream_status();
             json_response(200, &serde_json::to_string(&status).unwrap_or_else(|_| "{}".into()))
         }
+        ("GET", "/api/spot/status") => {
+            let status = app.spot_feed.status_snapshot();
+            json_response(200, &serde_json::to_string(&status).unwrap_or_else(|_| "{}".into()))
+        }
+        ("GET", "/api/spot/history") => {
+            let asset_raw = query_param(query, "asset").unwrap_or_else(|| "BTC".to_string());
+            let clean_asset = match spot_feed::validate_spot_asset_param(&asset_raw) {
+                Ok(a) => a,
+                Err(e) => return json_ok_err_response(400, &e),
+            };
+            let limit: usize = query_param(query, "limit")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(200)
+                .clamp(1, 500) as usize;
+            match app.spot_feed.read_history(clean_asset, limit) {
+                Ok(ticks) => {
+                    let payload = spot_feed::SpotHistoryResponse {
+                        ok: true,
+                        asset: clean_asset.to_string(),
+                        ticks,
+                    };
+                    json_response(200, &serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into()))
+                }
+                Err((status, msg)) => json_ok_err_response(status, &msg),
+            }
+        }
         ("POST", "/api/orderbook/subscribe") => {
             let parsed = match parse_json_object_body(
                 body,
@@ -8576,7 +8655,11 @@ fn start_background_collector(app: Arc<App>) {
             }
             st.in_flight = true;
         }
-        let res = collect_once_detailed(&app.data_dir, Some(&app.orderbook));
+        let res = collect_once_detailed(
+            &app.data_dir,
+            Some(&app.orderbook),
+            Some(&app.spot_feed),
+        );
         let updated = app.collector_scheduler.record_pass_result(&res);
         match res {
             Ok(rep) => {
@@ -9407,6 +9490,7 @@ fn main() {
     shadow_runner::start_background_runner(app.clone());
     start_background_reconciler(app.clone());
     orderbook::start_background_orderbook(app.clone());
+    spot_feed::start_background_spot_feed(app.clone());
     startup_discover_open_markets(app.clone());
     updater().start_background();
     println!("{}", start_banner(&url, &data_dir, updater().cfg.mode, opening));
@@ -9671,6 +9755,9 @@ mod tests {
             last_price: OptPrice::NONE,
             yes_bid_size: 0.0,
             no_bid_size: 0.0,
+            floor_strike: None,
+            cap_strike: None,
+            spot_price: None,
         }
     }
 
@@ -9704,6 +9791,9 @@ mod tests {
             last_price: OptPrice::NONE,
             yes_bid_size: 0.0,
             no_bid_size: 0.0,
+            floor_strike: None,
+            cap_strike: None,
+            spot_price: None,
         };
         // Conflicting settlements: not scored, ever.
         let conflict = vec![
@@ -10442,6 +10532,9 @@ mod tests {
             last_price: OptPrice::from_opt(Some(0.52)),
             yes_bid_size: 120.0,
             no_bid_size: 95.0,
+            floor_strike: None,
+            cap_strike: None,
+            spot_price: None,
         };
         let mut s2 = s1.clone();
         s2.fetched_at = 1060;

@@ -2199,6 +2199,9 @@ mod tests {
             last_price: crate::OptPrice::from_opt(yes_ask),
             yes_bid_size: 0.0,
             no_bid_size: 0.0,
+            floor_strike: None,
+            cap_strike: None,
+            spot_price: None,
         }
     }
 

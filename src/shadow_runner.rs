@@ -2553,6 +2553,9 @@ impl ShadowRunner {
                                             .map(|l| l.qty as f32)
                                             .unwrap_or(last.no_bid_size);
                                         st.l2_eval_ms.insert(ticker.to_string(), ob.updated_ms);
+                                        let live_spot =
+                                            app.spot_feed.latest_fresh_for_series(last.series.as_str());
+                                        let strike_opt = last.floor_strike.or(last.cap_strike);
                                         let cur_ctx = if has_v2 {
                                             let pav_blocks = pav_blocks_cache.get_or_insert_with(|| {
                                                 crate::recalibration::fit_is_market_pav_blocks(
@@ -2565,6 +2568,13 @@ impl ShadowRunner {
                                             let mut ctx_out = None;
                                             for pre in snaps {
                                                 ctx_out = tr.push_tick(pre, pav_blocks);
+                                            }
+                                            if let Some(ref mut c) = ctx_out {
+                                                inject_live_spot_strike(
+                                                    c,
+                                                    live_spot.as_ref(),
+                                                    strike_opt,
+                                                );
                                             }
                                             ctx_out
                                         } else {
@@ -2588,6 +2598,8 @@ impl ShadowRunner {
                                             yb_sz,
                                             nb_sz,
                                             cur_ctx.as_ref(),
+                                            live_spot.as_ref(),
+                                            strike_opt,
                                             &mut pending_live_amends,
                                         );
                                         if allow_live_entries {
@@ -2611,6 +2623,8 @@ impl ShadowRunner {
                                                 yb_sz,
                                                 nb_sz,
                                                 cur_ctx.as_ref(),
+                                                live_spot.as_ref(),
+                                                strike_opt,
                                                 false,
                                                 ob.updated_ms,
                                                 ob.last_trade_ms,
@@ -2652,8 +2666,9 @@ impl ShadowRunner {
                     None
                 };
 
-                for snap in &snaps[start_idx..] {
-                    let cur_ctx = v2_tracker.as_mut().and_then(|tr| {
+                for (rel_idx, snap) in snaps[start_idx..].iter().enumerate() {
+                    let is_latest_snap = start_idx + rel_idx + 1 == snaps.len();
+                    let mut cur_ctx = v2_tracker.as_mut().and_then(|tr| {
                         let pav_blocks = pav_blocks_cache.as_deref().unwrap_or(&[]);
                         tr.push_tick(snap, pav_blocks)
                     });
@@ -2810,6 +2825,16 @@ impl ShadowRunner {
                     );
 
                     // 1c. Dynamic maker repricing on resting quotes (cooldown & max_replaces_per_window).
+                    let replay_mode = wall_now >= close_epoch && snap.fetched_at < close_epoch;
+                    let live_spot = if !replay_mode && is_latest_snap {
+                        app.spot_feed.latest_fresh_for_series(snap.series.as_str())
+                    } else {
+                        None
+                    };
+                    let strike_opt = snap.floor_strike.or(snap.cap_strike);
+                    if let Some(ref mut c) = cur_ctx {
+                        inject_live_spot_strike(c, live_spot.as_ref(), strike_opt);
+                    }
                     evaluate_reprices_for_market(
                         &mut st,
                         app,
@@ -2828,6 +2853,8 @@ impl ShadowRunner {
                         snap.yes_bid_size,
                         snap.no_bid_size,
                         cur_ctx.as_ref(),
+                        live_spot.as_ref(),
+                        strike_opt,
                         &mut pending_live_amends,
                     );
 
@@ -2835,7 +2862,6 @@ impl ShadowRunner {
                     if secs_to_close <= cancel_before || !allow_live_entries {
                         continue;
                     }
-                    let replay_mode = wall_now >= close_epoch && snap.fetched_at < close_epoch;
                     evaluate_slots_for_market(
                         &mut st,
                         app,
@@ -2856,6 +2882,8 @@ impl ShadowRunner {
                         snap.yes_bid_size,
                         snap.no_bid_size,
                         cur_ctx.as_ref(),
+                        live_spot.as_ref(),
+                        strike_opt,
                         replay_mode,
                         0,
                         None,
@@ -3591,6 +3619,35 @@ fn resolve_bid_exit_execution(
     (fb, fb as f64)
 }
 
+fn inject_live_spot_strike(
+    ctx: &mut crate::strategy_v2::TickContext,
+    spot_opt: Option<&crate::spot_feed::SpotAssetStatus>,
+    strike_opt: Option<f64>,
+) {
+    if ctx.strike_price <= 0.0 {
+        if let Some(strike) = strike_opt.filter(|v| v.is_finite() && *v > 0.0) {
+            ctx.strike_price = strike;
+        }
+    }
+    if let Some(spot) = spot_opt {
+        if let Some(px) = spot.price.filter(|v| v.is_finite() && *v > 0.0) {
+            ctx.spot_price = px;
+            if ctx.strike_price > 0.0 {
+                let d = ((px - ctx.strike_price) / ctx.strike_price) * 10_000.0;
+                if d.is_finite() {
+                    ctx.spot_distance_bps = d;
+                }
+            }
+        }
+        if let Some(d30) = spot.delta_30s_bps.filter(|v| v.is_finite()) {
+            ctx.spot_delta_30s_bps = d30;
+        }
+        if let Some(vb) = spot.vol_bps.filter(|v| v.is_finite()) {
+            ctx.spot_vol_bps = vb;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_slot_tick_context(
     st: &RunnerState,
@@ -3603,6 +3660,8 @@ fn build_slot_tick_context(
     yb_c: u8,
     nb_c: u8,
     base_ctx: Option<&crate::strategy_v2::TickContext>,
+    live_spot: Option<&crate::spot_feed::SpotAssetStatus>,
+    strike_opt: Option<f64>,
     need_v2: bool,
 ) -> Option<crate::strategy_v2::TickContext> {
     if base_ctx.is_none() && !need_v2 {
@@ -3662,6 +3721,11 @@ fn build_slot_tick_context(
                 slot_avg_entry_cents: 0.0,
                 slot_unrealized_pnl_cents: 0.0,
                 slot_resting_cents: 0,
+                spot_price: 0.0,
+                strike_price: 0.0,
+                spot_distance_bps: 0.0,
+                spot_delta_30s_bps: 0.0,
+                spot_vol_bps: 0.0,
             }
         }
     };
@@ -3669,6 +3733,7 @@ fn build_slot_tick_context(
     ctx.slot_avg_entry_cents = avg_entry;
     ctx.slot_unrealized_pnl_cents = unreal_sum;
     ctx.slot_resting_cents = resting_cents;
+    inject_live_spot_strike(&mut ctx, live_spot, strike_opt);
     Some(ctx)
 }
 
@@ -3828,6 +3893,8 @@ fn evaluate_reprices_for_market(
     yes_bid_size: f32,
     no_bid_size: f32,
     cur_ctx: Option<&crate::strategy_v2::TickContext>,
+    live_spot: Option<&crate::spot_feed::SpotAssetStatus>,
+    strike_opt: Option<f64>,
     pending_live_amends: &mut Vec<PendingLiveAmend>,
 ) {
     if secs_to_close <= cancel_before {
@@ -3909,6 +3976,8 @@ fn evaluate_reprices_for_market(
             yb_c,
             nb_c,
             cur_ctx,
+            live_spot,
+            strike_opt,
             strat.is_v2(),
         );
         let Some((quote_dollars, eval_side, post_only)) = strat.entry_quote_with_ctx(
@@ -4012,6 +4081,8 @@ fn evaluate_slots_for_market(
     yes_bid_size: f32,
     no_bid_size: f32,
     cur_ctx: Option<&crate::strategy_v2::TickContext>,
+    live_spot: Option<&crate::spot_feed::SpotAssetStatus>,
+    strike_opt: Option<f64>,
     replay_mode: bool,
     l2_updated_ms: i64,
     l2_trade_ms: Option<i64>,
@@ -4089,6 +4160,8 @@ fn evaluate_slots_for_market(
             yb_c,
             nb_c,
             cur_ctx,
+            live_spot,
+            strike_opt,
             strat.is_v2(),
         );
         let Some((quote_dollars, entry_side, post_only)) = strat.entry_quote_with_ctx(
@@ -5150,6 +5223,8 @@ pub fn evaluate(ctx) {
                 0.35,
                 63,
                 34,
+                None,
+                None,
                 None,
                 true,
             )

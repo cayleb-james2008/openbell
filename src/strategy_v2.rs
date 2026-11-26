@@ -80,13 +80,23 @@ pub struct TickContext {
     pub slot_unrealized_pnl_cents: f64,
     #[serde(default)]
     pub slot_resting_cents: i64,
+    #[serde(default)]
+    pub spot_price: f64,
+    #[serde(default)]
+    pub strike_price: f64,
+    #[serde(default)]
+    pub spot_distance_bps: f64,
+    #[serde(default)]
+    pub spot_delta_30s_bps: f64,
+    #[serde(default)]
+    pub spot_vol_bps: f64,
 }
 
 impl TickContext {
     /// Convert this `TickContext` into a Rune dynamic `Object` so scripts can
     /// read `ctx.yes_ask`, `ctx.pav_ev_yes_cents`, `ctx.book_imbalance`, etc.
     pub fn to_rune_object(&self) -> Result<rune::runtime::Object, String> {
-        let mut obj = rune::runtime::Object::with_capacity(24)
+        let mut obj = rune::runtime::Object::with_capacity(29)
             .map_err(|e| format!("rune object alloc failed: {e}"))?;
         fn insert_val<T: rune::runtime::ToValue>(
             obj: &mut rune::runtime::Object,
@@ -133,6 +143,11 @@ impl TickContext {
             self.slot_unrealized_pnl_cents,
         )?;
         insert_val(&mut obj, "slot_resting_cents", self.slot_resting_cents)?;
+        insert_val(&mut obj, "spot_price", self.spot_price)?;
+        insert_val(&mut obj, "strike_price", self.strike_price)?;
+        insert_val(&mut obj, "spot_distance_bps", self.spot_distance_bps)?;
+        insert_val(&mut obj, "spot_delta_30s_bps", self.spot_delta_30s_bps)?;
+        insert_val(&mut obj, "spot_vol_bps", self.spot_vol_bps)?;
         Ok(obj)
     }
 }
@@ -149,6 +164,11 @@ pub struct CausalFeatureTracker {
     history_60s: VecDeque<(i64, f64)>,
     vol_mean_cents: f64,
     vol_m2: f64,
+    spot_history_30s: VecDeque<(i64, f64)>,
+    prev_spot_price: Option<f64>,
+    spot_ret_count: i64,
+    spot_ret_mean_bps: f64,
+    spot_ret_m2: f64,
     cached_close_str: Option<String>,
     cached_close_epoch: Option<i64>,
 }
@@ -164,6 +184,11 @@ impl CausalFeatureTracker {
             history_60s: VecDeque::new(),
             vol_mean_cents: 0.0,
             vol_m2: 0.0,
+            spot_history_30s: VecDeque::new(),
+            prev_spot_price: None,
+            spot_ret_count: 0,
+            spot_ret_mean_bps: 0.0,
+            spot_ret_m2: 0.0,
             cached_close_str: None,
             cached_close_epoch: None,
         }
@@ -280,6 +305,77 @@ impl CausalFeatureTracker {
         let pav_ev_yes_cents = (pav_yes_prob - ya - fee(ya)) * 100.0;
         let pav_ev_no_cents = ((1.0 - pav_yes_prob) - na - fee(na)) * 100.0;
 
+        let strike_price = snap
+            .floor_strike
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .or_else(|| snap.cap_strike.filter(|v| v.is_finite() && *v > 0.0))
+            .unwrap_or(0.0);
+        let spot_price = snap
+            .spot_price
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(0.0);
+        let spot_distance_bps = if spot_price > 0.0 && strike_price > 0.0 {
+            let d = ((spot_price - strike_price) / strike_price) * 10_000.0;
+            if d.is_finite() { d } else { 0.0 }
+        } else {
+            0.0
+        };
+        let (spot_delta_30s_bps, spot_vol_bps) = if spot_price > 0.0 {
+            self.spot_history_30s.push_back((snap.fetched_at, spot_price));
+            let spot_target_ts = snap.fetched_at - 30;
+            let mut ref_spot = self
+                .spot_history_30s
+                .front()
+                .map(|x| x.1)
+                .unwrap_or(spot_price);
+            let mut latest_old_spot_idx: Option<usize> = None;
+            for (idx, &(ts, val)) in self.spot_history_30s.iter().enumerate() {
+                if ts <= spot_target_ts {
+                    ref_spot = val;
+                    latest_old_spot_idx = Some(idx);
+                } else {
+                    break;
+                }
+            }
+            if let Some(keep_idx) = latest_old_spot_idx {
+                for _ in 0..keep_idx {
+                    self.spot_history_30s.pop_front();
+                }
+            }
+            let delta_bps = if ref_spot > 0.0 {
+                let d = ((spot_price - ref_spot) / ref_spot) * 10_000.0;
+                if d.is_finite() { d } else { 0.0 }
+            } else {
+                0.0
+            };
+
+            if let Some(prev_sp) = self.prev_spot_price {
+                if prev_sp > 0.0 {
+                    let ret_bps = ((spot_price - prev_sp) / prev_sp) * 10_000.0;
+                    if ret_bps.is_finite() {
+                        self.spot_ret_count += 1;
+                        let nf = self.spot_ret_count as f64;
+                        let d1 = ret_bps - self.spot_ret_mean_bps;
+                        self.spot_ret_mean_bps += d1 / nf;
+                        let d2 = ret_bps - self.spot_ret_mean_bps;
+                        self.spot_ret_m2 += d1 * d2;
+                    }
+                }
+            }
+            self.prev_spot_price = Some(spot_price);
+            let vol_bps = if self.spot_ret_count >= 2 {
+                let v = (self.spot_ret_m2 / (self.spot_ret_count as f64))
+                    .max(0.0)
+                    .sqrt();
+                if v.is_finite() { v } else { 0.0 }
+            } else {
+                0.0
+            };
+            (delta_bps, vol_bps)
+        } else {
+            (0.0, 0.0)
+        };
+
         Some(TickContext {
             yes_bid,
             yes_ask: ya,
@@ -305,6 +401,11 @@ impl CausalFeatureTracker {
             slot_avg_entry_cents: 0.0,
             slot_unrealized_pnl_cents: 0.0,
             slot_resting_cents: 0,
+            spot_price,
+            strike_price,
+            spot_distance_bps,
+            spot_delta_30s_bps,
+            spot_vol_bps,
         })
     }
 }
@@ -492,6 +593,11 @@ fn sample_boundary_contexts() -> Vec<TickContext> {
             slot_avg_entry_cents: 0.0,
             slot_unrealized_pnl_cents: 0.0,
             slot_resting_cents: 0,
+            spot_price: 95150.0,
+            strike_price: 95000.0,
+            spot_distance_bps: 15.789,
+            spot_delta_30s_bps: 8.5,
+            spot_vol_bps: 3.2,
         },
         TickContext {
             yes_bid: 0.49,
@@ -518,6 +624,11 @@ fn sample_boundary_contexts() -> Vec<TickContext> {
             slot_avg_entry_cents: 0.0,
             slot_unrealized_pnl_cents: 0.0,
             slot_resting_cents: 0,
+            spot_price: 0.0,
+            strike_price: 0.0,
+            spot_distance_bps: 0.0,
+            spot_delta_30s_bps: 0.0,
+            spot_vol_bps: 0.0,
         },
         TickContext {
             yes_bid: 0.01,
@@ -544,6 +655,11 @@ fn sample_boundary_contexts() -> Vec<TickContext> {
             slot_avg_entry_cents: 0.0,
             slot_unrealized_pnl_cents: 0.0,
             slot_resting_cents: 0,
+            spot_price: 185.0,
+            strike_price: 188.0,
+            spot_distance_bps: -159.57,
+            spot_delta_30s_bps: -22.0,
+            spot_vol_bps: 9.1,
         },
         TickContext {
             yes_bid: 0.97,
@@ -570,6 +686,11 @@ fn sample_boundary_contexts() -> Vec<TickContext> {
             slot_avg_entry_cents: 0.0,
             slot_unrealized_pnl_cents: 0.0,
             slot_resting_cents: 0,
+            spot_price: 2.55,
+            strike_price: 2.50,
+            spot_distance_bps: 200.0,
+            spot_delta_30s_bps: 14.0,
+            spot_vol_bps: 4.5,
         },
     ]
 }
@@ -604,6 +725,9 @@ fn canary_snapshot(
         last_price: OptPrice::from_opt(Some(ya)),
         yes_bid_size: y_sz,
         no_bid_size: n_sz,
+        floor_strike: None,
+        cap_strike: None,
+        spot_price: None,
     }
 }
 
@@ -1377,5 +1501,65 @@ pub fn evaluate(ctx) {
             assert!(validate_strategy_slug(bad).is_err(), "expected err for {bad}");
         }
         assert_eq!(validate_strategy_slug("good_strat-1.rn").unwrap(), "good_strat-1");
+    }
+
+    #[test]
+    fn tick_context_spot_strike_defaults_and_causal_metrics() {
+        let close = parse_iso_z("2026-11-26T15:15:00Z").unwrap();
+        let start = close - 900;
+
+        // 1. Legacy snapshots without spot/strike default cleanly to 0.0.
+        let legacy = vec![
+            test_snap(start + 10, 0.50, 0.52, 0.48, 0.50, 20.0, 20.0),
+            test_snap(start + 45, 0.54, 0.48, 0.52, 0.46, 30.0, 20.0),
+        ];
+        let legacy_ctxs = build_causal_tick_contexts(&legacy, &[]);
+        assert_eq!(legacy_ctxs.len(), 2);
+        for c in &legacy_ctxs {
+            assert_eq!(c.spot_price, 0.0);
+            assert_eq!(c.strike_price, 0.0);
+            assert_eq!(c.spot_distance_bps, 0.0);
+            assert_eq!(c.spot_delta_30s_bps, 0.0);
+            assert_eq!(c.spot_vol_bps, 0.0);
+        }
+
+        // 2. Snapshots with floor_strike + spot_price compute causal distance, 30s delta, and vol.
+        let mut s0 = test_snap(start + 10, 0.50, 0.52, 0.48, 0.50, 20.0, 20.0);
+        s0.floor_strike = Some(100_000.0);
+        s0.spot_price = Some(100_000.0);
+        let mut s1 = test_snap(start + 25, 0.55, 0.47, 0.53, 0.45, 30.0, 20.0);
+        s1.floor_strike = Some(100_000.0);
+        s1.spot_price = Some(100_100.0); // +10 bps
+        let mut s2 = test_snap(start + 45, 0.60, 0.42, 0.58, 0.40, 40.0, 15.0);
+        s2.floor_strike = Some(100_000.0);
+        s2.spot_price = Some(100_300.0); // +30 bps vs s0 (<= t-30)
+
+        let full = build_causal_tick_contexts(&[s0.clone(), s1.clone(), s2.clone()], &[]);
+        let prefix = build_causal_tick_contexts(&[s0, s1], &[]);
+        assert_eq!(full[1], prefix[1]);
+        assert!((full[2].spot_price - 100_300.0).abs() < 1e-9);
+        assert!((full[2].strike_price - 100_000.0).abs() < 1e-9);
+        assert!((full[2].spot_distance_bps - 30.0).abs() < 1e-6);
+        assert!((full[2].spot_delta_30s_bps - 30.0).abs() < 1e-6);
+        assert!(full[2].spot_vol_bps > 0.0 && full[2].spot_vol_bps.is_finite());
+
+        // 3. Rune v2 script can read all 5 new ctx fields and pass causal canary.
+        let src = r#"
+pub fn name() { "unit-spot-ctx-v2" }
+pub fn side() { "yes" }
+pub fn describe() { "Verifies all 29 TickContext fields including spot and strike." }
+pub fn evaluate(ctx) {
+    let _d = ctx.spot_distance_bps + ctx.spot_delta_30s_bps + ctx.spot_vol_bps;
+    if ctx.spot_price > ctx.strike_price && ctx.strike_price > 0.0 && ctx.secs_to_close >= 60 {
+        return Some(#{ enter: true, side: "yes", limit_cents: 55, post_only: true });
+    }
+    if ctx.spot_price == 0.0 && ctx.secs_to_close == 240 && ctx.delta_60s_cents >= 3.0 {
+        return Some(#{ enter: true, side: "yes", limit_cents: 68, post_only: true });
+    }
+    None
+}
+"#;
+        let v = validate_strategy_source_full(src).expect("spot v2 script must validate");
+        assert!(v.causal_canary_passed);
     }
 }

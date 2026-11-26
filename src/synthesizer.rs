@@ -1628,6 +1628,9 @@ mod tests {
                     last_price: OptPrice::from_opt(Some(0.51)),
                     yes_bid_size: 40.0,
                     no_bid_size: 40.0,
+                    floor_strike: None,
+                    cap_strike: None,
+                    spot_price: None,
                 },
                 Snapshot {
                     fetched_at: close_ep - 360,
@@ -1644,6 +1647,9 @@ mod tests {
                     last_price: OptPrice::from_opt(Some(0.58)),
                     yes_bid_size: 90.0,
                     no_bid_size: 20.0,
+                    floor_strike: None,
+                    cap_strike: None,
+                    spot_price: None,
                 },
                 Snapshot {
                     fetched_at: close_ep - 240,
@@ -1660,6 +1666,9 @@ mod tests {
                     last_price: OptPrice::from_opt(Some(0.57)),
                     yes_bid_size: 95.0,
                     no_bid_size: 18.0,
+                    floor_strike: None,
+                    cap_strike: None,
+                    spot_price: None,
                 },
             ];
             windows.insert(ticker, snaps);
@@ -1719,6 +1728,9 @@ mod tests {
                 last_price: OptPrice::from_opt(Some(0.51)),
                 yes_bid_size: 20.0,
                 no_bid_size: 20.0,
+                floor_strike: None,
+                cap_strike: None,
+                spot_price: None,
             }],
         );
         let r_single = synthesize_strategies(&single, &[], "single", &SynthesizeRequest::default()).unwrap();

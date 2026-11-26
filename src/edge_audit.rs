@@ -505,6 +505,9 @@ mod tests {
             last_price: crate::OptPrice::from_opt(ya),
             yes_bid_size: 150.0,
             no_bid_size: 150.0,
+            floor_strike: None,
+            cap_strike: None,
+            spot_price: None,
         }
     }
 
