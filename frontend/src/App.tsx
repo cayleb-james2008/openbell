@@ -37,6 +37,7 @@ const LiveDeskWorkspace = lazyComponent(() => import("@/LiveTradingPanel"), (m) 
 const QuantLabTab = lazyComponent(() => import("@/QuantLabTab"), (m) => m.QuantLabTab);
 const RuneSandbox = lazyComponent(() => import("@/RuneSandbox"), (m) => m.RuneSandbox);
 const SettingsSheet = lazyComponent(() => import("@/SettingsSheet"), (m) => m.SettingsSheet);
+const ShadowRunnerPanel = lazyComponent(() => import("@/ShadowRunnerPanel"), (m) => m.ShadowRunnerPanel);
 const SlotsTab = lazyComponent(() => import("@/SlotsTab"), (m) => m.SlotsTab);
 const StrategiesTab = lazyComponent(() => import("@/StrategiesTab"), (m) => m.StrategiesTab);
 import {
@@ -68,6 +69,7 @@ import {
   triggerKillSwitch,
 } from "@/lib/live";
 import { useWide } from "@/lib/media";
+import type { RunnerMode } from "@/lib/runner";
 
 function initialDataset(): Dataset {
   const qs = new URLSearchParams(location.search);
@@ -152,6 +154,8 @@ export function App() {
   const [liveBusy, setLiveBusy] = useState(false);
   const [savingLiveConfig, setSavingLiveConfig] = useState(false);
   const [armModalOpen, setArmModalOpen] = useState(false);
+  const [runnerMode, setRunnerMode] = useState<RunnerMode>("stopped");
+  const [runnerRefreshSignal, setRunnerRefreshSignal] = useState(0);
 
   // Collapsible workbench drawers
   const [ticketDrawerOpen, setTicketDrawerOpen] = useState(false);
@@ -184,6 +188,7 @@ export function App() {
       void QuantLabTab.preload();
       void RuneSandbox.preload();
       void SettingsSheet.preload();
+      void ShadowRunnerPanel.preload();
       void CommandPalette.preload();
     }, 60);
     return () => window.clearTimeout(timer);
@@ -344,6 +349,7 @@ export function App() {
     try {
       await armLiveTrading(home);
       await refreshLive();
+      setRunnerRefreshSignal((s) => s + 1);
       toast.success("Live Kalshi v2 order routing armed.");
     } catch (e) {
       toast.error(`Arm live failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -358,6 +364,7 @@ export function App() {
     try {
       await disarmLiveTrading(home);
       await refreshLive();
+      setRunnerRefreshSignal((s) => s + 1);
       toast.success("Live trading disarmed. Returned to paper mode.");
     } catch (e) {
       toast.error(`Disarm failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -408,6 +415,8 @@ export function App() {
     try {
       const res = await triggerKillSwitch(home);
       await refreshLive();
+      setRunnerMode("stopped");
+      setRunnerRefreshSignal((s) => s + 1);
       toast.error(
         `Emergency Kill Switch triggered: ${res.cancelledCount} resting order(s) canceled, live routing disarmed.`,
       );
@@ -975,6 +984,7 @@ export function App() {
                   bundle={liveBundle}
                   busy={liveBusy}
                   workspaceOpen={true}
+                  runnerMode={runnerMode}
                   onToggleWorkspace={() => setTicketDrawerOpen(true)}
                   onArmConfirm={() => void handleArmLive()}
                   onDisarm={() => void handleDisarmLive()}
@@ -995,6 +1005,17 @@ export function App() {
                   onCancelOrder={handleCancelLiveOrder}
                   onRequestArm={() => setArmModalOpen(true)}
                   onOpenSettings={() => setSettingsOpen(true)}
+                />
+                <ShadowRunnerPanel
+                  home={home}
+                  strategies={strategies}
+                  markets={markets}
+                  liveStatus={liveStatus}
+                  dataset={dataset}
+                  search={search}
+                  refreshSignal={runnerRefreshSignal}
+                  onRunnerStatusChange={(st) => setRunnerMode(st.mode)}
+                  onRequestArm={() => setArmModalOpen(true)}
                 />
               </div>
             </Suspense>
