@@ -337,6 +337,8 @@ pub struct AllocatedWinner {
     pub full_kelly_pct: f64,
     pub breakeven_fill_rate_pct: f64,
     pub regime_throttle_mult: f64,
+    pub execution_throttle_mult: f64,
+    pub execution_status: String,
     pub allocated_pct: f64,
     pub allocated_dollars: f64,
     pub rail_clamped_contracts: u32,
@@ -678,6 +680,7 @@ pub struct AutoAllocatorReport {
     pub dry_run_plan: DryRunOrderPlan,
     pub liquidity_capacity: LiquidityCapacityReport,
     pub daily_target: DailyTargetVerdict,
+    pub execution_health: crate::execution_audit::ExecutionHealthSummary,
     pub honesty_notes: Vec<String>,
 }
 
@@ -765,6 +768,7 @@ fn evaluate_split_candidates(
     min_trades: usize,
     is_maker: bool,
     slip_dollars: f64,
+    audit: Option<&crate::execution_audit::ExecutionHealthReport>,
 ) -> SelectionResult {
     let mut qualifying: Vec<SplitCandidate> = Vec::new();
     let mut quarantined: Vec<QuarantinedStrategy> = Vec::new();
@@ -773,14 +777,27 @@ fn evaluate_split_candidates(
     for (si, meta) in ctx.strategies.iter().enumerate() {
         let list = &entries_by_strat[si];
         let n = list.len();
+        let exec_q_entry = audit.and_then(|h| h.quarantine_state.find_entry(&meta.name));
 
         if n == 0 {
+            let reason = if let Some(qe) = exec_q_entry.filter(|e| e.status == "quarantined") {
+                format!(
+                    "execution quarantine: {}",
+                    if qe.reason.is_empty() {
+                        "adverse live/shadow markout decay"
+                    } else {
+                        qe.reason.as_str()
+                    }
+                )
+            } else {
+                format!("insufficient OOS depth (< {min_trades}): 0 trades")
+            };
             quarantined.push(QuarantinedStrategy {
                 strategy: meta.name.clone(),
                 side: meta.side.clone(),
                 oos_trades: 0,
                 oos_net_expectancy_cents: None,
-                reason: format!("insufficient OOS depth (< {min_trades}): 0 trades"),
+                reason,
             });
             continue;
         }
@@ -866,6 +883,26 @@ fn evaluate_split_candidates(
             worst_fold_expectancy_cents: worst_fold.and_then(finite_opt),
             stress_resilient,
         };
+
+        if let Some(qe) = exec_q_entry.filter(|e| e.status == "quarantined" || e.throttle_mult <= 0.0) {
+            quarantined.push(QuarantinedStrategy {
+                strategy: meta.name.clone(),
+                side: meta.side.clone(),
+                oos_trades: n,
+                oos_net_expectancy_cents: finite_opt(exp_cents),
+                reason: format!(
+                    "execution quarantine (live/shadow decay): {} (30s markout {:+.2}c, rolling fills {})",
+                    if qe.reason.is_empty() {
+                        "adverse markout / negative expectancy"
+                    } else {
+                        qe.reason.as_str()
+                    },
+                    qe.rolling_markout_30s_cents,
+                    qe.rolling_fills,
+                ),
+            });
+            continue;
+        }
 
         if n < min_trades {
             quarantined.push(QuarantinedStrategy {
@@ -1059,6 +1096,29 @@ pub fn compute_auto_allocator_report_with_orderbook(
     killed: bool,
     orderbook: Option<&crate::orderbook::OrderbookStore>,
 ) -> AutoAllocatorReport {
+    compute_auto_allocator_report_with_audit(
+        ctx,
+        raw_req,
+        rails,
+        live_armed,
+        killed,
+        orderbook,
+        None,
+    )
+}
+
+/// Same as `compute_auto_allocator_report_with_orderbook`, also ingesting live/shadow
+/// `ExecutionHealthReport` & `quarantine_state.json` decay telemetry so live-decaying or
+/// quarantined strategies are throttled/demoted even when static `snapshots.jsonl` OOS is positive.
+pub fn compute_auto_allocator_report_with_audit(
+    ctx: &TournamentTapeContext,
+    raw_req: &AutoAllocatorRequest,
+    rails: &RiskRailsConfig,
+    live_armed: bool,
+    killed: bool,
+    orderbook: Option<&crate::orderbook::OrderbookStore>,
+    audit: Option<&crate::execution_audit::ExecutionHealthReport>,
+) -> AutoAllocatorReport {
     let req = raw_req.sanitized();
     let is_maker = req.execution_mode == "maker";
     let slip_dollars = if is_maker {
@@ -1107,6 +1167,7 @@ pub fn compute_auto_allocator_report_with_orderbook(
         req.min_oos_trades,
         is_maker,
         slip_dollars,
+        audit,
     );
 
     // Evaluate IS split strictly causally (`close_epoch < split_epoch`) for OOS replay weights.
@@ -1118,6 +1179,7 @@ pub fn compute_auto_allocator_report_with_orderbook(
             req.min_oos_trades,
             is_maker,
             slip_dollars,
+            None,
         ))
     } else {
         None
@@ -1160,21 +1222,31 @@ pub fn compute_auto_allocator_report_with_orderbook(
             selection_basis,
         );
 
-    let total_allocated_pct = if n_winners == 0 {
-        0.0
-    } else {
-        let sum_raw: f64 = guarded_oos_weights_pct.iter().sum();
-        finite_or((sum_raw * regime_throttle_mult).clamp(0.0, 100.0), 0.0)
-    };
-    let cash_reserve_pct = finite_or((100.0 - total_allocated_pct).clamp(0.0, 100.0), 100.0);
-
     let mut active_winners = Vec::with_capacity(n_winners);
     let mut planned_intents = Vec::with_capacity(n_winners);
     let mut active_idx_set = std::collections::HashSet::with_capacity(n_winners);
+    let mut sum_alloc_pct = 0.0f64;
 
     for (i, cand) in oos_sel.accepted.iter().enumerate() {
         active_idx_set.insert(cand.strategy_idx);
-        let alloc_pct = finite_or(guarded_oos_weights_pct[i] * regime_throttle_mult, 0.0);
+        let exec_entry = audit.and_then(|h| h.quarantine_state.find_entry(&cand.strategy));
+        let execution_throttle_mult = exec_entry.map_or(1.0, |e| {
+            if e.status == "quarantined" {
+                0.0
+            } else if e.status == "throttled" {
+                finite_or(e.throttle_mult, 0.5).clamp(0.05, 1.0)
+            } else {
+                1.0
+            }
+        });
+        let execution_status = exec_entry
+            .map(|e| e.status.clone())
+            .unwrap_or_else(|| "active".to_string());
+        let alloc_pct = finite_or(
+            guarded_oos_weights_pct[i] * regime_throttle_mult * execution_throttle_mult,
+            0.0,
+        );
+        sum_alloc_pct += alloc_pct;
         let alloc_dollars = finite_or(req.starting_bankroll * (alloc_pct / 100.0), 0.0);
         let max_limit_cents =
             ((cand.avg_entry_price * 100.0).round() as i64).clamp(1, 99) as u8;
@@ -1240,6 +1312,8 @@ pub fn compute_auto_allocator_report_with_orderbook(
             full_kelly_pct: cand.full_kelly_pct,
             breakeven_fill_rate_pct,
             regime_throttle_mult,
+            execution_throttle_mult,
+            execution_status,
             allocated_pct: alloc_pct,
             allocated_dollars: alloc_dollars,
             rail_clamped_contracts,
@@ -1259,6 +1333,13 @@ pub fn compute_auto_allocator_report_with_orderbook(
             note,
         });
     }
+
+    let total_allocated_pct = if n_winners == 0 {
+        0.0
+    } else {
+        finite_or(sum_alloc_pct.clamp(0.0, 100.0), 0.0)
+    };
+    let cash_reserve_pct = finite_or((100.0 - total_allocated_pct).clamp(0.0, 100.0), 100.0);
 
     let regime_attribution = compute_regime_attribution(
         &oos_by_strat,
@@ -1293,6 +1374,7 @@ pub fn compute_auto_allocator_report_with_orderbook(
         &oos_by_epoch,
         &epoch_is_high_vol,
         is_total_entries,
+        audit,
     );
     let (active_calm_ev, active_hv_ev, active_calm_1c_ok, active_hv_1c_ok, active_reg_status) =
         evaluate_regime_stability(
@@ -1490,6 +1572,19 @@ pub fn compute_auto_allocator_report_with_orderbook(
         ));
     }
 
+    let execution_health = audit.map_or_else(
+        crate::execution_audit::ExecutionHealthSummary::default,
+        |h| h.to_summary(),
+    );
+    if !execution_health.quarantined_names.is_empty() || !execution_health.throttled_names.is_empty() {
+        honesty_notes.push(format!(
+            "Execution Markout Guard active: {} (quarantined: [{}], throttled: [{}]).",
+            execution_health.summary,
+            execution_health.quarantined_names.join(", "),
+            execution_health.throttled_names.join(", "),
+        ));
+    }
+
     AutoAllocatorReport {
         execution_mode: req.execution_mode,
         sizing_mode: req.sizing_mode,
@@ -1532,6 +1627,7 @@ pub fn compute_auto_allocator_report_with_orderbook(
         dry_run_plan,
         liquidity_capacity,
         daily_target,
+        execution_health,
         honesty_notes,
     }
 }
@@ -3965,6 +4061,7 @@ fn compute_preset_leaderboard(
     oos_by_epoch: &BTreeMap<i64, Vec<&TournamentEntry>>,
     epoch_is_high_vol: &BTreeMap<i64, bool>,
     is_total_entries: usize,
+    audit: Option<&crate::execution_audit::ExecutionHealthReport>,
 ) -> (Vec<StrategyPresetCandidate>, Option<String>) {
     struct PresetSpec {
         id: &'static str,
@@ -4100,6 +4197,7 @@ fn compute_preset_leaderboard(
             cand_req.min_oos_trades,
             is_maker,
             slip_dollars,
+            audit,
         );
         let is_sel = if is_total_entries > 0 {
             Some(evaluate_split_candidates(
@@ -4109,6 +4207,7 @@ fn compute_preset_leaderboard(
                 cand_req.min_oos_trades,
                 is_maker,
                 slip_dollars,
+                None,
             ))
         } else {
             None

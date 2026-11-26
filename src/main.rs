@@ -11,6 +11,7 @@ mod analytics;
 mod auto_allocator;
 mod edge_audit;
 mod embedded_chunks;
+mod execution_audit;
 mod gzip_inflate;
 mod kalshi_live;
 mod open;
@@ -4383,8 +4384,43 @@ impl App {
         (strategies_json, slots_json, equity_json)
     }
 
+    fn execution_health_for_tape(
+        &self,
+        dpath: &Path,
+        persist_quarantine: bool,
+    ) -> execution_audit::ExecutionHealthReport {
+        let tape = self.tape(dpath);
+        let mut tape_mids: std::collections::HashMap<String, Vec<execution_audit::MidpointObs>> =
+            std::collections::HashMap::new();
+        let mut tape_settle: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (t, snaps) in tape.grouped.iter() {
+            for s in snaps {
+                let res = s.result.as_str().trim().to_ascii_lowercase();
+                if res == "yes" || res == "no" {
+                    tape_settle.insert(t.clone(), res);
+                } else if let (Some(yb), Some(ya)) = (s.yes_bid.get(), s.yes_ask.get()) {
+                    tape_mids
+                        .entry(t.clone())
+                        .or_default()
+                        .push(execution_audit::MidpointObs {
+                            ts_secs: s.fetched_at as f64,
+                            yes_mid_cents: (yb + ya) * 50.0,
+                        });
+                }
+            }
+        }
+        execution_audit::evaluate_execution_health(
+            &self.data_dir,
+            Some(&self.orderbook),
+            Some(&tape_mids),
+            Some(&tape_settle),
+            persist_quarantine,
+        )
+    }
+
     /// Cached Autonomous Edge Allocator JSON payload keyed on tape, strategy dir,
-    /// request parameters, and current Hard Risk Rails state.
+    /// request parameters, execution audit files, and current Hard Risk Rails state.
     fn allocator_shared(
         &self,
         dpath: &Path,
@@ -4422,6 +4458,16 @@ impl App {
         rails.max_open_exposure_dollars.to_bits().hash(&mut h);
         rails.allowed_ticker_prefix.hash(&mut h);
         self.orderbook.revision().hash(&mut h);
+        for fname in [
+            "quarantine_state.json",
+            "shadow_ledger.jsonl",
+            "live_executions.jsonl",
+            "orderbooks.jsonl",
+            "markout_samples.jsonl",
+        ] {
+            let fp = self.data_dir.join(fname);
+            tape_stat(&fp).unwrap_or((0, 0)).hash(&mut h);
+        }
         let req_hash = h.finish();
 
         {
@@ -4438,13 +4484,15 @@ impl App {
         }
 
         let ctx = self.tournament_ctx_shared(dpath);
-        let rep = auto_allocator::compute_auto_allocator_report_with_orderbook(
+        let health = self.execution_health_for_tape(dpath, false);
+        let rep = auto_allocator::compute_auto_allocator_report_with_audit(
             &ctx,
             &san,
             &rails,
             live_armed,
             killed,
             Some(&self.orderbook),
+            Some(&health),
         );
         let json = Arc::new(serde_json::to_string(&rep).unwrap_or_else(|_| "{}".into()));
 
@@ -6044,6 +6092,8 @@ fn try_handle_inline_get(
         || path.starts_with("/api/tape/stream")
         || path.starts_with("/api/stream")
         || path.starts_with("/api/orderbook")
+        || path.starts_with("/api/analytics/execution-health")
+        || path.starts_with("/api/analytics/quarantine")
     {
         return None;
     }
@@ -6373,6 +6423,73 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 .unwrap_or(1.0);
             let payload = app.edge_audit_shared(&dpath, &dataset, slippage);
             json_response(200, &payload)
+        }
+        ("GET", "/api/analytics/execution-health") => {
+            let (_, dpath) = match resolve_dataset_checked(app, query, None) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let rep = app.execution_health_for_tape(&dpath, true);
+            app.runner.set_quarantine_state(rep.quarantine_state.clone());
+            json_response(200, &serde_json::to_string(&rep).unwrap_or_else(|_| "{}".into()))
+        }
+        ("POST", "/api/analytics/quarantine/override") => {
+            let parsed = match parse_json_object_body(
+                body,
+                false,
+                "Quarantine override request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let Some(strategy) = parsed.get("strategy").and_then(|v| v.as_str()) else {
+                return json_ok_err_response(400, "missing string field \"strategy\"");
+            };
+            let Some(action) = parsed.get("action").and_then(|v| v.as_str()) else {
+                return json_ok_err_response(400, "missing string field \"action\"");
+            };
+            let reason = match parsed.get("reason") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(s)) => Some(s.as_str()),
+                Some(_) => {
+                    return json_ok_err_response(400, "optional field \"reason\" must be a string");
+                }
+            };
+            let clean_strat = strategy.trim();
+            let (strats, _) = load_strategies_with_errors(&app.strategies_dir);
+            let known_strat = strats.iter().any(|s| {
+                s.name == clean_strat
+                    || s.name == clean_strat.replace('-', "_")
+                    || s.name == clean_strat.replace('_', "-")
+            }) || execution_audit::strategy_exists_in_audit(&app.data_dir, clean_strat);
+            if !known_strat {
+                return json_ok_err_response(
+                    400,
+                    &format!("unknown strategy \"{clean_strat}\""),
+                );
+            }
+            match execution_audit::apply_quarantine_override(
+                &app.data_dir,
+                clean_strat,
+                action,
+                reason,
+            ) {
+                Ok((entry, q_state)) => {
+                    app.runner.set_quarantine_state(q_state.clone());
+                    {
+                        let mut guard = app.allocator_cache.write().unwrap_or_else(|p| p.into_inner());
+                        guard.clear();
+                    }
+                    let out = serde_json::json!({
+                        "ok": true,
+                        "strategy": clean_strat,
+                        "entry": entry,
+                        "quarantine_state": q_state,
+                    });
+                    json_response(200, &out.to_string())
+                }
+                Err(e) => json_ok_err_response(400, &e),
+            }
         }
         ("POST", "/api/analytics/scale-plan") => {
             let parsed = match parse_json_object_body(
@@ -7557,6 +7674,101 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 .ledger_query(limit, strategy.as_deref(), mode.as_deref());
             json_response(200, &serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()))
         }
+        ("POST", "/api/runner/sync-allocator") => {
+            let parsed = match parse_json_object_body(
+                body,
+                true,
+                "Runner sync-allocator request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let (_, dpath) = match resolve_dataset_checked(
+                app,
+                query,
+                parsed.get("dataset").and_then(|v| v.as_str()),
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let alloc_req: auto_allocator::AutoAllocatorRequest = if body.trim().is_empty() {
+                Default::default()
+            } else {
+                match serde_json::from_str(body) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return json_ok_err_response(
+                            400,
+                            &format!("invalid allocator parameters: {e}"),
+                        );
+                    }
+                }
+            };
+            let bankroll_override = match parsed.get("bankroll_dollars") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => match v.as_f64() {
+                    Some(b) if b.is_finite() && b > 0.0 && b <= 10_000_000.0 => Some(b),
+                    _ => {
+                        return json_ok_err_response(
+                            400,
+                            "bankroll_dollars must be finite between $0.01 and $10,000,000",
+                        );
+                    }
+                },
+            };
+            let exec_override = match parsed.get("execution_mode") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(s)) => {
+                    let m = s.trim().to_ascii_lowercase();
+                    if m != "maker" && m != "taker" {
+                        return json_ok_err_response(
+                            400,
+                            "execution_mode must be \"maker\" or \"taker\"",
+                        );
+                    }
+                    Some(m)
+                }
+                Some(_) => {
+                    return json_ok_err_response(400, "execution_mode must be a string");
+                }
+            };
+            let (live_armed, killed, rails) = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                (st.rails.live_armed, st.rails.killed, st.rails.rails.clone())
+            };
+            let ctx = app.tournament_ctx_shared(&dpath);
+            let health = app.execution_health_for_tape(&dpath, true);
+            let san = alloc_req.sanitized();
+            let rep = auto_allocator::compute_auto_allocator_report_with_audit(
+                &ctx,
+                &san,
+                &rails,
+                live_armed,
+                killed,
+                Some(&app.orderbook),
+                Some(&health),
+            );
+            match app.runner.sync_from_allocator(
+                &rep,
+                &rails,
+                &health.quarantine_state,
+                bankroll_override,
+                exec_override.as_deref(),
+                live_armed,
+                killed,
+            ) {
+                Ok((slots, excluded_quarantined, status)) => {
+                    let out = serde_json::json!({
+                        "ok": true,
+                        "slots": slots,
+                        "excluded_quarantined": excluded_quarantined,
+                        "status": status,
+                    });
+                    json_response(200, &out.to_string())
+                }
+                Err(e) => json_ok_err_response(400, &e),
+            }
+        }
         ("GET", "/api/orderbook") => {
             let Some(raw_ticker) = query_param(query, "ticker") else {
                 return json_ok_err_response(400, "missing ticker parameter");
@@ -8484,12 +8696,15 @@ fn main() {
                             let is_strict_mutation = (route == "/api/strategies/save"
                                 && method == "POST")
                                 || (route.starts_with("/api/strategies/") && method == "DELETE")
-                                || (route == "/api/research/synthesize" && method == "POST");
+                                || (route == "/api/research/synthesize" && method == "POST")
+                                || (route == "/api/analytics/quarantine/override"
+                                    && method == "POST");
                             let is_strict_live = route == "/api/live"
                                 || route.starts_with("/api/live/")
                                 || route == "/api/runner"
                                 || route.starts_with("/api/runner/")
-                                || route == "/api/orderbook/subscribe";
+                                || route == "/api/orderbook/subscribe"
+                                || route == "/api/analytics/execution-health";
                             if is_strict_live || is_strict_mutation {
                                 if is_strict_mutation {
                                     if !is_loopback_host(host) {
