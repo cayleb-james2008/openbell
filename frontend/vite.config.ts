@@ -178,6 +178,8 @@ export default defineConfig({
             norm.endsWith("/frontend/src/lib/lazy.tsx") ||
             norm.endsWith("/frontend/src/lib/live.ts") ||
             norm.endsWith("/frontend/src/lib/media.ts") ||
+            norm.endsWith("/frontend/src/lib/orderbook.ts") ||
+            norm.endsWith("/frontend/src/OrderbookLadder.tsx") ||
             norm.endsWith("/frontend/src/TapeCharts.tsx") ||
             norm.endsWith("/frontend/src/AutoCollectorStrip.tsx") ||
             norm.endsWith("/frontend/src/Update.tsx") ||

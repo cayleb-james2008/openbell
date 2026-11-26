@@ -17,7 +17,9 @@ import {
 } from "@/components/ui";
 import { MarketHistoryChart, ProbBar, ProvenanceTag } from "@/TapeCharts";
 import { AutoCollectorStrip } from "@/AutoCollectorStrip";
+import { OrderbookLadder } from "@/OrderbookLadder";
 import { useWide } from "@/lib/media";
+import { useOrderbook } from "@/lib/orderbook";
 import {
   type CollectorScheduleStatus,
   type Dataset,
@@ -82,6 +84,10 @@ function MarketInspector({
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(false);
   const ticker = market ? cleanStr(market.ticker, "") : "";
+  const orderbook = useOrderbook(ticker, {
+    enabled: Boolean(ticker),
+    sseEnabled: dataset !== "fixture",
+  });
 
   useEffect(() => {
     if (!ticker) {
@@ -189,6 +195,18 @@ function MarketInspector({
                     <ProvenanceTag kind="venue" />
                   </div>
                   <ProbBar yesProb={prob} />
+                </div>
+
+                <div className="border-t border-hairline pt-4">
+                  <OrderbookLadder
+                    ticker={ticker}
+                    snapshot={orderbook.snapshot}
+                    streamStatus={orderbook.streamStatus}
+                    orderQty={10}
+                    loading={orderbook.loading}
+                    error={orderbook.error}
+                    onRefresh={orderbook.refresh}
+                  />
                 </div>
 
                 <div className="border-t border-hairline pt-4">

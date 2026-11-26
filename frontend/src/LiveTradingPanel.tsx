@@ -28,6 +28,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui";
+import { OrderbookLadder } from "@/OrderbookLadder";
 import { type Market, cleanStr, isNum, money, moneySigned } from "@/lib/desk";
 import {
   type LiveConfigPayload,
@@ -37,6 +38,7 @@ import {
   type LiveStatus,
   evaluateOrderRails,
 } from "@/lib/live";
+import { deriveSideBookLevels, useOrderbook, walkBookLevels } from "@/lib/orderbook";
 import type { RunnerMode } from "@/lib/runner";
 
 function shortTs(iso: string): string {
@@ -551,6 +553,16 @@ export function LiveDeskWorkspace({
 
   const parsedCount = Number(countInput);
   const parsedPrice = Number(priceInput);
+  const cleanTicketTicker = ticker.trim().toUpperCase();
+  const ticketOrderQty = Number.isFinite(parsedCount) && parsedCount >= 1 ? Math.floor(parsedCount) : 1;
+  const orderbook = useOrderbook(cleanTicketTicker, {
+    enabled: cleanTicketTicker.length >= 4,
+    sseEnabled: true,
+  });
+  const ticketWalk = useMemo(
+    () => walkBookLevels(deriveSideBookLevels(orderbook.snapshot, side, action), ticketOrderQty),
+    [orderbook.snapshot, side, action, ticketOrderQty],
+  );
   const railEval = useMemo(
     () => evaluateOrderRails(status, ticker, parsedCount, parsedPrice, action, postOnly),
     [status, ticker, parsedCount, parsedPrice, action, postOnly],
@@ -763,6 +775,21 @@ export function LiveDeskWorkspace({
             </div>
           </dl>
 
+          {/* Live L2 Book-Walk VWAP Impact */}
+          <div
+            id="live-ticket-vwap-impact"
+            className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-hairline bg-board/60 px-3 py-2 text-xs"
+          >
+            <span className="text-ink-3">
+              L2 VWAP ({ticketOrderQty}ct {action.toUpperCase()} {side.toUpperCase()})
+            </span>
+            <span className="mono font-semibold text-ink">
+              {ticketWalk.vwapCents !== null
+                ? `${ticketWalk.vwapCents.toFixed(2)}c (+${ticketWalk.slippageCents?.toFixed(2) ?? "0.00"}c slip)`
+                : "No resting depth"}
+            </span>
+          </div>
+
           {/* Real-time Hard Risk Rails Indicator */}
           <div id="live-risk-rails-check" className="space-y-1.5 pt-1">
             <div className="flex items-center justify-between text-xs">
@@ -830,11 +857,26 @@ export function LiveDeskWorkspace({
         </div>
       </form>
 
-      {/* Right: Resting Orders (with Cancel), Open Positions, Recent Fills */}
-      <div
-        id="live-portfolio-panel"
-        className="flex flex-col justify-between overflow-hidden rounded-[10px] border border-hairline bg-surface lg:col-span-7"
-      >
+      {/* Right: L2 Orderbook Ladder + Resting Orders, Open Positions, Recent Fills */}
+      <div className="flex flex-col gap-4 lg:col-span-7">
+        <OrderbookLadder
+          ticker={cleanTicketTicker}
+          snapshot={orderbook.snapshot}
+          streamStatus={orderbook.streamStatus}
+          orderQty={ticketOrderQty}
+          side={side}
+          action={action}
+          selectedPriceCents={Number.isInteger(parsedPrice) ? parsedPrice : null}
+          loading={orderbook.loading}
+          error={orderbook.error}
+          onSelectPrice={(priceCents) => setPriceInput(String(priceCents))}
+          onRefresh={orderbook.refresh}
+        />
+
+        <div
+          id="live-portfolio-panel"
+          className="flex flex-col justify-between overflow-hidden rounded-[10px] border border-hairline bg-surface"
+        >
         <div>
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-board/50 px-4 py-3">
             <div className="flex items-center gap-2">
@@ -1026,6 +1068,7 @@ export function LiveDeskWorkspace({
           <span className="mono">
             Daily loss {money(status.dailyRealizedLossDollars)} / {money(status.rails.maxDailyLossDollars)}
           </span>
+        </div>
         </div>
       </div>
     </section>
