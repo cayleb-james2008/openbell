@@ -1,4 +1,4 @@
-// OpenBell v0.32.0 Strategy Runtime v2, Persistent Library CRUD, and Walk-Forward Edge Synthesizer client.
+// OpenBell v0.33.0 Strategy Runtime v2, Persistent Library CRUD, and Walk-Forward Edge Synthesizer client.
 // Mutations always send X-OpenBell-CSRF: 1 and Content-Type: application/json.
 import {
   type Dataset,
@@ -47,6 +47,10 @@ export const V2_TICK_CONTEXT_FIELDS: TickContextFieldSpec[] = [
   { field: "pav_ev_yes_cents", type: "f64", unit: "cents", description: "Net expected value for YES after fees" },
   { field: "pav_ev_no_cents", type: "f64", unit: "cents", description: "Net expected value for NO after fees" },
   { field: "series", type: "string", unit: "ticker", description: "Market series prefix such as KXBTC15M" },
+  { field: "slot_position_contracts", type: "i64", unit: "contracts", description: "Open filled contracts held by this slot in the ticker" },
+  { field: "slot_avg_entry_cents", type: "f64", unit: "cents", description: "Weighted average entry price in cents for open slot contracts" },
+  { field: "slot_unrealized_pnl_cents", type: "f64", unit: "cents", description: "Mark-to-bid unrealized P&L in cents for open slot contracts" },
+  { field: "slot_resting_cents", type: "i64", unit: "cents", description: "Current resting entry quote limit price in cents, or 0 if none" },
 ];
 
 export const DEFAULT_V2_STRATEGY_SOURCE = `// Paper-only Kalshi 15m strategy script v2

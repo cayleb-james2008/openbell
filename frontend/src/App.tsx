@@ -1236,6 +1236,7 @@ export function App() {
 
       <Toaster
         position="bottom-right"
+        expand
         theme={theme}
         toastOptions={{
           style: {

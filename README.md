@@ -1,17 +1,17 @@
 # OpenBell
 
-![version](https://img.shields.io/badge/version-v0.32.0-0969da?style=flat-square)
+![version](https://img.shields.io/badge/version-v0.33.0-0969da?style=flat-square)
 ![stack](https://img.shields.io/badge/stack-Rust%20%2B%20React%2019-111827?style=flat-square)
-![tests](https://img.shields.io/badge/tests-167%2F167%20pass-16a34a?style=flat-square)
-![binary](https://img.shields.io/badge/release%20binary-6.45%20MiB-0969da?style=flat-square)
+![tests](https://img.shields.io/badge/tests-173%2F173%20pass-16a34a?style=flat-square)
+![binary](https://img.shields.io/badge/release%20binary-6.51%20MiB-0969da?style=flat-square)
 ![safety](https://img.shields.io/badge/live__armed-false%20on%20boot-16a34a?style=flat-square)
 
-OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction markets. It includes a Kalshi Trade API v2 client (`live_armed: false` on every boot, seven hard risk rails, fail-closed `0600` runtime persistence, closed-loop fill/settlement reconciliation, an emergency kill switch, and explicit kill latch reset), a live WebSocket and REST L2 orderbook stream (`OrderbookStore` auto-subscription up to 32 active markets, trade channel ingestion, bounded snapshot history, book-walk VWAP sizing, and DOM depth ladder), a tick-driven shadow orderbook runner (decoupled resting-quote management, direct L2 touch/cross/trade matching, idempotent settlement logging, fail-closed stale-sync gating, persistent slot pause guards, and restart clamping), an adverse-selection markout telemetry and auto-quarantine feedback loop (`execution_audit` + `AutoAllocator` runner sync), a causal Strategy Runtime v2 with confined script library CRUD and a walk-forward BH-FDR edge synthesizer, a deduplicating public 15-minute tape collector, and a post-only maker allocator.
+OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction markets. It includes a Kalshi Trade API v2 client (`live_armed: false` on every boot, seven hard risk rails, fail-closed `0600` runtime persistence, resting order amendment and 1-click position flattening, closed-loop fill/settlement reconciliation, an emergency kill switch, and explicit kill latch reset), a live WebSocket and REST L2 orderbook stream (`OrderbookStore` auto-subscription up to 32 active markets, trade channel ingestion, bounded snapshot history, book-walk VWAP sizing, and DOM depth ladder), a tick-driven shadow orderbook runner (active quote repricing with cooldown and per-window replace caps, take-profit, stop-loss, and pre-close exit routing, slot inventory injection into `TickContext`, direct L2 touch/cross/trade matching, idempotent settlement logging, fail-closed stale-sync gating, persistent slot pause guards, and restart clamping), an adverse-selection markout telemetry and auto-quarantine feedback loop (`execution_audit` + `AutoAllocator` runner sync), a causal Strategy Runtime v2 with confined script library CRUD and a walk-forward BH-FDR edge synthesizer, a deduplicating public 15-minute tape collector, and a post-only maker allocator.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/hero-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/hero-light.png">
-  <img alt="OpenBell v0.32.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
+  <img alt="OpenBell v0.33.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
 </picture>
 
 ## Feature gallery
@@ -147,6 +147,18 @@ OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction marke
       </picture>
     </td>
   </tr>
+  <tr>
+    <td colspan="2" valign="top">
+      <strong>Active Quote Lifecycle, Order Amendment, and Intra-Window Exits (<code>v0.33.0</code>)</strong><br>
+      <sub>Adds resting order amendment (<code>POST /api/live/orders/{id}/amend</code>) and 1-click position flattening (<code>POST /api/live/positions/{ticker}/flatten</code>) behind fail-closed <code>live_armed</code>, stale-sync, and kill-switch checks, injects live per-slot inventory into the 24-field causal <code>TickContext</code>, and equips <code>ShadowRunner</code> slots with cooldown-paced quote repricing, take-profit, stop-loss, and pre-close exit routing plus inline Amend, Flatten, and lifecycle badges.</sub>
+      <br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/lifecycle-c4e1-dark.png">
+        <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/lifecycle-c4e1-light.png">
+        <img alt="OpenBell v0.33.0 Active Quote Lifecycle, Order Amend, and Position Flatten" src="docs/screenshots/lifecycle-c4e1-light.png">
+      </picture>
+    </td>
+  </tr>
 </table>
 
 ## Causal execution and fail-closed risk pipeline
@@ -164,16 +176,16 @@ flowchart LR
   R -- "confirm_arm = true" --> K["Kalshi Trade API v2 (RSA-PSS SHA-256)"]
 ```
 
-## Verified baseline (`v0.32.0`)
+## Verified baseline (`v0.33.0`)
 
-| Metric | `v0.10.0` Baseline | `v0.32.0` Verified | Delta |
+| Metric | `v0.10.0` Baseline | `v0.33.0` Verified | Delta |
 | --- | --- | --- | --- |
-| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`6.45 MiB`** (`6,767,976 B`) | **`-39.5%`** |
-| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`99,682 B`** (`97 kB`) / **`22,830 B`** (`22 kB`, `25` chunks) | **`-94.6%` wire bytes** |
-| Cold boot to first `HTTP 200` | `9.11 ms` | **`5.84 ms`** | Under `10 ms` |
-| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`19.75 MB`** (`20,228 KB`) | **`-84.3%`** |
-| Concurrent HTTP throughput (`16w`, `5/5` SSE) | `4,921.3 req/s` | **`4,542.2 req/s`** (`4.91 ms` p95, `0/11,364` errors) | Under `5 ms` p95 |
-| Security and test verification | `49/49` fuzz | **`167/167` Rust tests**, `25/25` raw-TCP fuzz, `gate 130/130`, `replay 18/18`, `sloplint 0/0/0`, `RAILS OK`, `EQUITY OK` | Clean |
+| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`6.51 MiB`** (`6,825,320 B`) | **`-38.9%`** |
+| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`99,756 B`** (`97 kB`) / **`22,865 B`** (`22 kB`, `25` chunks) | **`-94.6%` wire bytes** |
+| Cold boot to first `HTTP 200` | `9.11 ms` | **`6.15 ms`** | Under `10 ms` |
+| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`18.92 MB`** (`19,376 KB`) | **`-84.9%`** |
+| Concurrent HTTP throughput (`16w`, `5/5` SSE) | `4,921.3 req/s` | **`4,860.1 req/s`** (`4.54 ms` p95, `0/12,158` errors) | Under `5 ms` p95 |
+| Security and test verification | `49/49` fuzz | **`173/173` Rust tests**, `25/25` raw-TCP fuzz, `gate 133/133`, `replay 18/18`, `sloplint 0/0/0`, `RAILS OK`, `EQUITY OK` | Clean |
 
 ## Quick start (synthetic paper mode)
 
@@ -198,7 +210,7 @@ HTTP requests enforce Host-header loopback confinement (`403` on non-loopback ho
 
 ### Causal paper analytics, v2 scripts, and slot simulation
 
-The strategy runtime (`src/strategy_v2.rs`) supports both v1 `allow_entry(...)` scripts and v2 `evaluate(ctx)` scripts reading a 20-field strictly causal `TickContext` (`ticks[..=t]` plus in-sample-only PAV posterior probabilities and expected values), enforced by a 1-bar causal lookahead canary check before saving to disk. The walk-forward synthesizer (`src/synthesizer.rs`) searches `momentum_microstructure`, `mean_reversion_pav`, and `maker_imbalance` parameter grids on the chronological 60% in-sample window slice, evaluates held-out 40% out-of-sample returns with Kalshi maker/taker fees, and screens candidates with Benjamini-Hochberg FDR control, Deflated Sharpe Ratio, and library return-correlation caps.
+The strategy runtime (`src/strategy_v2.rs`) supports both v1 `allow_entry(...)` scripts and v2 `evaluate(ctx)` scripts reading a 24-field strictly causal `TickContext` (`ticks[..=t]` plus in-sample-only PAV posterior probabilities, expected values, and live per-slot inventory fields), enforced by a 1-bar causal lookahead canary check before saving to disk. The walk-forward synthesizer (`src/synthesizer.rs`) searches `momentum_microstructure`, `mean_reversion_pav`, and `maker_imbalance` parameter grids on the chronological 60% in-sample window slice, evaluates held-out 40% out-of-sample returns with Kalshi maker/taker fees, and screens candidates with Benjamini-Hochberg FDR control, Deflated Sharpe Ratio, and library return-correlation caps.
 
 The auto-allocator (`src/auto_allocator.rs`) splits settled windows chronologically into 60% in-sample and 40% out-of-sample periods, freezes replay weights on in-sample data when in-sample history exists, enforces a correlated regime drawdown ceiling across multi-asset and same-asset strategy clusters bounded by `max_daily_loss_dollars`, and models Kalshi maker fees (`0.0175 * p * (1 - p)`, one quarter of taker `0.07 * p * (1 - p)`) rounded up to whole cents per order (`ceil(rate * C * p * (1 - p) * 100) / 100`). Across `strategies/*.rn`, it runs the 16 built-in paper strategies (`bid_ask_imbalance`, `favourite_floor`, `favourite_late`, `late_convergence_cap`, `longshot_late`, `maker_late_theta_no`, `maker_spread_capture`, `mean_reversion_fade`, `mid_window_momentum`, `no_favourite`, `opening_range_break`, `spot_lead_momentum_yes`, `spread_compression`, `tail_overreaction_fade`, `time_decay_harvest`, and `volatility_squeeze`), partitions epochs into Calm and High-Vol regimes causally, and computes the `+0c` through `+3c` slippage ladder with break-even cushion status.
 

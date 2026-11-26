@@ -51,6 +51,7 @@ input, textarea, select, [contenteditable] {
 }
 
 [data-sonner-toaster] [data-sonner-toast] {
+  min-height: 44px !important;
   background: var(--surface) !important;
   color: var(--ink) !important;
   border: 1px solid var(--hairline) !important;
