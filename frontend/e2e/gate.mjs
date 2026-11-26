@@ -434,8 +434,16 @@ for (const m of measures) {
   ok('Backtest on Tape renders paper P&L, Sharpe, Max Drawdown & Brier',
     sbTxt.includes('Paper Net P&L') && sbTxt.includes('Sharpe') && sbTxt.includes('Max Drawdown') && sbTxt.includes('Brier Score'),
     sbTxt.slice(0, 120))
+  const tickFieldsCount = await p.locator('#v2-tick-context-strip [data-tick-field]').count()
+  await p.locator('#v2-tick-context-strip [data-tick-field="pav_ev_yes_cents"]').click(); await p.waitForTimeout(100)
+  const editorWithCtx = await p.locator('#rune-editor').inputValue()
+  ok('V2 TickContext strip renders all 20 causal fields and click inserts ctx.<field> into editor',
+    tickFieldsCount === 20 && editorWithCtx.includes('ctx.pav_ev_yes_cents'),
+    `fields=${tickFieldsCount}`)
+  const synthVisible = await p.locator('#strategy-synthesizer').isVisible()
   const sandboxRuneLeak = await p.evaluate(() => /\brune\b/i.test(document.body.innerText))
   ok('zero user-facing Rune jargon on Strategies + Sandbox view', !sandboxRuneLeak)
+  ok('Walk-Forward Edge Synthesizer mounts on Strategies tab with zero Rune jargon', synthVisible && !sandboxRuneLeak)
   await p.screenshot({ path: `${OUT}/strategies-sandbox-1440.png` })
   await p.locator('#open-sandbox-btn').click(); await p.waitForTimeout(150)
 
@@ -768,8 +776,8 @@ for (const m of measures) {
   await p.route('**/api/home', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.9.0'
-    j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan', 'tournament', 'auto_collector', 'live_kalshi', 'risk_rails', 'edge_audit', 'shadow_runner']
+    j.version = '0.27.0'
+    j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan', 'tournament', 'auto_collector', 'live_kalshi', 'risk_rails', 'edge_audit', 'shadow_runner', 'strategy_v2', 'strategy_crud', 'synthesizer']
     j.collector = {
       ...j.collector,
       auto_collect_enabled: schedState.enabled,
@@ -779,6 +787,121 @@ for (const m of measures) {
       readiness_progress_pct: 70,
     }
     return r.fulfill({ response: res, body: JSON.stringify(j) })
+  })
+  const savedScripts = new Map()
+  const deletedScripts = new Set()
+  await p.route('**/api/strategies/save', r => {
+    checkCsrf(r)
+    hits.add('strategies-save')
+    const b = JSON.parse(r.request().postData() || '{}')
+    const name = String(b.name || 'custom-strategy-v2')
+    savedScripts.set(name, String(b.source || ''))
+    deletedScripts.delete(name)
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        name,
+        file: `${name}.rn`,
+        side: 'yes',
+        version: String(b.source || '').includes('evaluate(') ? 'v2' : 'v1',
+        causal_canary_passed: true,
+        message: `Saved ${name}.rn to strategy library.`,
+      }),
+    })
+  })
+  await p.route(/\/api\/strategies\/(?!save\b)[^/?]+(\?.*)?$/, r => {
+    if (r.request().method() === 'DELETE') {
+      checkCsrf(r)
+      hits.add('strategies-delete')
+      const name = decodeURIComponent(new URL(r.request().url()).pathname.split('/').pop() || '')
+      savedScripts.delete(name)
+      deletedScripts.add(name)
+      return r.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ ok: true, name, message: `Deleted ${name}.rn from strategy library.` }),
+      })
+    }
+    return r.fallback()
+  })
+  await p.route('**/api/research/synthesize', r => {
+    checkCsrf(r)
+    hits.add('research-synthesize')
+    const b = JSON.parse(r.request().postData() || '{}')
+    const fam = String(b.family || 'all')
+    const mode = String(b.execution_mode || 'maker') === 'taker' ? 'taker' : 'maker'
+    const alpha = Number(b.fdr_alpha) || 0.05
+    const maxC = Number(b.max_candidates) || 12
+    const candSource = `pub fn name() {\n    "synth-pav-reversion-1"\n}\npub fn side() {\n    "yes"\n}\npub fn evaluate(ctx) {\n    if ctx.secs_to_close >= 90 && ctx.pav_ev_yes_cents >= 2.5 {\n        #{ enter: true, side: "yes", limit_cents: (ctx.yes_bid * 100.0).round() + 1.0, post_only: true }\n    } else {\n        #{ enter: false, side: "yes", limit_cents: 0, post_only: true }\n    }\n}`
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        family: fam,
+        execution_mode: mode,
+        fdr_alpha: alpha,
+        max_candidates: maxC,
+        candidates_evaluated: 2,
+        survivor_count: 1,
+        is_windows: 144,
+        oos_windows: 96,
+        honesty_note: 'Chronological 60/40 IS discovery and held-out OOS screening with BH-FDR and DSR.',
+        elapsed_ms: 14,
+        candidates: [
+          {
+            id: 'synth-pav-reversion-1',
+            name: 'synth-pav-reversion-1',
+            family: fam === 'all' ? 'mean_reversion_pav' : fam,
+            side: 'yes',
+            execution_mode: mode,
+            post_only: mode === 'maker',
+            is_trades: 42,
+            oos_trades: 28,
+            is_win_rate_pct: 78.6,
+            oos_win_rate_pct: 75.0,
+            oos_net_expectancy_cents: 3.12,
+            oos_net_pnl_dollars: 8.74,
+            oos_sharpe: 1.68,
+            deflated_sharpe: 1.21,
+            p_value: 0.004,
+            bh_adjusted_p_value: 0.008,
+            max_corr_with_library: 0.24,
+            survived_fdr: true,
+            passed_dsr: true,
+            causal_canary_passed: true,
+            description: 'IS PAV edge survivor with positive book imbalance.',
+            source: candSource,
+          },
+          {
+            id: 'synth-filtered-2',
+            name: 'synth-filtered-2',
+            family: 'momentum_microstructure',
+            side: 'no',
+            execution_mode: mode,
+            post_only: mode === 'maker',
+            is_trades: 30,
+            oos_trades: 18,
+            is_win_rate_pct: 60.0,
+            oos_win_rate_pct: 55.6,
+            oos_net_expectancy_cents: -0.35,
+            oos_net_pnl_dollars: -0.63,
+            oos_sharpe: -0.18,
+            deflated_sharpe: -0.44,
+            p_value: 0.41,
+            bh_adjusted_p_value: 0.41,
+            max_corr_with_library: 0.48,
+            survived_fdr: false,
+            passed_dsr: false,
+            causal_canary_passed: true,
+            rejection_reason: 'Negative OOS expectancy',
+            description: 'Rejected candidate below OOS hurdle.',
+            source: candSource.replace('synth-pav-reversion-1', 'synth-filtered-2'),
+          },
+        ],
+      }),
+    })
   })
   await p.route('**/api/live/status*', r => {
     hits.add('live-status')
@@ -1459,6 +1582,37 @@ for (const m of measures) {
   await p.locator('#open-sandbox-btn').click(); await p.waitForTimeout(150)
   await p.locator('#sandbox-validate-btn').click(); await p.waitForTimeout(150)
   await p.locator('#sandbox-backtest-btn').click(); await p.waitForTimeout(200)
+  await p.locator('#synth-family').selectOption('mean_reversion_pav')
+  await p.locator('#synth-exec-mode').selectOption('maker')
+  await p.locator('#synth-fdr-alpha').fill('0.05')
+  await p.locator('#synth-max-candidates').fill('12')
+  await p.locator('#synth-run-btn').click(); await p.waitForTimeout(250)
+  const synthTableTxt = await p.locator('#synth-table').innerText()
+  const synthPreviewTxt = await p.locator('#synth-source-preview').innerText()
+  await p.locator('#synth-save-btn').click(); await p.waitForTimeout(200)
+  await p.locator('#synth-test-sandbox-btn').click(); await p.waitForTimeout(200)
+  const sandboxLoadedSynth = (await p.locator('#rune-editor').inputValue()).includes('evaluate(ctx)')
+  ok('Walk-Forward Edge Synthesizer executes POST /api/research/synthesize with CSRF, renders DSR + BH-FDR table & v2 preview, and loads Test in Sandbox',
+    hits.has('research-synthesize') &&
+      synthTableTxt.includes('synth-pav-reversion-1') &&
+      synthTableTxt.includes('1.21') &&
+      synthTableTxt.includes('0.0080') &&
+      synthPreviewTxt.includes('evaluate(ctx)') &&
+      sandboxLoadedSynth,
+    `synth=${hits.has('research-synthesize')} preview=${synthPreviewTxt.includes('evaluate(ctx)')} sandbox=${sandboxLoadedSynth}`)
+  await p.locator('#sandbox-save-as-btn').click(); await p.waitForTimeout(120)
+  await p.locator('#sandbox-save-as-input').fill('synth-pav-custom')
+  await p.locator('#sandbox-save-as-confirm-btn').click(); await p.waitForTimeout(200)
+  await p.locator('#sandbox-clone-btn').click(); await p.waitForTimeout(200)
+  await p.locator('#sandbox-delete-btn').click(); await p.waitForTimeout(120)
+  await p.locator('#sandbox-delete-confirm-btn').click(); await p.waitForTimeout(200)
+  ok('Persistent Strategy Library CRUD executes Save, Save As, Clone, and DELETE /api/strategies/{name} with X-OpenBell-CSRF',
+    hits.has('strategies-save') &&
+      hits.has('strategies-delete') &&
+      savedScripts.has('synth-pav-reversion-1') &&
+      savedScripts.has('synth-pav-custom') &&
+      deletedScripts.has('synth-pav-custom-copy'),
+    `saved=${[...savedScripts.keys()].join(',')} deleted=${[...deletedScripts].join(',')}`)
   await p.locator('#tab-slots').click(); await p.waitForTimeout(200)
   await Promise.all([p.waitForEvent('download'), p.locator('#export-report-md').click()])
   await p.locator('#run-edge-audit-btn').click(); await p.waitForTimeout(450)

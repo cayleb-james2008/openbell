@@ -1,9 +1,9 @@
-// Rune Strategies workbench tab: ranked leaderboard for all 12+ Rune strategies with null/malformed guards,
-// j/k/Enter keyboard navigation, Tremor SparkAreaChart + Tracker evidence bar, Vaul Strategy Inspector
-// with Cult UI Expandable Rune source, and Interactive Rune Sandbox Editor + Backtester.
-import { Suspense, useEffect, useMemo, useState } from "react";
+// Strategy Library workbench tab: ranked leaderboard for all strategy scripts with null/malformed guards,
+// j/k/Enter keyboard navigation, Tremor SparkAreaChart + Tracker evidence bar, Vaul Strategy Inspector,
+// Interactive Strategy Sandbox Editor + CRUD + Backtester, and Walk-Forward Edge Synthesizer.
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { Drawer } from "vaul";
-import { Code2, Play, X } from "lucide-react";
+import { Code2, FlaskConical, Play, X } from "lucide-react";
 import {
   Badge,
   Button,
@@ -19,10 +19,16 @@ import {
   type TrackerBlock,
 } from "@/components/ui";
 import { StrategyEquityChart, TremorSpark, validPoints, type Point } from "@/Charts";
+import type { SandboxSourcePayload } from "@/RuneSandbox";
 import { lazyComponent } from "@/lib/lazy";
 
 const RuneSandbox = lazyComponent(() => import("@/RuneSandbox"), (m) => m.RuneSandbox);
+const StrategySynthesizerPanel = lazyComponent(
+  () => import("@/StrategySynthesizerPanel"),
+  (m) => m.StrategySynthesizerPanel,
+);
 void RuneSandbox.preload();
+void StrategySynthesizerPanel.preload();
 import { useWide } from "@/lib/media";
 import {
   type Dataset,
@@ -305,6 +311,7 @@ export function StrategiesTab({
   dataset,
   search,
   onRetry,
+  onLibraryMutated,
   isActiveTab,
   jumpStrategy,
   sandboxSignal,
@@ -318,6 +325,7 @@ export function StrategiesTab({
   dataset: Dataset;
   search: string;
   onRetry: () => void;
+  onLibraryMutated?: () => void | Promise<void>;
   isActiveTab: boolean;
   jumpStrategy?: string | null;
   sandboxSignal?: number;
@@ -328,6 +336,9 @@ export function StrategiesTab({
   const [openName, setOpenName] = useState<string | null>(null);
   const [sandboxOpen, setSandboxOpen] = useState(false);
   const [sandboxInitName, setSandboxInitName] = useState<string | null>(null);
+  const [sandboxPayload, setSandboxPayload] = useState<SandboxSourcePayload | null>(null);
+  const sandboxWrapRef = useRef<HTMLDivElement>(null);
+  const synthWrapRef = useRef<HTMLDivElement>(null);
 
   const slots = slotsRead?.ok ? slotsRead.v : null;
   const equity = equityRead?.ok ? equityRead.v : null;
@@ -421,7 +432,7 @@ export function StrategiesTab({
     });
   }, [validRows, filter, search, pnlByStrategy]);
 
-  // j / k / Enter keyboard navigation on Rune Strategies tab and inside open Strategy Inspector.
+  // j / k / Enter keyboard navigation on Strategies tab and inside open Strategy Inspector.
   useEffect(() => {
     if (!isActiveTab && !openName) return;
     const onKey = (e: KeyboardEvent) => {
@@ -495,6 +506,15 @@ export function StrategiesTab({
             Use <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">j</kbd>/<kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">k</kbd> and <kbd className="rounded border border-hairline bg-track px-1 py-0.5 font-mono text-ink">Enter</kbd>
           </span>
           <Button
+            id="open-synthesizer-btn"
+            variant="outline"
+            className="min-h-11 gap-1.5 px-3 text-xs font-medium sm:min-h-9"
+            onClick={() => synthWrapRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })}
+          >
+            <FlaskConical className="size-3.5" aria-hidden />
+            <span>Edge Synthesizer</span>
+          </Button>
+          <Button
             id="open-sandbox-btn"
             variant={sandboxOpen ? "default" : "outline"}
             className="min-h-11 gap-1.5 px-3 text-xs font-medium sm:min-h-9"
@@ -509,17 +529,21 @@ export function StrategiesTab({
 
       {/* Interactive Strategy Sandbox Editor & Backtest Panel */}
       {sandboxOpen && (
-        <Suspense fallback={null}>
-          <RuneSandbox
-            strategies={validRows}
-            markets={markets}
-            slots={slots}
-            home={home}
-            dataset={dataset}
-            initialStrategyName={sandboxInitName}
-            onClose={() => setSandboxOpen(false)}
-          />
-        </Suspense>
+        <div ref={sandboxWrapRef} className="scroll-mt-16">
+          <Suspense fallback={null}>
+            <RuneSandbox
+              strategies={validRows}
+              markets={markets}
+              slots={slots}
+              home={home}
+              dataset={dataset}
+              initialStrategyName={sandboxInitName}
+              initialSourcePayload={sandboxPayload}
+              onLibraryMutated={onLibraryMutated}
+              onClose={() => setSandboxOpen(false)}
+            />
+          </Suspense>
+        </div>
       )}
 
       {!strategiesRead ? (
@@ -633,6 +657,27 @@ export function StrategiesTab({
         </div>
       )}
 
+      <div ref={synthWrapRef} className="scroll-mt-16 pt-1">
+        <Suspense fallback={null}>
+          <StrategySynthesizerPanel
+            home={home}
+            dataset={dataset}
+            markets={markets}
+            slots={slots}
+            strategies={validRows}
+            onTestInSandbox={(source, name) => {
+              setSandboxInitName(null);
+              setSandboxPayload({ name, source, seq: Date.now() });
+              setSandboxOpen(true);
+              requestAnimationFrame(() => {
+                sandboxWrapRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+              });
+            }}
+            onLibraryMutated={onLibraryMutated}
+          />
+        </Suspense>
+      </div>
+
       <StrategyInspector
         strategy={openStrategy}
         pnl={openStrategy ? (pnlByStrategy.get(cleanStr(openStrategy.strategy, "")) ?? null) : null}
@@ -641,6 +686,7 @@ export function StrategiesTab({
         tradesTruncated={!!slots?.trades_truncated}
         onOpenInSandbox={(name) => {
           setOpenName(null);
+          setSandboxPayload(null);
           setSandboxInitName(name);
           setSandboxOpen(true);
         }}

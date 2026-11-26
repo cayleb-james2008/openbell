@@ -1,8 +1,19 @@
-// Interactive Rune Strategy Sandbox Editor & Paper Tape Backtester.
-// Calls POST /api/strategy/validate and POST /api/backtest on v0.5.0+, falling back cleanly to the
-// deterministic client Rune evaluator on loaded tape windows. Strictly paper-only.
-import { useEffect, useMemo, useState } from "react";
-import { CheckCircle2, Code2, Play, RotateCcw, ShieldCheck, TriangleAlert } from "lucide-react";
+// Interactive Strategy Sandbox Editor, Persistent Library CRUD, and Paper Tape Backtester.
+// Calls /api/strategy/validate, /api/backtest, POST /api/strategies/save, and DELETE /api/strategies/{name}.
+// Strictly paper-only. Zero user-facing internal engine jargon (#155).
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  CheckCircle2,
+  Code2,
+  Copy,
+  FilePlus2,
+  Play,
+  RotateCcw,
+  Save,
+  ShieldCheck,
+  Trash2,
+  TriangleAlert,
+} from "lucide-react";
 import { toast } from "sonner";
 import { Badge, Button, StatusPill } from "@/components/ui";
 import { StrategyEquityChart, ProvenanceTag } from "@/Charts";
@@ -26,6 +37,21 @@ import {
   runRuneBacktest,
   validateRuneStrategy,
 } from "@/lib/quant";
+import {
+  DEFAULT_V2_STRATEGY_SOURCE,
+  V2_TICK_CONTEXT_FIELDS,
+  deleteStrategyScript,
+  extractStrategyNameFromSource,
+  rewriteStrategyNameFn,
+  saveStrategyScript,
+  validateStrategySlug,
+} from "@/lib/research";
+
+export type SandboxSourcePayload = {
+  name: string;
+  source: string;
+  seq: number;
+};
 
 export function RuneSandbox({
   strategies,
@@ -34,6 +60,8 @@ export function RuneSandbox({
   home,
   dataset,
   initialStrategyName,
+  initialSourcePayload,
+  onLibraryMutated,
   onClose,
 }: {
   strategies: Strategy[];
@@ -42,15 +70,26 @@ export function RuneSandbox({
   home: Home | null;
   dataset: Dataset;
   initialStrategyName?: string | null;
+  initialSourcePayload?: SandboxSourcePayload | null;
+  onLibraryMutated?: () => void | Promise<void>;
   onClose?: () => void;
 }) {
   const [source, setSource] = useState<string>(DEFAULT_SANDBOX_RUNE);
   const [loadedFrom, setLoadedFrom] = useState<string>("template");
+  const [scriptName, setScriptName] = useState<string>("late-favourite-edge");
   const [loadingTemplate, setLoadingTemplate] = useState(false);
   const [validating, setValidating] = useState(false);
   const [backtesting, setBacktesting] = useState(false);
+  const [mutatingLibrary, setMutatingLibrary] = useState(false);
+  const [saveAsOpen, setSaveAsOpen] = useState(false);
+  const [saveAsName, setSaveAsName] = useState("");
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [crudError, setCrudError] = useState("");
+  const [activeField, setActiveField] = useState<string>(V2_TICK_CONTEXT_FIELDS[0].field);
   const [validation, setValidation] = useState<RuneValidationResult | null>(null);
   const [result, setResult] = useState<BacktestResult | null>(null);
+
+  const editorRef = useRef<HTMLTextAreaElement>(null);
 
   const strategyNames = useMemo(
     () =>
@@ -62,9 +101,22 @@ export function RuneSandbox({
   );
 
   const loadLibraryStrategy = async (name: string) => {
+    setSaveAsOpen(false);
+    setDeleteConfirmOpen(false);
+    setCrudError("");
+
     if (!name || name === "template") {
       setSource(DEFAULT_SANDBOX_RUNE);
       setLoadedFrom("template");
+      setScriptName("late-favourite-edge");
+      setValidation(null);
+      setResult(null);
+      return;
+    }
+    if (name === "template-v2") {
+      setSource(DEFAULT_V2_STRATEGY_SOURCE);
+      setLoadedFrom("template-v2");
+      setScriptName("pav-maker-edge-v2");
       setValidation(null);
       setResult(null);
       return;
@@ -74,6 +126,7 @@ export function RuneSandbox({
       const res = await fetchStrategySource(name);
       setSource(res.source);
       setLoadedFrom(name);
+      setScriptName(name);
       setValidation(null);
       setResult(null);
     } catch (e) {
@@ -89,9 +142,22 @@ export function RuneSandbox({
     }
   }, [initialStrategyName]);
 
+  useEffect(() => {
+    if (!initialSourcePayload) return;
+    setSource(initialSourcePayload.source);
+    const cleanTarget = initialSourcePayload.name.trim() || "synthesized-strategy-v2";
+    setScriptName(cleanTarget);
+    setLoadedFrom(strategyNames.includes(cleanTarget) ? cleanTarget : "template-v2");
+    setSaveAsOpen(false);
+    setDeleteConfirmOpen(false);
+    setCrudError("");
+    setValidation(null);
+    setResult(null);
+  }, [initialSourcePayload]);
+
   const baselineStats = useMemo(() => {
     if (!slots) return null;
-    if (loadedFrom && loadedFrom !== "template") {
+    if (loadedFrom && loadedFrom !== "template" && loadedFrom !== "template-v2") {
       const tot = slots.strategy_totals?.find((t) => t.strategy === loadedFrom);
       const row = strategies.find((s) => cleanStr(s.strategy, "") === loadedFrom);
       if (tot || row) {
@@ -103,9 +169,10 @@ export function RuneSandbox({
         };
       }
     }
-    const potDelta = isNum(slots.paper_equity_dollars) && isNum(slots.paper_pot_start)
-      ? slots.paper_equity_dollars - slots.paper_pot_start
-      : null;
+    const potDelta =
+      isNum(slots.paper_equity_dollars) && isNum(slots.paper_pot_start)
+        ? slots.paper_equity_dollars - slots.paper_pot_start
+        : null;
     return {
       label: "Active Paper Pot",
       pnl: potDelta,
@@ -115,6 +182,36 @@ export function RuneSandbox({
   }, [slots, strategies, loadedFrom]);
 
   const lineCount = useMemo(() => Math.max(1, source.split("\n").length), [source]);
+
+  const activeFieldInfo = useMemo(
+    () => V2_TICK_CONTEXT_FIELDS.find((f) => f.field === activeField) ?? V2_TICK_CONTEXT_FIELDS[0],
+    [activeField],
+  );
+
+  const isLibraryBacked =
+    (loadedFrom !== "template" && loadedFrom !== "template-v2") ||
+    strategyNames.includes(scriptName.trim());
+
+  const deleteTargetName =
+    loadedFrom !== "template" && loadedFrom !== "template-v2" ? loadedFrom : scriptName.trim();
+
+  const handleInsertField = (fieldName: string) => {
+    setActiveField(fieldName);
+    const token = `ctx.${fieldName}`;
+    const el = editorRef.current;
+    if (!el) {
+      setSource((prev) => `${prev}${prev.endsWith("\n") ? "" : "\n"}${token}`);
+      return;
+    }
+    const start = el.selectionStart ?? source.length;
+    const end = el.selectionEnd ?? source.length;
+    const next = source.slice(0, start) + token + source.slice(end);
+    setSource(next);
+    requestAnimationFrame(() => {
+      el.focus();
+      el.selectionStart = el.selectionEnd = start + token.length;
+    });
+  };
 
   const handleValidate = async () => {
     setValidating(true);
@@ -157,6 +254,84 @@ export function RuneSandbox({
     }
   };
 
+  const persistScript = async (targetRaw: string, overwrite: boolean, nextSource?: string) => {
+    const check = validateStrategySlug(targetRaw);
+    if (!check.ok) {
+      setCrudError(check.error);
+      toast.error(check.error);
+      return;
+    }
+    const slug = check.slug;
+    const bodySource = rewriteStrategyNameFn(nextSource ?? source, slug);
+
+    setMutatingLibrary(true);
+    setCrudError("");
+    try {
+      const saved = await saveStrategyScript({ name: slug, source: bodySource, overwrite }, home);
+      setSource(bodySource);
+      setScriptName(saved.name);
+      setLoadedFrom(saved.name);
+      setSaveAsOpen(false);
+      setDeleteConfirmOpen(false);
+      toast.success(saved.message);
+      await onLibraryMutated?.();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setCrudError(msg);
+      toast.error(`Save failed: ${msg}`);
+    } finally {
+      setMutatingLibrary(false);
+    }
+  };
+
+  const handleSave = async () => {
+    const target =
+      scriptName.trim() ||
+      (loadedFrom !== "template" && loadedFrom !== "template-v2"
+        ? loadedFrom
+        : extractStrategyNameFromSource(source) || "custom-strategy-v2");
+    await persistScript(target, true);
+  };
+
+  const handleClone = async () => {
+    const baseRaw =
+      (loadedFrom !== "template" && loadedFrom !== "template-v2" ? loadedFrom : scriptName.trim()) ||
+      extractStrategyNameFromSource(source) ||
+      "strategy";
+    const baseClean = baseRaw.replace(/\.rn$/i, "").replace(/-copy(-\d+)?$/, "");
+    let candidate = `${baseClean}-copy`;
+    let suffix = 2;
+    const existing = new Set(strategyNames);
+    while (existing.has(candidate)) {
+      candidate = `${baseClean}-copy-${suffix}`;
+      suffix++;
+    }
+    await persistScript(candidate, false);
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deleteTargetName) return;
+    setMutatingLibrary(true);
+    setCrudError("");
+    try {
+      const res = await deleteStrategyScript(deleteTargetName, home);
+      setDeleteConfirmOpen(false);
+      setLoadedFrom("template");
+      setSource(DEFAULT_SANDBOX_RUNE);
+      setScriptName("late-favourite-edge");
+      setValidation(null);
+      setResult(null);
+      toast.success(res.message);
+      await onLibraryMutated?.();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setCrudError(msg);
+      toast.error(`Delete failed: ${msg}`);
+    } finally {
+      setMutatingLibrary(false);
+    }
+  };
+
   return (
     <div
       id="rune-sandbox"
@@ -167,12 +342,12 @@ export function RuneSandbox({
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-hairline pb-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <Code2 className="size-4 text-info-foreground" aria-hidden />
+            <Code2 className="size-4 text-info-foreground" strokeWidth={1.5} aria-hidden />
             <h3 className="text-sm font-semibold text-ink">Interactive Strategy Sandbox</h3>
             <ProvenanceTag kind="paper" />
           </div>
           <p className="mt-0.5 text-xs text-ink-2">
-            Edit strategy rules in memory, inspect diagnostics, and backtest on collected 15m tape windows.
+            Edit v1 or v2 strategy scripts, inspect compile checks, manage library files, and backtest on 15m tape windows.
           </p>
         </div>
 
@@ -184,11 +359,12 @@ export function RuneSandbox({
             id="sandbox-template-select"
             aria-label="Load strategy template"
             value={loadedFrom}
-            disabled={loadingTemplate}
+            disabled={loadingTemplate || mutatingLibrary}
             onChange={(e) => void loadLibraryStrategy(e.target.value)}
             className="mono min-h-11 rounded-md border border-hairline bg-board px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9"
           >
-            <option value="template">Starter template</option>
+            <option value="template">v1 Starter template</option>
+            <option value="template-v2">v2 TickContext template</option>
             {strategyNames.map((n) => (
               <option key={n} value={n}>
                 {n}.rn
@@ -204,13 +380,235 @@ export function RuneSandbox({
         </div>
       </div>
 
+      {/* Persistent Library CRUD Toolbar */}
+      <div
+        id="sandbox-library-controls"
+        className="mt-3 flex flex-wrap items-end justify-between gap-2.5 rounded-lg border border-hairline bg-board/50 p-3"
+      >
+        <div className="flex min-w-0 flex-1 flex-wrap items-end gap-2">
+          <div className="flex min-w-[200px] flex-1 flex-col gap-1 sm:max-w-xs">
+            <label htmlFor="sandbox-strategy-name" className="text-xs font-medium text-ink-2">
+              Library Script Name
+            </label>
+            <input
+              id="sandbox-strategy-name"
+              type="text"
+              value={scriptName}
+              disabled={mutatingLibrary}
+              placeholder="my-strategy-v2"
+              onChange={(e) => setScriptName(e.target.value)}
+              className="mono min-h-11 rounded-md border border-hairline bg-surface px-2.5 text-xs text-ink placeholder:text-ink-3 outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9"
+            />
+          </div>
+
+          <Button
+            id="sandbox-save-btn"
+            variant="default"
+            disabled={mutatingLibrary || validating || backtesting}
+            onClick={() => void handleSave()}
+            className="min-h-11 gap-1.5 px-3 text-xs font-medium sm:min-h-9"
+          >
+            <Save className="size-3.5" strokeWidth={1.5} aria-hidden />
+            <span>{mutatingLibrary ? "Saving..." : "Save"}</span>
+          </Button>
+
+          <Button
+            id="sandbox-save-as-btn"
+            variant="outline"
+            disabled={mutatingLibrary}
+            onClick={() => {
+              const base = (scriptName.trim() || "custom-strategy").replace(/\.rn$/i, "");
+              setSaveAsName(`${base}-v2`);
+              setSaveAsOpen((v) => !v);
+              setDeleteConfirmOpen(false);
+            }}
+            className="min-h-11 gap-1.5 px-3 text-xs sm:min-h-9"
+          >
+            <FilePlus2 className="size-3.5" strokeWidth={1.5} aria-hidden />
+            <span>Save As</span>
+          </Button>
+
+          <Button
+            id="sandbox-clone-btn"
+            variant="outline"
+            disabled={mutatingLibrary}
+            onClick={() => void handleClone()}
+            className="min-h-11 gap-1.5 px-3 text-xs sm:min-h-9"
+          >
+            <Copy className="size-3.5" strokeWidth={1.5} aria-hidden />
+            <span>Clone</span>
+          </Button>
+
+          <Button
+            id="sandbox-delete-btn"
+            variant="danger"
+            disabled={mutatingLibrary || !isLibraryBacked}
+            onClick={() => {
+              setDeleteConfirmOpen((v) => !v);
+              setSaveAsOpen(false);
+            }}
+            className="min-h-11 gap-1.5 px-3 text-xs sm:min-h-9"
+          >
+            <Trash2 className="size-3.5" strokeWidth={1.5} aria-hidden />
+            <span>Delete</span>
+          </Button>
+        </div>
+      </div>
+
+      {/* Inline Save As prompt */}
+      {saveAsOpen && (
+        <div
+          id="sandbox-save-as-bar"
+          className="mt-2 flex flex-wrap items-end gap-2 rounded-lg border border-hairline bg-board p-3"
+        >
+          <div className="flex min-w-[200px] flex-1 flex-col gap-1 sm:max-w-xs">
+            <label htmlFor="sandbox-save-as-input" className="text-xs font-medium text-ink-2">
+              New Strategy Script Name
+            </label>
+            <input
+              id="sandbox-save-as-input"
+              type="text"
+              value={saveAsName}
+              onChange={(e) => setSaveAsName(e.target.value)}
+              placeholder="new-strategy-slug"
+              className="mono min-h-11 rounded-md border border-hairline bg-surface px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9"
+            />
+          </div>
+          <Button
+            id="sandbox-save-as-confirm-btn"
+            variant="default"
+            disabled={mutatingLibrary}
+            onClick={() => void persistScript(saveAsName, false)}
+            className="min-h-11 px-3 text-xs sm:min-h-9"
+          >
+            Confirm Save As
+          </Button>
+          <Button
+            variant="ghost"
+            onClick={() => setSaveAsOpen(false)}
+            className="min-h-11 px-3 text-xs sm:min-h-9"
+          >
+            Cancel
+          </Button>
+        </div>
+      )}
+
+      {/* Inline Delete confirmation */}
+      {deleteConfirmOpen && (
+        <div
+          id="sandbox-delete-confirm-bar"
+          role="alert"
+          className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dot-red/50 bg-board px-3 py-2.5 text-xs"
+        >
+          <span className="text-ink">
+            Delete <strong className="mono font-semibold">{deleteTargetName}.rn</strong> from the persistent library?
+          </span>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              id="sandbox-delete-confirm-btn"
+              variant="danger"
+              disabled={mutatingLibrary}
+              onClick={() => void handleConfirmDelete()}
+              className="min-h-11 px-3 text-xs sm:min-h-8"
+            >
+              Confirm Delete
+            </Button>
+            <Button
+              variant="ghost"
+              onClick={() => setDeleteConfirmOpen(false)}
+              className="min-h-11 px-3 text-xs sm:min-h-8"
+            >
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {crudError && (
+        <div
+          id="sandbox-crud-error"
+          role="alert"
+          className="mt-2 flex items-start gap-2 rounded-lg border border-dot-red/50 bg-board px-3 py-2 text-xs text-destructive-foreground"
+        >
+          <TriangleAlert className="mt-0.5 size-4 shrink-0" strokeWidth={1.5} aria-hidden />
+          <span>{crudError}</span>
+        </div>
+      )}
+
+      {/* V2 TickContext Causal Feature Reference Strip */}
+      <div
+        id="v2-tick-context-strip"
+        data-v2-tick-context
+        className="mt-3 rounded-lg border border-hairline bg-board/40 p-3"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-semibold text-ink">
+              V2 TickContext Causal Fields
+            </span>
+            <Badge variant="outline" className="mono text-xs">
+              evaluate(ctx)
+            </Badge>
+            <span className="text-xs text-ink-3">
+              Click any field to insert at cursor
+            </span>
+          </div>
+          <Button
+            id="sandbox-load-v2-btn"
+            variant="outline"
+            size="sm"
+            onClick={() => void loadLibraryStrategy("template-v2")}
+            className="min-h-11 px-2.5 text-xs sm:min-h-8"
+          >
+            Load v2 Template
+          </Button>
+        </div>
+
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {V2_TICK_CONTEXT_FIELDS.map((f) => {
+            const active = activeField === f.field;
+            return (
+              <button
+                key={f.field}
+                type="button"
+                data-tick-field={f.field}
+                title={`${f.type} (${f.unit}): ${f.description}`}
+                onMouseEnter={() => setActiveField(f.field)}
+                onFocus={() => setActiveField(f.field)}
+                onClick={() => handleInsertField(f.field)}
+                className={
+                  "mono min-h-11 cursor-pointer rounded border px-2 py-1 text-xs outline-none transition-[background-color,border-color,color] duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring sm:min-h-7 " +
+                  (active
+                    ? "border-ink bg-surface font-medium text-ink"
+                    : "border-hairline bg-board text-ink-2 hover:border-ink-3 hover:text-ink")
+                }
+              >
+                {f.field}
+              </button>
+            );
+          })}
+        </div>
+
+        <div id="v2-tick-field-detail" className="mt-2 flex flex-wrap items-center gap-2 text-xs text-ink-2">
+          <span className="mono font-semibold text-ink">ctx.{activeFieldInfo.field}</span>
+          <Badge variant="secondary" className="mono text-xs">
+            {activeFieldInfo.type} ({activeFieldInfo.unit})
+          </Badge>
+          <span>{activeFieldInfo.description}</span>
+        </div>
+      </div>
+
       {/* Side-by-side Editor + Backtest Results */}
       <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-12">
         {/* Left: Code Editor & Controls */}
         <div className="flex flex-col gap-3 lg:col-span-6">
           <div className="overflow-hidden rounded-lg border border-hairline bg-board">
             <div className="flex items-center justify-between border-b border-hairline bg-surface px-3 py-1.5 font-mono text-xs text-ink-3">
-              <span>{loadedFrom === "template" ? "sandbox.rn" : `${loadedFrom}.rn`}</span>
+              <span>
+                {loadedFrom === "template" || loadedFrom === "template-v2"
+                  ? `${scriptName || "sandbox"}.rn`
+                  : `${loadedFrom}.rn`}
+              </span>
               <span>{lineCount} lines, whole-cent sim</span>
             </div>
             <div className="flex">
@@ -223,6 +621,7 @@ export function RuneSandbox({
                 ))}
               </div>
               <textarea
+                ref={editorRef}
                 id="rune-editor"
                 aria-label="Strategy source code"
                 spellCheck={false}
@@ -256,7 +655,7 @@ export function RuneSandbox({
               onClick={() => void handleBacktest()}
             >
               <Play className="size-3.5" aria-hidden />
-              <span>{backtesting ? "Backtesting…" : "Backtest on Tape"}</span>
+              <span>{backtesting ? "Backtesting..." : "Backtest on Tape"}</span>
             </Button>
 
             <Button
@@ -267,7 +666,7 @@ export function RuneSandbox({
               onClick={() => void handleValidate()}
             >
               <ShieldCheck className="size-3.5" aria-hidden />
-              <span>{validating ? "Validating…" : "Validate Strategy"}</span>
+              <span>{validating ? "Validating..." : "Validate Strategy"}</span>
             </Button>
 
             <Button
@@ -276,6 +675,10 @@ export function RuneSandbox({
               onClick={() => {
                 setSource(DEFAULT_SANDBOX_RUNE);
                 setLoadedFrom("template");
+                setScriptName("late-favourite-edge");
+                setSaveAsOpen(false);
+                setDeleteConfirmOpen(false);
+                setCrudError("");
                 setValidation(null);
                 setResult(null);
               }}
@@ -441,7 +844,7 @@ export function RuneSandbox({
                 </div>
                 {result.trades.length === 0 ? (
                   <p className="py-2 text-xs text-ink-2">
-                    Zero settled windows matched `allow_entry(...)` on this tape.
+                    Zero settled windows matched the active entry rules on this tape.
                   </p>
                 ) : (
                   <ul className="max-h-44 divide-y divide-hairline overflow-y-auto border-t border-hairline">
