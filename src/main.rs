@@ -19,6 +19,8 @@ mod recalibration;
 mod risk_rails;
 mod scaling;
 mod shadow_runner;
+mod strategy_v2;
+mod synthesizer;
 mod tournament;
 mod update;
 
@@ -1187,6 +1189,8 @@ struct Strategy {
     budget_deaths: std::cell::Cell<usize>,
     /// Cached probe of whether this Rune unit exports `entry_quote`.
     has_entry_quote: std::cell::Cell<Option<bool>>,
+    /// Cached probe of whether this Rune unit exports v2 `evaluate(ctx)`.
+    has_evaluate: std::cell::Cell<Option<bool>>,
 }
 
 static SHARED_RUNTIME: std::sync::Mutex<Option<std::sync::Weak<rune::runtime::RuntimeContext>>> =
@@ -1278,6 +1282,7 @@ impl Strategy {
                     vm: std::cell::RefCell::new(None),
                     budget_deaths: std::cell::Cell::new(0),
                     has_entry_quote: std::cell::Cell::new(None),
+                    has_evaluate: std::cell::Cell::new(None),
                 });
             }
         }
@@ -1348,6 +1353,7 @@ impl Strategy {
             vm: std::cell::RefCell::new(None),
             budget_deaths: std::cell::Cell::new(0),
             has_entry_quote: std::cell::Cell::new(None),
+            has_evaluate: std::cell::Cell::new(None),
         };
         strat.name = strat.call_string("name")?;
         strat.side = strat.call_string("side")?;
@@ -1552,7 +1558,129 @@ impl Strategy {
                 }
             }
         }
+        if self.is_v2() {
+            let yb = (1.0 - no_ask).clamp(0.01, 0.99);
+            let nb = (1.0 - yes_ask).clamp(0.01, 0.99);
+            let ctx = strategy_v2::TickContext {
+                yes_bid: yb,
+                yes_ask,
+                no_bid: nb,
+                no_ask,
+                secs_to_close,
+                spread_cents: ((yes_ask - yb) * 100.0).max(0.0),
+                yes_bid_size: 0.0,
+                no_bid_size: 0.0,
+                book_imbalance: 0.0,
+                tick_index: 0,
+                open_yes_ask: yes_ask,
+                prev_yes_ask: yes_ask,
+                high_yes_ask: yes_ask,
+                low_yes_ask: yes_ask,
+                delta_60s_cents: 0.0,
+                window_vol_cents: 0.0,
+                pav_yes_prob: yes_ask.clamp(0.01, 0.99),
+                pav_ev_yes_cents: 0.0,
+                pav_ev_no_cents: 0.0,
+                series: String::new(),
+            };
+            if let Some(dec) = self.evaluate_v2(&ctx) {
+                return Some((dec.limit_cents as f64) / 100.0);
+            }
+        }
         None
+    }
+
+    fn is_v2(&self) -> bool {
+        if let Some(cached) = self.has_evaluate.get() {
+            return cached;
+        }
+        let detected = self
+            .with_vm(strategy_v2::detect_vm_has_evaluate)
+            .unwrap_or(false);
+        self.has_evaluate.set(Some(detected));
+        detected
+    }
+
+    fn evaluate_v2(&self, ctx: &strategy_v2::TickContext) -> Option<strategy_v2::V2Decision> {
+        if !self.budget_open() {
+            return None;
+        }
+        let t0 = std::time::Instant::now();
+        let eval_hash = rune::Hash::type_hash(["evaluate"]);
+        let out = self.with_vm(|vm| {
+            strategy_v2::call_evaluate_v2_vm(vm, eval_hash, ctx, &self.side)
+        });
+        self.spent.set(self.spent.get() + t0.elapsed());
+        if self.spent.get().as_secs() >= STRATEGY_DEADLINE_SECS {
+            self.exhausted.set(true);
+        }
+        match out {
+            Ok(dec) => {
+                self.budget_deaths.set(0);
+                dec
+            }
+            Err((_msg, budget_halt)) => {
+                self.call_failures.set(self.call_failures.get() + 1);
+                if budget_halt {
+                    let deaths = self.budget_deaths.get() + 1;
+                    self.budget_deaths.set(deaths);
+                    if deaths >= BUDGET_DEATH_LIMIT {
+                        self.exhausted.set(true);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Evaluate either v2 `evaluate(ctx)` (when present) or v1 `entry_quote`/`allow_entry`,
+    /// returning `(limit_dollars, side, post_only)`.
+    fn entry_quote_with_ctx(
+        &self,
+        yes_ask: f64,
+        no_ask: f64,
+        secs_to_close: i64,
+        ctx: Option<&strategy_v2::TickContext>,
+        default_post_only: bool,
+    ) -> Option<(f64, String, bool)> {
+        if self.is_v2() {
+            let owned_fallback;
+            let c = match ctx {
+                Some(c) => c,
+                None => {
+                    let yb = (1.0 - no_ask).clamp(0.01, 0.99);
+                    let nb = (1.0 - yes_ask).clamp(0.01, 0.99);
+                    owned_fallback = strategy_v2::TickContext {
+                        yes_bid: yb,
+                        yes_ask,
+                        no_bid: nb,
+                        no_ask,
+                        secs_to_close,
+                        spread_cents: ((yes_ask - yb) * 100.0).max(0.0),
+                        yes_bid_size: 0.0,
+                        no_bid_size: 0.0,
+                        book_imbalance: 0.0,
+                        tick_index: 0,
+                        open_yes_ask: yes_ask,
+                        prev_yes_ask: yes_ask,
+                        high_yes_ask: yes_ask,
+                        low_yes_ask: yes_ask,
+                        delta_60s_cents: 0.0,
+                        window_vol_cents: 0.0,
+                        pav_yes_prob: yes_ask.clamp(0.01, 0.99),
+                        pav_ev_yes_cents: 0.0,
+                        pav_ev_no_cents: 0.0,
+                        series: String::new(),
+                    };
+                    &owned_fallback
+                }
+            };
+            return self
+                .evaluate_v2(c)
+                .map(|d| ((d.limit_cents as f64) / 100.0, d.side, d.post_only));
+        }
+        self.entry_quote(yes_ask, no_ask, secs_to_close)
+            .map(|q| (q, self.side.clone(), default_post_only))
     }
 }
 
@@ -1614,6 +1742,11 @@ fn window_fingerprint(snaps: &[Snapshot]) -> u64 {
         s.fetched_at.hash(&mut h);
         s.yes_ask.get().map(f64::to_bits).hash(&mut h);
         s.no_ask.get().map(f64::to_bits).hash(&mut h);
+        s.yes_bid.get().map(f64::to_bits).hash(&mut h);
+        s.no_bid.get().map(f64::to_bits).hash(&mut h);
+        s.yes_bid_size.to_bits().hash(&mut h);
+        s.no_bid_size.to_bits().hash(&mut h);
+        s.series.hash(&mut h);
         s.close_time.hash(&mut h);
     }
     h.finish()
@@ -1621,7 +1754,7 @@ fn window_fingerprint(snaps: &[Snapshot]) -> u64 {
 
 /// The entry a strategy would have taken in one window: the ask on its
 /// side at the first snapshot (in fetch order) where its Rune
-/// `allow_entry` says yes. None when it never enters.
+/// `allow_entry` (v1) or `evaluate` (v2) says yes. None when it never enters.
 #[cfg(test)]
 fn window_entry(strat: &Strategy, snaps: &[Snapshot]) -> Option<f64> {
     window_entry_keyed(strat, None, snaps, window_fingerprint(snaps))
@@ -1633,20 +1766,40 @@ fn window_entry_keyed(
     snaps: &[Snapshot],
     win_fp: u64,
 ) -> Option<f64> {
+    window_entry_keyed_with_pav(strat, ticker, snaps, win_fp, &[]).map(|(p, _)| p)
+}
+
+fn window_entry_keyed_with_pav(
+    strat: &Strategy,
+    ticker: Option<&str>,
+    snaps: &[Snapshot],
+    win_fp: u64,
+    pav_blocks: &[recalibration::PavBlock],
+) -> Option<(f64, String)> {
     // A strategy whose aggregate allowance is spent degrades to
     // no-entry for the rest of the pass — from the index or not.
     if !strat.budget_open() {
         return None;
     }
-    let key = (strat.fingerprint, win_fp);
-    if let Some(hit) = ENTRY_CACHE.lock().unwrap().get(&key) {
-        return *hit;
+    let is_v2 = strat.is_v2();
+    let pav_fp = if is_v2 && !pav_blocks.is_empty() {
+        recalibration::pav_blocks_fingerprint(pav_blocks)
+    } else {
+        0
+    };
+    let eff_strat_fp = strat.fingerprint ^ pav_fp;
+    let key = (eff_strat_fp, win_fp);
+    if !is_v2 {
+        if let Some(hit) = ENTRY_CACHE.lock().unwrap().get(&key) {
+            return hit.map(|p| (p, strat.side.clone()));
+        }
     }
     // Resume a previous scan of this window when its covered
-    // prefix is still the window's prefix verbatim.
+    // prefix is still the window's prefix verbatim (v1 only; v2 multi-bar
+    // features depend on ticks from the start of the window).
     let mut resume_from = 0usize;
     let is_settled = snaps.iter().any(|s| !s.result.is_empty());
-    let ticker_sym: Option<Sym> = if !is_settled {
+    let ticker_sym: Option<Sym> = if !is_settled && !is_v2 {
         ticker.map(|t| {
             snaps
                 .first()
@@ -1673,14 +1826,15 @@ fn window_entry_keyed(
                     if !strat.budget_exhausted() {
                         ENTRY_CACHE.lock().unwrap().insert(key, Some(price));
                     }
-                    return Some(price);
+                    return Some((price, strat.side.clone()));
                 }
                 resume_from = scanned;
             }
         }
     }
-    let entry = window_entry_scan(strat, &snaps[resume_from..]);
-    if !strat.budget_exhausted() {
+    let entry = window_entry_scan_with_pav(strat, &snaps[resume_from..], pav_blocks);
+    if !strat.budget_exhausted() && !is_v2 {
+        let entry_price = entry.as_ref().map(|(p, _)| *p);
         let mut guard = ENTRY_CACHE.lock().unwrap();
         // Windows stop changing once settled, so the index stays
         // small; the cap is insurance for a months-long process —
@@ -1688,7 +1842,7 @@ fn window_entry_keyed(
         if guard.len() > 250_000 {
             guard.clear();
         }
-        guard.insert(key, entry);
+        guard.insert(key, entry_price);
         drop(guard);
         if let Some(t_sym) = ticker_sym {
             let mut guard = PREFIX_CACHE.lock().unwrap();
@@ -1697,14 +1851,33 @@ fn window_entry_keyed(
             }
             guard.insert(
                 (strat.fingerprint, t_sym),
-                (snaps.len(), win_fp, entry),
+                (snaps.len(), win_fp, entry_price),
             );
         }
     }
     entry
 }
 
-fn window_entry_scan(strat: &Strategy, snaps: &[Snapshot]) -> Option<f64> {
+fn window_entry_scan_with_pav(
+    strat: &Strategy,
+    snaps: &[Snapshot],
+    pav_blocks: &[recalibration::PavBlock],
+) -> Option<(f64, String)> {
+    if strat.is_v2() {
+        let mut tracker = strategy_v2::CausalFeatureTracker::new();
+        for snap in snaps {
+            let Some(ctx) = tracker.push_tick(snap, pav_blocks) else {
+                continue;
+            };
+            if let Some(dec) = strat.evaluate_v2(&ctx) {
+                let price = (dec.limit_cents as f64) / 100.0;
+                if (0.01..=0.99).contains(&price) {
+                    return Some((price, dec.side));
+                }
+            }
+        }
+        return None;
+    }
     for snap in snaps {
         let (Some(ya), Some(na)) = (snap.yes_ask.get(), snap.no_ask.get()) else {
             continue;
@@ -1718,7 +1891,7 @@ fn window_entry_scan(strat: &Strategy, snaps: &[Snapshot]) -> Option<f64> {
             // Only whole cents trade (README): 0.45 yes, never 0.4567.
             let whole_cent = ((price * 100.0) - (price * 100.0).round()).abs() < 1e-9;
             if (0.01..=0.99).contains(&price) && whole_cent {
-                return Some(price);
+                return Some((price, strat.side.clone()));
             }
         }
     }
@@ -1847,6 +2020,11 @@ fn score_strategy_windows_fps(
     standard: Standard,
     fps: Option<&[(u64, u64)]>,
 ) -> ScoreReport {
+    let pav_blocks = if strat.is_v2() {
+        recalibration::fit_is_market_pav_blocks(windows).0
+    } else {
+        Vec::new()
+    };
     // (close_epoch, pnl per contract) for every settled window we entered.
     let mut trades: Vec<(i64, f64)> = Vec::new();
     let mut settled = 0usize;
@@ -1865,13 +2043,15 @@ fn score_strategy_windows_fps(
             WindowFacts::Unsettled => continue,
         };
         settled += 1;
-        let Some(price) = window_entry_keyed(strat, Some(_ticker), snaps, win_fp) else {
+        let Some((price, entry_side)) =
+            window_entry_keyed_with_pav(strat, Some(_ticker), snaps, win_fp, &pav_blocks)
+        else {
             continue;
         };
         if price <= 0.0 || price >= 1.0 {
             continue;
         }
-        let payoff = if result == strat.side { 1.0 } else { 0.0 };
+        let payoff = if result == entry_side { 1.0 } else { 0.0 };
         let pnl = payoff - price - fee(price);
         trades.push((close_epoch, pnl));
     }
@@ -2072,12 +2252,17 @@ fn simulate_slots_windows_fps(
             trades: Vec::new(),
         };
     }
+    let pav_blocks = if strategies.iter().any(|s| s.is_v2()) {
+        recalibration::fit_is_market_pav_blocks(grouped).0
+    } else {
+        Vec::new()
+    };
     // Settled windows in chronological order, with every strategy's
     // entry price precomputed.
     struct Window {
         close_epoch: i64,
         result: String,
-        entries: Vec<Option<f64>>,
+        entries: Vec<Option<(f64, String)>>,
     }
     let mut windows: Vec<Window> = Vec::new();
     let mut conflicted_windows = 0usize;
@@ -2098,7 +2283,7 @@ fn simulate_slots_windows_fps(
         // entry lookup in this window.
         let entries = strategies
             .iter()
-            .map(|s| window_entry_keyed(s, Some(_ticker), snaps, win_fp))
+            .map(|s| window_entry_keyed_with_pav(s, Some(_ticker), snaps, win_fp, &pav_blocks))
             .collect();
         windows.push(Window {
             close_epoch,
@@ -2131,7 +2316,7 @@ fn simulate_slots_windows_fps(
         for slot in 0..n {
             let si = slot_strat[slot];
             let strat = &strategies[si];
-            let Some(price) = window.entries[si] else {
+            let Some((price, ref entry_side)) = window.entries[si] else {
                 continue;
             };
             if price <= 0.0 || price >= 1.0 {
@@ -2141,7 +2326,7 @@ fn simulate_slots_windows_fps(
             if contracts <= 0 {
                 continue;
             }
-            let payoff = if window.result == strat.side {
+            let payoff = if &window.result == entry_side {
                 contracts as f64
             } else {
                 0.0
@@ -3065,6 +3250,22 @@ fn tape_stat(path: &Path) -> Option<(u64, u64)> {
     ))
 }
 
+static STRAT_DIR_KEY_INVALIDATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn invalidate_strategies_dir_caches() {
+    STRAT_DIR_KEY_INVALIDATED.store(true, std::sync::atomic::Ordering::Release);
+    if let Ok(mut g) = STRAT_CACHE.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = ENTRY_CACHE.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = PREFIX_CACHE.lock() {
+        g.clear();
+    }
+}
+
 /// Fast fingerprint of `strategies_dir` + `paper_pot` so concurrent HTTP readers
 /// hit `analysis_cache` without compiling or cloning strategies on every request.
 fn strategies_dir_key(dir: &Path, paper_pot: f64) -> u64 {
@@ -3073,13 +3274,16 @@ fn strategies_dir_key(dir: &Path, paper_pot: f64) -> u64 {
         static LAST_KEY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         static LAST_KEY_VAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         static LAST_POT_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let invalidated =
+            STRAT_DIR_KEY_INVALIDATED.swap(false, std::sync::atomic::Ordering::AcqRel);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let pot_bits = paper_pot.to_bits();
         let prev_ms = LAST_KEY_MS.load(std::sync::atomic::Ordering::Relaxed);
-        if now_ms.saturating_sub(prev_ms) < 150
+        if !invalidated
+            && now_ms.saturating_sub(prev_ms) < 150
             && LAST_POT_BITS.load(std::sync::atomic::Ordering::Relaxed) == pot_bits
         {
             let v = LAST_KEY_VAL.load(std::sync::atomic::Ordering::Relaxed);
@@ -3094,7 +3298,10 @@ fn strategies_dir_key(dir: &Path, paper_pot: f64) -> u64 {
         computed
     }
     #[cfg(test)]
-    strategies_dir_key_uncached(dir, paper_pot)
+    {
+        let _ = STRAT_DIR_KEY_INVALIDATED.swap(false, std::sync::atomic::Ordering::AcqRel);
+        strategies_dir_key_uncached(dir, paper_pot)
+    }
 }
 
 fn strategies_dir_key_uncached(dir: &Path, paper_pot: f64) -> u64 {
@@ -5345,6 +5552,8 @@ fn home_json_body(app: &App) -> String {
             "risk_rails",
             "shadow_runner",
             "orderbook_l2",
+            "strategy_v2",
+            "synthesizer",
         ],
     };
     serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string())
@@ -6266,6 +6475,110 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             }
             let payload = app.sandbox_backtest_cached(&dpath, &dataset, source, cfg);
             json_response(200, &payload)
+        }
+        ("POST", "/api/strategies/save") => {
+            let parsed = match parse_json_object_body(
+                body,
+                false,
+                "Strategy save request body must be a JSON object with a string \"source\" field",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let Some(source) = parsed.get("source").and_then(|v| v.as_str()) else {
+                return json_ok_err_response(400, "missing string field \"source\"");
+            };
+            let requested = match parsed.get("file").or_else(|| parsed.get("name")) {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => match v.as_str() {
+                    Some(s) => Some(s),
+                    None => {
+                        return json_ok_err_response(400, "strategy name/file must be a string");
+                    }
+                },
+            };
+            match strategy_v2::save_strategy_atomic(&app.strategies_dir, requested, source) {
+                Ok(saved) => {
+                    invalidate_strategies_dir_caches();
+                    app.invalidate_live_hot();
+                    json_response(
+                        200,
+                        &serde_json::to_string(&saved).unwrap_or_else(|_| "{}".to_string()),
+                    )
+                }
+                Err(err) => {
+                    let payload = serde_json::json!({
+                        "ok": false,
+                        "error": err.message(),
+                        "errors": err.errors(),
+                    });
+                    json_response(err.status(), &payload.to_string())
+                }
+            }
+        }
+        ("DELETE", r) if r.starts_with("/api/strategies/") => {
+            let raw_name = r.strip_prefix("/api/strategies/").unwrap_or("");
+            match strategy_v2::delete_strategy_confined(&app.strategies_dir, raw_name) {
+                Ok(deleted) => {
+                    invalidate_strategies_dir_caches();
+                    app.invalidate_live_hot();
+                    json_response(
+                        200,
+                        &serde_json::to_string(&deleted).unwrap_or_else(|_| "{}".to_string()),
+                    )
+                }
+                Err(err) => {
+                    let payload = serde_json::json!({
+                        "ok": false,
+                        "error": err.message(),
+                        "errors": err.errors(),
+                    });
+                    json_response(err.status(), &payload.to_string())
+                }
+            }
+        }
+        ("POST", "/api/research/synthesize") => {
+            let parsed = match parse_json_object_body(
+                body,
+                true,
+                "Synthesizer request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let req: synthesizer::SynthesizeRequest = if body.trim().is_empty() {
+                Default::default()
+            } else {
+                match serde_json::from_str(body) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return json_ok_err_response(
+                            400,
+                            &format!("invalid synthesize parameters: {e}"),
+                        );
+                    }
+                }
+            };
+            let (dataset, dpath) = match resolve_dataset_checked(
+                app,
+                query,
+                parsed
+                    .get("dataset")
+                    .and_then(|v| v.as_str())
+                    .or(req.dataset.as_deref()),
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let view = app.tape(&dpath);
+            let (strategies, _) = load_strategies_with_errors(&app.strategies_dir);
+            match synthesizer::synthesize_strategies(&view.grouped, &strategies, &dataset, &req) {
+                Ok(rep) => json_response(
+                    200,
+                    &serde_json::to_string(&rep).unwrap_or_else(|_| "{}".to_string()),
+                ),
+                Err(e) => json_ok_err_response(400, &e),
+            }
         }
         ("GET", "/api/live/status") => {
             let snap = {
@@ -7464,13 +7777,54 @@ fn main() {
                                 break;
                             }
                             let route = path.split_once('?').map(|(r, _)| r).unwrap_or(&path);
+                            let is_strict_mutation = (route == "/api/strategies/save"
+                                && method == "POST")
+                                || (route.starts_with("/api/strategies/") && method == "DELETE")
+                                || (route == "/api/research/synthesize" && method == "POST");
                             let is_strict_live = route == "/api/live"
                                 || route.starts_with("/api/live/")
                                 || route == "/api/runner"
                                 || route.starts_with("/api/runner/")
                                 || route == "/api/orderbook/subscribe";
-                            if is_strict_live {
-                                if let Some((status, message)) =
+                            if is_strict_live || is_strict_mutation {
+                                if is_strict_mutation {
+                                    if !is_loopback_host(host) {
+                                        let response = json_err_response(
+                                            403,
+                                            "strategy and research mutations are restricted to localhost (loopback) only",
+                                        );
+                                        let _ = stream.write_all(response.as_bytes());
+                                        break;
+                                    }
+                                    let csrf = headers
+                                        .iter()
+                                        .find(|(n, _)| n == "x-openbell-csrf")
+                                        .map(|(_, v)| v.trim())
+                                        .unwrap_or("");
+                                    if csrf != "1" {
+                                        let response = json_err_response(
+                                            403,
+                                            "mutations require X-OpenBell-CSRF: 1",
+                                        );
+                                        let _ = stream.write_all(response.as_bytes());
+                                        break;
+                                    }
+                                    let ct = headers
+                                        .iter()
+                                        .find(|(n, _)| n == "content-type")
+                                        .map(|(_, v)| v.as_str())
+                                        .unwrap_or("");
+                                    if !(ct.len() >= 16
+                                        && ct[..16].eq_ignore_ascii_case("application/json"))
+                                    {
+                                        let response = json_err_response(
+                                            415,
+                                            "mutations require Content-Type: application/json",
+                                        );
+                                        let _ = stream.write_all(response.as_bytes());
+                                        break;
+                                    }
+                                } else if let Some((status, message)) =
                                     refuse_live_request(&method, host, &headers)
                                 {
                                     let response = json_err_response(status, message);

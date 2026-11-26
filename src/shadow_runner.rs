@@ -1345,6 +1345,12 @@ impl ShadowRunner {
 
         // Refresh compiled strategy cache only when strategies_dir changes.
         cached_strats.refresh_if_needed(&app.strategies_dir, app.paper_pot);
+        let has_v2 = cached_strats.strategies.iter().any(|s| s.is_v2());
+        let pav_blocks = if has_v2 {
+            crate::recalibration::fit_is_market_pav_blocks(&tape.grouped).0
+        } else {
+            Vec::new()
+        };
 
         let mut pending_live_intents: Vec<PendingLiveOrderIntent> = Vec::new();
         let mut live_cancels: Vec<(String, VirtualOrLiveOrder, i64, String)> = Vec::new();
@@ -1381,7 +1387,20 @@ impl ShadowRunner {
                     }
                 };
 
+                let mut v2_tracker = if has_v2 {
+                    let mut tr = crate::strategy_v2::CausalFeatureTracker::new();
+                    for pre in &snaps[..start_idx] {
+                        let _ = tr.push_tick(pre, &pav_blocks);
+                    }
+                    Some(tr)
+                } else {
+                    None
+                };
+
                 for snap in &snaps[start_idx..] {
+                    let cur_ctx = v2_tracker
+                        .as_mut()
+                        .and_then(|tr| tr.push_tick(snap, &pav_blocks));
                     if !snap.result.is_empty() {
                         // Cancel any live orders on venue if needed, and settle shadow/filled positions.
                         let live_to_cancel: Vec<VirtualOrLiveOrder> = st
@@ -1562,25 +1581,40 @@ impl ShadowRunner {
                         let Some(strat) = cached_strats.find(&strat_name) else {
                             continue;
                         };
-                        let Some(quote_dollars) = strat.entry_quote(ya, na, secs_to_close) else {
+                        let Some((quote_dollars, entry_side, post_only)) = strat
+                            .entry_quote_with_ctx(
+                                ya,
+                                na,
+                                secs_to_close,
+                                cur_ctx.as_ref(),
+                                exec_mode != "taker",
+                            )
+                        else {
                             continue;
                         };
                         let Some(quote_cents) = to_whole_cents(quote_dollars) else {
                             continue;
                         };
+                        let eff_exec_mode = if post_only && exec_mode == "maker" {
+                            "maker".to_string()
+                        } else if !post_only && strat.is_v2() {
+                            "taker".to_string()
+                        } else {
+                            exec_mode.clone()
+                        };
 
-                        let (side_ask_c, side_bid_c, side_bid_sz) = if strat.side == "yes" {
+                        let (side_ask_c, side_bid_c, side_bid_sz) = if entry_side == "yes" {
                             (ya_c, yb_c, snap.yes_bid_size)
                         } else {
                             (na_c, nb_c, snap.no_bid_size)
                         };
 
                         let (limit_cents, eff_contracts, taker_exact_cents, taker_slip_cents) =
-                            if exec_mode == "taker" {
+                            if eff_exec_mode == "taker" {
                                 let (fc, qty, exact_c, slip, _used_l2) = resolve_taker_execution(
                                     &app.orderbook,
                                     ticker,
-                                    &strat.side,
+                                    &entry_side,
                                     max_contracts,
                                     side_bid_c,
                                     side_ask_c,
@@ -1618,8 +1652,8 @@ impl ShadowRunner {
                                 strategy: strat.name.clone(),
                                 ticker: ticker.to_string(),
                                 series: snap.series.as_str().to_string(),
-                                execution_mode: exec_mode,
-                                side: strat.side.clone(),
+                                execution_mode: eff_exec_mode,
+                                side: entry_side,
                                 limit_cents,
                                 quote_cents,
                                 contracts,
@@ -1631,11 +1665,11 @@ impl ShadowRunner {
                         }
 
                         // Shadow execution: record QuotePosted, then either immediate taker fill or resting maker quote.
-                        let queue_initial = if exec_mode == "taker" || limit_cents > side_bid_c {
+                        let queue_initial = if eff_exec_mode == "taker" || limit_cents > side_bid_c {
                             0
                         } else if let Some(l2_q) = app
                             .orderbook
-                            .queue_ahead_at_fresh(ticker, &strat.side, limit_cents)
+                            .queue_ahead_at_fresh(ticker, &entry_side, limit_cents)
                         {
                             l2_q.min(u32::MAX as u64) as u32
                         } else if limit_cents == side_bid_c {
@@ -1651,17 +1685,17 @@ impl ShadowRunner {
                             ticker: ticker.to_string(),
                             series: snap.series.as_str().to_string(),
                             mode: "shadow".to_string(),
-                            execution_mode: exec_mode.clone(),
-                            side: strat.side.clone(),
+                            execution_mode: eff_exec_mode.clone(),
+                            side: entry_side.clone(),
                             limit_cents,
                             contracts,
-                            filled_contracts: if exec_mode == "taker" { contracts } else { 0 },
+                            filled_contracts: if eff_exec_mode == "taker" { contracts } else { 0 },
                             queue_ahead_initial: queue_initial,
                             queue_ahead_remaining: queue_initial,
                             posted_at: snap.fetched_at,
                             close_epoch,
                             live_order_id: None,
-                            status: if exec_mode == "taker" {
+                            status: if eff_exec_mode == "taker" {
                                 "filled".to_string()
                             } else {
                                 "resting".to_string()
@@ -1682,8 +1716,8 @@ impl ShadowRunner {
                             ticker: ticker.to_string(),
                             series: snap.series.as_str().to_string(),
                             order_id: order_id.clone(),
-                            side: strat.side.clone(),
-                            execution_mode: exec_mode.clone(),
+                            side: entry_side,
+                            execution_mode: eff_exec_mode.clone(),
                             limit_cents,
                             fill_cents: None,
                             contracts,
@@ -1698,7 +1732,7 @@ impl ShadowRunner {
                         st.append_event(post_ev.clone());
                         publish_runner_sse("quote_posted", &post_ev);
 
-                        if exec_mode == "taker" {
+                        if eff_exec_mode == "taker" {
                             let fee_d = taker_fee_dollars(taker_exact_cents / 100.0)
                                 * (contracts as f64);
                             st.record_fill(

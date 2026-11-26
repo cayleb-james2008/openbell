@@ -1602,9 +1602,11 @@ struct CompiledSandboxStrategy {
     name: String,
     side: String,
     description: Option<String>,
+    is_v2: bool,
     unit: Arc<rune::Unit>,
     runtime: Arc<rune::runtime::RuntimeContext>,
     allow_entry_hash: rune::Hash,
+    evaluate_hash: rune::Hash,
     vm: rune::Vm,
     spent: Duration,
     exhausted: bool,
@@ -1614,125 +1616,25 @@ struct CompiledSandboxStrategy {
 
 impl CompiledSandboxStrategy {
     fn compile(source: &str) -> Result<(Self, String), (Vec<String>, String)> {
-        let context = rune::Context::with_default_modules()
-            .map_err(|e| (vec![format!("rune context error: {e}")], String::new()))?;
-        let runtime = Arc::new(
-            context
-                .runtime()
-                .map_err(|e| (vec![format!("rune runtime error: {e}")], String::new()))?,
-        );
-        let mut sources = rune::Sources::new();
-        let src = rune::Source::new("sandbox.rn", source)
-            .map_err(|e| (vec![format!("invalid source: {e}")], String::new()))?;
-        sources
-            .insert(src)
-            .map_err(|e| (vec![format!("source insert error: {e}")], String::new()))?;
-
-        let mut diagnostics = rune::Diagnostics::new();
-        let build_res = rune::prepare(&mut sources)
-            .with_context(&context)
-            .with_diagnostics(&mut diagnostics)
-            .build();
-
-        let diag_text = if !diagnostics.is_empty() {
-            diagnostics
-                .diagnostics()
-                .iter()
-                .map(|d| match d {
-                    rune::diagnostics::Diagnostic::Fatal(f) => f.to_string(),
-                    rune::diagnostics::Diagnostic::Warning(w) => format!("warning: {w}"),
-                    other => format!("{other:?}"),
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            String::new()
-        };
-
-        let unit = match build_res {
-            Ok(u) => Arc::new(u),
-            Err(e) => {
-                let msg = e.to_string().replace(" (see diagnostics for details)", "");
-                return Err((vec![format!("compile error: {msg}")], diag_text));
-            }
-        };
-
-        let mut vm = rune::Vm::new(runtime.clone(), unit.clone());
-
-        let call_str = |vm: &mut rune::Vm, fn_name: &str| -> Result<String, String> {
-            let val = rune::runtime::budget::with(
-                STRATEGY_BUDGET,
-                rune::alloc::limit::with(STRATEGY_MEMORY_BYTES, || vm.call([fn_name], ())),
-            )
-            .call()
-            .map_err(|e| format!("call `{fn_name}()` failed: {e}"))?;
-            rune::from_value::<String>(val)
-                .map_err(|e| format!("`{fn_name}()` must return String: {e}"))
-        };
-
-        let name = call_str(&mut vm, "name").map_err(|e| (vec![e], diag_text.clone()))?;
-        if name.trim().is_empty() || name.len() > 64 {
-            return Err((
-                vec!["`name()` must return a non-empty string (<= 64 chars)".to_string()],
-                diag_text,
-            ));
-        }
-
-        let side = call_str(&mut vm, "side").map_err(|e| (vec![e], diag_text.clone()))?;
-        if side != "yes" && side != "no" {
-            return Err((
-                vec![format!(
-                    "`side()` must return \"yes\" or \"no\", got \"{side}\""
-                )],
-                diag_text,
-            ));
-        }
-
-        let description = call_str(&mut vm, "describe").ok();
-        let allow_entry_hash = rune::Hash::type_hash(["allow_entry"]);
-
-        let mut compiled = Self {
-            name,
-            side,
-            description,
-            unit,
-            runtime,
-            allow_entry_hash,
+        let v = crate::strategy_v2::validate_strategy_source_full(source)?;
+        let is_v2 = v.version == crate::strategy_v2::StrategyVersion::V2;
+        let vm = rune::Vm::new(v.runtime.clone(), v.unit.clone());
+        let compiled = Self {
+            name: v.name,
+            side: v.side,
+            description: v.description,
+            is_v2,
+            unit: v.unit,
+            runtime: v.runtime,
+            allow_entry_hash: rune::Hash::type_hash(["allow_entry"]),
+            evaluate_hash: rune::Hash::type_hash(["evaluate"]),
             vm,
             spent: Duration::ZERO,
             exhausted: false,
             call_failures: 0,
             budget_deaths: 0,
         };
-
-        // Probe `allow_entry` on representative & boundary inputs to verify the
-        // contract signature and catch immediate type/runtime failures.
-        let probes = [
-            (0.70, 0.32, 240i64),
-            (0.50, 0.52, 450i64),
-            (0.01, 0.99, 61i64),
-            (0.99, 0.01, 899i64),
-        ];
-        for (ya, na, secs) in probes {
-            match compiled.call_allow_entry_raw(ya, na, secs) {
-                Ok(_) => {}
-                Err(e) => {
-                    return Err((
-                        vec![format!(
-                            "`allow_entry({ya}, {na}, {secs})` failed validation probe: {e}"
-                        )],
-                        diag_text,
-                    ));
-                }
-            }
-        }
-        // Reset per-pass meters after validation probes.
-        compiled.spent = Duration::ZERO;
-        compiled.exhausted = false;
-        compiled.call_failures = 0;
-        compiled.budget_deaths = 0;
-
-        Ok((compiled, diag_text))
+        Ok((compiled, v.diagnostics))
     }
 
     #[inline]
@@ -1780,8 +1682,13 @@ impl CompiledSandboxStrategy {
     }
 
     /// Scan one settled window for the first whole-cent entry quote in `0.01..=0.99`.
-    /// Returns `(Option<entry_price>, ticks_scanned)`.
-    fn scan_window(&mut self, snaps: &[Snapshot], known_close: Option<i64>) -> (Option<f64>, usize) {
+    /// Returns `(Option<(entry_price, side)>, ticks_scanned)`.
+    fn scan_window(
+        &mut self,
+        snaps: &[Snapshot],
+        known_close: Option<i64>,
+        pav_blocks: &[crate::recalibration::PavBlock],
+    ) -> (Option<(f64, String)>, usize) {
         if !self.budget_open() {
             return (None, 0);
         }
@@ -1792,40 +1699,75 @@ impl CompiledSandboxStrategy {
         let mut scanned = 0usize;
         let mut entry = None;
 
-        for snap in snaps {
-            let (Some(ya), Some(na)) = (snap.yes_ask.get(), snap.no_ask.get()) else {
-                continue;
-            };
-            let price = if is_yes { ya } else { na };
-            // Enforce Kalshi whole-cent rule strictly in `0.01..=0.99`.
-            if !is_valid_whole_cent(price) {
-                continue;
-            }
-            let close_epoch = if let Some(c) = known_close {
-                Some(c)
-            } else if last_close_str == Some(snap.close_time.as_ref()) {
-                last_close_epoch
-            } else {
-                let parsed = parse_iso_z(&snap.close_time);
-                last_close_str = Some(snap.close_time.as_ref());
-                last_close_epoch = parsed;
-                parsed
-            };
-            let Some(close) = close_epoch else {
-                continue;
-            };
-            let secs_to_close = close - snap.fetched_at;
-            scanned += 1;
-            match self.call_allow_entry_raw(ya, na, secs_to_close) {
-                Ok(true) => {
-                    entry = Some((price * 100.0).round() / 100.0);
-                    break;
-                }
-                Ok(false) => {}
-                Err(_) => {
-                    self.call_failures += 1;
-                    if self.exhausted {
+        if self.is_v2 {
+            let mut tracker = crate::strategy_v2::CausalFeatureTracker::new();
+            for snap in snaps {
+                let Some(ctx) = tracker.push_tick(snap, pav_blocks) else {
+                    continue;
+                };
+                scanned += 1;
+                match crate::strategy_v2::call_evaluate_v2_vm(
+                    &mut self.vm,
+                    self.evaluate_hash,
+                    &ctx,
+                    &self.side,
+                ) {
+                    Ok(Some(dec)) => {
+                        self.budget_deaths = 0;
+                        entry = Some(((dec.limit_cents as f64) / 100.0, dec.side));
                         break;
+                    }
+                    Ok(None) => {
+                        self.budget_deaths = 0;
+                    }
+                    Err((_, budget_halt)) => {
+                        self.call_failures += 1;
+                        if budget_halt {
+                            self.budget_deaths += 1;
+                            if self.budget_deaths >= BUDGET_DEATH_LIMIT {
+                                self.exhausted = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for snap in snaps {
+                let (Some(ya), Some(na)) = (snap.yes_ask.get(), snap.no_ask.get()) else {
+                    continue;
+                };
+                let price = if is_yes { ya } else { na };
+                // Enforce Kalshi whole-cent rule strictly in `0.01..=0.99`.
+                if !is_valid_whole_cent(price) {
+                    continue;
+                }
+                let close_epoch = if let Some(c) = known_close {
+                    Some(c)
+                } else if last_close_str == Some(snap.close_time.as_ref()) {
+                    last_close_epoch
+                } else {
+                    let parsed = parse_iso_z(&snap.close_time);
+                    last_close_str = Some(snap.close_time.as_ref());
+                    last_close_epoch = parsed;
+                    parsed
+                };
+                let Some(close) = close_epoch else {
+                    continue;
+                };
+                let secs_to_close = close - snap.fetched_at;
+                scanned += 1;
+                match self.call_allow_entry_raw(ya, na, secs_to_close) {
+                    Ok(true) => {
+                        entry = Some(((price * 100.0).round() / 100.0, self.side.clone()));
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        self.call_failures += 1;
+                        if self.exhausted {
+                            break;
+                        }
                     }
                 }
             }
@@ -1994,6 +1936,12 @@ pub fn validate_and_backtest_rune_source_with_config(
     let mut raw_entries: Vec<RawEntry> = Vec::new();
     let mut cal_obs: Vec<CalibrationObservation> = Vec::new();
 
+    let pav_blocks = if strat.is_v2 {
+        crate::recalibration::fit_is_market_pav_blocks(tape_windows).0
+    } else {
+        Vec::new()
+    };
+
     for (ticker, snaps) in tape_windows {
         let facts_fp = facts_fingerprint(snaps);
         let (result, close_epoch) = match window_facts_keyed(snaps, facts_fp) {
@@ -2006,12 +1954,12 @@ pub fn validate_and_backtest_rune_source_with_config(
         };
         settled += 1;
 
-        let (entry_opt, scanned) = strat.scan_window(snaps, Some(close_epoch));
+        let (entry_opt, scanned) = strat.scan_window(snaps, Some(close_epoch), &pav_blocks);
         ticks_scanned += scanned;
-        let Some(price) = entry_opt else {
+        let Some((price, entry_side)) = entry_opt else {
             continue;
         };
-        let won = result == strat.side;
+        let won = result == entry_side;
         let payoff = if won { 1.0 } else { 0.0 };
         let pnl_per_contract = payoff - price - fee(price);
         let series = snaps

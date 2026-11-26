@@ -21,6 +21,8 @@
 use crate::analytics::{
     compute_return_ratios, is_valid_whole_cent, wilson_interval_95,
 };
+use crate::recalibration::{fit_pav_blocks_for_settled_windows, pav_blocks_fingerprint, PavBlock};
+use crate::strategy_v2::{call_evaluate_v2_vm, CausalFeatureTracker};
 use crate::{
     fee, is_budget_halt, parse_iso_z, window_facts_scan, window_fingerprint, Snapshot, Strategy,
     WindowFacts, BUDGET_DEATH_LIMIT, STRATEGY_BUDGET, STRATEGY_DEADLINE_SECS,
@@ -43,9 +45,10 @@ pub const PRICE_BUCKET_LABELS: [&str; 5] = ["10-30c", "30-50c", "50-70c", "70-90
 /// Canonical 2D regime seconds-to-close bucket labels.
 pub const TIME_BUCKET_LABELS: [&str; 4] = [">600s", "300-600s", "120-300s", "<120s"];
 
-/// Cache mapping `(strategy_fingerprint, window_fingerprint)` -> `Option<(entry_price, secs_to_close)>`
+/// Cache mapping `(strategy_fingerprint, window_fingerprint)` -> `Option<(entry_price, secs_to_close, is_yes)>`
 /// so repeated tournament builds over append-only tapes avoid re-scanning settled windows.
-type TournamentEntryCache = Mutex<HashMap<(u64, u64), Option<(f64, i64)>>>;
+type CachedWindowEntry = Option<(f64, i64, bool)>;
+type TournamentEntryCache = Mutex<HashMap<(u64, u64), CachedWindowEntry>>;
 static TOURNAMENT_ENTRY_CACHE: LazyLock<TournamentEntryCache> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -366,14 +369,18 @@ pub struct TournamentReport {
 // Fast Window Scanner (captures exact entry_price + secs_to_close with cache)
 // ---------------------------------------------------------------------------
 
-/// Scan one settled window for `(entry_price, secs_to_close)` using an already-borrowed
-/// strategy VM, precomputed `allow_entry` hash, and exact whole-cent & budget/memory guards.
+/// Scan one settled window for `(entry_price, secs_to_close, is_yes)` using an already-borrowed
+/// strategy VM, dispatching cleanly between v1 `allow_entry` and v2 `evaluate(ctx)`.
+#[allow(clippy::too_many_arguments)]
 fn scan_window_with_vm(
     strat: &Strategy,
     vm: &mut rune::Vm,
     snaps: &[Snapshot],
     allow_entry_hash: rune::Hash,
-) -> Option<(f64, i64)> {
+    evaluate_hash: rune::Hash,
+    is_v2: bool,
+    pav_blocks: &[PavBlock],
+) -> Option<(f64, i64, bool)> {
     if !strat.budget_open() {
         return None;
     }
@@ -382,60 +389,91 @@ fn scan_window_with_vm(
     let is_yes = strat.side == "yes";
     let mut last_close_str: Option<&str> = None;
     let mut last_close_epoch: Option<i64> = None;
-    let mut found: Option<(f64, i64)> = None;
+    let mut found: Option<(f64, i64, bool)> = None;
 
-    for snap in snaps {
-        let (Some(ya), Some(na)) = (snap.yes_ask.get(), snap.no_ask.get()) else {
-            continue;
-        };
-        let price = if is_yes { ya } else { na };
-        if !is_valid_whole_cent(price) {
-            continue;
-        }
-        let close_epoch = if last_close_str == Some(snap.close_time.as_ref()) {
-            last_close_epoch
-        } else {
-            let parsed = parse_iso_z(&snap.close_time);
-            last_close_str = Some(snap.close_time.as_ref());
-            last_close_epoch = parsed;
-            parsed
-        };
-        let Some(close) = close_epoch else {
-            continue;
-        };
-        let secs_to_close = close - snap.fetched_at;
-
-        let call_res = rune::runtime::budget::with(
-            STRATEGY_BUDGET,
-            rune::alloc::limit::with(STRATEGY_MEMORY_BYTES, || {
-                vm.call(allow_entry_hash, (ya, na, secs_to_close))
-            }),
-        )
-        .call();
-
-        match call_res {
-            Ok(val) => {
-                strat.budget_deaths.set(0);
-                match rune::from_value::<bool>(val) {
-                    Ok(true) => {
-                        let norm = (price * 100.0).round() / 100.0;
-                        found = Some((norm, secs_to_close));
-                        break;
-                    }
-                    Ok(false) => {}
-                    Err(_) => {
-                        strat.call_failures.set(strat.call_failures.get() + 1);
+    if is_v2 {
+        let mut tracker = CausalFeatureTracker::new();
+        for snap in snaps {
+            let Some(ctx) = tracker.push_tick(snap, pav_blocks) else {
+                continue;
+            };
+            match call_evaluate_v2_vm(vm, evaluate_hash, &ctx, &strat.side) {
+                Ok(Some(dec)) => {
+                    strat.budget_deaths.set(0);
+                    let norm = (dec.limit_cents as f64) / 100.0;
+                    found = Some((norm, ctx.secs_to_close, dec.side == "yes"));
+                    break;
+                }
+                Ok(None) => {
+                    strat.budget_deaths.set(0);
+                }
+                Err((_, budget_halt)) => {
+                    strat.call_failures.set(strat.call_failures.get() + 1);
+                    if budget_halt {
+                        let deaths = strat.budget_deaths.get() + 1;
+                        strat.budget_deaths.set(deaths);
+                        if deaths >= BUDGET_DEATH_LIMIT {
+                            strat.exhausted.set(true);
+                            break;
+                        }
                     }
                 }
             }
-            Err(e) => {
-                strat.call_failures.set(strat.call_failures.get() + 1);
-                if is_budget_halt(&e) {
-                    let deaths = strat.budget_deaths.get() + 1;
-                    strat.budget_deaths.set(deaths);
-                    if deaths >= BUDGET_DEATH_LIMIT {
-                        strat.exhausted.set(true);
-                        break;
+        }
+    } else {
+        for snap in snaps {
+            let (Some(ya), Some(na)) = (snap.yes_ask.get(), snap.no_ask.get()) else {
+                continue;
+            };
+            let price = if is_yes { ya } else { na };
+            if !is_valid_whole_cent(price) {
+                continue;
+            }
+            let close_epoch = if last_close_str == Some(snap.close_time.as_ref()) {
+                last_close_epoch
+            } else {
+                let parsed = parse_iso_z(&snap.close_time);
+                last_close_str = Some(snap.close_time.as_ref());
+                last_close_epoch = parsed;
+                parsed
+            };
+            let Some(close) = close_epoch else {
+                continue;
+            };
+            let secs_to_close = close - snap.fetched_at;
+
+            let call_res = rune::runtime::budget::with(
+                STRATEGY_BUDGET,
+                rune::alloc::limit::with(STRATEGY_MEMORY_BYTES, || {
+                    vm.call(allow_entry_hash, (ya, na, secs_to_close))
+                }),
+            )
+            .call();
+
+            match call_res {
+                Ok(val) => {
+                    strat.budget_deaths.set(0);
+                    match rune::from_value::<bool>(val) {
+                        Ok(true) => {
+                            let norm = (price * 100.0).round() / 100.0;
+                            found = Some((norm, secs_to_close, is_yes));
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(_) => {
+                            strat.call_failures.set(strat.call_failures.get() + 1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    strat.call_failures.set(strat.call_failures.get() + 1);
+                    if is_budget_halt(&e) {
+                        let deaths = strat.budget_deaths.get() + 1;
+                        strat.budget_deaths.set(deaths);
+                        if deaths >= BUDGET_DEATH_LIMIT {
+                            strat.exhausted.set(true);
+                            break;
+                        }
                     }
                 }
             }
@@ -457,6 +495,7 @@ pub fn build_tournament_context(
     strategies: &[Strategy],
 ) -> TournamentTapeContext {
     let allow_entry_hash = rune::Hash::type_hash(["allow_entry"]);
+    let evaluate_hash = rune::Hash::type_hash(["evaluate"]);
 
     struct SettledWin<'a> {
         ticker: &'a str,
@@ -514,12 +553,29 @@ pub fn build_tournament_context(
         (Some(boundary), cut, settled_windows.len() - cut)
     };
 
+    // Fit IS-only PAV blocks once if any loaded strategy uses v2 `evaluate(ctx)`.
+    let pav_blocks: Vec<PavBlock> = if strategies.iter().any(|s| s.is_v2()) {
+        let is_slice: Vec<(&str, i64, &str, &[Snapshot])> = settled_windows[..windows_settled_is]
+            .iter()
+            .map(|w| (w.ticker, w.close_epoch, w.result.as_str(), w.snaps))
+            .collect();
+        fit_pav_blocks_for_settled_windows(&is_slice)
+    } else {
+        Vec::new()
+    };
+    let pav_fp = pav_blocks_fingerprint(&pav_blocks);
+
     // Strategy-outer loop keeps one VM hot in cache and batches TOURNAMENT_ENTRY_CACHE
     // lookups/inserts to 2 mutex acquisitions per strategy instead of 24,000.
     let mut entries: Vec<TournamentEntry> = Vec::new();
     for (si, strat) in strategies.iter().enumerate() {
-        let fp = strat.fingerprint;
-        let cached: Vec<Option<Option<(f64, i64)>>> = {
+        let is_v2 = strat.is_v2();
+        let fp = if is_v2 {
+            strat.fingerprint ^ pav_fp
+        } else {
+            strat.fingerprint
+        };
+        let cached: Vec<Option<CachedWindowEntry>> = {
             if let Ok(guard) = TOURNAMENT_ENTRY_CACHE.lock() {
                 settled_windows
                     .iter()
@@ -530,30 +586,39 @@ pub fn build_tournament_context(
             }
         };
 
-        let mut new_cache_entries: Vec<(u64, Option<(f64, i64)>)> = Vec::new();
+        let mut new_cache_entries: Vec<(u64, CachedWindowEntry)> = Vec::new();
         strat.with_vm(|vm| {
             for (wi, w) in settled_windows.iter().enumerate() {
                 let entry_opt = match cached[wi] {
                     Some(hit) => hit,
                     None => {
-                        let computed = scan_window_with_vm(strat, vm, w.snaps, allow_entry_hash);
+                        let computed = scan_window_with_vm(
+                            strat,
+                            vm,
+                            w.snaps,
+                            allow_entry_hash,
+                            evaluate_hash,
+                            is_v2,
+                            &pav_blocks,
+                        );
                         if !strat.budget_exhausted() {
                             new_cache_entries.push((w.win_fp, computed));
                         }
                         computed
                     }
                 };
-                if let Some((price, secs_to_close)) = entry_opt {
+                if let Some((price, secs_to_close, entry_is_yes)) = entry_opt {
+                    let entry_side = if entry_is_yes { "yes" } else { "no" };
                     entries.push(TournamentEntry {
                         close_epoch: w.close_epoch,
                         ticker: w.ticker.to_string(),
                         series: w.series.clone(),
                         strategy_idx: si,
                         strategy: strat.name.clone(),
-                        side: strat.side.clone(),
+                        side: entry_side.to_string(),
                         entry_price: price,
                         secs_to_close,
-                        won: w.result == strat.side,
+                        won: w.result == entry_side,
                     });
                 }
             }

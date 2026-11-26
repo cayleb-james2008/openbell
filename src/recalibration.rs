@@ -850,6 +850,91 @@ fn representative_window_market_quote(snaps: &[Snapshot], close_epoch: i64) -> O
     best.map(|(_, mid, ask)| (mid, ask))
 }
 
+/// Deterministic fingerprint of fitted PAV blocks for strategy entry cache keying.
+pub fn pav_blocks_fingerprint(blocks: &[PavBlock]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    blocks.len().hash(&mut h);
+    for b in blocks {
+        b.mean_pred_p.to_bits().hash(&mut h);
+        b.calibrated_p.to_bits().hash(&mut h);
+        b.weight.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Fit strictly chronological in-sample (first 60% of settled epochs) 5-point
+/// PAV isotonic blocks from market tape windows. OOS outcomes are never read.
+pub fn fit_is_market_pav_blocks(
+    windows: &BTreeMap<String, Vec<Snapshot>>,
+) -> (Vec<PavBlock>, Option<i64>) {
+    let mut market_obs: Vec<TimedCalibrationObs> = Vec::new();
+    for (ticker, snaps) in windows {
+        let facts_fp = facts_fingerprint(snaps);
+        let (result, close_epoch) = match window_facts_keyed(snaps, facts_fp) {
+            WindowFacts::Settled { result, close_epoch } => (result, close_epoch),
+            WindowFacts::Conflict | WindowFacts::Unsettled => continue,
+        };
+        let series = snaps.first().map(|s| s.series.to_string()).unwrap_or_default();
+        if let Some((mid, ask)) = representative_window_market_quote(snaps, close_epoch) {
+            market_obs.push(TimedCalibrationObs {
+                close_epoch,
+                ticker: ticker.clone(),
+                series,
+                side: "yes".to_string(),
+                raw_prob: mid,
+                entry_price: ask,
+                outcome: result == "yes",
+            });
+        }
+    }
+    if market_obs.is_empty() {
+        return (Vec::new(), None);
+    }
+    market_obs.sort_by(|a, b| {
+        a.close_epoch
+            .cmp(&b.close_epoch)
+            .then_with(|| a.ticker.cmp(&b.ticker))
+    });
+    let mut epochs: Vec<i64> = market_obs.iter().map(|o| o.close_epoch).collect();
+    epochs.dedup();
+    let (is_obs, split_epoch) = if epochs.len() < 2 {
+        (market_obs.as_slice(), Some(epochs[0]))
+    } else {
+        let is_epoch_count = ((epochs.len() * 3) / 5).max(1).min(epochs.len() - 1);
+        let boundary = epochs[is_epoch_count];
+        let cut = market_obs.partition_point(|o| o.close_epoch < boundary);
+        (&market_obs[..cut], Some(boundary))
+    };
+    (fit_5pt_pav(is_obs), split_epoch)
+}
+
+/// Fit 5-point PAV isotonic blocks directly over an explicitly provided slice of
+/// settled `(ticker, close_epoch, result, snaps)` windows (strictly IS-only).
+pub fn fit_pav_blocks_for_settled_windows<'a>(
+    settled: &[(&'a str, i64, &'a str, &'a [Snapshot])],
+) -> Vec<PavBlock> {
+    let mut obs: Vec<TimedCalibrationObs> = Vec::with_capacity(settled.len());
+    for &(ticker, close_epoch, result, snaps) in settled {
+        let series = snaps.first().map(|s| s.series.to_string()).unwrap_or_default();
+        if let Some((mid, ask)) = representative_window_market_quote(snaps, close_epoch) {
+            obs.push(TimedCalibrationObs {
+                close_epoch,
+                ticker: ticker.to_string(),
+                series,
+                side: "yes".to_string(),
+                raw_prob: mid,
+                entry_price: ask,
+                outcome: result == "yes",
+            });
+        }
+    }
+    if obs.is_empty() {
+        return Vec::new();
+    }
+    fit_5pt_pav(&obs)
+}
+
 /// Run the full desk PAV isotonic recalibration study over collected tape
 /// windows and loaded strategies, keeping the portfolio entry population and
 /// full-history market population cleanly separated.
