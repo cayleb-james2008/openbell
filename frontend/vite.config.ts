@@ -112,12 +112,10 @@ function singleFile(): Plugin {
             throw new Error(`Lazy chunk ${file} back-imports entry script ${entryJsBasename}`);
           }
           const destRaw = path.join(chunksOutDir, file);
-          fs.writeFileSync(destRaw, rawBuf);
           const gzBuf = zlib.gzipSync(rawBuf, { level: 9 });
           const useGz = gzBuf.length < rawBuf.length;
-          if (useGz) {
-            fs.writeFileSync(destRaw + ".gz", gzBuf);
-          }
+          // Only the file the binary embeds is written: the .gz when it is smaller, else the raw file.
+          fs.writeFileSync(useGz ? destRaw + ".gz" : destRaw, useGz ? gzBuf : rawBuf);
           const sha = crypto.createHash("sha256").update(rawBuf).digest("hex");
           const embedPath = useGz ? `../assets/chunks/${file}.gz` : `../assets/chunks/${file}`;
           entries.push(
