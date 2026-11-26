@@ -190,8 +190,17 @@ esac
 
     let mut ev2 = String::new();
     let mut data2 = String::new();
-    reader.read_line(&mut ev2).unwrap();
-    reader.read_line(&mut data2).unwrap();
+    for _ in 0..16 {
+        ev2.clear();
+        data2.clear();
+        let mut frame_blank = String::new();
+        reader.read_line(&mut ev2).unwrap();
+        reader.read_line(&mut data2).unwrap();
+        reader.read_line(&mut frame_blank).unwrap();
+        if ev2.trim() == "event: tape" {
+            break;
+        }
+    }
     assert_eq!(ev2.trim(), "event: tape");
     assert!(
         data2.contains("\"snapshots_written\":1") && data2.contains("\"deduplicated\":1"),

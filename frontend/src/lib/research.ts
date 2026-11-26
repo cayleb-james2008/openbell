@@ -1,4 +1,4 @@
-// OpenBell v0.31.0 Strategy Runtime v2, Persistent Library CRUD, and Walk-Forward Edge Synthesizer client.
+// OpenBell v0.32.0 Strategy Runtime v2, Persistent Library CRUD, and Walk-Forward Edge Synthesizer client.
 // Mutations always send X-OpenBell-CSRF: 1 and Content-Type: application/json.
 import {
   type Dataset,
