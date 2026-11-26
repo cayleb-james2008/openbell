@@ -3,7 +3,7 @@
 // and Vaul Market Inspector drawer.
 import { useEffect, useMemo, useState } from "react";
 import { Drawer } from "vaul";
-import { Activity, Clock, RefreshCw, X } from "lucide-react";
+import { Activity, Clock, Layers, RefreshCw, X } from "lucide-react";
 import {
   Badge,
   Button,
@@ -19,7 +19,7 @@ import { MarketHistoryChart, ProbBar, ProvenanceTag } from "@/TapeCharts";
 import { AutoCollectorStrip } from "@/AutoCollectorStrip";
 import { OrderbookLadder } from "@/OrderbookLadder";
 import { useWide } from "@/lib/media";
-import { useOrderbook } from "@/lib/orderbook";
+import { useOrderbook, useOrderbookStreamStatus } from "@/lib/orderbook";
 import {
   type CollectorScheduleStatus,
   type Dataset,
@@ -295,6 +295,22 @@ export function TapeTab({
   const [pinnedTicker, setPinnedTicker] = useState<string>("");
   const [inlineHistory, setInlineHistory] = useState<Market[] | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const { streamStatus: l2StreamStatus } = useOrderbookStreamStatus({
+    enabled: true,
+    sseEnabled: dataset !== "fixture",
+  });
+
+  const activeL2Tickers = useMemo(() => {
+    if (!l2StreamStatus) return [];
+    return l2StreamStatus.active_l2_tickers.length > 0
+      ? l2StreamStatus.active_l2_tickers
+      : l2StreamStatus.subscribed_tickers;
+  }, [l2StreamStatus]);
+
+  const selectedL2Ticker = useMemo(() => {
+    if (pinnedTicker && activeL2Tickers.includes(pinnedTicker)) return pinnedTicker;
+    return activeL2Tickers[0] ?? "";
+  }, [pinnedTicker, activeL2Tickers]);
 
   const validMarkets = useMemo(() => {
     if (!marketsRead || !marketsRead.ok) return [];
@@ -317,10 +333,10 @@ export function TapeTab({
   const settledCount = validMarkets.length - openCount;
 
   useEffect(() => {
-    if (openCount === 0) return;
+    if (openCount === 0 && !l2StreamStatus?.last_trade_ms) return;
     const id = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [openCount]);
+  }, [openCount, l2StreamStatus?.last_trade_ms]);
 
   // Handle jump from Cmd+K Command Palette
   useEffect(() => {
@@ -472,6 +488,33 @@ export function TapeTab({
             <Activity className="size-3" strokeWidth={1.5} aria-hidden />
             <span>{stream.mode === "sse" ? "SSE live" : "30s poll"}</span>
           </StatusPill>
+
+          <span data-tape-l2-pill className="inline-flex">
+            <StatusPill
+              id="tape-l2-feed-pill"
+              tone={
+                l2StreamStatus?.ws_connected || l2StreamStatus?.mode === "ws"
+                  ? "success"
+                  : l2StreamStatus?.mode === "rest"
+                    ? "info"
+                    : "neutral"
+              }
+              className="min-h-7 px-2.5 py-0.5 text-xs text-ink-2"
+              title={
+                l2StreamStatus?.last_error ??
+                `L2 books: ${l2StreamStatus?.active_books ?? 0} active, ${l2StreamStatus?.auto_subscribed_count ?? 0} auto-subscribed`
+              }
+            >
+              <Layers className="size-3" strokeWidth={1.5} aria-hidden />
+              <span className="mono">
+                {l2StreamStatus?.ws_connected || l2StreamStatus?.mode === "ws"
+                  ? `L2 WS (${l2StreamStatus?.active_books ?? activeL2Tickers.length})`
+                  : l2StreamStatus?.mode === "rest"
+                    ? `L2 REST (${l2StreamStatus?.active_books ?? activeL2Tickers.length})`
+                    : "L2 Offline"}
+              </span>
+            </StatusPill>
+          </span>
         </div>
       </div>
 
@@ -669,12 +712,37 @@ export function TapeTab({
         </div>
       )}
 
-      {/* Background Auto-Collector Control Strip + 200-Window Readiness Gate Progress Bar */}
+      {/* Background Auto-Collector Control Strip + 200-Window Readiness Gate + L2 Telemetry Strip */}
       <AutoCollectorStrip
         status={collectorStatus}
         updating={updatingSchedule}
         onSelectSchedule={onSelectSchedule}
         onOpenScorecard={onOpenScorecard}
+        l2StreamStatus={l2StreamStatus}
+        selectedL2Ticker={selectedL2Ticker}
+        onSelectL2Ticker={(t) => {
+          if (t) setPinnedTicker(t);
+        }}
+        onInspectL2Ticker={(t) => {
+          const clean = t.trim().toUpperCase();
+          if (!clean) return;
+          setPinnedTicker(clean);
+          const found = validMarkets.find((m) => cleanStr(m.ticker, "").toUpperCase() === clean);
+          setSelected(
+            found ?? {
+              ticker: clean,
+              close_time: null,
+              yes_bid: null,
+              yes_ask: null,
+              no_bid: null,
+              no_ask: null,
+              last_price: null,
+              result: null,
+              status: "open",
+            },
+          );
+        }}
+        nowMs={nowMs}
         variant="banner"
       />
 

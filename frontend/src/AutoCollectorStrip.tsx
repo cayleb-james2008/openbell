@@ -1,8 +1,10 @@
-// Public Read-Only Auto-Collector Schedule Control Strip (Off / 60s / 180s) + 200-Window Readiness Gate Progress Bar.
+// Public Read-Only Auto-Collector Schedule Control Strip (Off / 60s / 180s), 200-Window Readiness Gate Progress Bar,
+// and Live L2 Multi-Ticker WS/Trade Telemetry Strip.
 // Rendered both inside Live 15m Tape and synchronized inside the Settings Vaul sheet. Strictly public GET only.
-import { AlertTriangle, Clock, ShieldCheck } from "lucide-react";
+import { Activity, AlertTriangle, Clock, ShieldCheck } from "lucide-react";
 import { StatusPill } from "@/components/ui";
-import type { CollectorScheduleStatus } from "@/lib/desk";
+import { type CollectorScheduleStatus, ageWords } from "@/lib/desk";
+import type { OrderbookStreamStatus } from "@/lib/orderbook";
 
 type CadenceChoice = "off" | "60" | "180";
 
@@ -11,17 +13,48 @@ function activeChoice(status: CollectorScheduleStatus | null): CadenceChoice {
   return status.intervalSecs >= 120 ? "180" : "60";
 }
 
+function l2FeedBadge(status?: OrderbookStreamStatus | null): {
+  tone: "success" | "info" | "warning" | "neutral";
+  label: string;
+} {
+  const active = status?.active_books ?? 0;
+  if (status?.ws_connected || status?.mode === "ws") {
+    return status.stale_books > 0 && status.stale_books >= active && active > 0
+      ? { tone: "warning", label: `L2 WS Stale (${active})` }
+      : { tone: "success", label: `L2 WS (${active})` };
+  }
+  if (status?.mode === "rest") {
+    return { tone: "info", label: `L2 REST (${active})` };
+  }
+  return { tone: "neutral", label: "L2 Offline" };
+}
+
+function formatSyncHz(rateHz: number | undefined): string {
+  const rate = typeof rateHz === "number" && Number.isFinite(rateHz) && rateHz >= 0 ? rateHz : 0;
+  return rate > 0 && rate < 1 ? `${rate.toFixed(2)} Hz` : `${rate.toFixed(1)} Hz`;
+}
+
 export function AutoCollectorStrip({
   status,
   updating,
   onSelectSchedule,
   onOpenScorecard,
+  l2StreamStatus,
+  selectedL2Ticker = "",
+  onSelectL2Ticker,
+  onInspectL2Ticker,
+  nowMs,
   variant = "banner",
 }: {
   status: CollectorScheduleStatus | null;
   updating: boolean;
   onSelectSchedule: (enabled: boolean, intervalSecs: number) => void;
   onOpenScorecard?: () => void;
+  l2StreamStatus?: OrderbookStreamStatus | null;
+  selectedL2Ticker?: string;
+  onSelectL2Ticker?: (ticker: string) => void;
+  onInspectL2Ticker?: (ticker: string) => void;
+  nowMs?: number;
   variant?: "banner" | "compact";
 }) {
   const choice = activeChoice(status);
@@ -114,87 +147,174 @@ export function AutoCollectorStrip({
     );
   }
 
+  const l2Tickers = l2StreamStatus
+    ? l2StreamStatus.active_l2_tickers.length > 0
+      ? l2StreamStatus.active_l2_tickers
+      : l2StreamStatus.subscribed_tickers
+    : [];
+  const effectiveL2Ticker =
+    selectedL2Ticker && l2Tickers.includes(selectedL2Ticker)
+      ? selectedL2Ticker
+      : (l2Tickers[0] ?? "");
+  const l2Badge = l2FeedBadge(l2StreamStatus);
+  const autoSubscribedCount = l2StreamStatus?.auto_subscribed_count ?? 0;
+  const effectiveNowMs = nowMs ?? Date.now();
+  const lastTradeAge =
+    l2StreamStatus?.last_trade_ms && l2StreamStatus.last_trade_ms > 0
+      ? ageWords(Math.max(0, (effectiveNowMs - l2StreamStatus.last_trade_ms) / 1000))
+      : "none yet";
+  const syncHzLabel = formatSyncHz(l2StreamStatus?.tape_sync_rate_hz);
+
   return (
     <div
       id="auto-collector-strip"
-      className="flex flex-col gap-3 rounded-[10px] border border-hairline bg-surface px-4 py-3 lg:flex-row lg:items-center lg:justify-between"
+      className="space-y-2.5 rounded-[10px] border border-hairline bg-surface px-4 py-3"
     >
-      {/* Left: Auto-collector cadence toggle */}
-      <div className="flex flex-wrap items-center gap-2.5">
-        <div className="flex items-center gap-1.5">
-          <Clock className="size-4 text-info-foreground" aria-hidden />
-          <span className="text-xs font-semibold text-ink">Auto-Collector</span>
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        {/* Left: Auto-collector cadence toggle */}
+        <div className="flex flex-wrap items-center gap-2.5">
+          <div className="flex items-center gap-1.5">
+            <Clock className="size-4 text-info-foreground" aria-hidden />
+            <span className="text-xs font-semibold text-ink">Auto-Collector</span>
+          </div>
+
+          <div className="flex items-center gap-1" role="group" aria-label="Background public tape collector cadence">
+            {choices.map(([id, label, enabled, secs]) => (
+              <button
+                key={id}
+                type="button"
+                data-collector-mode={id}
+                aria-pressed={choice === id}
+                disabled={updating}
+                onClick={() => onSelectSchedule(enabled, secs)}
+                className={
+                  "mono min-h-11 min-w-11 cursor-pointer rounded-md border px-2.5 text-xs font-medium outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8 sm:min-w-0 " +
+                  (choice === id
+                    ? "border-ink bg-ink text-canvas"
+                    : "border-hairline bg-board text-ink-2 hover:bg-surface hover:text-ink")
+                }
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          <StatusPill id="auto-collector-status-pill" tone={badgeTone}>
+            <span className="mono">{badgeText}</span>
+          </StatusPill>
+
+          {status?.rateLimited && (
+            <span className="inline-flex items-center gap-1 font-mono text-xs text-warning-foreground">
+              <AlertTriangle className="size-3.5" aria-hidden />
+              Adaptive 429 backoff active
+            </span>
+          )}
         </div>
 
-        <div className="flex items-center gap-1" role="group" aria-label="Background public tape collector cadence">
-          {choices.map(([id, label, enabled, secs]) => (
-            <button
-              key={id}
-              type="button"
-              data-collector-mode={id}
-              aria-pressed={choice === id}
-              disabled={updating}
-              onClick={() => onSelectSchedule(enabled, secs)}
-              className={
-                "mono min-h-11 min-w-11 cursor-pointer rounded-md border px-2.5 text-xs font-medium outline-none transition-[color,background-color,border-color] duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8 sm:min-w-0 " +
-                (choice === id
-                  ? "border-ink bg-ink text-canvas"
-                  : "border-hairline bg-board text-ink-2 hover:bg-surface hover:text-ink")
-              }
+        {/* Right: 200-Window Readiness Gate Progress Bar */}
+        <div id="readiness-progress" className="flex flex-1 flex-wrap items-center gap-3 lg:max-w-[460px] lg:justify-end">
+          <div className="min-w-[180px] flex-1 space-y-1">
+            <div className="flex items-center justify-between gap-2 font-mono text-xs">
+              <span className="inline-flex items-center gap-1 text-ink-2">
+                <ShieldCheck className="size-3.5 text-info-foreground" aria-hidden />
+                <span>Readiness Gate</span>
+              </span>
+              <span className="font-semibold text-ink">
+                {settled} / {target} windows ({pct}%)
+              </span>
+            </div>
+            <div
+              role="progressbar"
+              aria-label="Settled tape progress toward 200-window readiness gate"
+              aria-valuenow={Math.min(settled, target)}
+              aria-valuemin={0}
+              aria-valuemax={target}
+              className="h-2 w-full overflow-hidden rounded-full bg-track"
             >
-              {label}
+              <div
+                className={"h-full rounded-full " + (pct >= 100 ? "bg-dot-green" : "bg-blue")}
+                style={{ width: `${Math.max(pct, settled > 0 ? 3 : 0)}%` }}
+              />
+            </div>
+          </div>
+
+          {onOpenScorecard && (
+            <button
+              type="button"
+              onClick={onOpenScorecard}
+              className="min-h-11 shrink-0 cursor-pointer rounded-md border border-hairline bg-board px-2.5 text-xs font-medium text-ink-2 outline-none transition-[color,background-color] duration-(--dur-press) hover:bg-surface hover:text-ink focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+            >
+              5-Gate View
             </button>
-          ))}
+          )}
         </div>
-
-        <StatusPill id="auto-collector-status-pill" tone={badgeTone}>
-          <span className="mono">{badgeText}</span>
-        </StatusPill>
-
-        {status?.rateLimited && (
-          <span className="inline-flex items-center gap-1 font-mono text-xs text-warning-foreground">
-            <AlertTriangle className="size-3.5" aria-hidden />
-            Adaptive 429 backoff active
-          </span>
-        )}
       </div>
 
-      {/* Right: 200-Window Readiness Gate Progress Bar */}
-      <div id="readiness-progress" className="flex flex-1 flex-wrap items-center gap-3 lg:max-w-[460px] lg:justify-end">
-        <div className="min-w-[180px] flex-1 space-y-1">
-          <div className="flex items-center justify-between gap-2 font-mono text-xs">
-            <span className="inline-flex items-center gap-1 text-ink-2">
-              <ShieldCheck className="size-3.5 text-info-foreground" aria-hidden />
-              <span>Readiness Gate</span>
-            </span>
-            <span className="font-semibold text-ink">
-              {settled} / {target} windows ({pct}%)
-            </span>
-          </div>
-          <div
-            role="progressbar"
-            aria-label="Settled tape progress toward 200-window readiness gate"
-            aria-valuenow={Math.min(settled, target)}
-            aria-valuemin={0}
-            aria-valuemax={target}
-            className="h-2 w-full overflow-hidden rounded-full bg-track"
-          >
-            <div
-              className={"h-full rounded-full " + (pct >= 100 ? "bg-dot-green" : "bg-blue")}
-              style={{ width: `${Math.max(pct, settled > 0 ? 3 : 0)}%` }}
-            />
-          </div>
+      {/* Bottom: Live L2 multi-ticker feed pill & WS/trade telemetry */}
+      <div
+        id="l2-telemetry-strip"
+        data-l2-telemetry-strip
+        className="flex flex-col gap-2 border-t border-hairline pt-2.5 lg:flex-row lg:items-center lg:justify-between"
+      >
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs">
+          <span data-l2-feed-pill className="inline-flex">
+            <StatusPill
+              id="l2-feed-pill"
+              tone={l2Badge.tone}
+              title={l2StreamStatus?.last_error ?? undefined}
+            >
+              <Activity className="size-3 shrink-0" strokeWidth={1.5} aria-hidden />
+              <span className="mono">{l2Badge.label}</span>
+            </StatusPill>
+          </span>
+
+          <span data-l2-autosub-count className="mono text-ink-2">
+            Auto-sub <strong className="font-semibold text-ink">{autoSubscribedCount}</strong>
+          </span>
+
+          <span data-l2-last-trade className="mono text-ink-2">
+            Last trade <strong className="font-semibold text-ink">{lastTradeAge}</strong>
+          </span>
+
+          <span data-l2-sync-hz className="mono text-ink-2">
+            Sync <strong className="font-semibold text-ink">{syncHzLabel}</strong>
+          </span>
         </div>
 
-        {onOpenScorecard && (
-          <button
-            type="button"
-            onClick={onOpenScorecard}
-            className="min-h-11 shrink-0 cursor-pointer rounded-md border border-hairline bg-board px-2.5 text-xs font-medium text-ink-2 outline-none transition-[color,background-color] duration-(--dur-press) hover:bg-surface hover:text-ink focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <label htmlFor="l2-active-ticker-select" className="shrink-0 text-xs font-medium text-ink-2">
+            Active L2
+          </label>
+          <select
+            id="l2-active-ticker-select"
+            data-l2-ticker-select
+            aria-label="Active L2 tickers"
+            value={effectiveL2Ticker}
+            disabled={l2Tickers.length === 0}
+            onChange={(e) => onSelectL2Ticker?.(e.target.value)}
+            className="mono min-h-11 min-w-0 max-w-full flex-1 cursor-pointer rounded-md border border-ink-3 bg-board px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-track disabled:text-ink-2 sm:min-h-8 sm:max-w-[240px] sm:flex-initial"
           >
-            5-Gate View
-          </button>
-        )}
+            {l2Tickers.length === 0 ? (
+              <option value="">No active tickers</option>
+            ) : (
+              l2Tickers.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))
+            )}
+          </select>
+          {onInspectL2Ticker && effectiveL2Ticker && (
+            <button
+              type="button"
+              id="l2-inspect-ticker-btn"
+              onClick={() => onInspectL2Ticker(effectiveL2Ticker)}
+              className="min-h-11 shrink-0 cursor-pointer rounded-md border border-hairline bg-board px-2.5 text-xs font-medium text-ink-2 outline-none transition-[color,background-color] duration-(--dur-press) hover:bg-surface hover:text-ink focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+            >
+              Inspect L2
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

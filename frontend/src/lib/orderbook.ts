@@ -1,6 +1,7 @@
-// OpenBell E2 Live L2 Orderbook client, SSE stream merger, and client-side book-walk VWAP calculator.
+// OpenBell E2 Live L2 Orderbook client, SSE stream merger, history reader, and client-side book-walk VWAP calculator.
 // Aligned with Zone A endpoints:
 //   GET  /api/orderbook?ticker=<TICKER>
+//   GET  /api/orderbook/history?ticker=<TICKER>&limit=<LIMIT>
 //   GET  /api/orderbook/stream-status
 //   POST /api/orderbook/subscribe
 //   SSE  /api/tape/stream (`event: orderbook`)
@@ -43,6 +44,16 @@ export type OrderbookStreamStatus = {
   last_error: string | null;
   delta_count: number;
   resync_count: number;
+  auto_subscribed_count: number;
+  active_l2_tickers: string[];
+  last_trade_ms: number | null;
+  tape_sync_rate_hz: number;
+};
+
+export type OrderbookHistoryResponse = {
+  ok: boolean;
+  ticker: string;
+  records: OrderbookSnapshot[];
 };
 
 export type OrderbookSubscribeResult = {
@@ -177,6 +188,10 @@ export function defaultOrderbookStreamStatus(): OrderbookStreamStatus {
     last_error: null,
     delta_count: 0,
     resync_count: 0,
+    auto_subscribed_count: 0,
+    active_l2_tickers: [],
+    last_trade_ms: null,
+    tape_sync_rate_hz: 0,
   };
 }
 
@@ -237,6 +252,15 @@ export function normalizeOrderbookStreamStatus(raw: unknown): OrderbookStreamSta
         .map((t) => (typeof t === "string" ? t.trim().toUpperCase() : ""))
         .filter((t) => t.length > 0)
     : [];
+  const activeL2Tickers = Array.isArray(o.active_l2_tickers)
+    ? o.active_l2_tickers
+        .map((t) => (typeof t === "string" ? t.trim().toUpperCase() : ""))
+        .filter((t) => t.length > 0)
+    : subs;
+  const rawLastTradeMs = pickNum(o, ["last_trade_ms"]);
+  const lastTradeMs = rawLastTradeMs !== null && rawLastTradeMs > 0 ? Math.round(rawLastTradeMs) : null;
+  const rawSyncRate = pickNum(o, ["tape_sync_rate_hz"]);
+  const tapeSyncRateHz = rawSyncRate !== null && rawSyncRate >= 0 ? Number(rawSyncRate.toFixed(2)) : 0;
   return {
     ws_connected: wsConnected,
     mode: normalizeStreamMode(o.mode ?? o.transport, wsConnected),
@@ -246,6 +270,10 @@ export function normalizeOrderbookStreamStatus(raw: unknown): OrderbookStreamSta
     last_error: typeof o.last_error === "string" && o.last_error.trim() ? o.last_error.trim() : null,
     delta_count: Math.max(0, Math.round(pickNum(o, ["delta_count", "deltas_received"]) ?? 0)),
     resync_count: Math.max(0, Math.round(pickNum(o, ["resync_count", "snapshots_recorded"]) ?? 0)),
+    auto_subscribed_count: Math.max(0, Math.round(pickNum(o, ["auto_subscribed_count"]) ?? 0)),
+    active_l2_tickers: activeL2Tickers,
+    last_trade_ms: lastTradeMs,
+    tape_sync_rate_hz: tapeSyncRateHz,
   };
 }
 
@@ -344,6 +372,46 @@ export async function fetchOrderbookStreamStatus(): Promise<OrderbookStreamStatu
     throw new Error(`Orderbook stream-status answered ${r.status}`);
   }
   return normalizeOrderbookStreamStatus(await r.json());
+}
+
+export async function fetchOrderbookHistory(
+  ticker: string,
+  limit = 20,
+): Promise<OrderbookHistoryResponse> {
+  const clean = ticker.trim().toUpperCase();
+  if (!clean) return { ok: false, ticker: "", records: [] };
+  const safeLimit = Math.max(1, Math.min(200, Math.round(limit)));
+  const qs = new URLSearchParams({
+    ticker: clean,
+    limit: String(safeLimit),
+  });
+  const r = await fetch(`/api/orderbook/history?${qs.toString()}`);
+  if (!r.ok) {
+    throw new Error(`Orderbook history request answered ${r.status}`);
+  }
+  const raw = (await r.json()) as Record<string, unknown> | null;
+  const rawList = Array.isArray(raw?.records)
+    ? raw.records
+    : Array.isArray(raw?.snapshots)
+      ? raw.snapshots
+      : Array.isArray(raw?.history)
+        ? raw.history
+        : [];
+  const records = rawList
+    .map((item) => normalizeOrderbookSnapshot(item, clean))
+    .filter(
+      (snap) =>
+        snap.updated_ms > 0 ||
+        snap.last_seq > 0 ||
+        snap.yes_bids.length > 0 ||
+        snap.yes_asks.length > 0,
+    )
+    .sort((a, b) => a.updated_ms - b.updated_ms || a.last_seq - b.last_seq);
+  return {
+    ok: typeof raw?.ok === "boolean" ? raw.ok : true,
+    ticker: cleanStr(raw?.ticker, clean).toUpperCase(),
+    records,
+  };
 }
 
 export async function subscribeOrderbook(
@@ -546,5 +614,74 @@ export function useOrderbook(
     loading,
     error,
     refresh: manualRefresh,
+  };
+}
+
+export function useOrderbookStreamStatus(
+  options: { enabled?: boolean; pollMs?: number; sseEnabled?: boolean } = {},
+) {
+  const { enabled = true, pollMs = 4000, sseEnabled = true } = options;
+  const [streamStatus, setStreamStatus] = useState<OrderbookStreamStatus | null>(null);
+  const [loading, setLoading] = useState(false);
+  const seqRef = useRef(0);
+  const lastSseRefreshRef = useRef(0);
+
+  const refresh = useCallback(async () => {
+    if (!enabled) return;
+    const reqId = ++seqRef.current;
+    try {
+      const st = await fetchOrderbookStreamStatus();
+      if (reqId !== seqRef.current) return;
+      setStreamStatus(st);
+    } catch {
+      /* keep previous status on transient error */
+    } finally {
+      if (reqId === seqRef.current) setLoading(false);
+    }
+  }, [enabled]);
+
+  useEffect(() => {
+    if (!enabled) {
+      setStreamStatus(null);
+      setLoading(false);
+      return;
+    }
+    let alive = true;
+    setLoading(true);
+    void refresh();
+
+    const pollId = window.setInterval(() => {
+      if (alive) void refresh();
+    }, Math.max(1000, pollMs));
+
+    return () => {
+      alive = false;
+      window.clearInterval(pollId);
+    };
+  }, [enabled, pollMs, refresh]);
+
+  useEffect(() => {
+    if (!enabled || !sseEnabled) return;
+    return subscribeOrderbookStream(
+      true,
+      () => {
+        const now = Date.now();
+        if (now - lastSseRefreshRef.current >= 1200) {
+          lastSseRefreshRef.current = now;
+          void refresh();
+        }
+      },
+      {
+        onReconnect: () => {
+          void refresh();
+        },
+      },
+    );
+  }, [enabled, sseEnabled, refresh]);
+
+  return {
+    streamStatus,
+    loading,
+    refresh,
   };
 }
