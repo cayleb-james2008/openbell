@@ -45,6 +45,7 @@ import {
   rewriteStrategyNameFn,
   saveStrategyScript,
   validateStrategySlug,
+  validateStrategySource,
 } from "@/lib/research";
 
 export type SandboxSourcePayload = {
@@ -90,6 +91,16 @@ export function RuneSandbox({
   const [result, setResult] = useState<BacktestResult | null>(null);
 
   const editorRef = useRef<HTMLTextAreaElement>(null);
+  const mutateLockRef = useRef(false);
+  const backtestSeqRef = useRef(0);
+
+  // Clear stale backtest state when switching between live and fixture datasets.
+  useEffect(() => {
+    backtestSeqRef.current += 1;
+    setResult(null);
+    setCrudError("");
+    setBacktesting(false);
+  }, [dataset]);
 
   const strategyNames = useMemo(
     () =>
@@ -195,6 +206,23 @@ export function RuneSandbox({
   const deleteTargetName =
     loadedFrom !== "template" && loadedFrom !== "template-v2" ? loadedFrom : scriptName.trim();
 
+  const nameCheck = useMemo(() => validateStrategySlug(scriptName), [scriptName]);
+  const saveAsCheck = useMemo(() => validateStrategySlug(saveAsName), [saveAsName]);
+  const sourceCheck = useMemo(() => validateStrategySource(source), [source]);
+
+  useEffect(() => {
+    if (!deleteConfirmOpen) return;
+    if (!isLibraryBacked || !deleteTargetName) {
+      setDeleteConfirmOpen(false);
+      return;
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !mutatingLibrary) setDeleteConfirmOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [deleteConfirmOpen, isLibraryBacked, deleteTargetName, mutatingLibrary]);
+
   const handleInsertField = (fieldName: string) => {
     setActiveField(fieldName);
     const token = `ctx.${fieldName}`;
@@ -214,13 +242,29 @@ export function RuneSandbox({
   };
 
   const handleValidate = async () => {
+    if (!sourceCheck.ok) {
+      setCrudError(sourceCheck.error);
+      setValidation({
+        valid: false,
+        name: nameCheck.ok ? nameCheck.slug : "custom-strategy",
+        side: "unknown",
+        diagnostics: [{ level: "error", message: sourceCheck.error }],
+        elapsedMs: 0,
+        source: "client",
+      });
+      toast.error(sourceCheck.error);
+      return;
+    }
     setValidating(true);
+    setCrudError("");
     try {
       const res = await validateRuneStrategy(source, home);
       setValidation(res);
       if (res.valid) {
         toast.success(`Strategy syntax valid (${res.name}, ${res.side.toUpperCase()}).`);
       } else {
+        const firstErr = res.diagnostics.find((d) => d.level === "error")?.message;
+        if (firstErr && /403|415/.test(firstErr)) setCrudError(firstErr);
         toast.error(`Validation found ${res.diagnostics.filter((d) => d.level === "error").length} issue(s).`);
       }
     } finally {
@@ -229,10 +273,26 @@ export function RuneSandbox({
   };
 
   const handleBacktest = async () => {
+    if (!sourceCheck.ok) {
+      setCrudError(sourceCheck.error);
+      setValidation({
+        valid: false,
+        name: nameCheck.ok ? nameCheck.slug : "custom-strategy",
+        side: "unknown",
+        diagnostics: [{ level: "error", message: sourceCheck.error }],
+        elapsedMs: 0,
+        source: "client",
+      });
+      toast.error(sourceCheck.error);
+      return;
+    }
+    const reqSeq = ++backtestSeqRef.current;
     setBacktesting(true);
+    setCrudError("");
     try {
       const startEq = slots && isNum(slots.paper_pot_start) ? slots.paper_pot_start : 100;
       const res = await runRuneBacktest(source, dataset, home, markets, slots, startEq);
+      if (reqSeq !== backtestSeqRef.current) return;
       setResult(res);
       setValidation({
         valid: res.valid,
@@ -247,23 +307,34 @@ export function RuneSandbox({
           `Backtest complete: ${res.summary.windowsTraded} trades, ${moneySigned(res.summary.netPnlDollars)} paper P&L.`,
         );
       } else {
+        const firstErr = res.diagnostics.find((d) => d.level === "error")?.message;
+        if (firstErr && /403|415/.test(firstErr)) setCrudError(firstErr);
         toast.error("Backtest halted: fix strategy compile diagnostics first.");
       }
     } finally {
-      setBacktesting(false);
+      if (reqSeq === backtestSeqRef.current) setBacktesting(false);
     }
   };
 
   const persistScript = async (targetRaw: string, overwrite: boolean, nextSource?: string) => {
+    if (mutateLockRef.current || mutatingLibrary) return;
     const check = validateStrategySlug(targetRaw);
     if (!check.ok) {
       setCrudError(check.error);
       toast.error(check.error);
       return;
     }
+    const candidateSource = nextSource ?? source;
+    const srcCheck = validateStrategySource(candidateSource);
+    if (!srcCheck.ok) {
+      setCrudError(srcCheck.error);
+      toast.error(srcCheck.error);
+      return;
+    }
     const slug = check.slug;
-    const bodySource = rewriteStrategyNameFn(nextSource ?? source, slug);
+    const bodySource = rewriteStrategyNameFn(candidateSource, slug);
 
+    mutateLockRef.current = true;
     setMutatingLibrary(true);
     setCrudError("");
     try {
@@ -280,17 +351,18 @@ export function RuneSandbox({
       setCrudError(msg);
       toast.error(`Save failed: ${msg}`);
     } finally {
+      mutateLockRef.current = false;
       setMutatingLibrary(false);
     }
   };
 
   const handleSave = async () => {
-    const target =
-      scriptName.trim() ||
-      (loadedFrom !== "template" && loadedFrom !== "template-v2"
-        ? loadedFrom
-        : extractStrategyNameFromSource(source) || "custom-strategy-v2");
-    await persistScript(target, true);
+    if (!nameCheck.ok) {
+      setCrudError(nameCheck.error);
+      toast.error(nameCheck.error);
+      return;
+    }
+    await persistScript(nameCheck.slug, true);
   };
 
   const handleClone = async () => {
@@ -310,11 +382,18 @@ export function RuneSandbox({
   };
 
   const handleConfirmDelete = async () => {
-    if (!deleteTargetName) return;
+    if (mutateLockRef.current || mutatingLibrary) return;
+    const check = validateStrategySlug(deleteTargetName);
+    if (!check.ok) {
+      setCrudError(check.error);
+      toast.error(check.error);
+      return;
+    }
+    mutateLockRef.current = true;
     setMutatingLibrary(true);
     setCrudError("");
     try {
-      const res = await deleteStrategyScript(deleteTargetName, home);
+      const res = await deleteStrategyScript(check.slug, home);
       setDeleteConfirmOpen(false);
       setLoadedFrom("template");
       setSource(DEFAULT_SANDBOX_RUNE);
@@ -328,6 +407,7 @@ export function RuneSandbox({
       setCrudError(msg);
       toast.error(`Delete failed: ${msg}`);
     } finally {
+      mutateLockRef.current = false;
       setMutatingLibrary(false);
     }
   };
@@ -395,10 +475,23 @@ export function RuneSandbox({
               type="text"
               value={scriptName}
               disabled={mutatingLibrary}
+              aria-invalid={!nameCheck.ok}
+              aria-describedby={!nameCheck.ok ? "sandbox-name-error" : undefined}
               placeholder="my-strategy-v2"
-              onChange={(e) => setScriptName(e.target.value)}
-              className="mono min-h-11 rounded-md border border-hairline bg-surface px-2.5 text-xs text-ink placeholder:text-ink-3 outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9"
+              onChange={(e) => {
+                setScriptName(e.target.value);
+                if (crudError) setCrudError("");
+              }}
+              className={
+                "mono min-h-11 rounded-md border bg-surface px-2.5 text-xs text-ink placeholder:text-ink-3 outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9 " +
+                (!nameCheck.ok ? "border-dot-red" : "border-hairline")
+              }
             />
+            {!nameCheck.ok && (
+              <span id="sandbox-name-error" className="text-xs text-destructive-foreground">
+                {nameCheck.error}
+              </span>
+            )}
           </div>
 
           <Button
@@ -469,10 +562,20 @@ export function RuneSandbox({
               id="sandbox-save-as-input"
               type="text"
               value={saveAsName}
+              aria-invalid={!saveAsCheck.ok}
+              aria-describedby={!saveAsCheck.ok ? "sandbox-save-as-error" : undefined}
               onChange={(e) => setSaveAsName(e.target.value)}
               placeholder="new-strategy-slug"
-              className="mono min-h-11 rounded-md border border-hairline bg-surface px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9"
+              className={
+                "mono min-h-11 rounded-md border bg-surface px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9 " +
+                (!saveAsCheck.ok ? "border-dot-red" : "border-hairline")
+              }
             />
+            {!saveAsCheck.ok && (
+              <span id="sandbox-save-as-error" className="text-xs text-destructive-foreground">
+                {saveAsCheck.error}
+              </span>
+            )}
           </div>
           <Button
             id="sandbox-save-as-confirm-btn"
@@ -493,33 +596,55 @@ export function RuneSandbox({
         </div>
       )}
 
-      {/* Inline Delete confirmation */}
+      {/* Delete Confirmation Modal & Guard */}
       {deleteConfirmOpen && (
-        <div
-          id="sandbox-delete-confirm-bar"
-          role="alert"
-          className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dot-red/50 bg-board px-3 py-2.5 text-xs"
-        >
-          <span className="text-ink">
-            Delete <strong className="mono font-semibold">{deleteTargetName}.rn</strong> from the persistent library?
-          </span>
-          <div className="flex flex-wrap items-center gap-2">
-            <Button
-              id="sandbox-delete-confirm-btn"
-              variant="danger"
-              disabled={mutatingLibrary}
-              onClick={() => void handleConfirmDelete()}
-              className="min-h-11 px-3 text-xs sm:min-h-8"
-            >
-              Confirm Delete
-            </Button>
-            <Button
-              variant="ghost"
-              onClick={() => setDeleteConfirmOpen(false)}
-              className="min-h-11 px-3 text-xs sm:min-h-8"
-            >
-              Cancel
-            </Button>
+        <div className="fixed inset-0 z-50 flex items-start justify-center pt-[14vh]">
+          <div
+            aria-hidden="true"
+            className="fixed inset-0 bg-ink/40"
+            onClick={() => {
+              if (!mutatingLibrary) setDeleteConfirmOpen(false);
+            }}
+          />
+          <div
+            id="sandbox-delete-confirm-bar"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="sandbox-delete-title"
+            className="relative z-10 w-[calc(100%-24px)] max-w-[460px] overflow-hidden rounded-[12px] border border-hairline bg-surface text-ink shadow-(--elev-lift) outline-none"
+          >
+            <div className="border-b border-hairline px-5 py-4">
+              <div className="flex items-start gap-2.5">
+                <TriangleAlert className="mt-0.5 size-5 shrink-0 text-destructive-foreground" strokeWidth={1.5} aria-hidden />
+                <div>
+                  <h4 id="sandbox-delete-title" className="text-base font-semibold text-ink">
+                    Delete Strategy Script
+                  </h4>
+                  <p className="mt-1 text-xs text-ink-2">
+                    Permanently delete <strong className="mono font-semibold text-ink">{deleteTargetName}.rn</strong> from the persistent strategy library? This action cannot be undone.
+                  </p>
+                </div>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-2 bg-board/50 px-5 py-3">
+              <Button
+                variant="outline"
+                disabled={mutatingLibrary}
+                onClick={() => setDeleteConfirmOpen(false)}
+                className="min-h-11 px-3 text-xs sm:min-h-9"
+              >
+                Cancel
+              </Button>
+              <Button
+                id="sandbox-delete-confirm-btn"
+                variant="danger"
+                disabled={mutatingLibrary || !isLibraryBacked}
+                onClick={() => void handleConfirmDelete()}
+                className="min-h-11 px-3 text-xs font-semibold sm:min-h-9"
+              >
+                {mutatingLibrary ? "Deleting..." : "Confirm Delete"}
+              </Button>
+            </div>
           </div>
         </div>
       )}
@@ -528,10 +653,19 @@ export function RuneSandbox({
         <div
           id="sandbox-crud-error"
           role="alert"
-          className="mt-2 flex items-start gap-2 rounded-lg border border-dot-red/50 bg-board px-3 py-2 text-xs text-destructive-foreground"
+          className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dot-red/50 bg-board px-3 py-2 text-xs text-destructive-foreground"
         >
-          <TriangleAlert className="mt-0.5 size-4 shrink-0" strokeWidth={1.5} aria-hidden />
-          <span>{crudError}</span>
+          <span className="flex items-start gap-2">
+            <TriangleAlert className="mt-0.5 size-4 shrink-0" strokeWidth={1.5} aria-hidden />
+            <span>{crudError}</span>
+          </span>
+          <button
+            type="button"
+            onClick={() => setCrudError("")}
+            className="min-h-11 cursor-pointer rounded border border-hairline bg-surface px-2.5 text-xs font-medium text-ink-2 hover:text-ink sm:min-h-7"
+          >
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -609,7 +743,9 @@ export function RuneSandbox({
                   ? `${scriptName || "sandbox"}.rn`
                   : `${loadedFrom}.rn`}
               </span>
-              <span>{lineCount} lines, whole-cent sim</span>
+              <span className={!sourceCheck.ok ? "text-destructive-foreground" : undefined}>
+                {!sourceCheck.ok ? "Source empty" : `${lineCount} lines, whole-cent sim`}
+              </span>
             </div>
             <div className="flex">
               <div

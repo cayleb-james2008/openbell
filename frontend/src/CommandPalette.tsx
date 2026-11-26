@@ -299,7 +299,7 @@ export function CommandPalette({
                     <Dices className="size-4 text-ink-2" aria-hidden />
                     <span>Quant Lab: Monte Carlo Fan (1,000 Paths)</span>
                   </span>
-                  <span className="mono text-xs text-ink-3">P5–P95</span>
+                  <span className="mono text-xs text-ink-3">P5-P95</span>
                 </Command.Item>
                 <Command.Item
                   value="Quant Lab Walk Forward In-Sample Out-of-Sample Sharpe Sortino"

@@ -753,6 +753,15 @@ export async function fetchRunnerLedger(
   };
 }
 
+export class RunnerApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "RunnerApiError";
+    this.status = status;
+  }
+}
+
 async function parseRunnerError(r: Response, fallback: string): Promise<string> {
   const body = (await r.json().catch(() => ({}))) as { error?: string; message?: string };
   return body.error || body.message || fallback;
@@ -791,7 +800,9 @@ export async function saveRunnerConfig(
     headers: MUTATION_HEADERS,
     body: JSON.stringify(payload),
   });
-  if (!r.ok) throw new Error(await parseRunnerError(r, `Runner config answered ${r.status}`));
+  if (!r.ok) {
+    throw new RunnerApiError(r.status, await parseRunnerError(r, `Runner config answered ${r.status}`));
+  }
   return normalizeRunnerStatus(unwrapRunnerStatus(await r.json()), "server");
 }
 
@@ -809,11 +820,11 @@ export async function startRunner(
   currentStatus?: RunnerStatus,
 ): Promise<RunnerStatus> {
   if (payload.mode === "live_auto" && !payload.confirm_auto_live) {
-    throw new Error("Live Auto requires explicit confirmation.");
+    throw new RunnerApiError(400, "Live Auto requires explicit confirmation.");
   }
   if (!supportsShadowRunner(home)) {
     if (payload.mode === "live_auto" && (!currentStatus?.live_armed || currentStatus?.killed)) {
-      throw new Error("Live Auto is blocked until live trading is armed and kill switch is clear.");
+      throw new RunnerApiError(403, "Live Auto is blocked until live trading is armed and kill switch is clear.");
     }
     const base = currentStatus ?? normalizeRunnerStatus({}, "preview");
     return {
@@ -827,7 +838,9 @@ export async function startRunner(
     headers: MUTATION_HEADERS,
     body: JSON.stringify(payload),
   });
-  if (!r.ok) throw new Error(await parseRunnerError(r, `Runner start answered ${r.status}`));
+  if (!r.ok) {
+    throw new RunnerApiError(r.status, await parseRunnerError(r, `Runner start answered ${r.status}`));
+  }
   return normalizeRunnerStatus(unwrapRunnerStatus(await r.json()), "server");
 }
 
@@ -850,19 +863,24 @@ export async function stopRunner(
     headers: MUTATION_HEADERS,
     body: JSON.stringify(payload),
   });
-  if (!r.ok) throw new Error(await parseRunnerError(r, `Runner stop answered ${r.status}`));
+  if (!r.ok) {
+    throw new RunnerApiError(r.status, await parseRunnerError(r, `Runner stop answered ${r.status}`));
+  }
   return normalizeRunnerStatus(unwrapRunnerStatus(await r.json()), "server");
 }
 
 export function subscribeRunnerStream(
   enabled: boolean,
   onEvent: (ev: RunnerSseEvent) => void,
+  onReconnect?: () => void,
 ): () => void {
   if (!enabled || typeof EventSource === "undefined") {
     return () => {};
   }
   let closed = false;
-  const es = new EventSource("/api/tape/stream");
+  let attempt = 0;
+  let reconnectTimer: number | null = null;
+  let es: EventSource | null = null;
 
   const handleRunnerEvent = (msg: MessageEvent<string>) => {
     if (closed) return;
@@ -884,15 +902,42 @@ export function subscribeRunnerStream(
     }
   };
 
-  es.addEventListener("runner", handleRunnerEvent as EventListener);
-  es.onerror = () => {
+  const connect = () => {
     if (closed) return;
-    es.close();
-    closed = true;
+    const source = new EventSource("/api/tape/stream");
+    es = source;
+    source.onopen = () => {
+      if (closed) return;
+      const wasReconnect = attempt > 0;
+      attempt = 0;
+      if (wasReconnect) onReconnect?.();
+    };
+    source.addEventListener("runner", handleRunnerEvent as EventListener);
+    source.onerror = () => {
+      source.close();
+      if (es === source) es = null;
+      if (closed) return;
+      const delayMs = Math.min(15000, 1000 * 2 ** Math.min(attempt, 4));
+      attempt += 1;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, delayMs);
+    };
   };
+
+  connect();
 
   return () => {
     closed = true;
-    es.close();
+    if (reconnectTimer !== null) {
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (es) {
+      es.close();
+      es = null;
+    }
   };
 }
