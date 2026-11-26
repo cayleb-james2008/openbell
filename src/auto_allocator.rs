@@ -500,7 +500,7 @@ pub struct AssetClusterRisk {
     pub penalty_applied_pct: f64,
 }
 
-/// Cross-asset (`BTC`/`ETH`/`SOL`/`XRP`/`DOGE`) window return correlation cluster guard report.
+/// Cross-asset (`BTC`/`ETH`/`SOL`/`XRP`/`DOGE`) & strategy cluster exposure ceiling guard report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiversificationGuardReport {
     pub enabled: bool,
@@ -510,6 +510,12 @@ pub struct DiversificationGuardReport {
     pub correlated_cluster_heat_pct: f64,
     pub cluster_heat_cap_pct: f64,
     pub heat_trimmed_pct: f64,
+    pub daily_rail_ceiling_pct: f64,
+    pub regime_drawdown_ceiling_pct: f64,
+    pub hv_regime_mult: f64,
+    pub worst_correlated_cluster_heat_pct: f64,
+    pub ceiling_trimmed_pct: f64,
+    pub ceiling_status: String,
     pub clusters: Vec<AssetClusterRisk>,
     pub diversified_safe_preset_id: Option<String>,
     pub summary: String,
@@ -526,6 +532,9 @@ pub struct SessionBriefingReport {
     pub fee_drag_cents: f64,
     pub maker_fee_savings_dollars: f64,
     pub correlation_cluster_penalty_pct: f64,
+    pub regime_drawdown_ceiling_pct: f64,
+    pub worst_correlated_cluster_heat_pct: f64,
+    pub ceiling_status: String,
     pub daily_loss_rail_dollars: f64,
     pub projected_worst_day_loss_dollars: f64,
     pub daily_loss_headroom_dollars: f64,
@@ -1016,9 +1025,10 @@ pub fn compute_auto_allocator_report(
     };
 
     let n_winners = oos_sel.accepted.len();
+    let (epoch_is_high_vol, calm_windows, high_vol_windows) = classify_causal_epoch_regimes(ctx);
 
-    // Apply cross-asset correlation cluster guard strictly causally on IS for OOS replay
-    // (zero lookahead), and on OOS winners for forward live allocation weights.
+    // Apply cross-asset correlation cluster guard & causal regime drawdown ceiling strictly causally on IS
+    // for OOS replay (zero lookahead), and on OOS winners for forward live allocation weights.
     let (guarded_oos_weights_pct, mut diversification) = apply_diversification_guard(
         &oos_by_strat,
         &oos_sel.accepted,
@@ -1026,6 +1036,8 @@ pub fn compute_auto_allocator_report(
         &req,
         is_maker,
         slip_dollars,
+        &epoch_is_high_vol,
+        rails.max_daily_loss_dollars,
     );
     let (replay_weights, selection_basis) = build_causal_replay_weights(
         is_sel.as_ref(),
@@ -1035,6 +1047,8 @@ pub fn compute_auto_allocator_report(
         &req,
         is_maker,
         slip_dollars,
+        &epoch_is_high_vol,
+        rails.max_daily_loss_dollars,
     );
 
     let (comparison, regime_throttle_mult, current_oos_drawdown_pct, throttle_reason, oos_window_returns) =
@@ -1088,9 +1102,9 @@ pub fn compute_auto_allocator_report(
             && notional <= rails.max_order_dollars + 1e-9;
 
         let note = if killed {
-            "Blocked — emergency kill switch is latched".to_string()
+            "Blocked: emergency kill switch is latched".to_string()
         } else if !live_armed {
-            "Paper plan only — live_armed=false (disarmed on boot)".to_string()
+            "Paper plan only: live_armed=false (disarmed on boot)".to_string()
         } else if rail_clamped_contracts == 0 {
             "Allocated budget below 1 whole contract at limit price".to_string()
         } else if is_maker {
@@ -1171,7 +1185,6 @@ pub fn compute_auto_allocator_report(
         req.starting_bankroll,
         rails.max_daily_loss_dollars,
     );
-    let (epoch_is_high_vol, calm_windows, high_vol_windows) = classify_causal_epoch_regimes(ctx);
     let (preset_leaderboard, top_safe_preset) = compute_preset_leaderboard(
         ctx,
         &req,
@@ -1324,7 +1337,7 @@ pub fn compute_auto_allocator_report(
     }
     if n_winners == 0 {
         honesty_notes.push(format!(
-            "0 strategies cleared min_oos_trades >= {} with positive OOS net expectancy — 100% held in cash reserve to protect bankroll.",
+            "0 strategies cleared min_oos_trades >= {} with positive OOS net expectancy, so 100% is held in cash reserve to protect bankroll.",
             req.min_oos_trades
         ));
     }
@@ -2384,6 +2397,7 @@ fn canonical_asset_from_series(series: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_diversification_guard(
     entries_by_strat: &[Vec<&TournamentEntry>],
     accepted: &[SplitCandidate],
@@ -2391,10 +2405,21 @@ fn apply_diversification_guard(
     req: &AutoAllocatorRequest,
     is_maker: bool,
     slip_dollars: f64,
+    epoch_is_high_vol: &BTreeMap<i64, bool>,
+    max_daily_loss_dollars: f64,
 ) -> (Vec<f64>, DiversificationGuardReport) {
     let cluster_heat_cap_pct = finite_or(
         (req.max_total_heat_pct * CLUSTER_HEAT_CAP_FRACTION).max(req.max_slot_risk_pct),
         req.max_slot_risk_pct,
+    );
+    let daily_rail_ceiling_pct = finite_or(
+        ((max_daily_loss_dollars.max(0.0) / req.starting_bankroll.max(1.0)) * 100.0)
+            .clamp(0.5, 100.0),
+        100.0,
+    );
+    let default_regime_ceiling_pct = finite_or(
+        daily_rail_ceiling_pct.clamp(0.5, cluster_heat_cap_pct.max(0.5)),
+        cluster_heat_cap_pct,
     );
     if accepted.is_empty() || raw_weights_pct.is_empty() {
         return (
@@ -2407,6 +2432,12 @@ fn apply_diversification_guard(
                 correlated_cluster_heat_pct: 0.0,
                 cluster_heat_cap_pct,
                 heat_trimmed_pct: 0.0,
+                daily_rail_ceiling_pct,
+                regime_drawdown_ceiling_pct: default_regime_ceiling_pct,
+                hv_regime_mult: 1.0,
+                worst_correlated_cluster_heat_pct: 0.0,
+                ceiling_trimmed_pct: 0.0,
+                ceiling_status: "NO_DATA".to_string(),
                 clusters: Vec::new(),
                 diversified_safe_preset_id: None,
                 summary: "No active slots available for cross-asset correlation clustering."
@@ -2502,6 +2533,7 @@ fn apply_diversification_guard(
         .collect();
     let mut visited = vec![false; n_assets];
     let mut clusters: Vec<AssetClusterRisk> = Vec::new();
+    let mut cluster_members: Vec<Vec<usize>> = Vec::new();
 
     for start in 0..n_assets {
         if visited[start] {
@@ -2562,6 +2594,7 @@ fn apply_diversification_guard(
         }
 
         let penalty_applied_pct = finite_or((raw_heat_pct - guarded_heat_pct).max(0.0), 0.0);
+        cluster_members.push(member_winners);
         clusters.push(AssetClusterRisk {
             cluster_id,
             assets: comp_assets,
@@ -2570,6 +2603,175 @@ fn apply_diversification_guard(
             max_intra_cluster_corr: max_intra,
             penalty_applied_pct,
         });
+    }
+
+    // Winner-level correlated exposure & causal High-Vol regime drawdown ceiling guard.
+    // Closes same-asset multi-strategy stacking and tightens cluster exposure under High-Vol drawdown streaks
+    // so correlated stacks stay bounded by the configured daily loss rail budget.
+    let n_winners = accepted.len();
+    let winner_epoch_rets: Vec<BTreeMap<i64, f64>> = accepted
+        .iter()
+        .map(|cand| {
+            let mut ep_acc: BTreeMap<i64, (f64, usize)> = BTreeMap::new();
+            if let Some(list) = entries_by_strat.get(cand.strategy_idx) {
+                for e in list {
+                    let p = e.entry_price.clamp(0.01, 0.99);
+                    let af = if is_maker { maker_fee(p) } else { fee(p) };
+                    let payoff = if e.won { 1.0 } else { 0.0 };
+                    let net_pnl = payoff - p - af - slip_dollars;
+                    let cost = (p + af + slip_dollars).min(1.0);
+                    let ret = if cost > 1e-9 { net_pnl / cost } else { 0.0 };
+                    let slot = ep_acc.entry(e.close_epoch).or_insert((0.0, 0));
+                    slot.0 += finite_or(ret, 0.0);
+                    slot.1 += 1;
+                }
+            }
+            ep_acc
+                .into_iter()
+                .map(|(ep, (sum, cnt))| (ep, sum / (cnt.max(1) as f64)))
+                .collect()
+        })
+        .collect();
+
+    let mut w_adj = vec![vec![false; n_winners]; n_winners];
+    for i in 0..n_winners {
+        for j in (i + 1)..n_winners {
+            let mut xs = Vec::new();
+            let mut ys = Vec::new();
+            for (&ep, &ri) in &winner_epoch_rets[i] {
+                if let Some(&rj) = winner_epoch_rets[j].get(&ep) {
+                    xs.push(ri);
+                    ys.push(rj);
+                }
+            }
+            if xs.len() >= 4 {
+                if let Some(r) = pearson_correlation(&xs, &ys) {
+                    let same_asset_comove = winner_assets[i] == winner_assets[j] && r >= 0.35;
+                    if r.abs() >= CLUSTER_CORRELATION_THRESHOLD || same_asset_comove {
+                        w_adj[i][j] = true;
+                        w_adj[j][i] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut w_visited = vec![false; n_winners];
+    let mut hv_regime_mult = 1.0f64;
+    let mut regime_drawdown_ceiling_pct = default_regime_ceiling_pct;
+    let mut worst_correlated_cluster_heat_pct = 0.0f64;
+    let mut ceiling_trimmed_pct = 0.0f64;
+    let mut has_unprotected_ceiling_breach = false;
+    let mut saw_multi_winner_cluster = false;
+
+    for start in 0..n_winners {
+        if w_visited[start] {
+            continue;
+        }
+        let mut stack = vec![start];
+        w_visited[start] = true;
+        let mut w_comp = Vec::new();
+        while let Some(u) = stack.pop() {
+            w_comp.push(u);
+            for (v, &connected) in w_adj[u].iter().enumerate() {
+                if connected && !w_visited[v] {
+                    w_visited[v] = true;
+                    stack.push(v);
+                }
+            }
+        }
+        if w_comp.len() < 2 {
+            continue;
+        }
+        saw_multi_winner_cluster = true;
+
+        // Measure causal High-Vol loss streak & cumulative drawdown severity strictly from this split's epochs.
+        let mut comp_ep_acc: BTreeMap<i64, (f64, usize)> = BTreeMap::new();
+        for &wi in &w_comp {
+            for (&ep, &ret) in &winner_epoch_rets[wi] {
+                let slot = comp_ep_acc.entry(ep).or_insert((0.0, 0));
+                slot.0 += ret;
+                slot.1 += 1;
+            }
+        }
+        let mut hv_streak = 0usize;
+        let mut max_hv_streak = 0usize;
+        let mut cur_hv_dd = 0.0f64;
+        let mut max_hv_dd = 0.0f64;
+        let mut hv_neg_count = 0usize;
+        let mut hv_total = 0usize;
+        for (ep, (sum_r, cnt)) in comp_ep_acc {
+            if !epoch_is_high_vol.get(&ep).copied().unwrap_or(false) {
+                hv_streak = 0;
+                cur_hv_dd = 0.0;
+                continue;
+            }
+            hv_total += 1;
+            let mean_r = sum_r / (cnt.max(1) as f64);
+            if mean_r < -1e-6 {
+                hv_neg_count += 1;
+                hv_streak += 1;
+                cur_hv_dd += (-mean_r).clamp(0.0, 1.0);
+                if hv_streak > max_hv_streak {
+                    max_hv_streak = hv_streak;
+                }
+                if cur_hv_dd > max_hv_dd {
+                    max_hv_dd = cur_hv_dd;
+                }
+            } else {
+                hv_streak = 0;
+                cur_hv_dd = 0.0;
+            }
+        }
+        let comp_hv_mult = if max_hv_streak >= 2 {
+            (1.0 + 0.35 * ((max_hv_streak - 1).min(4) as f64))
+                .max(max_hv_dd.min(2.5))
+                .clamp(1.0, 2.5)
+        } else if hv_total >= 4 && (hv_neg_count as f64 / (hv_total as f64)) > 0.45 {
+            1.25
+        } else {
+            1.0
+        };
+        hv_regime_mult = hv_regime_mult.max(comp_hv_mult);
+
+        let comp_ceiling_pct = finite_or(
+            (daily_rail_ceiling_pct / comp_hv_mult).clamp(0.5, cluster_heat_cap_pct.max(0.5)),
+            cluster_heat_cap_pct,
+        );
+        regime_drawdown_ceiling_pct = regime_drawdown_ceiling_pct.min(comp_ceiling_pct);
+
+        let pre_heat: f64 = w_comp.iter().map(|&wi| guarded_weights[wi]).sum();
+        let mut post_heat = pre_heat;
+        if pre_heat > comp_ceiling_pct + 1e-9 {
+            if req.enable_diversification_guard {
+                let scale = (comp_ceiling_pct / pre_heat).clamp(0.0, 1.0);
+                for &wi in &w_comp {
+                    guarded_weights[wi] = finite_or(guarded_weights[wi] * scale, 0.0);
+                }
+                post_heat = finite_or(
+                    w_comp.iter().map(|&wi| guarded_weights[wi]).sum(),
+                    comp_ceiling_pct,
+                );
+                ceiling_trimmed_pct += (pre_heat - post_heat).max(0.0);
+            } else {
+                has_unprotected_ceiling_breach = true;
+            }
+        }
+        if post_heat > worst_correlated_cluster_heat_pct {
+            worst_correlated_cluster_heat_pct = post_heat;
+        }
+    }
+
+    if !saw_multi_winner_cluster {
+        regime_drawdown_ceiling_pct = default_regime_ceiling_pct;
+    }
+
+    // Re-sync asset cluster telemetry with any regime drawdown ceiling trims applied above.
+    for (ci, members) in cluster_members.iter().enumerate() {
+        let updated_heat = finite_or(members.iter().map(|&wi| guarded_weights[wi]).sum(), 0.0);
+        clusters[ci].guarded_heat_pct = updated_heat;
+        clusters[ci].penalty_applied_pct =
+            finite_or((clusters[ci].raw_heat_pct - updated_heat).max(0.0), 0.0);
     }
 
     clusters.sort_by(|a, b| {
@@ -2590,6 +2792,12 @@ fn apply_diversification_guard(
     let correlated_cluster_heat_pct = if raw_corr_heat <= 1e-12 { 0.0 } else { raw_corr_heat };
     let raw_trimmed = finite_or(clusters.iter().map(|c| c.penalty_applied_pct).sum(), 0.0);
     let heat_trimmed_pct = if raw_trimmed <= 1e-12 { 0.0 } else { raw_trimmed };
+    let ceiling_trimmed_pct = if ceiling_trimmed_pct <= 1e-12 {
+        0.0
+    } else {
+        finite_or(ceiling_trimmed_pct, 0.0)
+    };
+    let worst_correlated_cluster_heat_pct = finite_or(worst_correlated_cluster_heat_pct, 0.0);
 
     let (status, effective_diversification_score) = if total_guarded <= 1e-9 {
         ("NO_DATA".to_string(), 0.0)
@@ -2605,14 +2813,25 @@ fn apply_diversification_guard(
         let base_div = ((n_eff - 1.0) / 3.0).clamp(0.0, 1.0) * 65.0 + 35.0;
         let corr_factor = 1.0 - 0.30 * max_cross_asset_corr.unwrap_or(0.0).clamp(0.0, 1.0);
         let unprotected_excess_penalty = if !req.enable_diversification_guard {
-            clusters
+            let asset_pen: f64 = clusters
                 .iter()
                 .filter(|c| c.assets.len() >= 2 && c.raw_heat_pct > cluster_heat_cap_pct)
                 .map(|c| {
                     ((c.raw_heat_pct - cluster_heat_cap_pct) / cluster_heat_cap_pct.max(1.0) * 30.0)
                         .min(30.0)
                 })
-                .sum::<f64>()
+                .sum();
+            let ceiling_pen = if has_unprotected_ceiling_breach
+                && worst_correlated_cluster_heat_pct > regime_drawdown_ceiling_pct
+            {
+                ((worst_correlated_cluster_heat_pct - regime_drawdown_ceiling_pct)
+                    / regime_drawdown_ceiling_pct.max(1.0)
+                    * 25.0)
+                    .min(25.0)
+            } else {
+                0.0
+            };
+            asset_pen + ceiling_pen
         } else {
             0.0
         };
@@ -2628,10 +2847,29 @@ fn apply_diversification_guard(
         (st.to_string(), score)
     };
 
+    let ceiling_status = if total_guarded <= 1e-9 {
+        "NO_DATA"
+    } else if !req.enable_diversification_guard && has_unprotected_ceiling_breach {
+        "UNPROTECTED_BREACH"
+    } else if ceiling_trimmed_pct > 1e-6 {
+        "CEILING_CLAMPED"
+    } else {
+        "WITHIN_CEILING"
+    }
+    .to_string();
+
     let corr_str = max_cross_asset_corr
         .map(|r| format!("{r:.2}"))
         .unwrap_or_else(|| "n/a".to_string());
-    let summary = if status == "CLUSTER_CAPPED" {
+    let summary = if ceiling_status == "CEILING_CLAMPED" {
+        format!(
+            "Regime ceiling ({regime_drawdown_ceiling_pct:.1}% under {hv_regime_mult:.2}x HV mult) trimmed {ceiling_trimmed_pct:.1}% correlated heat -> worst cluster {worst_correlated_cluster_heat_pct:.1}%"
+        )
+    } else if ceiling_status == "UNPROTECTED_BREACH" {
+        format!(
+            "Guard OFF: correlated cluster {worst_correlated_cluster_heat_pct:.1}% exceeds {regime_drawdown_ceiling_pct:.1}% regime DD ceiling ({hv_regime_mult:.2}x HV)"
+        )
+    } else if status == "CLUSTER_CAPPED" {
         format!(
             "Cluster cap ({cluster_heat_cap_pct:.1}%) trimmed {heat_trimmed_pct:.1}% correlated heat (max |r| {corr_str}) -> div score {effective_diversification_score:.0}/100"
         )
@@ -2645,7 +2883,7 @@ fn apply_diversification_guard(
         )
     } else {
         format!(
-            "{} asset cluster(s) · max |r| {corr_str} · cluster heat {correlated_cluster_heat_pct:.1}% / {cluster_heat_cap_pct:.1}% cap -> div score {effective_diversification_score:.0}/100",
+            "{} asset cluster(s) · max |r| {corr_str} · ceiling {worst_correlated_cluster_heat_pct:.1}% / {regime_drawdown_ceiling_pct:.1}% -> div score {effective_diversification_score:.0}/100",
             clusters.len()
         )
     };
@@ -2660,6 +2898,12 @@ fn apply_diversification_guard(
             correlated_cluster_heat_pct,
             cluster_heat_cap_pct,
             heat_trimmed_pct,
+            daily_rail_ceiling_pct,
+            regime_drawdown_ceiling_pct,
+            hv_regime_mult,
+            worst_correlated_cluster_heat_pct,
+            ceiling_trimmed_pct,
+            ceiling_status,
             clusters,
             diversified_safe_preset_id: None,
             summary,
@@ -2865,7 +3109,10 @@ fn compute_session_briefing(
         .map(|v| format!("{v:.2}c"))
         .unwrap_or_else(|| "n/a".to_string());
     let summary = format!(
-        "{status}: expected {exp_str} vs realized {real_str} · fee drag {fee_drag_cents:.2}c/ct · cluster trim {correlation_cluster_penalty_pct:.1}% · daily rail headroom ${daily_loss_headroom_dollars:.2} ({daily_loss_headroom_pct:.0}%) · regime {} · slip cushion {cushion_str} ({slippage_cushion_status})",
+        "{status}: expected {exp_str} vs realized {real_str} · fee drag {fee_drag_cents:.2}c/ct · cluster trim {correlation_cluster_penalty_pct:.1}% · ceiling {} ({:.1}%/{:.1}%) · daily rail headroom ${daily_loss_headroom_dollars:.2} ({daily_loss_headroom_pct:.0}%) · regime {} · slip cushion {cushion_str} ({slippage_cushion_status})",
+        diversification.ceiling_status,
+        diversification.worst_correlated_cluster_heat_pct,
+        diversification.regime_drawdown_ceiling_pct,
         regime_stability.status
     );
 
@@ -2878,6 +3125,9 @@ fn compute_session_briefing(
         fee_drag_cents,
         maker_fee_savings_dollars,
         correlation_cluster_penalty_pct,
+        regime_drawdown_ceiling_pct: diversification.regime_drawdown_ceiling_pct,
+        worst_correlated_cluster_heat_pct: diversification.worst_correlated_cluster_heat_pct,
+        ceiling_status: diversification.ceiling_status.clone(),
         daily_loss_rail_dollars,
         projected_worst_day_loss_dollars,
         daily_loss_headroom_dollars,
@@ -3034,6 +3284,7 @@ fn evaluate_regime_stability(
     (calm_ev, hv_ev, calm_1c_ok, hv_1c_ok, label.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_causal_replay_weights(
     is_sel: Option<&SelectionResult>,
     oos_sel: &SelectionResult,
@@ -3042,6 +3293,8 @@ fn build_causal_replay_weights(
     req: &AutoAllocatorRequest,
     is_maker: bool,
     slip_dollars: f64,
+    epoch_is_high_vol: &BTreeMap<i64, bool>,
+    max_daily_loss_dollars: f64,
 ) -> (HashMap<usize, f64>, String) {
     match is_sel {
         Some(sel) => {
@@ -3052,6 +3305,8 @@ fn build_causal_replay_weights(
                 req,
                 is_maker,
                 slip_dollars,
+                epoch_is_high_vol,
+                max_daily_loss_dollars,
             );
             let mut m = HashMap::with_capacity(sel.accepted.len());
             for (i, c) in sel.accepted.iter().enumerate() {
@@ -3238,6 +3493,8 @@ fn compute_preset_leaderboard(
             &cand_req,
             is_maker,
             slip_dollars,
+            epoch_is_high_vol,
+            rails.max_daily_loss_dollars,
         );
         let (replay_weights, selection_basis) = build_causal_replay_weights(
             is_sel.as_ref(),
@@ -3247,6 +3504,8 @@ fn compute_preset_leaderboard(
             &cand_req,
             is_maker,
             slip_dollars,
+            epoch_is_high_vol,
+            rails.max_daily_loss_dollars,
         );
 
         let (comparison, _, _, _, oos_returns) = replay_oos_comparison(
@@ -4787,5 +5046,125 @@ mod tests {
         assert_eq!(rep_thin.slippage_cushion_status, "THIN");
         assert!(!rep_thin.slippage_ladder[1].positive_ev);
         assert!(!rep_thin.slippage_ladder[1].survival_ok);
+    }
+
+    #[test]
+    fn correlated_regime_drawdown_ceiling_prevents_rail_breach_stacking() {
+        let strats = vec![
+            StrategyMeta {
+                name: "btc-trend".into(),
+                side: "yes".into(),
+            },
+            StrategyMeta {
+                name: "btc-momo".into(),
+                side: "yes".into(),
+            },
+        ];
+        // Both trade KXBTC15M with r in [0.40, 0.64] (below 0.65 pruning cutoff, yet co-moving)
+        // and experience a 3-epoch High-Vol correlated drawdown streak in both IS & OOS.
+        let build_entries = |tail_won: bool| {
+            let mut entries = Vec::new();
+            let mut vol_scores = HashMap::new();
+            for w in 0..90i64 {
+                let epoch = 1_774_000_000 + w * 900;
+                let ticker = format!("KXBTC15M-RC{w:03}");
+                let is_hv_streak = (22..=24).contains(&w) || (68..=70).contains(&w);
+                vol_scores.insert(ticker.clone(), if is_hv_streak { 14.0 } else { 2.5 });
+                let (w0, w1) = if is_hv_streak {
+                    (false, false)
+                } else if w >= 85 {
+                    (tail_won, tail_won)
+                } else {
+                    // Co-moving shared wins/losses with moderate divergence so r lands around ~0.48
+                    // (above 0.35 same-asset cluster threshold, below 0.65 prune cutoff).
+                    match w % 8 {
+                        0 => (false, false),
+                        1 => (true, false),
+                        2 => (false, true),
+                        _ => (true, true),
+                    }
+                };
+                entries.push(TournamentEntry {
+                    close_epoch: epoch,
+                    ticker: ticker.clone(),
+                    series: "KXBTC15M".into(),
+                    strategy_idx: 0,
+                    strategy: "btc-trend".into(),
+                    side: "yes".into(),
+                    entry_price: 0.55,
+                    secs_to_close: 240,
+                    won: w0,
+                });
+                entries.push(TournamentEntry {
+                    close_epoch: epoch,
+                    ticker,
+                    series: "KXBTC15M".into(),
+                    strategy_idx: 1,
+                    strategy: "btc-momo".into(),
+                    side: "yes".into(),
+                    entry_price: 0.55,
+                    secs_to_close: 240,
+                    won: w1,
+                });
+            }
+            TournamentTapeContext {
+                window_vol_scores: vol_scores,
+                ..make_ctx(strats.clone(), entries, 90, 36, 1_774_000_000 + 54 * 900)
+            }
+        };
+
+        let ctx_win = build_entries(true);
+        let ctx_lose = build_entries(false);
+        let rails = RiskRailsConfig {
+            max_daily_loss_dollars: 150.0, // 15% of $1,000 bankroll
+            ..RiskRailsConfig::default()
+        };
+        let req_off = AutoAllocatorRequest {
+            execution_mode: "maker".into(),
+            sizing_mode: "half_kelly".into(),
+            maker_fill_rate: 1.0,
+            min_oos_trades: 20,
+            max_slot_risk_pct: 15.0,
+            max_total_heat_pct: 30.0,
+            starting_bankroll: 1_000.0,
+            require_stress_resilience: false,
+            enable_regime_throttle: false,
+            enable_diversification_guard: false,
+            ..AutoAllocatorRequest::default()
+        };
+        let req_on = AutoAllocatorRequest {
+            enable_diversification_guard: true,
+            ..req_off.clone()
+        };
+
+        let off = compute_auto_allocator_report(&ctx_win, &req_off, &rails, false, false);
+        let on = compute_auto_allocator_report(&ctx_win, &req_on, &rails, false, false);
+        let on_lose = compute_auto_allocator_report(&ctx_lose, &req_on, &rails, false, false);
+
+        assert!(!on.live_armed);
+        assert_eq!(on.active_winners.len(), 2, "both same-asset correlated winners survive 0.65 prune");
+        assert_eq!(off.diversification.ceiling_status, "UNPROTECTED_BREACH");
+        assert!(
+            off.diversification.worst_correlated_cluster_heat_pct
+                > off.diversification.regime_drawdown_ceiling_pct
+        );
+        assert_eq!(on.diversification.ceiling_status, "CEILING_CLAMPED");
+        assert!(on.diversification.hv_regime_mult > 1.0);
+        assert!(on.diversification.ceiling_trimmed_pct > 0.0);
+        assert!(
+            on.diversification.worst_correlated_cluster_heat_pct
+                <= on.diversification.regime_drawdown_ceiling_pct + 1e-6
+        );
+        assert_eq!(on.session_briefing.ceiling_status, "CEILING_CLAMPED");
+        assert!(on.total_allocated_pct < off.total_allocated_pct);
+
+        // Causal replay invariant: early OOS curve checkpoint (w=54..84) cannot depend on tail_won at w>=85.
+        assert!(
+            (on.comparison.equity_curve[10].allocator_equity
+                - on_lose.comparison.equity_curve[10].allocator_equity)
+                .abs()
+                < 1e-9,
+            "causal regime drawdown ceiling replay leaked future outcome"
+        );
     }
 }

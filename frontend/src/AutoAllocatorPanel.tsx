@@ -83,6 +83,13 @@ function cushionTone(status: string | undefined): "success" | "warning" | "error
   return "neutral";
 }
 
+function ceilingTone(status: string | undefined): "success" | "warning" | "error" | "neutral" {
+  if (status === "WITHIN_CEILING") return "success";
+  if (status === "CEILING_CLAMPED") return "warning";
+  if (status === "UNPROTECTED_BREACH") return "error";
+  return "neutral";
+}
+
 export type StagedOrderDraft = {
   ticker: string;
   side: "yes" | "no";
@@ -1094,6 +1101,14 @@ export function AutoAllocatorPanel({
                   ? "NO DATA"
                   : report.session_briefing.slippage_cushion_status}
               </StatusPill>
+              <StatusPill
+                id="allocator-briefing-ceiling-pill"
+                tone={ceilingTone(report.diversification?.ceiling_status)}
+              >
+                Ceiling: {fmtPct(report.diversification?.worst_correlated_cluster_heat_pct ?? 0, 1)} /{" "}
+                {fmtPct(report.diversification?.regime_drawdown_ceiling_pct ?? 0, 1)} ·{" "}
+                {(report.diversification?.ceiling_status ?? "NO_DATA").replaceAll("_", " ")}
+              </StatusPill>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <Button
@@ -1144,11 +1159,11 @@ export function AutoAllocatorPanel({
               </div>
             </div>
             <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
-              <div className="text-ink-3">Correlation Cluster Penalty</div>
+              <div className="text-ink-3">Correlation &amp; Regime Ceiling</div>
               <div className="mono mt-0.5 font-semibold text-ink">
                 {report.session_briefing.correlation_cluster_penalty_pct > 0.05 ? "-" : ""}{fmtPct(report.session_briefing.correlation_cluster_penalty_pct, 1)}{" "}
                 <span className="text-ink-3">
-                  (div {Math.round(report.diversification?.effective_diversification_score ?? 0)}/100)
+                  (div {Math.round(report.diversification?.effective_diversification_score ?? 0)}/100 · cap {fmtPct(report.session_briefing.regime_drawdown_ceiling_pct, 1)})
                 </span>
               </div>
             </div>
@@ -1382,7 +1397,9 @@ export function AutoAllocatorPanel({
                       {report.diversification.max_cross_asset_corr === null
                         ? "n/a"
                         : report.diversification.max_cross_asset_corr.toFixed(2)}{" "}
-                      · cluster cap {fmtPct(report.diversification.cluster_heat_cap_pct, 1)}
+                      · cluster cap {fmtPct(report.diversification.cluster_heat_cap_pct, 1)} · regime ceiling{" "}
+                      {fmtPct(report.diversification.regime_drawdown_ceiling_pct, 1)} (
+                      {report.diversification.hv_regime_mult.toFixed(2)}x HV)
                     </span>
                     {report.diversification.clusters.slice(0, 4).map((cl) => (
                       <Badge key={cl.cluster_id} variant="outline" className="mono text-xs text-ink-2">

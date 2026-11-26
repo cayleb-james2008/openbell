@@ -38,6 +38,12 @@ export type DiversificationGuardReport = {
   correlated_cluster_heat_pct: number;
   cluster_heat_cap_pct: number;
   heat_trimmed_pct: number;
+  daily_rail_ceiling_pct: number;
+  regime_drawdown_ceiling_pct: number;
+  hv_regime_mult: number;
+  worst_correlated_cluster_heat_pct: number;
+  ceiling_trimmed_pct: number;
+  ceiling_status: "NO_DATA" | "WITHIN_CEILING" | "CEILING_CLAMPED" | "UNPROTECTED_BREACH" | string;
   clusters: AssetClusterRisk[];
   diversified_safe_preset_id: string | null;
   summary: string;
@@ -79,6 +85,9 @@ export type SessionBriefingReport = {
   fee_drag_cents: number;
   maker_fee_savings_dollars: number;
   correlation_cluster_penalty_pct: number;
+  regime_drawdown_ceiling_pct: number;
+  worst_correlated_cluster_heat_pct: number;
+  ceiling_status: string;
   daily_loss_rail_dollars: number;
   projected_worst_day_loss_dollars: number;
   daily_loss_headroom_dollars: number;
@@ -735,6 +744,15 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
       correlated_cluster_heat_pct: finiteOr(divRaw.correlated_cluster_heat_pct, 0),
       cluster_heat_cap_pct: finiteOr(divRaw.cluster_heat_cap_pct, 26),
       heat_trimmed_pct: finiteOr(divRaw.heat_trimmed_pct, 0),
+      daily_rail_ceiling_pct: finiteOr(divRaw.daily_rail_ceiling_pct, 25),
+      regime_drawdown_ceiling_pct: finiteOr(
+        divRaw.regime_drawdown_ceiling_pct,
+        finiteOr(divRaw.cluster_heat_cap_pct, 26),
+      ),
+      hv_regime_mult: finiteOr(divRaw.hv_regime_mult, 1),
+      worst_correlated_cluster_heat_pct: finiteOr(divRaw.worst_correlated_cluster_heat_pct, 0),
+      ceiling_trimmed_pct: finiteOr(divRaw.ceiling_trimmed_pct, 0),
+      ceiling_status: strOr(divRaw.ceiling_status, "NO_DATA"),
       clusters: divClustersRaw
         .filter((c): c is Record<string, unknown> => !!c && typeof c === "object")
         .map((c) => ({
@@ -766,6 +784,15 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
       fee_drag_cents: finiteOr(briefRaw.fee_drag_cents, 0),
       maker_fee_savings_dollars: finiteOr(briefRaw.maker_fee_savings_dollars, 0),
       correlation_cluster_penalty_pct: finiteOr(briefRaw.correlation_cluster_penalty_pct, 0),
+      regime_drawdown_ceiling_pct: finiteOr(
+        briefRaw.regime_drawdown_ceiling_pct,
+        finiteOr(divRaw.regime_drawdown_ceiling_pct, finiteOr(divRaw.cluster_heat_cap_pct, 26)),
+      ),
+      worst_correlated_cluster_heat_pct: finiteOr(
+        briefRaw.worst_correlated_cluster_heat_pct,
+        finiteOr(divRaw.worst_correlated_cluster_heat_pct, 0),
+      ),
+      ceiling_status: strOr(briefRaw.ceiling_status, strOr(divRaw.ceiling_status, "NO_DATA")),
       daily_loss_rail_dollars: finiteOr(briefRaw.daily_loss_rail_dollars, 25),
       projected_worst_day_loss_dollars: finiteOr(briefRaw.projected_worst_day_loss_dollars, 0),
       daily_loss_headroom_dollars: finiteOr(briefRaw.daily_loss_headroom_dollars, 25),
@@ -844,6 +871,17 @@ function makeOfflineDiversification(
       Math.max(params.max_slot_risk_pct, params.max_total_heat_pct * 0.65).toFixed(1),
     ),
     heat_trimmed_pct: 0,
+    daily_rail_ceiling_pct: 25,
+    regime_drawdown_ceiling_pct: Number(
+      Math.min(
+        25,
+        Math.max(params.max_slot_risk_pct, params.max_total_heat_pct * 0.65),
+      ).toFixed(1),
+    ),
+    hv_regime_mult: 1,
+    worst_correlated_cluster_heat_pct: 0,
+    ceiling_trimmed_pct: 0,
+    ceiling_status: hasWinners ? "WITHIN_CEILING" : "NO_DATA",
     clusters: hasWinners
       ? [
           {
@@ -902,6 +940,9 @@ function makeOfflineSessionBriefing(
     fee_drag_cents: feeDragCents,
     maker_fee_savings_dollars: feeSavingsDollars,
     correlation_cluster_penalty_pct: 0,
+    regime_drawdown_ceiling_pct: 25,
+    worst_correlated_cluster_heat_pct: 0,
+    ceiling_status: hasWinners ? "WITHIN_CEILING" : "NO_DATA",
     daily_loss_rail_dollars: 25,
     projected_worst_day_loss_dollars: 0,
     daily_loss_headroom_dollars: 25,

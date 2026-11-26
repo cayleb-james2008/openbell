@@ -929,7 +929,7 @@ impl KalshiLiveClient {
         let resp = match body {
             Some(payload) => {
                 req = req.set("Content-Type", "application/json");
-                req.send_json(payload.clone())
+                req.send_string(&payload.to_string())
             }
             None => req.call(),
         };

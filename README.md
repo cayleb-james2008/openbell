@@ -1,9 +1,9 @@
 # OpenBell
 
-![version](https://img.shields.io/badge/version-v0.21.0-0969da?style=flat-square)
+![version](https://img.shields.io/badge/version-v0.22.0-0969da?style=flat-square)
 ![stack](https://img.shields.io/badge/stack-Rust%20%2B%20React%2019-111827?style=flat-square)
-![tests](https://img.shields.io/badge/tests-125%2F125%20pass-16a34a?style=flat-square)
-![binary](https://img.shields.io/badge/release%20binary-5.88%20MB-0969da?style=flat-square)
+![tests](https://img.shields.io/badge/tests-126%2F126%20pass-16a34a?style=flat-square)
+![binary](https://img.shields.io/badge/release%20binary-5.84%20MiB-0969da?style=flat-square)
 ![safety](https://img.shields.io/badge/live__armed-false%20on%20boot-16a34a?style=flat-square)
 
 OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction markets. It pairs a Kalshi Trade API v2 client (`live_armed: false` on every boot, seven hard risk rails, and an emergency kill switch) with a deduplicating public 15-minute tape collector, a 16-strategy paper slot simulator, and a causal post-only maker allocator.
@@ -11,7 +11,7 @@ OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction marke
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/hero-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/hero-light.png">
-  <img alt="OpenBell v0.21.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
+  <img alt="OpenBell v0.22.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
 </picture>
 
 ## Feature gallery
@@ -55,18 +55,18 @@ flowchart LR
   R -- "confirm_arm = true" --> K["Kalshi Trade API v2 (RSA-PSS SHA-256)"]
 ```
 
-## Verified benchmarks (`v0.21.0` vs `v0.10.0`)
+## Verified benchmarks (`v0.22.0` vs `v0.10.0`)
 
 Measured on a 100k-tick, 2,000-window 15-minute tape via `scale-audit` under `#154` (`taskset -c 24-31`, 16 workers, 5 SSE subscribers, and 25 raw-TCP fuzz checks):
 
-| Metric | `v0.10.0` Baseline | `v0.21.0` Verified | Delta |
+| Metric | `v0.10.0` Baseline | `v0.22.0` Verified | Delta |
 | --- | --- | --- | --- |
-| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`5.88 MB`** (`6,169,952 B`) | **`-44.8%`** |
+| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`5.84 MiB`** (`6,128,992 B`) | **`-45.2%`** |
 | Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`95,074 B`** / **`21,931 B`** (`21` `/chunks/*`) | **`-94.8%` wire bytes** |
-| Cold boot to first `HTTP 200` | `9.11 ms` | **`8.83 ms`** (`7.89 ms` uncontended) | **`-3.1%`** |
-| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`18.77 MB`** (`19,220 KB`; `18.23 MB` uncontended) | **`-85.1%`** |
-| Concurrent HTTP throughput (16w, `5/5` SSE) | `4,921.3 req/s` (30w) | **`2,842.4 req/s`** (`5.29 ms` p50, `7.86 ms` p95 under contention; `4,011.4 req/s` uncontended) / **`3,620.3 req/s`** keep-alive (`0` err) | **`2.41x`–`3.41x` vs `1,178` v0.9.0** |
-| Security and test verification | `49/49` fuzz | **`125/125` Rust tests**, `25/25` raw-TCP fuzz, `gate 101/101`, `replay 18/18`, `sloplint 0 FAIL/WARN`, `RAILS OK`, `EQUITY OK` | Clean |
+| Cold boot to first `HTTP 200` | `9.11 ms` | **`7.36 ms`** | **`-19.2%`** |
+| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`17.49 MB`** (`17,908 KB`) | **`-86.1%`** |
+| Concurrent HTTP throughput (16w, `5/5` SSE) | `4,921.3 req/s` (30w) | **`3,239.5 req/s`** (`4.66 ms` p50, `7.37 ms` p95, `0` errors) | **`2.75x` vs `1,178` v0.9.0** |
+| Security and test verification | `49/49` fuzz | **`126/126` Rust tests**, `25/25` raw-TCP fuzz, `gate 101/101`, `replay 18/18`, `sloplint 0 FAIL/WARN`, `RAILS OK`, `EQUITY OK` | Clean |
 
 ## Quick start (synthetic paper mode)
 
@@ -91,14 +91,14 @@ HTTP requests enforce Host-header loopback confinement (`403` on non-loopback ho
 
 ### Causal paper analytics and slot simulation
 
-The auto-allocator in `src/auto_allocator.rs` splits settled windows chronologically into 60% in-sample and 40% out-of-sample periods, freezes replay weights on in-sample data when in-sample history exists, and models Kalshi maker fees (`0.0175 * p * (1 - p)`, one quarter of taker `0.07 * p * (1 - p)`) rounded up to whole cents per order (`ceil(rate * C * p * (1 - p) * 100) / 100`). Across `strategies/*.rn`, it runs 16 paper strategies (`bid_ask_imbalance`, `favourite_floor`, `favourite_late`, `late_convergence_cap`, `longshot_late`, `maker_late_theta_no`, `maker_spread_capture`, `mean_reversion_fade`, `mid_window_momentum`, `no_favourite`, `opening_range_break`, `spot_lead_momentum_yes`, `spread_compression`, `tail_overreaction_fade`, `time_decay_harvest`, and `volatility_squeeze`), partitions epochs into Calm and High-Vol regimes causally, and computes the `+0c` through `+3c` slippage ladder with break-even cushion status.
+The auto-allocator in `src/auto_allocator.rs` splits settled windows chronologically into 60% in-sample and 40% out-of-sample periods, freezes replay weights on in-sample data when in-sample history exists, enforces a correlated regime drawdown ceiling across both multi-asset and same-asset strategy clusters bounded by `max_daily_loss_dollars`, and models Kalshi maker fees (`0.0175 * p * (1 - p)`, one quarter of taker `0.07 * p * (1 - p)`) rounded up to whole cents per order (`ceil(rate * C * p * (1 - p) * 100) / 100`). Across `strategies/*.rn`, it runs 16 paper strategies (`bid_ask_imbalance`, `favourite_floor`, `favourite_late`, `late_convergence_cap`, `longshot_late`, `maker_late_theta_no`, `maker_spread_capture`, `mean_reversion_fade`, `mid_window_momentum`, `no_favourite`, `opening_range_break`, `spot_lead_momentum_yes`, `spread_compression`, `tail_overreaction_fade`, `time_decay_harvest`, and `volatility_squeeze`), partitions epochs into Calm and High-Vol regimes causally, and computes the `+0c` through `+3c` slippage ladder with break-even cushion status.
 
-Static assets (`assets/index.html.gz` and 21 embedded `/chunks/*` routes) stay gzip-compressed in `.rodata` and inflate via pure-Rust RFC 1951/1952 `inflate_gzip` (`src/gzip_inflate.rs`) for `identity` HTTP clients, while `TapePoolGuard`, zero-capacity-trimmed market JSON, and `mallopt` bounds keep peak RSS under `19 MB`.
+Static assets (`assets/index.html.gz` and 21 embedded `/chunks/*` routes) stay gzip-compressed in `.rodata` and inflate via pure-Rust RFC 1951/1952 `inflate_gzip` (`src/gzip_inflate.rs`) for `identity` HTTP clients, while `TapePoolGuard`, zero-capacity-trimmed market JSON, and `mallopt` bounds keep peak RSS under `18 MB`.
 
 ### Verification suite
 
 - `cargo clippy --all-targets -- -D warnings`
-- `cargo test` (`125` unit and integration tests across `analytics`, `auto_allocator`, `edge_audit`, `kalshi_live`, `recalibration`, `risk_rails`, `scaling`, `tournament`, `update`, and HTTP/SSE/CWE-59 suites)
+- `cargo test` (`126` unit and integration tests across `analytics`, `auto_allocator`, `edge_audit`, `kalshi_live`, `recalibration`, `risk_rails`, `scaling`, `tournament`, `update`, and HTTP/SSE/CWE-59 suites)
 - `cargo check --target x86_64-pc-windows-msvc`
 - `bash .loop/checks/rails.sh && bash .loop/checks/equity.sh`
 - `cd frontend && npm run check:ui -- --skip-build --lints` (`gate 101/101`, `replay 18/18`, Hallmark `sloplint --scope app --render`)

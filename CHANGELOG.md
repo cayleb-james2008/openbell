@@ -4,6 +4,13 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.22.0 - 2026-11-25
+
+- Added a causal correlated regime drawdown and exposure concentration ceiling guard in `src/auto_allocator.rs` (`apply_diversification_guard`, `DiversificationGuardReport`, `SessionBriefingReport`) that groups correlated winners across both multi-asset and same-asset strategy pairs (`|r| >= 0.55` cross-asset or `r >= 0.35` same-asset), computes a causal High-Vol loss-streak multiplier (`hv_regime_mult`), and caps cluster exposure at `regime_drawdown_ceiling_pct` bounded by `rails.max_daily_loss_dollars` while keeping `live_armed: false`.
+- Surfaced the `#allocator-briefing-ceiling-pill` status badge, ceiling headroom metrics in `#allocator-session-briefing`, and High-Vol cluster ceiling details in `#allocator-forward-envelope` inside `frontend/src/AutoAllocatorPanel.tsx`, with matching `DiversificationGuardReport` / `SessionBriefingReport` types and offline defaults in `frontend/src/lib/allocator.ts`.
+- Replaced `ureq`'s `json` feature and default `base64`/`sha2` `std` features, switched `itoa`/`ryu` to `opt-level = "z"`, eliminated seven `serde_json::to_value` DOM allocations and repeated `serde_json::json!` error maps via typed `Serialize` helpers (`#[inline(never)]`) in `src/main.rs`, deduplicated `Strategy::load` script preparation, added `EINTR`-safe socket reads (`read_retry`), and tuned worker stack (`1 MB`), `mallopt` mmap threshold (`16 KB`), and burst pool bounds (`24` max workers) (`5.84 MiB` / `6,128,992 B` release binary, `7.36 ms` cold boot, `17.49 MB` / `17,908 KB` Peak `VmHWM`, `3,239.5 req/s` `7.37 ms` p95 under 16-worker + 5-SSE contention).
+- Cleaned prose across `README.md` and this changelog entry, refreshed light and dark screenshots in `docs/screenshots/`, and verified `126/126` Rust tests and `25/25` raw-TCP security fuzz checks.
+
 ## 0.21.0 - 2026-11-25
 
 - Added causal slippage sensitivity ladder across `+0c`, `+1c`, `+2c`, and `+3c` adverse fill levels in `src/auto_allocator.rs` (`compute_slippage_ladder_and_cushion`, `SlippageLadderStep`), plus break-even slippage ceiling (`c`) and cushion status (`THIN` under `1c`, `MODERATE` `1c` to `2c`, `SAFE` at `>=2c` with `0.0%` daily rail breach).

@@ -1267,70 +1267,16 @@ impl Strategy {
             }
         }
         let (unit, runtime) = {
-            let use_batch = ACTIVE_COMPILE_FLAG.with(|f| f.get());
-            if use_batch {
-                ACTIVE_COMPILE_CTX.with(|c| {
-                    let mut b = c.borrow_mut();
-                    if b.is_none() {
-                        let ctx = rune::Context::with_default_modules().map_err(|e| e.to_string())?;
-                        let existing_rt = SHARED_RUNTIME
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .as_ref()
-                            .and_then(|w| w.upgrade());
-                        let rt = match existing_rt {
-                            Some(rt) => rt,
-                            None => {
-                                let arc = Arc::new(ctx.runtime().map_err(|e| e.to_string())?);
-                                *SHARED_RUNTIME.lock().unwrap_or_else(|p| p.into_inner()) =
-                                    Some(Arc::downgrade(&arc));
-                                arc
-                            }
-                        };
-                        *b = Some((ctx, rt));
-                    }
-                    let (context, runtime) = b.as_ref().unwrap();
-                    let mut sources = rune::Sources::new();
-                    sources
-                        .insert(rune::Source::memory(&script).map_err(|e| e.to_string())?)
-                        .map_err(|e| e.to_string())?;
-                    let mut diagnostics = rune::Diagnostics::new();
-                    let unit = rune::prepare(&mut sources)
-                        .with_context(context)
-                        .with_diagnostics(&mut diagnostics)
-                        .build()
-                        .map_err(|e| {
-                            format!(
-                                "strategy {} failed to build: {}",
-                                path.display(),
-                                e.to_string().replace(" (see diagnostics for details)", "")
-                            )
-                        })?;
-                    Ok::<_, String>((Arc::new(unit), runtime.clone()))
-                })?
-            } else {
-                let context = rune::Context::with_default_modules().map_err(|e| e.to_string())?;
-                let existing_rt = SHARED_RUNTIME
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .as_ref()
-                    .and_then(|w| w.upgrade());
-                let runtime = match existing_rt {
-                    Some(rt) => rt,
-                    None => {
-                        let rt = Arc::new(context.runtime().map_err(|e| e.to_string())?);
-                        *SHARED_RUNTIME.lock().unwrap_or_else(|p| p.into_inner()) =
-                            Some(Arc::downgrade(&rt));
-                        rt
-                    }
-                };
+            let compile_with = |context: &rune::Context,
+                                runtime: Arc<rune::runtime::RuntimeContext>|
+             -> Result<(Arc<rune::Unit>, Arc<rune::runtime::RuntimeContext>), String> {
                 let mut sources = rune::Sources::new();
                 sources
                     .insert(rune::Source::memory(&script).map_err(|e| e.to_string())?)
                     .map_err(|e| e.to_string())?;
                 let mut diagnostics = rune::Diagnostics::new();
                 let unit = rune::prepare(&mut sources)
-                    .with_context(&context)
+                    .with_context(context)
                     .with_diagnostics(&mut diagnostics)
                     .build()
                     .map_err(|e| {
@@ -1340,7 +1286,39 @@ impl Strategy {
                             e.to_string().replace(" (see diagnostics for details)", "")
                         )
                     })?;
-                (Arc::new(unit), runtime)
+                Ok((Arc::new(unit), runtime))
+            };
+            let shared_rt = |ctx: &rune::Context| -> Result<Arc<rune::runtime::RuntimeContext>, String> {
+                let existing = SHARED_RUNTIME
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .and_then(|w| w.upgrade());
+                match existing {
+                    Some(rt) => Ok(rt),
+                    None => {
+                        let arc = Arc::new(ctx.runtime().map_err(|e| e.to_string())?);
+                        *SHARED_RUNTIME.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(Arc::downgrade(&arc));
+                        Ok(arc)
+                    }
+                }
+            };
+            if ACTIVE_COMPILE_FLAG.with(|f| f.get()) {
+                ACTIVE_COMPILE_CTX.with(|c| {
+                    let mut b = c.borrow_mut();
+                    if b.is_none() {
+                        let ctx = rune::Context::with_default_modules().map_err(|e| e.to_string())?;
+                        let rt = shared_rt(&ctx)?;
+                        *b = Some((ctx, rt));
+                    }
+                    let (context, runtime) = b.as_ref().unwrap();
+                    compile_with(context, runtime.clone())
+                })?
+            } else {
+                let context = rune::Context::with_default_modules().map_err(|e| e.to_string())?;
+                let runtime = shared_rt(&context)?;
+                compile_with(&context, runtime)?
             }
         };
         let mut strat = Strategy {
@@ -3172,7 +3150,7 @@ impl App {
             let _pool_guard = TapePoolGuard::enter(4096);
             if let Ok(file) = std::fs::File::open(path) {
                 use std::io::BufRead as _;
-                let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+                let mut reader = std::io::BufReader::with_capacity(32 * 1024, file);
                 let mut line = Vec::with_capacity(512);
                 let mut offset = 0u64;
                 loop {
@@ -3400,9 +3378,7 @@ impl App {
         let (strategies, _) = load_strategies_with_errors(&self.strategies_dir);
 
         let cal = analytics::calibration_from_windows(&view.grouped, &strategies);
-        let mut cal_val = serde_json::to_value(&cal).unwrap_or_else(|_| serde_json::json!({}));
-        cal_val["dataset"] = serde_json::json!(dataset);
-        let calibration_json = Arc::new(cal_val.to_string());
+        let calibration_json = Arc::new(json_with_dataset(&cal, dataset));
 
         let wf = analytics::walk_forward_from_desk(&view.grouped, &strategies, &sim);
         let portfolio_returns = Arc::new(wf.portfolio.window_returns.clone());
@@ -3411,9 +3387,7 @@ impl App {
             strat_map.insert(s.strategy.clone(), s.split.window_returns.clone());
         }
         let strategy_returns = Arc::new(strat_map);
-        let mut wf_val = serde_json::to_value(&wf).unwrap_or_else(|_| serde_json::json!({}));
-        wf_val["dataset"] = serde_json::json!(dataset);
-        let walkforward_json = Arc::new(wf_val.to_string());
+        let walkforward_json = Arc::new(json_with_dataset(&wf, dataset));
         let paper_pot_start = sim.paper_pot_start;
 
         let out = (
@@ -3479,9 +3453,7 @@ impl App {
         if let Some(score) = res.score.as_mut() {
             score.verdict = dataset_verdict(&score.verdict, dataset);
         }
-        let mut val = serde_json::to_value(&res).unwrap_or_else(|_| serde_json::json!({}));
-        val["dataset"] = serde_json::json!(dataset);
-        let payload = Arc::new(val.to_string());
+        let payload = Arc::new(json_with_dataset(&res, dataset));
 
         if res.validation.valid {
             let mut guard = self.backtest_cache.write().unwrap_or_else(|p| p.into_inner());
@@ -3541,9 +3513,7 @@ impl App {
         let view = self.tape(dpath);
         let (strategies, _) = load_strategies_with_errors(&self.strategies_dir);
         let rep = recalibration::recalibration_from_windows(&view.grouped, &strategies, slippage);
-        let mut val = serde_json::to_value(&rep).unwrap_or_else(|_| serde_json::json!({}));
-        val["dataset"] = serde_json::json!(dataset);
-        let payload = Arc::new(val.to_string());
+        let payload = Arc::new(json_with_dataset(&rep, dataset));
 
         let entry = RecalibrationCacheEntry {
             path: dpath.to_path_buf(),
@@ -3660,17 +3630,18 @@ impl App {
 
         let ctx = self.tournament_ctx_shared(dpath);
         let rep = tournament::compute_tournament_from_context(&ctx, slippage);
-        let mut val = serde_json::to_value(&rep).unwrap_or_else(|_| serde_json::json!({}));
-        val["dataset"] = serde_json::json!(dataset);
         // Provide a canonical `regime_heatmap` alias alongside `regime_heatmap_oos` / `regime_heatmap_full`.
         let primary_heatmap = if rep.regime_heatmap_oos.total_entries_in_grid > 0 {
             &rep.regime_heatmap_oos
         } else {
             &rep.regime_heatmap_full
         };
-        val["regime_heatmap"] = serde_json::to_value(primary_heatmap)
-            .unwrap_or_else(|_| serde_json::json!({}));
-        let payload = Arc::new(val.to_string());
+        let payload = Arc::new(json_with_dataset_pair(
+            &rep,
+            dataset,
+            "regime_heatmap",
+            primary_heatmap,
+        ));
 
         let entry = TournamentCacheEntry {
             path: dpath.to_path_buf(),
@@ -3813,9 +3784,7 @@ impl App {
 
         let ctx = self.scale_ctx_shared(dpath);
         let plan = scaling::compute_scale_plan_from_context(&ctx, &sanitized);
-        let mut val = serde_json::to_value(&plan).unwrap_or_else(|_| serde_json::json!({}));
-        val["dataset"] = serde_json::json!(dataset);
-        let payload = Arc::new(val.to_string());
+        let payload = Arc::new(json_with_dataset(&plan, dataset));
 
         let mut guard = self.scale_plan_cache.write().unwrap_or_else(|p| p.into_inner());
         if !guard.iter().any(|(k, _)| *k == cache_key) {
@@ -4310,11 +4279,88 @@ fn write_all_vectored<W: std::io::Write>(
     Ok(())
 }
 
+#[inline(never)]
 fn json_response(status: u16, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{SEC_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+#[derive(serde::Serialize)]
+struct JsonErr<'a> {
+    error: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct JsonOkErr<'a> {
+    ok: bool,
+    error: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct LiveErrPayload<'a> {
+    configured: bool,
+    connected: bool,
+    error: &'a str,
+}
+
+#[inline(never)]
+fn json_err_response(status: u16, msg: &str) -> String {
+    let body = serde_json::to_string(&JsonErr { error: msg }).unwrap_or_else(|_| "{}".to_string());
+    json_response(status, &body)
+}
+
+#[inline(never)]
+fn json_ok_err_response(status: u16, msg: &str) -> String {
+    let body =
+        serde_json::to_string(&JsonOkErr { ok: false, error: msg }).unwrap_or_else(|_| "{}".to_string());
+    json_response(status, &body)
+}
+
+#[inline(never)]
+fn live_err_response(status: u16, list_key: Option<&str>, msg: &str) -> String {
+    let err_json = serde_json::to_string(msg).unwrap_or_else(|_| "\"error\"".to_string());
+    let body = match list_key {
+        Some(k) => format!(
+            "{{\"configured\":true,\"connected\":false,\"{k}\":[],\"error\":{err_json}}}"
+        ),
+        None => serde_json::to_string(&LiveErrPayload {
+            configured: true,
+            connected: false,
+            error: msg,
+        })
+        .unwrap_or_else(|_| "{}".to_string()),
+    };
+    json_response(status, &body)
+}
+
+#[inline(never)]
+fn json_with_dataset<T: serde::Serialize>(val: &T, dataset: &str) -> String {
+    let raw = serde_json::to_string(val).unwrap_or_else(|_| "{}".to_string());
+    let ds = serde_json::to_string(dataset).unwrap_or_else(|_| "\"\"".to_string());
+    match raw.strip_prefix('{') {
+        Some("}") => format!("{{\"dataset\":{ds}}}"),
+        Some(rest) => format!("{{\"dataset\":{ds},{rest}"),
+        None => raw,
+    }
+}
+
+#[inline(never)]
+fn json_with_dataset_pair<T: serde::Serialize, E: serde::Serialize>(
+    val: &T,
+    dataset: &str,
+    extra_key: &str,
+    extra_val: &E,
+) -> String {
+    let raw = serde_json::to_string(val).unwrap_or_else(|_| "{}".to_string());
+    let ds = serde_json::to_string(dataset).unwrap_or_else(|_| "\"\"".to_string());
+    let ev = serde_json::to_string(extra_val).unwrap_or_else(|_| "null".to_string());
+    match raw.strip_prefix('{') {
+        Some("}") => format!("{{\"dataset\":{ds},\"{extra_key}\":{ev}}}"),
+        Some(rest) => format!("{{\"dataset\":{ds},\"{extra_key}\":{ev},{rest}"),
+        None => raw,
+    }
 }
 
 fn html_response(body: &str) -> String {
@@ -4562,6 +4608,15 @@ fn find_crlfcrlf(haystack: &[u8]) -> Option<usize> {
 }
 
 type RawRequest = (String, String, String, Vec<(String, String)>);
+fn read_retry(stream: &mut std::net::TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match stream.read(buf) {
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => return other,
+        }
+    }
+}
+
 fn read_request_with_prefix(
     stream: &mut std::net::TcpStream,
     stack_buf: &mut [u8; 4096],
@@ -4597,13 +4652,13 @@ fn read_request_with_prefix(
         }
         if let Some(v) = &mut overflow {
             let mut chunk = [0u8; 4096];
-            let n = stream.read(&mut chunk).ok()?;
+            let n = read_retry(stream, &mut chunk).ok()?;
             if n == 0 {
                 return None;
             }
             v.extend_from_slice(&chunk[..n]);
         } else if stack_len < stack_buf.len() {
-            let n = stream.read(&mut stack_buf[stack_len..]).ok()?;
+            let n = read_retry(stream, &mut stack_buf[stack_len..]).ok()?;
             if n == 0 {
                 return None;
             }
@@ -4612,7 +4667,7 @@ fn read_request_with_prefix(
             let mut v = Vec::with_capacity(8192);
             v.extend_from_slice(&stack_buf[..stack_len]);
             let mut chunk = [0u8; 4096];
-            let n = stream.read(&mut chunk).ok()?;
+            let n = read_retry(stream, &mut chunk).ok()?;
             if n == 0 {
                 return None;
             }
@@ -4708,13 +4763,13 @@ fn read_request_with_prefix(
         body.extend_from_slice(&already[..take]);
     }
     if body.len() < content_length {
-        let mut rbuf = [0u8; 65536];
+        let mut rbuf = [0u8; 8192];
         while body.len() < content_length {
             if std::time::Instant::now() >= deadline {
                 return None;
             }
             let want = (content_length - body.len()).min(rbuf.len());
-            match stream.read(&mut rbuf[..want]) {
+            match read_retry(stream, &mut rbuf[..want]) {
                 Ok(0) => return None,
                 Ok(n) => body.extend_from_slice(&rbuf[..n]),
                 Err(_) => return None,
@@ -5016,21 +5071,17 @@ fn resolve_dataset_checked(
                 || !meta.file_type().is_file()
                 || !is_confined_regular_file(&app.data_dir, &dpath)
             {
-                return Err(json_response(
+                return Err(json_err_response(
                     403,
-                    &serde_json::json!({
-                        "error": format!("dataset path is a symlink or escapes data_dir: {dataset}")
-                    })
-                    .to_string(),
+                    &format!("dataset path is a symlink or escapes data_dir: {dataset}"),
                 ));
             }
         }
         Err(_) => {
             if dataset != "live" {
-                return Err(json_response(
+                return Err(json_err_response(
                     404,
-                    &serde_json::json!({ "error": format!("no such dataset: {dataset}") })
-                        .to_string(),
+                    &format!("no such dataset: {dataset}"),
                 ));
             }
         }
@@ -5593,33 +5644,44 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let Some(ticker) = query_param(query, "ticker") else {
                 return json_response(400, "{\"error\":\"missing ticker parameter\"}");
             };
+            #[derive(serde::Serialize)]
+            struct MarketHistoryResp<'a, T: serde::Serialize> {
+                ticker: &'a str,
+                dataset: &'a str,
+                points: T,
+            }
             let points = market_history_from(app, &dpath, &ticker);
-            let body = serde_json::json!({
-                "ticker": ticker,
-                "dataset": dataset,
-                "points": points,
-            });
-            json_response(200, &body.to_string())
+            let body = serde_json::to_string(&MarketHistoryResp {
+                ticker: &ticker,
+                dataset: &dataset,
+                points,
+            })
+            .unwrap_or_else(|_| "{}".to_string());
+            json_response(200, &body)
         }
         ("GET", "/api/strategy/source") => {
             let Some(name) = query_param(query, "name") else {
                 return json_response(400, "{\"error\":\"missing name parameter\"}");
             };
+            #[derive(serde::Serialize)]
+            struct StratSourceResp {
+                strategy: String,
+                file: String,
+                side: String,
+                source: String,
+            }
             match strategy_source_for(&app.strategies_dir, &name) {
                 Some((file, side, source)) => json_response(
                     200,
-                    &serde_json::json!({
-                        "strategy": name,
-                        "file": file,
-                        "side": side,
-                        "source": source,
+                    &serde_json::to_string(&StratSourceResp {
+                        strategy: name,
+                        file,
+                        side,
+                        source,
                     })
-                    .to_string(),
+                    .unwrap_or_else(|_| "{}".to_string()),
                 ),
-                None => json_response(
-                    404,
-                    &serde_json::json!({ "error": format!("no such strategy: {name}") }).to_string(),
-                ),
+                None => json_err_response(404, &format!("no such strategy: {name}")),
             }
         }
         ("POST", "/api/collect") => {
@@ -5640,7 +5702,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     }
                     json_response(200, &payload.to_string())
                 }
-                Err((e, _)) => json_response(502, &serde_json::json!({ "error": e }).to_string()),
+                Err((e, _)) => json_err_response(502, &e),
             }
         }
         ("GET", "/api/collector/status") => {
@@ -5656,11 +5718,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     );
                 }
                 Err(e) => {
-                    return json_response(
-                        400,
-                        &serde_json::json!({ "error": format!("invalid JSON body: {e}") })
-                            .to_string(),
-                    );
+                    return json_err_response(400, &format!("invalid JSON body: {e}"));
                 }
             };
             let enabled = match parsed.get("enabled") {
@@ -5737,8 +5795,15 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             json_response(200, &equity_json)
         }
         ("GET", "/api/report") => {
+            #[derive(serde::Serialize)]
+            struct ReportWrap<T: serde::Serialize> {
+                report: T,
+            }
             let report = daily_report(app);
-            json_response(200, &serde_json::json!({ "report": report }).to_string())
+            json_response(
+                200,
+                &serde_json::to_string(&ReportWrap { report }).unwrap_or_else(|_| "{}".to_string()),
+            )
         }
         ("GET", "/api/export/report") => {
             let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
@@ -5757,10 +5822,9 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     "openbell-daily-report.csv",
                     &export_report_csv(app, &dpath, &dataset),
                 ),
-                other => json_response(
+                other => json_err_response(
                     400,
-                    &serde_json::json!({ "error": format!("unsupported export format: {other} (use md or csv)") })
-                        .to_string(),
+                    &format!("unsupported export format: {other} (use md or csv)"),
                 ),
             }
         }
@@ -5815,11 +5879,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         );
                     }
                     Err(e) => {
-                        return json_response(
-                            400,
-                            &serde_json::json!({ "error": format!("invalid JSON body: {e}") })
-                                .to_string(),
-                        );
+                        return json_err_response(400, &format!("invalid JSON body: {e}"));
                     }
                 }
             };
@@ -5834,11 +5894,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let req: auto_allocator::AutoAllocatorRequest = match serde_json::from_value(parsed) {
                 Ok(r) => r,
                 Err(e) => {
-                    return json_response(
-                        400,
-                        &serde_json::json!({ "error": format!("invalid allocator parameters: {e}") })
-                            .to_string(),
-                    );
+                    return json_err_response(400, &format!("invalid allocator parameters: {e}"));
                 }
             };
             let payload = app.allocator_shared(&dpath, &dataset, &req);
@@ -5883,11 +5939,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         );
                     }
                     Err(e) => {
-                        return json_response(
-                            400,
-                            &serde_json::json!({ "error": format!("invalid JSON body: {e}") })
-                                .to_string(),
-                        );
+                        return json_err_response(400, &format!("invalid JSON body: {e}"));
                     }
                 }
             };
@@ -5902,10 +5954,9 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let req: scaling::ScalePlanRequest = match serde_json::from_value(parsed) {
                 Ok(r) => r,
                 Err(e) => {
-                    return json_response(
+                    return json_err_response(
                         400,
-                        &serde_json::json!({ "error": format!("invalid scale-plan parameters: {e}") })
-                            .to_string(),
+                        &format!("invalid scale-plan parameters: {e}"),
                     );
                 }
             };
@@ -5925,11 +5976,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         );
                     }
                     Err(e) => {
-                        return json_response(
-                            400,
-                            &serde_json::json!({ "error": format!("invalid JSON body: {e}") })
-                                .to_string(),
-                        );
+                        return json_err_response(400, &format!("invalid JSON body: {e}"));
                     }
                 }
             };
@@ -5968,20 +6015,16 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 Some(name) => match strategy_returns.get(name) {
                     Some(v) => (name, v.as_slice()),
                     None => {
-                        return json_response(
-                            404,
-                            &serde_json::json!({ "error": format!("no such strategy: {name}") })
-                                .to_string(),
-                        );
+                        return json_err_response(404, &format!("no such strategy: {name}"));
                     }
                 },
             };
             let mc =
                 analytics::run_monte_carlo_with_equity(returns_slice, start_equity, paths, seed);
-            let mut val = serde_json::to_value(&mc).unwrap_or_else(|_| serde_json::json!({}));
-            val["dataset"] = serde_json::json!(dataset);
-            val["strategy"] = serde_json::json!(strategy_label);
-            json_response(200, &val.to_string())
+            json_response(
+                200,
+                &json_with_dataset_pair(&mc, &dataset, "strategy", &strategy_label),
+            )
         }
         ("POST", "/api/strategy/validate") => {
             let parsed: serde_json::Value = match serde_json::from_str::<serde_json::Value>(body) {
@@ -6102,11 +6145,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
                     st.connected = false;
                     st.rails.last_error = Some(e.clone());
-                    return json_response(
-                        502,
-                        &serde_json::json!({ "configured": true, "connected": false, "error": e })
-                            .to_string(),
-                    );
+                    return live_err_response(502, None, &e);
                 }
             };
             match client.get_balance() {
@@ -6137,11 +6176,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         st.connected = false;
                         st.rails.last_error = Some(e.clone());
                     }
-                    json_response(
-                        502,
-                        &serde_json::json!({ "configured": true, "connected": false, "error": e })
-                            .to_string(),
-                    )
+                    live_err_response(502, None, &e)
                 }
             }
         }
@@ -6165,13 +6200,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             }
             let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
                 Ok(c) => c,
-                Err(e) => {
-                    return json_response(
-                        502,
-                        &serde_json::json!({ "configured": true, "connected": false, "positions": [], "error": e })
-                            .to_string(),
-                    );
-                }
+                Err(e) => return live_err_response(502, Some("positions"), &e),
             };
             match client.get_positions() {
                 Ok(positions) => {
@@ -6207,11 +6236,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         st.connected = false;
                         st.rails.last_error = Some(e.clone());
                     }
-                    json_response(
-                        502,
-                        &serde_json::json!({ "configured": true, "connected": false, "positions": [], "error": e })
-                            .to_string(),
-                    )
+                    live_err_response(502, Some("positions"), &e)
                 }
             }
         }
@@ -6235,13 +6260,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let status_filter = query_param(query, "status");
             let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
                 Ok(c) => c,
-                Err(e) => {
-                    return json_response(
-                        502,
-                        &serde_json::json!({ "configured": true, "connected": false, "orders": [], "error": e })
-                            .to_string(),
-                    );
-                }
+                Err(e) => return live_err_response(502, Some("orders"), &e),
             };
             match client.get_orders(status_filter.as_deref()) {
                 Ok(orders) => {
@@ -6266,11 +6285,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         st.connected = false;
                         st.rails.last_error = Some(e.clone());
                     }
-                    json_response(
-                        502,
-                        &serde_json::json!({ "configured": true, "connected": false, "orders": [], "error": e })
-                            .to_string(),
-                    )
+                    live_err_response(502, Some("orders"), &e)
                 }
             }
         }
@@ -6297,13 +6312,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 .unwrap_or(50);
             let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
                 Ok(c) => c,
-                Err(e) => {
-                    return json_response(
-                        502,
-                        &serde_json::json!({ "configured": true, "connected": false, "fills": [], "error": e })
-                            .to_string(),
-                    );
-                }
+                Err(e) => return live_err_response(502, Some("fills"), &e),
             };
             match client.get_fills(Some(limit)) {
                 Ok(fills) => {
@@ -6328,11 +6337,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         st.connected = false;
                         st.rails.last_error = Some(e.clone());
                     }
-                    json_response(
-                        502,
-                        &serde_json::json!({ "configured": true, "connected": false, "fills": [], "error": e })
-                            .to_string(),
-                    )
+                    live_err_response(502, Some("fills"), &e)
                 }
             }
         }
@@ -6346,11 +6351,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     );
                 }
                 Err(e) => {
-                    return json_response(
-                        400,
-                        &serde_json::json!({ "error": format!("invalid JSON body: {e}") })
-                            .to_string(),
-                    );
+                    return json_err_response(400, &format!("invalid JSON body: {e}"));
                 }
             };
             let (mut next_cfg, mut next_rails) = {
@@ -6409,10 +6410,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         match kalshi_live::validate_api_base_url(trimmed) {
                             Ok(valid) => next_cfg.api_base_url = Some(valid),
                             Err(e) => {
-                                return json_response(
-                                    400,
-                                    &serde_json::json!({ "error": e }).to_string(),
-                                );
+                                return json_err_response(400, &e);
                             }
                         }
                     }
@@ -6460,11 +6458,17 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let validated_rails = match next_rails.validate() {
                 Ok(r) => r,
                 Err(errs) => {
-                    return json_response(
-                        400,
-                        &serde_json::json!({ "error": errs.join("; "), "rail_violations": errs })
-                            .to_string(),
-                    );
+                    #[derive(serde::Serialize)]
+                    struct RailErr<'a> {
+                        error: String,
+                        rail_violations: &'a [String],
+                    }
+                    let body = serde_json::to_string(&RailErr {
+                        error: errs.join("; "),
+                        rail_violations: &errs,
+                    })
+                    .unwrap_or_else(|_| "{}".to_string());
+                    return json_response(400, &body);
                 }
             };
             let saved_cfg = match kalshi_live::save_live_config(
@@ -6474,11 +6478,11 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             ) {
                 Ok(c) => c,
                 Err(e) => {
-                    return json_response(400, &serde_json::json!({ "error": e }).to_string());
+                    return json_err_response(400, &e);
                 }
             };
             if let Err(e) = risk_rails::save_rails_config(&app.data_dir, &validated_rails) {
-                return json_response(500, &serde_json::json!({ "error": e }).to_string());
+                return json_err_response(500, &e);
             }
             let snap = {
                 let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
@@ -6493,14 +6497,13 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 st.rails.last_error = None;
                 st.rails.status_snapshot(&st.config, st.connected)
             };
-            let ev = serde_json::json!({
-                "type": "live_status",
-                "configured": snap.configured,
-                "live_armed": snap.live_armed,
-                "environment": snap.environment,
-                "ts": now_unix(),
-            })
-            .to_string();
+            let ev = format!(
+                "{{\"type\":\"live_status\",\"configured\":{},\"live_armed\":{},\"environment\":{},\"ts\":{}}}",
+                snap.configured,
+                snap.live_armed,
+                serde_json::to_string(&snap.environment).unwrap_or_else(|_| "\"demo\"".to_string()),
+                now_unix(),
+            );
             tape_hub().publish(ev);
             json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
         }
@@ -6514,11 +6517,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     );
                 }
                 Err(e) => {
-                    return json_response(
-                        400,
-                        &serde_json::json!({ "error": format!("invalid JSON body: {e}") })
-                            .to_string(),
-                    );
+                    return json_err_response(400, &format!("invalid JSON body: {e}"));
                 }
             };
             let confirm_arm = match parsed.get("confirm_arm") {
@@ -6539,22 +6538,27 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             };
             match res {
                 Ok(()) => {
-                    let ev = serde_json::json!({
-                        "type": "live_status",
-                        "live_armed": true,
-                        "environment": snap.environment,
-                        "ts": now_unix(),
-                    })
-                    .to_string();
+                    let ev = format!(
+                        "{{\"type\":\"live_status\",\"live_armed\":true,\"environment\":{},\"ts\":{}}}",
+                        serde_json::to_string(&snap.environment).unwrap_or_else(|_| "\"demo\"".to_string()),
+                        now_unix(),
+                    );
                     tape_hub().publish(ev);
                     json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
                 }
                 Err(e) => {
+                    #[derive(serde::Serialize)]
+                    struct ArmErr<'a> {
+                        error: &'a str,
+                        status: &'a risk_rails::LiveStatusSnapshot,
+                    }
                     let code = if !configured { 412 } else { 400 };
-                    json_response(
-                        code,
-                        &serde_json::json!({ "error": e, "status": snap }).to_string(),
-                    )
+                    let body = serde_json::to_string(&ArmErr {
+                        error: &e,
+                        status: &snap,
+                    })
+                    .unwrap_or_else(|_| "{}".to_string());
+                    json_response(code, &body)
                 }
             }
         }
@@ -6564,12 +6568,10 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 st.rails.disarm();
                 st.rails.status_snapshot(&st.config, st.connected)
             };
-            let ev = serde_json::json!({
-                "type": "live_status",
-                "live_armed": false,
-                "ts": now_unix(),
-            })
-            .to_string();
+            let ev = format!(
+                "{{\"type\":\"live_status\",\"live_armed\":false,\"ts\":{}}}",
+                now_unix()
+            );
             tape_hub().publish(ev);
             json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
         }
@@ -6583,11 +6585,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     );
                 }
                 Err(e) => {
-                    return json_response(
-                        400,
-                        &serde_json::json!({ "error": format!("invalid JSON body: {e}") })
-                            .to_string(),
-                    );
+                    return json_err_response(400, &format!("invalid JSON body: {e}"));
                 }
             };
             let post_only = match parsed.get("post_only") {
@@ -6603,11 +6601,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let intent: risk_rails::LiveOrderIntent = match serde_json::from_value(parsed) {
                 Ok(i) => i,
                 Err(e) => {
-                    return json_response(
-                        400,
-                        &serde_json::json!({ "ok": false, "error": format!("invalid order intent: {e}") })
-                            .to_string(),
-                    );
+                    return json_ok_err_response(400, &format!("invalid order intent: {e}"));
                 }
             };
             let (auth_res, cfg) = {
@@ -6627,10 +6621,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         ) {
                             Ok(maker_req) => (maker_req, check),
                             Err(e) => {
-                                return json_response(
-                                    400,
-                                    &serde_json::json!({ "ok": false, "error": e }).to_string(),
-                                );
+                                return json_ok_err_response(400, &e);
                             }
                         }
                     } else {
@@ -6638,38 +6629,46 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     }
                 }
                 Err(check) => {
-                    return json_response(
-                        403,
-                        &serde_json::json!({
-                            "ok": false,
-                            "error": check.rail_violations.join("; "),
-                            "rail_violations": check.rail_violations,
-                            "order_notional_dollars": check.order_notional_dollars,
-                            "projected_exposure_dollars": check.projected_exposure_dollars,
-                        })
-                        .to_string(),
-                    );
+                    #[derive(serde::Serialize)]
+                    struct OrderRailErr<'a> {
+                        ok: bool,
+                        error: String,
+                        rail_violations: &'a [String],
+                        order_notional_dollars: f64,
+                        projected_exposure_dollars: f64,
+                    }
+                    let body = serde_json::to_string(&OrderRailErr {
+                        ok: false,
+                        error: check.rail_violations.join("; "),
+                        rail_violations: &check.rail_violations,
+                        order_notional_dollars: check.order_notional_dollars,
+                        projected_exposure_dollars: check.projected_exposure_dollars,
+                    })
+                    .unwrap_or_else(|_| "{}".to_string());
+                    return json_response(403, &body);
                 }
             };
             if intent.dry_run {
-                return json_response(
-                    200,
-                    &serde_json::json!({
-                        "ok": true,
-                        "dry_run": true,
-                        "order_request": kalshi_req,
-                        "risk_check": check,
-                    })
-                    .to_string(),
-                );
+                #[derive(serde::Serialize)]
+                struct DryOrderResp<'a> {
+                    ok: bool,
+                    dry_run: bool,
+                    order_request: &'a kalshi_live::KalshiOrderRequest,
+                    risk_check: &'a risk_rails::RiskCheckResult,
+                }
+                let body = serde_json::to_string(&DryOrderResp {
+                    ok: true,
+                    dry_run: true,
+                    order_request: &kalshi_req,
+                    risk_check: &check,
+                })
+                .unwrap_or_else(|_| "{}".to_string());
+                return json_response(200, &body);
             }
             let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
                 Ok(c) => c,
                 Err(e) => {
-                    return json_response(
-                        412,
-                        &serde_json::json!({ "ok": false, "error": e }).to_string(),
-                    );
+                    return json_ok_err_response(412, &e);
                 }
             };
             match client.place_order(&kalshi_req) {
@@ -6682,45 +6681,42 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                             .record_submitted_order(&intent.action, check.order_notional_dollars);
                         st.rails.status_snapshot(&st.config, st.connected)
                     };
-                    let ev = serde_json::json!({
-                        "type": "live_order",
-                        "action": "placed",
-                        "order_id": order.order_id,
-                        "ticker": order.ticker,
-                        "ts": now_unix(),
-                    })
-                    .to_string();
+                    let ev = format!(
+                        "{{\"type\":\"live_order\",\"action\":\"placed\",\"order_id\":{},\"ticker\":{},\"ts\":{}}}",
+                        serde_json::to_string(&order.order_id).unwrap_or_else(|_| "\"\"".to_string()),
+                        serde_json::to_string(&order.ticker).unwrap_or_else(|_| "\"\"".to_string()),
+                        now_unix(),
+                    );
                     tape_hub().publish(ev);
-                    json_response(
-                        200,
-                        &serde_json::json!({
-                            "ok": true,
-                            "order": order,
-                            "risk_check": check,
-                            "status": snap,
-                        })
-                        .to_string(),
-                    )
+                    #[derive(serde::Serialize)]
+                    struct PlacedOrderResp<'a> {
+                        ok: bool,
+                        order: &'a kalshi_live::KalshiOrder,
+                        risk_check: &'a risk_rails::RiskCheckResult,
+                        status: &'a risk_rails::LiveStatusSnapshot,
+                    }
+                    let body = serde_json::to_string(&PlacedOrderResp {
+                        ok: true,
+                        order: &order,
+                        risk_check: &check,
+                        status: &snap,
+                    })
+                    .unwrap_or_else(|_| "{}".to_string());
+                    json_response(200, &body)
                 }
                 Err(e) => {
                     {
                         let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
                         st.rails.last_error = Some(e.clone());
                     }
-                    json_response(
-                        502,
-                        &serde_json::json!({ "ok": false, "error": e }).to_string(),
-                    )
+                    json_ok_err_response(502, &e)
                 }
             }
         }
         ("DELETE", r) if r.starts_with("/api/live/orders/") => {
             let order_id = &r["/api/live/orders/".len()..];
             if let Err(e) = kalshi_live::validate_order_id(order_id) {
-                return json_response(
-                    400,
-                    &serde_json::json!({ "ok": false, "error": e }).to_string(),
-                );
+                return json_ok_err_response(400, &e);
             }
             let cfg = {
                 let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
@@ -6729,42 +6725,39 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
                 Ok(c) => c,
                 Err(e) => {
-                    return json_response(
-                        412,
-                        &serde_json::json!({ "ok": false, "error": e }).to_string(),
-                    );
+                    return json_ok_err_response(412, &e);
                 }
             };
             match client.cancel_order(order_id) {
                 Ok(venue_resp) => {
-                    let ev = serde_json::json!({
-                        "type": "live_order",
-                        "action": "cancelled",
-                        "order_id": order_id,
-                        "ts": now_unix(),
-                    })
-                    .to_string();
+                    let ev = format!(
+                        "{{\"type\":\"live_order\",\"action\":\"cancelled\",\"order_id\":{},\"ts\":{}}}",
+                        serde_json::to_string(order_id).unwrap_or_else(|_| "\"\"".to_string()),
+                        now_unix(),
+                    );
                     tape_hub().publish(ev);
-                    json_response(
-                        200,
-                        &serde_json::json!({
-                            "ok": true,
-                            "order_id": order_id,
-                            "cancelled": true,
-                            "venue_response": venue_resp,
-                        })
-                        .to_string(),
-                    )
+                    #[derive(serde::Serialize)]
+                    struct CancelOrderResp<'a> {
+                        ok: bool,
+                        order_id: &'a str,
+                        cancelled: bool,
+                        venue_response: &'a serde_json::Value,
+                    }
+                    let body = serde_json::to_string(&CancelOrderResp {
+                        ok: true,
+                        order_id,
+                        cancelled: true,
+                        venue_response: &venue_resp,
+                    })
+                    .unwrap_or_else(|_| "{}".to_string());
+                    json_response(200, &body)
                 }
                 Err(e) => {
                     {
                         let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
                         st.rails.last_error = Some(e.clone());
                     }
-                    json_response(
-                        502,
-                        &serde_json::json!({ "ok": false, "error": e }).to_string(),
-                    )
+                    json_ok_err_response(502, &e)
                 }
             }
         }
@@ -6820,21 +6813,31 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             })
             .to_string();
             tape_hub().publish(ev);
-            json_response(
-                200,
-                &serde_json::json!({
-                    "ok": true,
-                    "disarmed": true,
-                    "killed": true,
-                    "kill_reason": why,
-                    "attempted": report.attempted,
-                    "cancelled_count": report.cancelled_count,
-                    "cancelled_ids": report.cancelled_ids,
-                    "errors": report.errors,
-                    "status": snap,
-                })
-                .to_string(),
-            )
+            #[derive(serde::Serialize)]
+            struct KillResp<'a> {
+                ok: bool,
+                disarmed: bool,
+                killed: bool,
+                kill_reason: &'a str,
+                attempted: usize,
+                cancelled_count: usize,
+                cancelled_ids: &'a [String],
+                errors: &'a [String],
+                status: &'a risk_rails::LiveStatusSnapshot,
+            }
+            let body = serde_json::to_string(&KillResp {
+                ok: true,
+                disarmed: true,
+                killed: true,
+                kill_reason: &why,
+                attempted: report.attempted,
+                cancelled_count: report.cancelled_count,
+                cancelled_ids: &report.cancelled_ids,
+                errors: &report.errors,
+                status: &snap,
+            })
+            .unwrap_or_else(|_| "{}".to_string());
+            json_response(200, &body)
         }
         _ => json_response(404, "{\"error\":\"not found\"}"),
     }
@@ -7064,8 +7067,8 @@ fn main() {
     // SAFETY: M_ARENA_MAX (-8), M_TRIM_THRESHOLD (-1), and M_MMAP_THRESHOLD (-3) bound heap arenas and return freed pages promptly.
     unsafe {
         mallopt(-8, 1);
-        mallopt(-1, 32 * 1024);
-        mallopt(-3, 32 * 1024);
+        mallopt(-1, 16 * 1024);
+        mallopt(-3, 16 * 1024);
     }
     if std::env::args().nth(1).as_deref().is_some_and(|a| a == "--version" || a == "-V") {
         println!("openbell-rs {}", env!("CARGO_PKG_VERSION"));
@@ -7152,7 +7155,7 @@ fn main() {
         std::sync::atomic::AtomicUsize::new(0);
     const MAX_CONCURRENT_HTTP_CONNS: usize = 128;
     const HTTP_POOL_WORKERS: usize = 16;
-    const MAX_HTTP_POOL_WORKERS: usize = 36;
+    const MAX_HTTP_POOL_WORKERS: usize = 24;
 
     struct ConnGuard;
     impl Drop for ConnGuard {
@@ -7186,7 +7189,7 @@ fn main() {
                         allowed_hosts: Arc<Vec<String>>,
                         burst: bool| {
         let _ = std::thread::Builder::new()
-            .stack_size(2 * 1024 * 1024)
+            .stack_size(1024 * 1024)
             .spawn(move || {
                 let mut buf = [0u8; 4096];
                 loop {
@@ -7220,7 +7223,7 @@ fn main() {
                     let mut in_keep_alive = false;
                     let mut sse_handed_off = false;
                     loop {
-                        let first_n = match stream.read(&mut buf) {
+                        let first_n = match read_retry(&mut stream, &mut buf) {
                             Ok(0) | Err(_) => break,
                             Ok(n) => n,
                         };
@@ -7255,10 +7258,7 @@ fn main() {
                                 break;
                             }
                             if method == "__bad_request__" {
-                                let resp = json_response(
-                                    400,
-                                    &serde_json::json!({ "error": body }).to_string(),
-                                );
+                                let resp = json_err_response(400, &body);
                                 let _ = stream.write_all(resp.as_bytes());
                                 break;
                             }
@@ -7270,10 +7270,7 @@ fn main() {
                             if let Some((status, message)) =
                                 refuse_request(&method, &headers, body.len(), &allowed_hosts)
                             {
-                                let response = json_response(
-                                    status,
-                                    &serde_json::json!({ "error": message }).to_string(),
-                                );
+                                let response = json_err_response(status, message);
                                 let _ = stream.write_all(response.as_bytes());
                                 break;
                             }
@@ -7282,10 +7279,7 @@ fn main() {
                                 if let Some((status, message)) =
                                     refuse_live_request(&method, host, &headers)
                                 {
-                                    let response = json_response(
-                                        status,
-                                        &serde_json::json!({ "error": message }).to_string(),
-                                    );
+                                    let response = json_err_response(status, message);
                                     let _ = stream.write_all(response.as_bytes());
                                     break;
                                 }
@@ -7438,9 +7432,9 @@ fn update_response(method: &str, path: &str, host: &str) -> Option<String> {
         ("POST", "/api/update/check") => json_response(200, &up.check_now().to_string()),
         ("POST", "/api/update/apply") | ("POST", "/api/update/restart") => {
             if !is_loopback_host(host) {
-                return Some(json_response(
+                return Some(json_err_response(
                     403,
-                    &json!({ "error": "updating is only allowed from this machine, not through a shared address" }).to_string(),
+                    "updating is only allowed from this machine, not through a shared address",
                 ));
             }
             if path == "/api/update/apply" {
@@ -7450,13 +7444,13 @@ fn update_response(method: &str, path: &str, host: &str) -> Option<String> {
                         snap["applied"] = json!(v);
                         json_response(200, &snap.to_string())
                     }
-                    Err(e) => json_response(409, &json!({ "error": e }).to_string()),
+                    Err(e) => json_err_response(409, &e),
                 }
             } else if let Some(e) = restart_refusal(
                 up.snapshot()["staged"].is_string(),
                 PASSES_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0,
             ) {
-                json_response(409, &json!({ "error": e }).to_string())
+                json_err_response(409, e)
             } else {
                 let restarter = up.clone();
                 std::thread::spawn(move || {
@@ -7466,7 +7460,7 @@ fn update_response(method: &str, path: &str, host: &str) -> Option<String> {
                         eprintln!("openbell-rs: restart failed: {e}");
                     }
                 });
-                json_response(200, &json!({ "restarting": true }).to_string())
+                json_response(200, "{\"restarting\":true}")
             }
         }
         _ => return None,
