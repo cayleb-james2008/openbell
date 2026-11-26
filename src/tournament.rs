@@ -149,6 +149,49 @@ pub struct TournamentTapeContext {
     pub split_epoch: Option<i64>,
     pub observed_series: Vec<String>,
     pub entries: Vec<TournamentEntry>,
+    pub window_vol_scores: HashMap<String, f64>,
+}
+
+/// Compute observable pre-settlement microstructure turbulence (mean quote spread + price range in cents).
+fn compute_window_vol_score(snaps: &[Snapshot]) -> f64 {
+    let mut spread_sum = 0.0f64;
+    let mut spread_n = 0usize;
+    let mut min_mid = f64::INFINITY;
+    let mut max_mid = f64::NEG_INFINITY;
+    for s in snaps {
+        if let (Some(yb), Some(ya)) = (s.yes_bid.get(), s.yes_ask.get()) {
+            if ya >= yb {
+                spread_sum += (ya - yb) * 100.0;
+                spread_n += 1;
+                let mid = (yb + ya) * 50.0;
+                if mid < min_mid {
+                    min_mid = mid;
+                }
+                if mid > max_mid {
+                    max_mid = mid;
+                }
+            }
+        } else if let Some(lp) = s.last_price.get() {
+            let mid = lp * 100.0;
+            if mid < min_mid {
+                min_mid = mid;
+            }
+            if mid > max_mid {
+                max_mid = mid;
+            }
+        }
+    }
+    let mean_spread = if spread_n > 0 {
+        spread_sum / (spread_n as f64)
+    } else {
+        2.0
+    };
+    let price_range = if min_mid.is_finite() && max_mid >= min_mid {
+        max_mid - min_mid
+    } else {
+        0.0
+    };
+    mean_spread + 0.35 * price_range
 }
 
 /// Per-series (BTC/ETH/SOL/XRP) OOS performance breakdown for one strategy.
@@ -517,6 +560,11 @@ pub fn build_tournament_context(
         })
         .collect();
 
+    let mut window_vol_scores = HashMap::with_capacity(settled_windows.len());
+    for w in &settled_windows {
+        window_vol_scores.insert(w.ticker.to_string(), compute_window_vol_score(w.snaps));
+    }
+
     TournamentTapeContext {
         strategies: strategy_metas,
         windows_settled_total: settled_windows.len(),
@@ -526,6 +574,7 @@ pub fn build_tournament_context(
         split_epoch,
         observed_series: series_set.into_iter().collect(),
         entries,
+        window_vol_scores,
     }
 }
 
@@ -1398,6 +1447,7 @@ mod tests {
             split_epoch: Some(split_epoch),
             observed_series: series_set.into_iter().collect(),
             entries,
+            window_vol_scores: HashMap::new(),
         }
     }
 
@@ -1700,6 +1750,7 @@ mod tests {
             split_epoch: None,
             observed_series: Vec::new(),
             entries: Vec::new(),
+            window_vol_scores: HashMap::new(),
         };
         let empty_rep = compute_tournament_from_context(&empty_ctx, 1.0);
         assert_eq!(empty_rep.rankings.len(), 1);

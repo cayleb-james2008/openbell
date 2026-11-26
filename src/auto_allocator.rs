@@ -426,7 +426,27 @@ pub struct StrategyPresetCandidate {
     pub risk_adjusted_score: f64,
     pub safe_gate_passed: bool,
     pub is_top_safe: bool,
+    pub calm_expectancy_cents: Option<f64>,
+    pub high_vol_expectancy_cents: Option<f64>,
+    pub calm_stress_1c_survival: bool,
+    pub high_vol_stress_1c_survival: bool,
+    pub regime_stability: String,
     pub note: String,
+}
+
+/// Causal chronological Calm vs High-Vol / Wide-Spread walk-forward regime stability report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegimeStabilityReport {
+    pub status: String,
+    pub causal_percentile_pct: f64,
+    pub calm_windows: usize,
+    pub high_vol_windows: usize,
+    pub active_calm_ev_cents: Option<f64>,
+    pub active_high_vol_ev_cents: Option<f64>,
+    pub active_calm_stress_1c_ok: bool,
+    pub active_high_vol_stress_1c_ok: bool,
+    pub all_regime_safe_presets: usize,
+    pub summary: String,
 }
 
 /// Paper forward-test envelope monitor comparing realized OOS expectancy & slippage
@@ -496,6 +516,9 @@ pub struct SessionBriefingReport {
     pub daily_loss_headroom_pct: f64,
     pub active_winners_count: usize,
     pub projected_daily_net_dollars: f64,
+    pub regime_stability: String,
+    pub calm_expectancy_cents: Option<f64>,
+    pub high_vol_expectancy_cents: Option<f64>,
     pub summary: String,
 }
 
@@ -531,6 +554,7 @@ pub struct AutoAllocatorReport {
     pub bootstrap_stress: BootstrapStressSummary,
     pub preset_leaderboard: Vec<StrategyPresetCandidate>,
     pub top_safe_preset: Option<String>,
+    pub regime_stability: RegimeStabilityReport,
     pub forward_envelope: ForwardEnvelopeMonitor,
     pub diversification: DiversificationGuardReport,
     pub session_briefing: SessionBriefingReport,
@@ -1125,6 +1149,7 @@ pub fn compute_auto_allocator_report(
         req.starting_bankroll,
         rails.max_daily_loss_dollars,
     );
+    let (epoch_is_high_vol, calm_windows, high_vol_windows) = classify_causal_epoch_regimes(ctx);
     let (preset_leaderboard, top_safe_preset) = compute_preset_leaderboard(
         ctx,
         &req,
@@ -1132,8 +1157,42 @@ pub fn compute_auto_allocator_report(
         &is_by_strat,
         &oos_by_strat,
         &oos_by_epoch,
+        &epoch_is_high_vol,
         is_total_entries,
     );
+    let (active_calm_ev, active_hv_ev, active_calm_1c_ok, active_hv_1c_ok, active_reg_status) =
+        evaluate_regime_stability(
+            &oos_by_strat,
+            &oos_sel.accepted,
+            &guarded_oos_weights_pct,
+            &epoch_is_high_vol,
+            is_maker,
+            slip_dollars,
+        );
+    let all_regime_safe_presets = preset_leaderboard
+        .iter()
+        .filter(|p| p.safe_gate_passed && p.regime_stability == "ALL-REGIME")
+        .count();
+    let regime_stability = RegimeStabilityReport {
+        status: active_reg_status.clone(),
+        causal_percentile_pct: 60.0,
+        calm_windows,
+        high_vol_windows,
+        active_calm_ev_cents: active_calm_ev,
+        active_high_vol_ev_cents: active_hv_ev,
+        active_calm_stress_1c_ok: active_calm_1c_ok,
+        active_high_vol_stress_1c_ok: active_hv_1c_ok,
+        all_regime_safe_presets,
+        summary: format!(
+            "{}: calm {} vs high-vol {} across {}/{} causal epochs ({} ALL-REGIME safe preset(s))",
+            active_reg_status,
+            active_calm_ev.map(|v| format!("{v:+.2}c")).unwrap_or_else(|| "n/a".to_string()),
+            active_hv_ev.map(|v| format!("{v:+.2}c")).unwrap_or_else(|| "n/a".to_string()),
+            calm_windows,
+            high_vol_windows,
+            all_regime_safe_presets,
+        ),
+    };
     diversification.diversified_safe_preset_id = preset_leaderboard
         .iter()
         .find(|p| p.id == "diversified_safe_basket" && p.safe_gate_passed)
@@ -1171,6 +1230,7 @@ pub fn compute_auto_allocator_report(
         &bootstrap_stress,
         &comparison,
         &daily_target,
+        &regime_stability,
         &oos_window_returns,
         live_armed,
     );
@@ -1265,6 +1325,7 @@ pub fn compute_auto_allocator_report(
         bootstrap_stress,
         preset_leaderboard,
         top_safe_preset,
+        regime_stability,
         forward_envelope,
         diversification,
         session_briefing,
@@ -2548,6 +2609,7 @@ fn compute_session_briefing(
     bootstrap_stress: &BootstrapStressSummary,
     comparison: &AllocatorComparison,
     daily_target: &DailyTargetVerdict,
+    regime_stability: &RegimeStabilityReport,
     oos_window_returns: &[(f64, f64)],
     live_armed: bool,
 ) -> SessionBriefingReport {
@@ -2626,7 +2688,8 @@ fn compute_session_briefing(
         .map(|v| format!("{v:+.2}c"))
         .unwrap_or_else(|| "n/a".to_string());
     let summary = format!(
-        "{status}: expected {exp_str} vs realized {real_str} · fee drag {fee_drag_cents:.2}c/ct · cluster trim {correlation_cluster_penalty_pct:.1}% · daily rail headroom ${daily_loss_headroom_dollars:.2} ({daily_loss_headroom_pct:.0}%)"
+        "{status}: expected {exp_str} vs realized {real_str} · fee drag {fee_drag_cents:.2}c/ct · cluster trim {correlation_cluster_penalty_pct:.1}% · daily rail headroom ${daily_loss_headroom_dollars:.2} ({daily_loss_headroom_pct:.0}%) · regime {}",
+        regime_stability.status
     );
 
     SessionBriefingReport {
@@ -2644,8 +2707,151 @@ fn compute_session_briefing(
         daily_loss_headroom_pct,
         active_winners_count: winners.len(),
         projected_daily_net_dollars: daily_target.projected_daily_net_dollars,
+        regime_stability: regime_stability.status.clone(),
+        calm_expectancy_cents: regime_stability.active_calm_ev_cents,
+        high_vol_expectancy_cents: regime_stability.active_high_vol_ev_cents,
         summary,
     }
+}
+
+/// Strictly causal chronological partitioning into Calm (`false`) vs High-Vol / Wide-Spread (`true`)
+/// epochs using backward-looking trailing 60th percentile (`< close_epoch`) — zero lookahead.
+fn classify_causal_epoch_regimes(ctx: &TournamentTapeContext) -> (BTreeMap<i64, bool>, usize, usize) {
+    let mut epoch_scores: BTreeMap<i64, (f64, usize)> = BTreeMap::new();
+    for e in &ctx.entries {
+        let score = ctx
+            .window_vol_scores
+            .get(&e.ticker)
+            .copied()
+            .unwrap_or_else(|| 2.0 + 18.0 * (0.5 - (e.entry_price - 0.5).abs()).max(0.0));
+        let slot = epoch_scores.entry(e.close_epoch).or_insert((0.0, 0));
+        slot.0 += score;
+        slot.1 += 1;
+    }
+
+    let mut epoch_is_high_vol = BTreeMap::new();
+    let mut prior_scores: Vec<f64> = Vec::with_capacity(64);
+    let mut sorted_scratch: Vec<f64> = Vec::with_capacity(64);
+    let mut calm_windows = 0usize;
+    let mut high_vol_windows = 0usize;
+
+    for (epoch, (sum_score, cnt)) in epoch_scores {
+        let cur = sum_score / (cnt.max(1) as f64);
+        let is_high_vol = if prior_scores.len() >= 4 {
+            sorted_scratch.clear();
+            let start = prior_scores.len().saturating_sub(48);
+            sorted_scratch.extend_from_slice(&prior_scores[start..]);
+            sorted_scratch.sort_by(|a, b| a.total_cmp(b));
+            let idx = (((sorted_scratch.len() - 1) as f64) * 0.60).round() as usize;
+            let tau = sorted_scratch[idx.min(sorted_scratch.len() - 1)];
+            cur > tau + 1e-9
+        } else {
+            cur >= 8.0
+        };
+        if is_high_vol {
+            high_vol_windows += 1;
+        } else {
+            calm_windows += 1;
+        }
+        epoch_is_high_vol.insert(epoch, is_high_vol);
+        prior_scores.push(cur);
+    }
+
+    (epoch_is_high_vol, calm_windows, high_vol_windows)
+}
+
+/// Evaluate weighted OOS net expectancy (`+0c` & `+1c` adverse fill) separately across
+/// causal Calm vs High-Vol / Wide-Spread epochs for an active strategy allocation.
+fn evaluate_regime_stability(
+    oos_by_strat: &[Vec<&TournamentEntry>],
+    accepted: &[SplitCandidate],
+    weights_pct: &[f64],
+    epoch_is_high_vol: &BTreeMap<i64, bool>,
+    is_maker: bool,
+    slip_dollars: f64,
+) -> (Option<f64>, Option<f64>, bool, bool, String) {
+    if accepted.is_empty() {
+        return (None, None, false, false, "NO_DATA".to_string());
+    }
+    let w_sum: f64 = weights_pct.iter().map(|w| w.max(0.0)).sum();
+    let use_equal = w_sum <= 1e-12;
+    let eq_w = 1.0 / (accepted.len() as f64);
+
+    let mut calm_base_num = 0.0f64;
+    let mut calm_1c_num = 0.0f64;
+    let mut calm_den = 0.0f64;
+    let mut calm_trades = 0usize;
+
+    let mut hv_base_num = 0.0f64;
+    let mut hv_1c_num = 0.0f64;
+    let mut hv_den = 0.0f64;
+    let mut hv_trades = 0usize;
+
+    for (i, cand) in accepted.iter().enumerate() {
+        let raw_w = weights_pct.get(i).copied().unwrap_or(0.0);
+        let w = if use_equal {
+            eq_w
+        } else {
+            raw_w.max(0.0) / w_sum
+        };
+        if w <= 1e-12 {
+            continue;
+        }
+        let Some(entries) = oos_by_strat.get(cand.strategy_idx) else {
+            continue;
+        };
+        for e in entries {
+            let p = e.entry_price.clamp(0.01, 0.99);
+            let af = if is_maker { maker_fee(p) } else { fee(p) };
+            let payoff = if e.won { 1.0 } else { 0.0 };
+            let net_base = payoff - p - af - slip_dollars;
+            let net_1c = net_base - 0.01;
+            let is_hv = epoch_is_high_vol.get(&e.close_epoch).copied().unwrap_or(false);
+            if is_hv {
+                hv_base_num += w * (net_base * 100.0);
+                hv_1c_num += w * (net_1c * 100.0);
+                hv_den += w;
+                hv_trades += 1;
+            } else {
+                calm_base_num += w * (net_base * 100.0);
+                calm_1c_num += w * (net_1c * 100.0);
+                calm_den += w;
+                calm_trades += 1;
+            }
+        }
+    }
+
+    let calm_ev = if calm_trades > 0 && calm_den > 1e-12 {
+        finite_opt(calm_base_num / calm_den)
+    } else {
+        None
+    };
+    let hv_ev = if hv_trades > 0 && hv_den > 1e-12 {
+        finite_opt(hv_base_num / hv_den)
+    } else {
+        None
+    };
+    let calm_1c_ok = calm_trades > 0 && calm_den > 1e-12 && (calm_1c_num / calm_den) > 0.0;
+    let hv_1c_ok = hv_trades > 0 && hv_den > 1e-12 && (hv_1c_num / hv_den) > 0.0;
+
+    let label = if calm_trades == 0 && hv_trades == 0 {
+        "NO_DATA"
+    } else if calm_ev.is_some_and(|v| v > 0.0)
+        && calm_1c_ok
+        && hv_ev.is_some_and(|v| v > 0.0)
+        && hv_1c_ok
+    {
+        "ALL-REGIME"
+    } else if calm_ev.is_some_and(|v| v > 0.0)
+        && calm_1c_ok
+        && (hv_trades == 0 || hv_ev.is_some_and(|v| v <= 0.0))
+    {
+        "CALM-ONLY"
+    } else {
+        "VOL-SENSITIVE"
+    };
+
+    (calm_ev, hv_ev, calm_1c_ok, hv_1c_ok, label.to_string())
 }
 
 fn build_causal_replay_weights(
@@ -2686,6 +2892,7 @@ fn build_causal_replay_weights(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_preset_leaderboard(
     ctx: &TournamentTapeContext,
     base_req: &AutoAllocatorRequest,
@@ -2693,6 +2900,7 @@ fn compute_preset_leaderboard(
     is_by_strat: &[Vec<&TournamentEntry>],
     oos_by_strat: &[Vec<&TournamentEntry>],
     oos_by_epoch: &BTreeMap<i64, Vec<&TournamentEntry>>,
+    epoch_is_high_vol: &BTreeMap<i64, bool>,
     is_total_entries: usize,
 ) -> (Vec<StrategyPresetCandidate>, Option<String>) {
     struct PresetSpec {
@@ -2924,6 +3132,21 @@ fn compute_preset_leaderboard(
             )
         };
 
+        let (
+            calm_expectancy_cents,
+            high_vol_expectancy_cents,
+            calm_stress_1c_survival,
+            high_vol_stress_1c_survival,
+            regime_stability,
+        ) = evaluate_regime_stability(
+            oos_by_strat,
+            &oos_sel.accepted,
+            &guarded_oos_weights,
+            epoch_is_high_vol,
+            is_maker,
+            slip_dollars,
+        );
+
         let note = if active_winners_count == 0 {
             format!("0 qualifying winners at min_oos >= {}", cand_req.min_oos_trades)
         } else if !safe_gate_passed {
@@ -2933,7 +3156,7 @@ fn compute_preset_leaderboard(
             )
         } else {
             format!(
-                "0.0% rail breach (OOS & +1c) · +1c P50 ${:.2} · +1c P95 DD {:.1}%",
+                "0.0% rail breach (OOS & +1c) · {regime_stability} · +1c P50 ${:.2} · +1c P95 DD {:.1}%",
                 boot.stress_1c_p50_end_equity, boot.stress_1c_p95_max_drawdown_pct
             )
         };
@@ -2956,6 +3179,11 @@ fn compute_preset_leaderboard(
             risk_adjusted_score,
             safe_gate_passed,
             is_top_safe: false,
+            calm_expectancy_cents,
+            high_vol_expectancy_cents,
+            calm_stress_1c_survival,
+            high_vol_stress_1c_survival,
+            regime_stability,
             note,
         });
     }
@@ -3160,6 +3388,7 @@ mod tests {
             split_epoch: Some(split_epoch),
             observed_series: vec!["KXBTC15M".to_string()],
             entries,
+            window_vol_scores: HashMap::new(),
         }
     }
 
@@ -4096,5 +4325,150 @@ mod tests {
         assert!(on.session_briefing.daily_loss_headroom_dollars <= on.session_briefing.daily_loss_rail_dollars + 1e-6);
         assert!(on.session_briefing.expected_fill_edge_cents.is_some());
         assert!(on.session_briefing.realized_fill_edge_cents.is_some());
+        assert_ne!(on.regime_stability.status, "NO_DATA");
+        assert_eq!(on.session_briefing.regime_stability, on.regime_stability.status);
+    }
+
+    #[test]
+    fn walk_forward_regime_stability_partitions_causally_and_classifies_presets() {
+        let strats = vec![
+            StrategyMeta {
+                name: "all-regime-edge".into(),
+                side: "yes".into(),
+            },
+            StrategyMeta {
+                name: "calm-only-edge".into(),
+                side: "yes".into(),
+            },
+        ];
+        let mut entries = Vec::new();
+        let mut vol_scores = HashMap::new();
+        for w in 0..100i64 {
+            let epoch = 1_772_000_000 + w * 900;
+            let ticker = format!("KXBTC15M-R{w:03}");
+            let is_high_vol = w >= 4 && (w % 3 == 0);
+            vol_scores.insert(ticker.clone(), if is_high_vol { 14.0 } else { 2.0 });
+
+            // all-regime wins consistently across Calm & High-Vol even under +1c slippage (80% win rate at 72c -> ~+7.6c EV; coprime with 3).
+            let all_won = (w % 5) != 0;
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker: ticker.clone(),
+                series: "KXBTC15M".into(),
+                strategy_idx: 0,
+                strategy: "all-regime-edge".into(),
+                side: "yes".into(),
+                entry_price: 0.72,
+                secs_to_close: 240,
+                won: all_won,
+            });
+
+            // calm-only wins in Calm (75%) but loses in High-Vol (0%) -> quarantined overall, CALM-ONLY standalone.
+            let calm_won = if is_high_vol { false } else { (w % 4) != 0 };
+            entries.push(TournamentEntry {
+                close_epoch: epoch,
+                ticker,
+                series: "KXBTC15M".into(),
+                strategy_idx: 1,
+                strategy: "calm-only-edge".into(),
+                side: "yes".into(),
+                entry_price: 0.72,
+                secs_to_close: 240,
+                won: calm_won,
+            });
+        }
+
+        let ctx_a = TournamentTapeContext {
+            window_vol_scores: vol_scores.clone(),
+            ..make_ctx(strats.clone(), entries.clone(), 100, 40, 1_772_000_000 + 60 * 900)
+        };
+        // Zero-lookahead canary: mutate future windows (>= 75) wildly and ensure earlier epochs (< 75) never change!
+        let mut vol_scores_mut = vol_scores;
+        for w in 75..100i64 {
+            vol_scores_mut.insert(format!("KXBTC15M-R{w:03}"), 99.0);
+        }
+        let ctx_b = TournamentTapeContext {
+            window_vol_scores: vol_scores_mut,
+            ..make_ctx(strats, entries, 100, 40, 1_772_000_000 + 60 * 900)
+        };
+        let (reg_a, calm_n, hv_n) = classify_causal_epoch_regimes(&ctx_a);
+        let (reg_b, _, _) = classify_causal_epoch_regimes(&ctx_b);
+        assert!(calm_n > 0 && hv_n > 0);
+        for w in 0..75i64 {
+            let epoch = 1_772_000_000 + w * 900;
+            assert_eq!(
+                reg_a.get(&epoch),
+                reg_b.get(&epoch),
+                "future volatility spike at >=75 leaked into causal epoch {w}"
+            );
+        }
+
+        let rails = RiskRailsConfig {
+            max_daily_loss_dollars: 500.0,
+            ..RiskRailsConfig::default()
+        };
+        let req = AutoAllocatorRequest {
+            execution_mode: "maker".into(),
+            sizing_mode: "quarter_kelly".into(),
+            maker_fill_rate: 0.75,
+            min_oos_trades: 20,
+            max_slot_risk_pct: 5.0,
+            max_total_heat_pct: 20.0,
+            starting_bankroll: 100.0,
+            require_stress_resilience: true,
+            enable_regime_throttle: false,
+            enable_diversification_guard: true,
+            ..AutoAllocatorRequest::default()
+        };
+        let rep = compute_auto_allocator_report(&ctx_a, &req, &rails, false, false);
+        assert!(!rep.live_armed);
+        assert_eq!(rep.regime_stability.status, "ALL-REGIME");
+        assert!(rep.regime_stability.active_calm_ev_cents.is_some_and(|v| v > 0.0));
+        assert!(rep.regime_stability.active_high_vol_ev_cents.is_some_and(|v| v > 0.0));
+        assert!(rep.regime_stability.active_calm_stress_1c_ok);
+        assert!(rep.regime_stability.active_high_vol_stress_1c_ok);
+        assert!(rep.regime_stability.all_regime_safe_presets >= 1);
+        assert_eq!(rep.session_briefing.regime_stability, "ALL-REGIME");
+        assert!(rep
+            .preset_leaderboard
+            .iter()
+            .any(|p| p.safe_gate_passed && p.regime_stability == "ALL-REGIME"));
+
+        // Verify calm-only strategy classifies end-to-end as CALM-ONLY (winning Calm, losing High-Vol).
+        let calm_only_entries: Vec<TournamentEntry> = ctx_a
+            .entries
+            .iter()
+            .filter(|e| e.strategy_idx == 1)
+            .cloned()
+            .map(|mut e| {
+                e.strategy_idx = 0;
+                e.entry_price = 0.60;
+                if *reg_a.get(&e.close_epoch).unwrap_or(&false) {
+                    e.won = e.close_epoch % 1800 == 0; // ~50% in HV -> negative EV at 60c
+                } else {
+                    e.won = true; // 100% in Calm -> overall positive EV
+                }
+                e
+            })
+            .collect();
+        let calm_ctx = TournamentTapeContext {
+            window_vol_scores: ctx_a.window_vol_scores.clone(),
+            ..make_ctx(
+                vec![StrategyMeta {
+                    name: "calm-only-edge".into(),
+                    side: "yes".into(),
+                }],
+                calm_only_entries,
+                100,
+                40,
+                1_772_000_000 + 60 * 900,
+            )
+        };
+        let calm_req = AutoAllocatorRequest {
+            require_stress_resilience: false,
+            ..req.clone()
+        };
+        let calm_rep = compute_auto_allocator_report(&calm_ctx, &calm_req, &rails, false, false);
+        assert_eq!(calm_rep.regime_stability.status, "CALM-ONLY");
     }
 }

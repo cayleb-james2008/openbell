@@ -69,6 +69,13 @@ function fmtBreachPct(v: number | null | undefined): string {
   return `${v.toFixed(1)}%`;
 }
 
+function regimeTone(status: string | undefined): "success" | "warning" | "error" | "neutral" {
+  if (status === "ALL-REGIME") return "success";
+  if (status === "CALM-ONLY") return "warning";
+  if (status === "VOL-SENSITIVE") return "error";
+  return "neutral";
+}
+
 export type StagedOrderDraft = {
   ticker: string;
   side: "yes" | "no";
@@ -290,6 +297,7 @@ export function AutoAllocatorPanel({
         ...report.session_briefing,
         live_armed: false,
       },
+      regime_stability: report.regime_stability,
       diversification: report.diversification,
       daily_target: report.daily_target,
     };
@@ -1056,6 +1064,14 @@ export function AutoAllocatorPanel({
               <Badge variant="outline" className="mono text-xs text-ink-2">
                 live_armed=false · {report.session_briefing.active_winners_count}w
               </Badge>
+              <StatusPill
+                id="allocator-briefing-regime-pill"
+                tone={regimeTone(report.session_briefing.regime_stability)}
+              >
+                {report.session_briefing.regime_stability === "NO_DATA"
+                  ? "NO DATA"
+                  : report.session_briefing.regime_stability}
+              </StatusPill>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <Button
@@ -1190,6 +1206,14 @@ export function AutoAllocatorPanel({
                   {report.diversification.status === "CLUSTER_CAPPED"
                     ? `Cluster Capped (-${report.diversification.heat_trimmed_pct.toFixed(1)}%)`
                     : `Diversified ${Math.round(report.diversification.effective_diversification_score)}/100`}
+                </StatusPill>
+              )}
+              {report.regime_stability && (
+                <StatusPill
+                  id="allocator-regime-stability-pill"
+                  tone={regimeTone(report.regime_stability.status)}
+                >
+                  Regime: {report.regime_stability.status}
                 </StatusPill>
               )}
               <Badge variant="outline" className="mono text-xs text-ink-2">
@@ -1340,11 +1364,20 @@ export function AutoAllocatorPanel({
                         {preset.is_top_safe && (
                           <StatusPill tone="success">TOP SAFE</StatusPill>
                         )}
+                        <StatusPill tone={regimeTone(preset.regime_stability)}>
+                          {preset.regime_stability}
+                        </StatusPill>
                       </div>
                       <div className="text-xs text-ink-3">{preset.subtitle}</div>
                     </TableCell>
                     <TableCell className="mono text-right">
-                      {preset.active_winners_count}w / {fmtCents(preset.net_expectancy_cents)}
+                      <div>
+                        {preset.active_winners_count}w / {fmtCents(preset.net_expectancy_cents)}
+                      </div>
+                      <div className="text-xs text-ink-3">
+                        Calm {fmtCents(preset.calm_expectancy_cents)} · HV{" "}
+                        {fmtCents(preset.high_vol_expectancy_cents)}
+                      </div>
                     </TableCell>
                     <TableCell className="mono text-right text-info-foreground">
                       {money(preset.bootstrap_p50_equity)}{" "}
