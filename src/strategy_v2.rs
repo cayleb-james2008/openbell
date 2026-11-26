@@ -17,7 +17,7 @@
 use crate::analytics::{check_paper_only_source, is_valid_whole_cent};
 use crate::recalibration::{evaluate_pav, PavBlock};
 use crate::{
-    fee, is_budget_halt, is_confined_regular_file, parse_iso_z, Snapshot,
+    fee, is_budget_halt, is_confined_regular_file, parse_iso_z, Snapshot, MAX_STRATEGY_BYTES,
     STRATEGY_BUDGET, STRATEGY_MEMORY_BYTES,
 };
 use serde::{Deserialize, Serialize};
@@ -678,6 +678,27 @@ pub struct ValidatedStrategySource {
 /// Compile, paper-only check, boundary-probe, and run 1-bar causal canary on a
 /// Rune v1 or v2 strategy source string purely in memory.
 pub fn validate_strategy_source_full(source: &str) -> Result<ValidatedStrategySource, (Vec<String>, String)> {
+    if source.contains('\0') {
+        return Err((
+            vec!["strategy source contains null byte".to_string()],
+            String::new(),
+        ));
+    }
+    if source.trim().is_empty() {
+        return Err((
+            vec!["strategy source cannot be empty".to_string()],
+            String::new(),
+        ));
+    }
+    if source.len() > MAX_STRATEGY_BYTES {
+        return Err((
+            vec![format!(
+                "strategy source exceeds maximum size ({} > {MAX_STRATEGY_BYTES} bytes)",
+                source.len()
+            )],
+            String::new(),
+        ));
+    }
     let violations = check_paper_only_source(source);
     if !violations.is_empty() {
         return Err((violations, String::new()));
@@ -728,12 +749,18 @@ pub fn validate_strategy_source_full(source: &str) -> Result<ValidatedStrategySo
 
     let mut vm = rune::Vm::new(runtime.clone(), unit.clone());
     let call_str = |vm: &mut rune::Vm, fn_name: &str| -> Result<String, String> {
-        let val = rune::runtime::budget::with(
+        let val = match rune::runtime::budget::with(
             STRATEGY_BUDGET,
             rune::alloc::limit::with(STRATEGY_MEMORY_BYTES, || vm.call([fn_name], ())),
         )
         .call()
-        .map_err(|e| format!("call `{fn_name}()` failed: {e}"))?;
+        {
+            Ok(v) => v,
+            Err(e) => {
+                vm.clear();
+                return Err(format!("call `{fn_name}()` failed: {e}"));
+            }
+        };
         rune::from_value::<String>(val)
             .map_err(|e| format!("`{fn_name}()` must return String: {e}"))
     };
@@ -754,7 +781,11 @@ pub fn validate_strategy_source_full(source: &str) -> Result<ValidatedStrategySo
         ));
     }
 
-    let description = call_str(&mut vm, "describe").ok();
+    let description = if vm.lookup_function(["describe"]).is_ok() {
+        Some(call_str(&mut vm, "describe").map_err(|e| (vec![e], diag_text.clone()))?)
+    } else {
+        None
+    };
     let has_v2 = detect_vm_has_evaluate(&mut vm).map_err(|e| (vec![e], diag_text.clone()))?;
 
     let version = if has_v2 {
@@ -783,6 +814,7 @@ pub fn validate_strategy_source_full(source: &str) -> Result<ValidatedStrategySo
             )
             .call()
             .map_err(|e| {
+                vm.clear();
                 (
                     vec![format!("`allow_entry({ya}, {na}, {secs})` failed validation probe: {e}")],
                     diag_text.clone(),
@@ -791,6 +823,23 @@ pub fn validate_strategy_source_full(source: &str) -> Result<ValidatedStrategySo
             rune::from_value::<bool>(out).map_err(|e| {
                 (
                     vec![format!("`allow_entry` must return bool: {e}")],
+                    diag_text.clone(),
+                )
+            })?;
+        }
+        if vm.lookup_function(["entry_quote"]).is_ok() {
+            let quote_hash = rune::Hash::type_hash(["entry_quote"]);
+            let _ = rune::runtime::budget::with(
+                STRATEGY_BUDGET,
+                rune::alloc::limit::with(STRATEGY_MEMORY_BYTES, || {
+                    vm.call(quote_hash, (0.70f64, 0.32f64, 240i64))
+                }),
+            )
+            .call()
+            .map_err(|e| {
+                vm.clear();
+                (
+                    vec![format!("`entry_quote(0.70, 0.32, 240)` failed validation probe: {e}")],
                     diag_text.clone(),
                 )
             })?;
@@ -1169,9 +1218,9 @@ fn percent_decode_strict(raw: &str) -> Result<String, String> {
                 .map_err(|_| "invalid UTF-8 in percent-encoding".to_string())?;
             let byte = u8::from_str_radix(hex, 16)
                 .map_err(|_| "invalid hex in percent-encoding".to_string())?;
-            // Reject encoded path separators or null bytes immediately.
-            if byte == b'/' || byte == b'\\' || byte == 0 {
-                return Err("encoded path separator rejected (CWE-22)".to_string());
+            // Reject encoded path separators, control bytes, or null bytes immediately.
+            if byte == b'/' || byte == b'\\' || byte == 0 || byte < 0x20 {
+                return Err("encoded path separator or control byte rejected (CWE-22)".to_string());
             }
             out.push(byte);
             i += 3;

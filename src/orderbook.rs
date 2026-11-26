@@ -27,6 +27,10 @@ const SSE_THROTTLE_MS: i64 = 250; // <= 4 Hz per ticker
 const REST_POLL_INTERVAL_MS: u64 = 1_500;
 const WS_RECONNECT_MAX_MS: u64 = 30_000;
 const MAX_WS_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_WS_CONTINUATION_FRAMES: usize = 128;
+const MAX_CACHED_BOOKS: usize = 128;
+const MAX_ORDERBOOKS_JSONL_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_LEVEL_QTY: u64 = 1_000_000_000;
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const KALSHI_PROD_WS: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
 const KALSHI_DEMO_WS: &str = "wss://demo-api.kalshi.co/trade-api/ws/v2";
@@ -136,6 +140,15 @@ impl Default for TickerBook {
 }
 
 impl TickerBook {
+    fn is_crossed(&self) -> bool {
+        let best_yes = self.yes_bids.keys().next_back().copied();
+        let best_no = self.no_bids.keys().next_back().copied();
+        match (best_yes, best_no) {
+            (Some(y), Some(n)) => (y as u16) + (n as u16) > 100,
+            _ => false,
+        }
+    }
+
     fn is_stale(&self, now: i64, stale_after_ms: i64) -> bool {
         if self.source == "empty" || !self.has_snapshot || self.updated_ms <= 0 || self.needs_resync {
             return true;
@@ -266,7 +279,7 @@ impl TickerBook {
         };
         let microprice_cents = match (yes_bids.first(), yes_asks.first()) {
             (Some(b), Some(a)) => {
-                let denom = (b.qty + a.qty) as f64;
+                let denom = b.qty.saturating_add(a.qty) as f64;
                 if denom > 0.0 {
                     Some(
                         ((b.price_cents as f64) * (a.qty as f64)
@@ -279,17 +292,48 @@ impl TickerBook {
             }
             _ => None,
         };
-        let vwap_10 = self.walk_asks(ticker, "yes", 10).map(|w| w.vwap_cents);
+        let vwap_10 = if yes_asks.is_empty() {
+            None
+        } else {
+            let mut rem = 10u64;
+            let mut filled = 0u64;
+            let mut cost = 0.0f64;
+            for lvl in &yes_asks {
+                if rem == 0 {
+                    break;
+                }
+                let take = rem.min(lvl.qty);
+                if take > 0 {
+                    filled = filled.saturating_add(take);
+                    rem = rem.saturating_sub(take);
+                    cost += (take as f64) * (lvl.price_cents as f64);
+                }
+            }
+            if filled > 0 {
+                Some(cost / (filled as f64))
+            } else {
+                None
+            }
+        };
 
-        let top3_yes: u64 = yes_bids.iter().take(3).map(|l| l.qty).sum();
-        let top3_no: u64 = no_bids.iter().take(3).map(|l| l.qty).sum();
-        let top3_tot = (top3_yes + top3_no) as f64;
+        let top3_yes: u64 = yes_bids
+            .iter()
+            .take(3)
+            .map(|l| l.qty)
+            .fold(0u64, u64::saturating_add);
+        let top3_no: u64 = no_bids
+            .iter()
+            .take(3)
+            .map(|l| l.qty)
+            .fold(0u64, u64::saturating_add);
+        let top3_tot = (top3_yes as f64) + (top3_no as f64);
         let imbalance_top3 = if top3_tot > 0.0 {
             ((top3_yes as f64) - (top3_no as f64)) / top3_tot
         } else {
             0.0
         };
 
+        // O(L) queue_by_level scan in descending price order using cumulative bid sums.
         let mut all_prices = BTreeSet::new();
         for &p in self.yes_bids.keys() {
             all_prices.insert(p);
@@ -298,15 +342,19 @@ impl TickerBook {
             all_prices.insert(p);
         }
         let mut queue_by_level = Vec::with_capacity(all_prices.len());
+        let mut yes_cum = 0u64;
+        let mut no_cum = 0u64;
         for p in all_prices.into_iter().rev() {
             let yq = self.yes_bids.get(&p).copied().unwrap_or(0);
             let nq = self.no_bids.get(&p).copied().unwrap_or(0);
+            yes_cum = yes_cum.saturating_add(yq);
+            no_cum = no_cum.saturating_add(nq);
             queue_by_level.push(QueueLevelSummary {
                 price_cents: p,
                 yes_bid_qty: yq,
                 no_bid_qty: nq,
-                yes_queue_ahead: self.queue_ahead_at("yes", p),
-                no_queue_ahead: self.queue_ahead_at("no", p),
+                yes_queue_ahead: yes_cum,
+                no_queue_ahead: no_cum,
             });
         }
 
@@ -461,28 +509,48 @@ impl OrderbookStore {
         let mut next_yes = BTreeMap::new();
         for &[p, q] in yes_bids {
             if (1..=99).contains(&p) && q > 0 {
-                next_yes.insert(p as u8, q);
+                next_yes.insert(p as u8, q.min(MAX_LEVEL_QTY));
             }
         }
         let mut next_no = BTreeMap::new();
         for &[p, q] in no_bids {
             if (1..=99).contains(&p) && q > 0 {
-                next_no.insert(p as u8, q);
+                next_no.insert(p as u8, q.min(MAX_LEVEL_QTY));
             }
         }
 
-        let (changed, sse_payload) = {
+        let need_disk = !self.data_dir.as_os_str().is_empty() && src != "empty";
+        let (changed, disk_vecs, sse_payload) = {
             let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let stale_after = st.stale_after_ms;
             let is_subscribed = st.subscribed_tickers.iter().any(|t| t == clean_ticker);
+            if !st.books.contains_key(clean_ticker) && st.books.len() >= MAX_CACHED_BOOKS {
+                let evict_key = st
+                    .books
+                    .iter()
+                    .filter(|(t, _)| !st.subscribed_tickers.iter().any(|s| s == *t))
+                    .min_by_key(|(_, b)| b.updated_ms)
+                    .map(|(t, _)| t.clone());
+                if let Some(k) = evict_key {
+                    st.books.remove(&k);
+                }
+            }
             let book = st.books.entry(clean_ticker.to_string()).or_default();
             let changed = book.yes_bids != next_yes || book.no_bids != next_no || !book.has_snapshot;
-            book.yes_bids = next_yes.clone();
-            book.no_bids = next_no.clone();
+            let disk_vecs = if changed && need_disk {
+                let yv: Vec<[u64; 2]> = next_yes.iter().rev().map(|(&p, &q)| [p as u64, q]).collect();
+                let nv: Vec<[u64; 2]> = next_no.iter().rev().map(|(&p, &q)| [p as u64, q]).collect();
+                Some((yv, nv))
+            } else {
+                None
+            };
+            book.yes_bids = next_yes;
+            book.no_bids = next_no;
             book.last_seq = seq;
             book.updated_ms = now;
             book.source = src.clone();
-            book.needs_resync = false;
+            let crossed = book.is_crossed();
+            book.needs_resync = crossed;
             book.has_snapshot = true;
 
             let mut sse = None;
@@ -490,12 +558,17 @@ impl OrderbookStore {
                 book.last_sse_emit_ms = now;
                 sse = Some(book.to_payload(clean_ticker, now, stale_after));
             }
-            (changed, sse)
+            if crossed {
+                st.resync_count = st.resync_count.saturating_add(1);
+            }
+            (changed, disk_vecs, sse)
         };
 
         self.revision.fetch_add(1, Ordering::Relaxed);
-        if changed && src != "empty" {
-            self.append_orderbook_record(clean_ticker, seq, &src, &next_yes, &next_no, now);
+        if changed {
+            if let Some((yv, nv)) = disk_vecs {
+                self.append_orderbook_record(clean_ticker, seq, &src, &yv, &nv, now);
+            }
         }
         if let Some(payload) = sse_payload {
             if let Ok(json) = serde_json::to_string(&payload) {
@@ -559,7 +632,7 @@ impl OrderbookStore {
                     };
                     let cur = map.get(&price_cents).copied().unwrap_or(0);
                     let next_qty = if delta >= 0 {
-                        cur.saturating_add(delta as u64)
+                        cur.saturating_add(delta as u64).min(MAX_LEVEL_QTY)
                     } else {
                         cur.saturating_sub(delta.unsigned_abs())
                     };
@@ -571,16 +644,20 @@ impl OrderbookStore {
                     book.last_seq = seq;
                     book.updated_ms = now;
                     book.source = "ws".to_string();
-
-                    let sse = if is_subscribed
-                        && now.saturating_sub(book.last_sse_emit_ms) >= SSE_THROTTLE_MS
-                    {
-                        book.last_sse_emit_ms = now;
-                        Some(book.to_payload(clean_ticker, now, stale_after))
+                    if book.is_crossed() {
+                        book.needs_resync = true;
+                        (false, None)
                     } else {
-                        None
-                    };
-                    (true, sse)
+                        let sse = if is_subscribed
+                            && now.saturating_sub(book.last_sse_emit_ms) >= SSE_THROTTLE_MS
+                        {
+                            book.last_sse_emit_ms = now;
+                            Some(book.to_payload(clean_ticker, now, stale_after))
+                        } else {
+                            None
+                        };
+                        (true, sse)
+                    }
                 }
             };
             if applied {
@@ -623,6 +700,9 @@ impl OrderbookStore {
 
     /// Parse and apply one incoming Kalshi v2 WebSocket JSON message.
     pub fn ingest_ws_message(&self, raw: &str) -> Result<(), String> {
+        if raw.len() > MAX_WS_FRAME_BYTES {
+            return Err("WS JSON message exceeds size limit".to_string());
+        }
         let val: serde_json::Value =
             serde_json::from_str(raw).map_err(|e| format!("invalid WS JSON: {e}"))?;
         let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -631,31 +711,41 @@ impl OrderbookStore {
 
         match msg_type {
             "orderbook_snapshot" => {
-                let ticker = msg
+                let raw_ticker = msg
                     .get("market_ticker")
                     .or_else(|| msg.get("ticker"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "orderbook_snapshot missing market_ticker".to_string())?;
+                let ticker = kalshi_live::validate_ticker(raw_ticker)?;
                 let parsed = kalshi_live::parse_kalshi_orderbook_json(msg)?;
                 self.ingest_snapshot(ticker, &parsed.yes, &parsed.no, seq.max(1), "ws");
                 Ok(())
             }
             "orderbook_delta" => {
-                let ticker = msg
+                if seq == 0 {
+                    return Err("orderbook_delta missing positive seq".to_string());
+                }
+                let raw_ticker = msg
                     .get("market_ticker")
                     .or_else(|| msg.get("ticker"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "orderbook_delta missing market_ticker".to_string())?;
+                let ticker = kalshi_live::validate_ticker(raw_ticker)?;
                 let side = msg
                     .get("side")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "orderbook_delta missing side".to_string())?;
+                let side_lc = side.trim().to_ascii_lowercase();
+                if side_lc != "yes" && side_lc != "no" {
+                    return Err(format!("orderbook_delta invalid side: {side}"));
+                }
                 let price_c = msg
                     .get("price")
                     .and_then(|v| v.as_u64())
                     .or_else(|| {
                         msg.get("price_dollars")
                             .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                            .filter(|d| d.is_finite() && *d >= 0.01 && *d <= 0.99)
                             .map(|d| (d * 100.0).round() as u64)
                     })
                     .filter(|p| (1..=99).contains(p))
@@ -667,10 +757,11 @@ impl OrderbookStore {
                     .or_else(|| {
                         msg.get("delta_fp")
                             .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                            .filter(|d| d.is_finite() && d.abs() <= MAX_LEVEL_QTY as f64)
                             .map(|d| d.round() as i64)
                     })
                     .ok_or_else(|| "orderbook_delta missing delta".to_string())?;
-                self.ingest_delta(ticker, side, price_c, delta, seq);
+                self.ingest_delta(ticker, &side_lc, price_c, delta, seq);
                 Ok(())
             }
             "trade" => {
@@ -791,8 +882,8 @@ impl OrderbookStore {
         ticker: &str,
         seq: u64,
         source: &str,
-        yes_bids: &BTreeMap<u8, u64>,
-        no_bids: &BTreeMap<u8, u64>,
+        yes_vec: &[[u64; 2]],
+        no_vec: &[[u64; 2]],
         ts_ms: i64,
     ) {
         if self.data_dir.as_os_str().is_empty() {
@@ -806,9 +897,15 @@ impl OrderbookStore {
             if meta.file_type().is_symlink() {
                 return;
             }
+            if meta.len() >= MAX_ORDERBOOKS_JSONL_BYTES {
+                let backup = self.data_dir.join("orderbooks.jsonl.1");
+                let backup_is_symlink = std::fs::symlink_metadata(&backup)
+                    .is_ok_and(|m| m.file_type().is_symlink());
+                if !backup_is_symlink {
+                    let _ = std::fs::rename(&path, &backup);
+                }
+            }
         }
-        let yes_vec: Vec<[u64; 2]> = yes_bids.iter().rev().map(|(&p, &q)| [p as u64, q]).collect();
-        let no_vec: Vec<[u64; 2]> = no_bids.iter().rev().map(|(&p, &q)| [p as u64, q]).collect();
         let line = serde_json::json!({
             "ts_ms": ts_ms,
             "ticker": ticker,
@@ -1029,16 +1126,36 @@ impl WsConnection {
     fn read_frame(&mut self) -> std::io::Result<(u8, Vec<u8>)> {
         let mut full_payload = Vec::new();
         let mut first_opcode = 0u8;
+        let mut fragments = 0usize;
         loop {
+            fragments += 1;
+            if fragments > MAX_WS_CONTINUATION_FRAMES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ws too many continuation frames",
+                ));
+            }
             let mut hdr = [0u8; 2];
             self.read_exact_bytes(&mut hdr)?;
             let fin = (hdr[0] & 0x80) != 0;
             let opcode = hdr[0] & 0x0f;
+            if opcode == 0 && first_opcode == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ws unexpected continuation frame",
+                ));
+            }
             if first_opcode == 0 && opcode != 0 {
                 first_opcode = opcode;
             }
             let masked = (hdr[1] & 0x80) != 0;
             let len7 = hdr[1] & 0x7f;
+            if opcode >= 0x8 && (!fin || len7 > 125) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ws invalid control frame",
+                ));
+            }
             let payload_len: usize = match len7 {
                 0..=125 => len7 as usize,
                 126 => {
@@ -1059,7 +1176,12 @@ impl WsConnection {
                     v as usize
                 }
             };
-            if payload_len > MAX_WS_FRAME_BYTES || full_payload.len() + payload_len > MAX_WS_FRAME_BYTES {
+            if payload_len > MAX_WS_FRAME_BYTES
+                || full_payload
+                    .len()
+                    .checked_add(payload_len)
+                    .is_none_or(|sum| sum > MAX_WS_FRAME_BYTES)
+            {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "ws payload exceeds limit",
@@ -1099,6 +1221,9 @@ impl WsConnection {
 
 fn parse_ws_url(url: &str) -> Result<(bool, String, u16, String), String> {
     let trimmed = url.trim();
+    if trimmed.contains('\r') || trimmed.contains('\n') || trimmed.contains('\0') {
+        return Err("WS URL contains invalid control characters".to_string());
+    }
     let (tls, rest) = if let Some(r) = trimmed.strip_prefix("wss://") {
         (true, r)
     } else if let Some(r) = trimmed.strip_prefix("ws://") {
@@ -1402,14 +1527,25 @@ pub fn start_background_orderbook(app: Arc<App>) {
 
                                     match conn.read_frame() {
                                         Ok((0x1, payload)) => {
-                                            if let Ok(txt) = std::str::from_utf8(&payload) {
-                                                if let Err(e) = app.orderbook.ingest_ws_message(txt) {
+                                            match std::str::from_utf8(&payload) {
+                                                Ok(txt) => {
+                                                    if let Err(e) = app.orderbook.ingest_ws_message(txt) {
+                                                        let mut st = app
+                                                            .orderbook
+                                                            .inner
+                                                            .lock()
+                                                            .unwrap_or_else(|p| p.into_inner());
+                                                        st.last_error = Some(e);
+                                                    }
+                                                }
+                                                Err(_) => {
                                                     let mut st = app
                                                         .orderbook
                                                         .inner
                                                         .lock()
                                                         .unwrap_or_else(|p| p.into_inner());
-                                                    st.last_error = Some(e);
+                                                    st.last_error =
+                                                        Some("invalid UTF-8 in WS text frame".to_string());
                                                 }
                                             }
                                         }
@@ -1602,5 +1738,93 @@ mod tests {
         assert_eq!(snap.yes_asks[0].price_cents, 62);
         assert_eq!(snap.yes_asks[0].qty, 10);
         assert_eq!(store.stream_status().delta_count, 1);
+    }
+
+    #[test]
+    fn hardening_malformed_crossed_clamping_zero_walk_and_bounded_disk_memory() {
+        let dir = std::env::temp_dir().join(format!("ob-l2-hard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = OrderbookStore::new(dir.clone());
+
+        // 1. Malformed WS JSON frames must error cleanly without panic.
+        for bad in [
+            "{not json",
+            r#"{"type":"orderbook_snapshot","msg":{}}"#,
+            r#"{"type":"orderbook_snapshot","msg":{"market_ticker":"../bad","yes":[[50,10]]}}"#,
+            r#"{"type":"orderbook_delta","seq":0,"msg":{"market_ticker":"KXBTC15M-H1","side":"yes","price":50,"delta":1}}"#,
+            r#"{"type":"orderbook_delta","seq":2,"msg":{"market_ticker":"KXBTC15M-H1","side":"maybe","price":50,"delta":1}}"#,
+            r#"{"type":"orderbook_delta","seq":2,"msg":{"market_ticker":"KXBTC15M-H1","side":"yes","price":0,"delta":1}}"#,
+            r#"{"type":"orderbook_delta","seq":2,"msg":{"market_ticker":"KXBTC15M-H1","side":"yes","price":100,"delta":1}}"#,
+            r#"{"type":"orderbook_delta","seq":2,"msg":{"market_ticker":"KXBTC15M-H1","side":"yes","price_dollars":"NaN","delta":1}}"#,
+            r#"{"type":"orderbook_delta","seq":2,"msg":{"market_ticker":"KXBTC15M-H1","side":"yes","price":50,"delta_fp":"inf"}}"#,
+        ] {
+            assert!(store.ingest_ws_message(bad).is_err(), "expected err for {bad}");
+        }
+
+        // 2. Price level clamping (only 1..=99c accepted; 0, >99, negative/NaN dropped).
+        let mixed = serde_json::json!({
+            "type": "orderbook_snapshot",
+            "seq": 1,
+            "msg": {
+                "market_ticker": "KXBTC15M-CLAMP",
+                "yes": [[0, 10], [55, 10], [100, 10], [150, 5]],
+                "no": [[0, 5], [40, 8], [100, 5]]
+            }
+        })
+        .to_string();
+        store.ingest_ws_message(&mixed).unwrap();
+        let clamp_snap = store.snapshot("KXBTC15M-CLAMP");
+        assert!(!clamp_snap.stale);
+        assert_eq!(clamp_snap.yes_bids.len(), 1);
+        assert_eq!(clamp_snap.yes_bids[0].price_cents, 55);
+        assert_eq!(clamp_snap.no_bids.len(), 1);
+        assert_eq!(clamp_snap.no_bids[0].price_cents, 40);
+
+        // 3. Book-walk edge cases: 0 qty -> None; insufficient depth -> partial fill.
+        assert!(store.walk_book("KXBTC15M-CLAMP", "yes", 0).is_none());
+        assert!(store.walk_book_fresh("KXBTC15M-CLAMP", "yes", 0).is_none());
+        let insuff = store.walk_book_fresh("KXBTC15M-CLAMP", "yes", 50).unwrap();
+        assert_eq!(insuff.fillable_qty, 8);
+        assert!(!insuff.fully_fillable);
+
+        // 4. Crossed book detection fails closed (needs_resync=true, stale=true, walk_book_fresh=None).
+        store.ingest_snapshot("KXBTC15M-CROSS", &[[65, 10]], &[[45, 10]], 1, "ws");
+        let cross_snap = store.snapshot("KXBTC15M-CROSS");
+        assert!(cross_snap.needs_resync);
+        assert!(cross_snap.stale);
+        assert!(store.walk_book_fresh("KXBTC15M-CROSS", "yes", 5).is_none());
+
+        // Crossed via delta also triggers needs_resync.
+        store.ingest_snapshot("KXBTC15M-CROSS2", &[[50, 10]], &[[45, 10]], 1, "ws");
+        assert!(!store.snapshot("KXBTC15M-CROSS2").needs_resync);
+        assert!(!store.ingest_delta("KXBTC15M-CROSS2", "yes", 60, 5, 2));
+        assert!(store.snapshot("KXBTC15M-CROSS2").needs_resync);
+
+        // 5. Out-of-order seq duplicate ignored cleanly vs forward gap flags resync.
+        store.ingest_snapshot("KXBTC15M-SEQ", &[[50, 10]], &[[45, 10]], 5, "ws");
+        assert!(!store.ingest_delta("KXBTC15M-SEQ", "yes", 50, -2, 5)); // duplicate seq
+        assert!(!store.snapshot("KXBTC15M-SEQ").needs_resync);
+        assert!(!store.ingest_delta("KXBTC15M-SEQ", "yes", 50, -2, 7)); // gap 5 -> 7
+        assert!(store.snapshot("KXBTC15M-SEQ").needs_resync);
+
+        // 6. Bounded memory cache (MAX_CACHED_BOOKS = 128).
+        for i in 0..160 {
+            store.ingest_snapshot(&format!("KXBTC15M-M{i}"), &[[50, 1]], &[[48, 1]], 1, "rest");
+        }
+        assert!(store.inner.lock().unwrap().books.len() <= MAX_CACHED_BOOKS);
+
+        // 7. Bounded disk rotation when orderbooks.jsonl >= MAX_ORDERBOOKS_JSONL_BYTES.
+        let ob_path = dir.join("orderbooks.jsonl");
+        let big_dummy = vec![b' '; MAX_ORDERBOOKS_JSONL_BYTES as usize + 64];
+        std::fs::write(&ob_path, &big_dummy).unwrap();
+        store.ingest_snapshot("KXBTC15M-ROT", &[[51, 5]], &[[47, 5]], 1, "ws");
+        assert!(dir.join("orderbooks.jsonl.1").exists(), "expected rotation backup");
+        assert!(
+            std::fs::metadata(&ob_path).unwrap().len() < 4096,
+            "fresh orderbooks.jsonl should be small after rotation"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

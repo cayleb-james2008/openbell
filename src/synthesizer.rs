@@ -738,7 +738,6 @@ fn simulate_candidate_on_windows(
         // or walk snaps directly while stepping ctxs. Since `build_causal_tick_contexts` skips
         // only invalid snaps, map each valid ctx to its snap position.
         let mut ctx_idx = 0usize;
-        let mut entered: Option<(f64, bool)> = None;
 
         for (si, _snap) in w.snaps.iter().enumerate() {
             let Some((ya_c, na_c, last_c, secs)) = w.snap_asks_c[si] else {
@@ -781,7 +780,6 @@ fn simulate_candidate_on_windows(
                     let won = w.result == side;
                     let pnl_d = (if won { 1.0 } else { 0.0 }) - fill_price - fee_d;
                     let ret = pnl_d / fill_price;
-                    entered = Some((pnl_d * 100.0, won));
                     trades.push(WindowTradeOutcome {
                         ticker: w.ticker.to_string(),
                         won,
@@ -803,7 +801,6 @@ fn simulate_candidate_on_windows(
                 let won = w.result == side;
                 let pnl_d = (if won { 1.0 } else { 0.0 }) - fill_price - fee_d;
                 let ret = pnl_d / fill_price;
-                entered = Some((pnl_d * 100.0, won));
                 trades.push(WindowTradeOutcome {
                     ticker: w.ticker.to_string(),
                     won,
@@ -813,7 +810,6 @@ fn simulate_candidate_on_windows(
                 break;
             }
         }
-        let _ = entered;
     }
 
     trades
@@ -891,27 +887,69 @@ pub fn inv_normal_cdf(p: f64) -> f64 {
     }
 }
 
-/// Compute (mean, std_dev, sharpe, skew, kurtosis) over sample returns.
+/// Compute (mean, std_dev, sharpe, skew, kurtosis) over finite sample returns.
 fn return_moments(xs: &[f64]) -> (Option<f64>, Option<f64>, Option<f64>, f64, f64) {
-    let n = xs.len();
-    if n == 0 {
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    for &x in xs {
+        if x.is_finite() {
+            sum += x;
+            count += 1;
+        }
+    }
+    if count == 0 || !sum.is_finite() {
         return (None, None, None, 0.0, 3.0);
     }
-    let nf = n as f64;
-    let mean = xs.iter().sum::<f64>() / nf;
-    if n < 2 {
+    let nf = count as f64;
+    let mean = sum / nf;
+    if !mean.is_finite() {
+        return (None, None, None, 0.0, 3.0);
+    }
+    if count < 2 {
         return (Some(mean), None, None, 0.0, 3.0);
     }
-    let var = xs.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / ((n - 1) as f64);
+    let var = xs
+        .iter()
+        .filter(|x| x.is_finite())
+        .map(|x| (x - mean) * (x - mean))
+        .sum::<f64>()
+        / ((count - 1) as f64);
     let sd = var.sqrt();
-    if !sd.is_finite() || sd < 1e-12 {
+    if !sd.is_finite() {
+        return (Some(mean), None, None, 0.0, 3.0);
+    }
+    if sd < 1e-12 {
         return (Some(mean), Some(sd), None, 0.0, 3.0);
     }
-    let sharpe = mean / sd;
-    let (skew, kurt) = if n >= 4 {
-        let m3 = xs.iter().map(|x| ((x - mean) / sd).powi(3)).sum::<f64>() / nf;
-        let m4 = xs.iter().map(|x| ((x - mean) / sd).powi(4)).sum::<f64>() / nf;
-        (m3.clamp(-5.0, 5.0), m4.clamp(1.0, 20.0))
+    let raw_sharpe = mean / sd;
+    if !raw_sharpe.is_finite() {
+        return (Some(mean), Some(sd), None, 0.0, 3.0);
+    }
+    let sharpe = raw_sharpe.clamp(-100.0, 100.0);
+    let (skew, kurt) = if count >= 4 {
+        let m3 = xs
+            .iter()
+            .filter(|x| x.is_finite())
+            .map(|x| ((x - mean) / sd).powi(3))
+            .sum::<f64>()
+            / nf;
+        let m4 = xs
+            .iter()
+            .filter(|x| x.is_finite())
+            .map(|x| ((x - mean) / sd).powi(4))
+            .sum::<f64>()
+            / nf;
+        let sk = if m3.is_finite() {
+            m3.clamp(-5.0, 5.0)
+        } else {
+            0.0
+        };
+        let ku = if m4.is_finite() {
+            m4.clamp(1.0, 20.0)
+        } else {
+            3.0
+        };
+        (sk, ku)
     } else {
         (0.0, 3.0)
     };
@@ -930,6 +968,22 @@ pub fn compute_deflated_sharpe(
     if !sr_hat.is_finite() || n_trades < 2 {
         return 0.0;
     }
+    let sr_clamped = sr_hat.clamp(-100.0, 100.0);
+    let safe_skew = if skew.is_finite() {
+        skew.clamp(-5.0, 5.0)
+    } else {
+        0.0
+    };
+    let safe_kurt = if kurt.is_finite() {
+        kurt.clamp(1.0, 20.0)
+    } else {
+        3.0
+    };
+    let safe_var = if trials_sharpe_var.is_finite() {
+        trials_sharpe_var.clamp(1e-6, 100.0)
+    } else {
+        0.05
+    };
     const EULER_GAMMA: f64 = 0.5772156649015329;
     let m = total_trials.max(1) as f64;
     let sr_0 = if total_trials <= 1 {
@@ -937,13 +991,13 @@ pub fn compute_deflated_sharpe(
     } else {
         let z1 = inv_normal_cdf(1.0 - 1.0 / m);
         let z2 = inv_normal_cdf(1.0 - 1.0 / (m * std::f64::consts::E));
-        ((1.0 - EULER_GAMMA) * z1 + EULER_GAMMA * z2) * trials_sharpe_var.max(1e-6).sqrt()
+        ((1.0 - EULER_GAMMA) * z1 + EULER_GAMMA * z2) * safe_var.sqrt()
     };
-    let denom = ((1.0 - skew * sr_hat + ((kurt - 1.0) / 4.0) * sr_hat * sr_hat)
+    let denom = ((1.0 - safe_skew * sr_clamped + ((safe_kurt - 1.0) / 4.0) * sr_clamped * sr_clamped)
         / ((n_trades - 1) as f64))
         .max(1e-9)
         .sqrt();
-    normal_cdf((sr_hat - sr_0) / denom)
+    normal_cdf((sr_clamped - sr_0) / denom).clamp(0.0, 1.0)
 }
 
 /// Benjamini-Hochberg step-up adjusted p-values across `total_hypotheses >= p_values.len()`.
@@ -1330,9 +1384,13 @@ pub fn synthesize_strategies(
 
         let pnl_dollars_1ct = oos_cents.iter().sum::<f64>() / 100.0;
         let raw_p = match (mean_c_opt, sd_c_opt) {
-            (Some(m), Some(sd)) if oos_n >= 2 && sd > 1e-12 => {
+            (Some(m), Some(sd)) if oos_n >= 2 && m.is_finite() && sd.is_finite() && sd > 1e-12 => {
                 let t_stat = m / (sd / (oos_n as f64).sqrt());
-                (1.0 - normal_cdf(t_stat)).clamp(0.0, 1.0)
+                if t_stat.is_finite() {
+                    (1.0 - normal_cdf(t_stat)).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                }
             }
             _ => 1.0,
         };
@@ -1376,7 +1434,8 @@ pub fn synthesize_strategies(
     // Cross-sectional trial Sharpe variance for Bailey-Lopez de Prado DSR.
     let trials_sharpe_var = return_moments(&all_oos_sharpes)
         .1
-        .map(|sd| (sd * sd).max(1e-4))
+        .filter(|sd| sd.is_finite())
+        .map(|sd| (sd * sd).clamp(1e-4, 100.0))
         .unwrap_or(0.05);
 
     // Benjamini-Hochberg FDR adjustment against total hypotheses explored in grid.
@@ -1627,6 +1686,66 @@ mod tests {
             assert_eq!(a.id, b.id);
             assert_eq!(a.source, b.source);
             assert!((a.bh_adjusted_p_value - b.bh_adjusted_p_value).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn degenerate_datasets_and_nan_inf_clamping() {
+        // 1. Empty dataset.
+        let empty: BTreeMap<String, Vec<Snapshot>> = BTreeMap::new();
+        let r_empty = synthesize_strategies(&empty, &[], "empty", &SynthesizeRequest::default()).unwrap();
+        assert_eq!(r_empty.windows_settled_total, 0);
+        assert_eq!(r_empty.survivors_count, 0);
+        assert!(r_empty.candidates.is_empty());
+
+        // 2. Single settled window (or multiple windows at same epoch -> 1 distinct epoch).
+        let mut single: BTreeMap<String, Vec<Snapshot>> = BTreeMap::new();
+        let close_ep = 1_795_700_900i64;
+        let close_str = iso_z(close_ep);
+        single.insert(
+            "KXBTC15M-ONE".to_string(),
+            vec![Snapshot {
+                fetched_at: close_ep - 300,
+                ticker: Sym::new("KXBTC15M-ONE"),
+                event_ticker: Sym::new("KXBTC15M-EV"),
+                series: Sym::new("KXBTC15M"),
+                close_time: Sym::new(&close_str),
+                status: Sym::new("settled"),
+                result: Sym::new("yes"),
+                yes_bid: OptPrice::from_opt(Some(0.50)),
+                yes_ask: OptPrice::from_opt(Some(0.52)),
+                no_bid: OptPrice::from_opt(Some(0.48)),
+                no_ask: OptPrice::from_opt(Some(0.50)),
+                last_price: OptPrice::from_opt(Some(0.51)),
+                yes_bid_size: 20.0,
+                no_bid_size: 20.0,
+            }],
+        );
+        let r_single = synthesize_strategies(&single, &[], "single", &SynthesizeRequest::default()).unwrap();
+        assert_eq!(r_single.windows_settled_total, 1);
+        assert!(r_single.candidates.is_empty());
+
+        // 3. NaN/Inf clamping in moments, DSR, and BH-FDR.
+        let (m, sd, sr, sk, ku) = return_moments(&[f64::NAN, f64::INFINITY, f64::NEG_INFINITY]);
+        assert!(m.is_none() && sd.is_none() && sr.is_none());
+        assert!(sk.is_finite() && ku.is_finite());
+
+        let (m2, sd2, sr2, _, _) = return_moments(&[1.0, f64::NAN, 3.0, f64::INFINITY]);
+        assert!(m2.unwrap().is_finite());
+        assert!(sd2.unwrap().is_finite());
+        assert!(sr2.unwrap().is_finite() && sr2.unwrap().abs() <= 100.0);
+
+        let dsr_nan = compute_deflated_sharpe(f64::NAN, 10, f64::NAN, f64::INFINITY, 20, f64::NAN);
+        assert!(dsr_nan.is_finite() && (0.0..=1.0).contains(&dsr_nan));
+        let dsr_inf = compute_deflated_sharpe(f64::INFINITY, 10, 0.0, 3.0, 20, 0.1);
+        assert!(dsr_inf.is_finite() && (0.0..=1.0).contains(&dsr_inf));
+        let dsr_high = compute_deflated_sharpe(1e9, 10, f64::NAN, f64::NAN, 20, f64::INFINITY);
+        assert!(dsr_high.is_finite() && (0.0..=1.0).contains(&dsr_high));
+
+        let bh = benjamini_hochberg_adjust(&[f64::NAN, -0.5, 2.5, 0.02], 0);
+        assert_eq!(bh.len(), 4);
+        for &q in &bh {
+            assert!(q.is_finite() && (0.0..=1.0).contains(&q));
         }
     }
 }

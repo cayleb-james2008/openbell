@@ -13,7 +13,7 @@ use crate::{
     risk_rails, strategies_dir_key, tape_hub, App, Strategy, SERIES,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -25,6 +25,18 @@ const MAX_TICK_INTERVAL_MS: u64 = 60_000;
 const DEFAULT_CANCEL_BEFORE_CLOSE_SECS: u64 = 30;
 const MAX_CANCEL_BEFORE_CLOSE_SECS: u64 = 600;
 const DEFAULT_BANKROLL_DOLLARS: f64 = 500.0;
+const MAX_RUNNER_SLOTS: usize = 64;
+const MAX_IN_MEMORY_LEDGER: usize = 10_000;
+const MAX_TERMINAL_ORDER_IDS: usize = 20_000;
+
+#[inline]
+fn sanitize_non_neg_size(sz: f32) -> f32 {
+    if sz.is_finite() && sz >= 0.0 {
+        sz.min(1_000_000_000.0)
+    } else {
+        0.0
+    }
+}
 
 #[inline]
 fn maker_fee_dollars(price: f64) -> f64 {
@@ -296,7 +308,9 @@ struct RunnerState {
     slots: Vec<SlotRuntime>,
     open_quotes: Vec<RestingQuote>,
     filled_positions: Vec<FilledPosition>,
-    settled_or_filled_slot_tickers: HashSet<(usize, String)>,
+    settled_or_filled_slot_tickers: HashMap<String, HashSet<usize>>,
+    terminal_order_ids: HashSet<String>,
+    terminal_order_queue: VecDeque<String>,
     ticker_cursor: HashMap<String, usize>,
     ledger: Vec<LedgerEvent>,
     next_seq: u64,
@@ -454,7 +468,7 @@ impl RunnerState {
         format!("ob-run-{}-{}", now_unix(), self.next_order_num)
     }
 
-    fn append_event(&mut self, mut ev: LedgerEvent) {
+    fn append_event(&mut self, mut ev: LedgerEvent) -> &LedgerEvent {
         self.next_seq = self.next_seq.saturating_add(1);
         ev.seq = self.next_seq;
         if let Ok(line) = serde_json::to_string(&ev) {
@@ -463,6 +477,50 @@ impl RunnerState {
             let _ = append_tape(&ledger_path(&self.data_dir), &row);
         }
         self.ledger.push(ev);
+        if self.ledger.len() > MAX_IN_MEMORY_LEDGER {
+            let excess = self.ledger.len() - MAX_IN_MEMORY_LEDGER;
+            self.ledger.drain(..excess);
+        }
+        self.ledger.last().expect("ledger non-empty after push")
+    }
+
+    fn append_and_publish(&mut self, ev: LedgerEvent, sse_kind: &str) {
+        let stored = self.append_event(ev);
+        publish_runner_sse(sse_kind, stored);
+    }
+
+    fn has_slot_ticker(&self, slot_id: usize, ticker: &str) -> bool {
+        self.settled_or_filled_slot_tickers
+            .get(ticker)
+            .is_some_and(|s| s.contains(&slot_id))
+    }
+
+    fn mark_slot_ticker(&mut self, slot_id: usize, ticker: &str) {
+        if let Some(set) = self.settled_or_filled_slot_tickers.get_mut(ticker) {
+            set.insert(slot_id);
+        } else {
+            let mut set = HashSet::new();
+            set.insert(slot_id);
+            self.settled_or_filled_slot_tickers
+                .insert(ticker.to_string(), set);
+        }
+    }
+
+    /// Returns `true` if `order_id` was not yet terminal and has now been marked terminal.
+    fn mark_terminal_order(&mut self, order_id: &str) -> bool {
+        if order_id.is_empty() {
+            return true;
+        }
+        if !self.terminal_order_ids.insert(order_id.to_string()) {
+            return false;
+        }
+        self.terminal_order_queue.push_back(order_id.to_string());
+        while self.terminal_order_queue.len() > MAX_TERMINAL_ORDER_IDS {
+            if let Some(old) = self.terminal_order_queue.pop_front() {
+                self.terminal_order_ids.remove(&old);
+            }
+        }
+        true
     }
 
     fn emit_quote_canceled(
@@ -471,6 +529,9 @@ impl RunnerState {
         ts: i64,
         reason: &str,
     ) {
+        if !self.mark_terminal_order(&q.order_id) {
+            return;
+        }
         let ev = LedgerEvent {
             seq: 0,
             ts,
@@ -494,8 +555,7 @@ impl RunnerState {
             reason: Some(reason.to_string()),
             live_order_id: q.live_order_id.clone(),
         };
-        self.append_event(ev.clone());
-        publish_runner_sse("quote_canceled", &ev);
+        self.append_and_publish(ev, "quote_canceled");
     }
 
     fn record_fill(
@@ -507,16 +567,30 @@ impl RunnerState {
         fee_dollars: f64,
         filled_at: i64,
     ) {
+        if q.contracts == 0 || !self.mark_terminal_order(&q.order_id) {
+            return;
+        }
+        let fill_cents = fill_cents.clamp(1, 99);
+        let safe_slip = if slippage_cents.is_finite() { slippage_cents } else { 0.0 };
+        let safe_wait = if queue_wait_secs.is_finite() && queue_wait_secs >= 0.0 {
+            queue_wait_secs
+        } else {
+            0.0
+        };
+        let safe_fee = if fee_dollars.is_finite() && fee_dollars >= 0.0 {
+            fee_dollars
+        } else {
+            0.0
+        };
         self.total_fills = self.total_fills.saturating_add(1);
-        self.slippage_sum_cents += slippage_cents;
+        self.slippage_sum_cents += safe_slip;
         self.slippage_count = self.slippage_count.saturating_add(1);
-        self.queue_wait_sum_secs += queue_wait_secs;
+        self.queue_wait_sum_secs += safe_wait;
         self.queue_wait_count = self.queue_wait_count.saturating_add(1);
         if let Some(slot) = self.slots.iter_mut().find(|s| s.cfg.slot_id == q.slot_id) {
             slot.fills = slot.fills.saturating_add(1);
         }
-        self.settled_or_filled_slot_tickers
-            .insert((q.slot_id, q.ticker.clone()));
+        self.mark_slot_ticker(q.slot_id, &q.ticker);
         self.filled_positions.push(FilledPosition {
             order_id: q.order_id.clone(),
             slot_id: q.slot_id,
@@ -528,7 +602,7 @@ impl RunnerState {
             side: q.side.clone(),
             fill_cents,
             contracts: q.contracts,
-            fee_dollars,
+            fee_dollars: safe_fee,
             live_order_id: q.live_order_id.clone(),
         });
         let ev = LedgerEvent {
@@ -546,16 +620,15 @@ impl RunnerState {
             limit_cents: q.limit_cents,
             fill_cents: Some(fill_cents),
             contracts: q.contracts,
-            slippage_cents: Some(slippage_cents),
-            queue_wait_secs: Some(queue_wait_secs),
-            fee_dollars: Some(fee_dollars),
+            slippage_cents: Some(safe_slip),
+            queue_wait_secs: Some(safe_wait),
+            fee_dollars: Some(safe_fee),
             realized_pnl_dollars: None,
             result: None,
             reason: None,
             live_order_id: q.live_order_id.clone(),
         };
-        self.append_event(ev.clone());
-        publish_runner_sse("quote_filled", &ev);
+        self.append_and_publish(ev, "quote_filled");
     }
 
     fn settle_ticker(&mut self, ticker: &str, result: &str, ts: i64) {
@@ -616,8 +689,7 @@ impl RunnerState {
                 reason: None,
                 live_order_id: pos.live_order_id.clone(),
             };
-            self.append_event(ev.clone());
-            publish_runner_sse("window_settled", &ev);
+            self.append_and_publish(ev, "window_settled");
 
             // Check per-slot realized drawdown circuit breaker.
             let mut pause_trigger: Option<(usize, String, String, f64, f64)> = None;
@@ -684,8 +756,7 @@ impl RunnerState {
                     reason: Some(reason),
                     live_order_id: None,
                 };
-                self.append_event(pause_ev.clone());
-                publish_runner_sse("slot_auto_paused", &pause_ev);
+                self.append_and_publish(pause_ev, "slot_auto_paused");
             }
         }
     }
@@ -802,6 +873,7 @@ impl ShadowRunner {
                     let valid_slots: Vec<RunnerSlotConfig> = s
                         .slots
                         .iter()
+                        .take(MAX_RUNNER_SLOTS)
                         .filter_map(|sl| normalize_slot(sl).ok())
                         .collect();
                     let bankroll = if s.bankroll_dollars.is_finite() && s.bankroll_dollars > 0.0 {
@@ -811,12 +883,25 @@ impl ShadowRunner {
                     } else {
                         DEFAULT_BANKROLL_DOLLARS
                     };
+                    let clamped_tick = s
+                        .tick_interval_ms
+                        .clamp(MIN_TICK_INTERVAL_MS, MAX_TICK_INTERVAL_MS);
+                    let clamped_cancel = s.cancel_before_close_secs.min(MAX_CANCEL_BEFORE_CLOSE_SECS);
+                    // Sanitize on disk immediately if persisted mode was "live_auto" or invalid.
+                    if s.mode != safe_mode.persisted_str() {
+                        let sanitized = PersistedRunnerState {
+                            mode: safe_mode.persisted_str().to_string(),
+                            tick_interval_ms: clamped_tick,
+                            cancel_before_close_secs: clamped_cancel,
+                            bankroll_dollars: bankroll,
+                            slots: valid_slots.clone(),
+                        };
+                        let _ = write_atomic_json(&state_path(data_dir), &sanitized);
+                    }
                     (
                         safe_mode,
-                        s.tick_interval_ms
-                            .clamp(MIN_TICK_INTERVAL_MS, MAX_TICK_INTERVAL_MS),
-                        s.cancel_before_close_secs
-                            .min(MAX_CANCEL_BEFORE_CLOSE_SECS),
+                        clamped_tick,
+                        clamped_cancel,
                         bankroll,
                         valid_slots,
                     )
@@ -834,8 +919,9 @@ impl ShadowRunner {
                 ),
             };
 
-        let ledger = load_ledger_events(&ledger_path(data_dir));
+        let mut ledger = load_ledger_events(&ledger_path(data_dir));
         let mut next_seq = 0u64;
+        let next_order_num = ledger.len() as u64;
         let mut total_quotes_posted = 0u64;
         let mut total_fills = 0u64;
         let mut total_realized_pnl_dollars = 0.0;
@@ -844,6 +930,9 @@ impl ShadowRunner {
         let mut queue_wait_sum_secs = 0.0;
         let mut queue_wait_count = 0u64;
         let mut slot_stats: HashMap<usize, (u64, u64, f64, f64)> = HashMap::new();
+        let mut settled_or_filled_slot_tickers: HashMap<String, HashSet<usize>> = HashMap::new();
+        let mut terminal_order_ids: HashSet<String> = HashSet::new();
+        let mut terminal_order_queue: VecDeque<String> = VecDeque::new();
 
         for ev in &ledger {
             if ev.seq > next_seq {
@@ -855,20 +944,50 @@ impl ShadowRunner {
                     total_quotes_posted = total_quotes_posted.saturating_add(1);
                     entry.0 = entry.0.saturating_add(1);
                 }
+                "QuoteCanceled" => {
+                    if !ev.order_id.is_empty() && terminal_order_ids.insert(ev.order_id.clone()) {
+                        terminal_order_queue.push_back(ev.order_id.clone());
+                        while terminal_order_queue.len() > MAX_TERMINAL_ORDER_IDS {
+                            if let Some(old) = terminal_order_queue.pop_front() {
+                                terminal_order_ids.remove(&old);
+                            }
+                        }
+                    }
+                }
                 "OrderFilled" => {
                     total_fills = total_fills.saturating_add(1);
                     entry.1 = entry.1.saturating_add(1);
-                    if let Some(sl) = ev.slippage_cents {
+                    if !ev.ticker.is_empty() {
+                        settled_or_filled_slot_tickers
+                            .entry(ev.ticker.clone())
+                            .or_default()
+                            .insert(ev.slot_id);
+                    }
+                    if !ev.order_id.is_empty() && terminal_order_ids.insert(ev.order_id.clone()) {
+                        terminal_order_queue.push_back(ev.order_id.clone());
+                        while terminal_order_queue.len() > MAX_TERMINAL_ORDER_IDS {
+                            if let Some(old) = terminal_order_queue.pop_front() {
+                                terminal_order_ids.remove(&old);
+                            }
+                        }
+                    }
+                    if let Some(sl) = ev.slippage_cents.filter(|v| v.is_finite()) {
                         slippage_sum_cents += sl;
                         slippage_count = slippage_count.saturating_add(1);
                     }
-                    if let Some(qw) = ev.queue_wait_secs {
+                    if let Some(qw) = ev.queue_wait_secs.filter(|v| v.is_finite() && *v >= 0.0) {
                         queue_wait_sum_secs += qw;
                         queue_wait_count = queue_wait_count.saturating_add(1);
                     }
                 }
                 "WindowSettled" => {
-                    if let Some(pnl) = ev.realized_pnl_dollars {
+                    if !ev.ticker.is_empty() {
+                        settled_or_filled_slot_tickers
+                            .entry(ev.ticker.clone())
+                            .or_default()
+                            .insert(ev.slot_id);
+                    }
+                    if let Some(pnl) = ev.realized_pnl_dollars.filter(|v| v.is_finite()) {
                         total_realized_pnl_dollars += pnl;
                         entry.2 += pnl;
                         if entry.2 > entry.3 {
@@ -878,6 +997,10 @@ impl ShadowRunner {
                 }
                 _ => {}
             }
+        }
+        if ledger.len() > MAX_IN_MEMORY_LEDGER {
+            let excess = ledger.len() - MAX_IN_MEMORY_LEDGER;
+            ledger.drain(..excess);
         }
 
         let slots = slot_cfgs
@@ -909,11 +1032,13 @@ impl ShadowRunner {
                 slots,
                 open_quotes: Vec::new(),
                 filled_positions: Vec::new(),
-                settled_or_filled_slot_tickers: HashSet::new(),
+                settled_or_filled_slot_tickers,
+                terminal_order_ids,
+                terminal_order_queue,
                 ticker_cursor: HashMap::new(),
                 ledger,
                 next_seq,
-                next_order_num: 0,
+                next_order_num,
                 total_quotes_posted,
                 total_fills,
                 total_realized_pnl_dollars,
@@ -952,6 +1077,9 @@ impl ShadowRunner {
             return Err(format!(
                 "cancel_before_close_secs must be <= {MAX_CANCEL_BEFORE_CLOSE_SECS}"
             ));
+        }
+        if req.slots.len() > MAX_RUNNER_SLOTS {
+            return Err(format!("too many slots (max {MAX_RUNNER_SLOTS})"));
         }
         let mut normalized = Vec::with_capacity(req.slots.len());
         let mut seen_ids = HashSet::new();
@@ -1346,11 +1474,7 @@ impl ShadowRunner {
         // Refresh compiled strategy cache only when strategies_dir changes.
         cached_strats.refresh_if_needed(&app.strategies_dir, app.paper_pot);
         let has_v2 = cached_strats.strategies.iter().any(|s| s.is_v2());
-        let pav_blocks = if has_v2 {
-            crate::recalibration::fit_is_market_pav_blocks(&tape.grouped).0
-        } else {
-            Vec::new()
-        };
+        let mut pav_blocks_cache: Option<Vec<crate::recalibration::PavBlock>> = None;
 
         let mut pending_live_intents: Vec<PendingLiveOrderIntent> = Vec::new();
         let mut live_cancels: Vec<(String, VirtualOrLiveOrder, i64, String)> = Vec::new();
@@ -1388,9 +1512,12 @@ impl ShadowRunner {
                 };
 
                 let mut v2_tracker = if has_v2 {
+                    let pav_blocks = pav_blocks_cache.get_or_insert_with(|| {
+                        crate::recalibration::fit_is_market_pav_blocks(&tape.grouped).0
+                    });
                     let mut tr = crate::strategy_v2::CausalFeatureTracker::new();
                     for pre in &snaps[..start_idx] {
-                        let _ = tr.push_tick(pre, &pav_blocks);
+                        let _ = tr.push_tick(pre, pav_blocks);
                     }
                     Some(tr)
                 } else {
@@ -1398,9 +1525,10 @@ impl ShadowRunner {
                 };
 
                 for snap in &snaps[start_idx..] {
-                    let cur_ctx = v2_tracker
-                        .as_mut()
-                        .and_then(|tr| tr.push_tick(snap, &pav_blocks));
+                    let cur_ctx = v2_tracker.as_mut().and_then(|tr| {
+                        let pav_blocks = pav_blocks_cache.as_deref().unwrap_or(&[]);
+                        tr.push_tick(snap, pav_blocks)
+                    });
                     if !snap.result.is_empty() {
                         // Cancel any live orders on venue if needed, and settle shadow/filled positions.
                         let live_to_cancel: Vec<VirtualOrLiveOrder> = st
@@ -1477,11 +1605,13 @@ impl ShadowRunner {
                         }
 
                         // Shadow maker matching engine: cross or touch + queue-ahead depletion.
-                        let (side_ask_c, side_bid_c, side_bid_sz) = if rq.order.side == "yes" {
+                        let (side_ask_c, side_bid_c, raw_bid_sz) = if rq.order.side == "yes" {
                             (ya_c, yb_c, snap.yes_bid_size)
                         } else {
                             (na_c, nb_c, snap.no_bid_size)
                         };
+                        let side_bid_sz = sanitize_non_neg_size(raw_bid_sz);
+                        let prev_bid_sz = sanitize_non_neg_size(rq.last_bid_size);
                         let limit_c = rq.order.limit_cents;
                         let side_last_hit = last_c.is_some_and(|p| {
                             let lp = if rq.order.side == "yes" {
@@ -1497,8 +1627,8 @@ impl ShadowRunner {
                         if strict_cross {
                             rq.order.queue_ahead_remaining = 0;
                         } else if touch {
-                            let bid_drop = if side_bid_c == limit_c && rq.last_bid_size > side_bid_sz {
-                                (rq.last_bid_size - side_bid_sz).round().max(0.0) as u32
+                            let bid_drop = if side_bid_c == limit_c && prev_bid_sz > side_bid_sz {
+                                (prev_bid_sz - side_bid_sz).round().max(0.0) as u32
                             } else {
                                 0
                             };
@@ -1506,17 +1636,23 @@ impl ShadowRunner {
                             rq.order.queue_ahead_remaining =
                                 rq.order.queue_ahead_remaining.saturating_sub(step_deplete);
                         } else if side_bid_c == limit_c
-                            && rq.last_bid_size > side_bid_sz
+                            && prev_bid_sz > side_bid_sz
                             && rq.order.queue_ahead_remaining > 1
                         {
                             // Bid depth ahead of us canceled/eroded while resting at best bid.
-                            let drop = (rq.last_bid_size - side_bid_sz).round().max(0.0) as u32;
+                            let drop = (prev_bid_sz - side_bid_sz).round().max(0.0) as u32;
                             let new_rem = rq.order.queue_ahead_remaining.saturating_sub(drop).max(1);
                             rq.order.queue_ahead_remaining = new_rem;
                         }
+                        rq.order.queue_ahead_remaining = rq
+                            .order
+                            .queue_ahead_remaining
+                            .min(rq.order.queue_ahead_initial);
                         rq.last_bid_size = side_bid_sz;
 
                         if rq.order.queue_ahead_remaining == 0 {
+                            rq.order.filled_contracts = rq.order.contracts;
+                            rq.order.status = "filled".to_string();
                             let fee_d = maker_fee_dollars(limit_c as f64 / 100.0)
                                 * (rq.order.contracts as f64);
                             let wait_s = (snap.fetched_at - rq.order.posted_at).max(0) as f64;
@@ -1542,41 +1678,36 @@ impl ShadowRunner {
                     let slot_count = st.slots.len();
 
                     for idx in 0..slot_count {
-                        let (slot_id, strat_name, series_filter, max_contracts, exec_mode, enabled, paused) = {
+                        let (slot_id, max_contracts) = {
                             let s = &st.slots[idx];
-                            (
-                                s.cfg.slot_id,
-                                s.cfg.strategy.clone(),
-                                s.cfg.series.clone(),
-                                s.cfg.max_contracts,
-                                s.cfg.execution_mode.clone(),
-                                s.cfg.enabled,
-                                s.paused,
-                            )
+                            if !s.cfg.enabled || s.paused {
+                                continue;
+                            }
+                            let series_match = if s.cfg.series.is_empty() {
+                                SERIES.iter().any(|&sr| sr == snap.series.as_str())
+                            } else {
+                                s.cfg
+                                    .series
+                                    .iter()
+                                    .any(|sr| sr.eq_ignore_ascii_case(snap.series.as_str()))
+                            };
+                            if !series_match {
+                                continue;
+                            }
+                            (s.cfg.slot_id, s.cfg.max_contracts)
                         };
-                        if !enabled || paused {
-                            continue;
-                        }
-                        let series_match = if series_filter.is_empty() {
-                            SERIES.iter().any(|&s| s == snap.series.as_str())
-                        } else {
-                            series_filter
-                                .iter()
-                                .any(|s| s.eq_ignore_ascii_case(snap.series.as_str()))
-                        };
-                        if !series_match {
-                            continue;
-                        }
                         if st
                             .open_quotes
                             .iter()
                             .any(|rq| rq.order.slot_id == slot_id && rq.order.ticker == ticker)
-                            || st
-                                .settled_or_filled_slot_tickers
-                                .contains(&(slot_id, ticker.to_string()))
+                            || st.has_slot_ticker(slot_id, ticker)
                         {
                             continue;
                         }
+                        let (strat_name, exec_mode) = {
+                            let s = &st.slots[idx];
+                            (s.cfg.strategy.clone(), s.cfg.execution_mode.clone())
+                        };
 
                         let Some(strat) = cached_strats.find(&strat_name) else {
                             continue;
@@ -1603,11 +1734,12 @@ impl ShadowRunner {
                             exec_mode.clone()
                         };
 
-                        let (side_ask_c, side_bid_c, side_bid_sz) = if entry_side == "yes" {
+                        let (side_ask_c, side_bid_c, raw_bid_sz) = if entry_side == "yes" {
                             (ya_c, yb_c, snap.yes_bid_size)
                         } else {
                             (na_c, nb_c, snap.no_bid_size)
                         };
+                        let side_bid_sz = sanitize_non_neg_size(raw_bid_sz);
 
                         let (limit_cents, eff_contracts, taker_exact_cents, taker_slip_cents) =
                             if eff_exec_mode == "taker" {
@@ -1729,8 +1861,7 @@ impl ShadowRunner {
                             reason: None,
                             live_order_id: None,
                         };
-                        st.append_event(post_ev.clone());
-                        publish_runner_sse("quote_posted", &post_ev);
+                        st.append_and_publish(post_ev, "quote_posted");
 
                         if eff_exec_mode == "taker" {
                             let fee_d = taker_fee_dollars(taker_exact_cents / 100.0)
@@ -1887,8 +2018,7 @@ impl ShadowRunner {
                         reason: None,
                         live_order_id: Some(placed.order_id),
                     };
-                    st.append_event(post_ev.clone());
-                    publish_runner_sse("quote_posted", &post_ev);
+                    st.append_and_publish(post_ev, "quote_posted");
 
                     if placed.status == "executed"
                         || (placed.remaining_count == 0 && placed.fill_count > 0)
@@ -1964,7 +2094,14 @@ impl CachedStrategies {
             let mut stem_map = HashMap::new();
             for (i, s) in strats.iter().enumerate() {
                 stem_map.insert(s.name.clone(), i);
-                stem_map.insert(s.name.replace('-', "_"), i);
+                let underscored = s.name.replace('-', "_");
+                if underscored != s.name {
+                    stem_map.insert(underscored, i);
+                }
+                let hyphenated = s.name.replace('_', "-");
+                if hyphenated != s.name {
+                    stem_map.insert(hyphenated, i);
+                }
             }
             self.strategies = strats;
             self.stem_map = stem_map;
@@ -2027,6 +2164,10 @@ pub fn resolve_taker_execution(
     side_ask_c: u8,
     quote_cents: u8,
 ) -> (u8, u32, f64, f64, bool) {
+    if contracts == 0 {
+        let fc = side_ask_c.clamp(1, 99);
+        return (fc, 0, fc as f64, 0.0, false);
+    }
     if let Some(walk) = orderbook.walk_book_fresh(ticker, side, contracts as u64) {
         let fill_c = walk.vwap_cents.round().clamp(1.0, 99.0) as u8;
         let filled_qty = (walk.fillable_qty as u32).min(contracts).max(1);
@@ -2200,6 +2341,111 @@ pub fn entry_quote(yes_ask, no_ask, secs_to_close) { Some(0.55) }
             .expect("expected OrderFilled via midpoint fallback");
         assert_eq!(mid_ev.fill_cents, Some(55));
         assert_eq!(app.orderbook.walk_fallback_count(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restart_clamps_live_auto_and_duplicate_fill_cancel_are_idempotent() {
+        let dir = std::env::temp_dir().join(format!("ob-sr-hard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data_dir = dir.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Write tampered runner_state.json with mode = "live_auto"
+        std::fs::write(
+            state_path(&data_dir),
+            serde_json::json!({
+                "mode": "live_auto",
+                "tick_interval_ms": 100,
+                "cancel_before_close_secs": 30,
+                "bankroll_dollars": 500.0,
+                "slots": [{
+                    "slot_id": 1,
+                    "strategy": "demo-strat",
+                    "series": ["KXBTC15M"],
+                    "max_contracts": 5,
+                    "execution_mode": "maker",
+                    "auto_pause_drawdown_dollars": 25.0,
+                    "enabled": true
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let runner = ShadowRunner::load(&data_dir, 500.0);
+        let snap = runner.status(false, false);
+        assert_eq!(snap.mode, "stopped", "live_auto MUST clamp to stopped on boot");
+        assert!(!snap.live_armed);
+        // Persisted file on disk must also be sanitized.
+        let disk_raw = std::fs::read_to_string(state_path(&data_dir)).unwrap();
+        let disk_v: serde_json::Value = serde_json::from_str(&disk_raw).unwrap();
+        assert_eq!(disk_v["mode"], "stopped");
+
+        // Duplicate fill & duplicate cancel idempotency on same order_id.
+        let order = VirtualOrLiveOrder {
+            order_id: "ob-run-idem-1".to_string(),
+            slot_id: 1,
+            strategy: "demo-strat".to_string(),
+            ticker: "KXBTC15M-IDEM1".to_string(),
+            series: "KXBTC15M".to_string(),
+            mode: "shadow".to_string(),
+            execution_mode: "maker".to_string(),
+            side: "yes".to_string(),
+            limit_cents: 55,
+            contracts: 4,
+            filled_contracts: 0,
+            queue_ahead_initial: 10,
+            queue_ahead_remaining: 10,
+            posted_at: 1_800_000_000,
+            close_epoch: 1_800_000_900,
+            live_order_id: None,
+            status: "resting".to_string(),
+        };
+        {
+            let mut st = runner.state.lock().unwrap();
+            st.record_fill(&order, 55, 0.0, 1.0, 0.02, 1_800_000_005);
+            st.record_fill(&order, 55, 0.0, 1.0, 0.02, 1_800_000_006);
+            // Cancel on an already-filled order_id must be ignored.
+            st.emit_quote_canceled(&order, 1_800_000_007, "late_cancel");
+            assert_eq!(st.total_fills, 1);
+            assert_eq!(st.filled_positions.len(), 1);
+        }
+
+        let cancel_order = VirtualOrLiveOrder {
+            order_id: "ob-run-idem-2".to_string(),
+            ticker: "KXBTC15M-IDEM2".to_string(),
+            ..order
+        };
+        {
+            let mut st = runner.state.lock().unwrap();
+            st.emit_quote_canceled(&cancel_order, 1_800_000_010, "first_cancel");
+            st.emit_quote_canceled(&cancel_order, 1_800_000_011, "second_cancel");
+            st.record_fill(&cancel_order, 55, 0.0, 1.0, 0.02, 1_800_000_012);
+            assert_eq!(st.total_fills, 1);
+        }
+        let ledger = runner.ledger_query(50, None, None);
+        assert_eq!(
+            ledger.entries.iter().filter(|e| e.order_id == "ob-run-idem-1").count(),
+            1
+        );
+        assert_eq!(
+            ledger.entries.iter().filter(|e| e.order_id == "ob-run-idem-2").count(),
+            1
+        );
+
+        // Zero-contract guard in resolve_taker_execution.
+        let ob = OrderbookStore::new(PathBuf::new());
+        let (_, q0, _, _, used0) = resolve_taker_execution(&ob, "KXBTC15M-IDEM1", "yes", 0, 50, 55, 55);
+        assert_eq!(q0, 0);
+        assert!(!used0);
+
+        // Queue depletion bounds with NaN/Inf/negative bid sizes.
+        assert_eq!(sanitize_non_neg_size(f32::NAN), 0.0);
+        assert_eq!(sanitize_non_neg_size(f32::INFINITY), 0.0);
+        assert_eq!(sanitize_non_neg_size(-12.5), 0.0);
+        assert_eq!(sanitize_non_neg_size(42.0), 42.0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

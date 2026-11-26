@@ -1264,6 +1264,7 @@ impl KalshiLiveClient {
 }
 
 fn parse_orderbook_side_levels(val: Option<&serde_json::Value>, dollars: bool) -> Vec<[u64; 2]> {
+    const MAX_LEVEL_QTY: f64 = 1_000_000_000.0;
     let Some(arr) = val.and_then(|v| v.as_array()) else {
         return Vec::new();
     };
@@ -1279,24 +1280,37 @@ fn parse_orderbook_side_levels(val: Option<&serde_json::Value>, dollars: bool) -
             pair[0]
                 .as_f64()
                 .or_else(|| pair[0].as_str().and_then(|s| s.parse::<f64>().ok()))
+                .filter(|d| d.is_finite())
                 .map(|d| (d * 100.0).round())
                 .filter(|p| p.is_finite() && (1.0..=99.0).contains(p))
                 .map(|p| p as u64)
         } else {
             pair[0]
                 .as_u64()
-                .or_else(|| pair[0].as_f64().map(|f| f.round() as u64))
+                .or_else(|| {
+                    pair[0]
+                        .as_f64()
+                        .filter(|f| f.is_finite() && *f >= 1.0 && *f <= 99.0)
+                        .map(|f| f.round() as u64)
+                })
                 .filter(|p| (1..=99).contains(p))
         };
         let qty = pair[1]
             .as_u64()
-            .or_else(|| pair[1].as_f64().map(|f| f.round().max(0.0) as u64))
+            .or_else(|| {
+                pair[1]
+                    .as_f64()
+                    .filter(|f| f.is_finite() && *f >= 0.0)
+                    .map(|f| f.min(MAX_LEVEL_QTY).round() as u64)
+            })
             .or_else(|| {
                 pair[1]
                     .as_str()
                     .and_then(|s| s.parse::<f64>().ok())
-                    .map(|f| f.round().max(0.0) as u64)
-            });
+                    .filter(|f| f.is_finite() && *f >= 0.0)
+                    .map(|f| f.min(MAX_LEVEL_QTY).round() as u64)
+            })
+            .map(|q| q.min(MAX_LEVEL_QTY as u64));
         if let (Some(p), Some(q)) = (price_c, qty) {
             if q > 0 {
                 out.push([p, q]);
