@@ -1619,6 +1619,10 @@ impl Strategy {
                 pav_ev_yes_cents: 0.0,
                 pav_ev_no_cents: 0.0,
                 series: String::new(),
+                slot_position_contracts: 0,
+                slot_avg_entry_cents: 0.0,
+                slot_unrealized_pnl_cents: 0.0,
+                slot_resting_cents: 0,
             };
             if let Some(dec) = self.evaluate_v2(&ctx) {
                 return Some((dec.limit_cents as f64) / 100.0);
@@ -1708,6 +1712,10 @@ impl Strategy {
                         pav_ev_yes_cents: 0.0,
                         pav_ev_no_cents: 0.0,
                         series: String::new(),
+                        slot_position_contracts: 0,
+                        slot_avg_entry_cents: 0.0,
+                        slot_unrealized_pnl_cents: 0.0,
+                        slot_resting_cents: 0,
                     };
                     &owned_fallback
                 }
@@ -7304,6 +7312,550 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 }
             }
         }
+        ("POST", r) if r.starts_with("/api/live/orders/") && r.ends_with("/amend") => {
+            let order_id = &r["/api/live/orders/".len()..r.len() - "/amend".len()];
+            if let Err(e) = kalshi_live::validate_order_id(order_id) {
+                return json_ok_err_response(400, &e);
+            }
+            let parsed = match parse_json_object_body(
+                body,
+                false,
+                "Amend request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let Some(price_u64) = parsed.get("price_cents").and_then(|v| v.as_u64()) else {
+                return json_ok_err_response(400, "price_cents must be an integer in 1..=99");
+            };
+            if !(1..=99).contains(&price_u64) {
+                return json_ok_err_response(
+                    400,
+                    &format!("price_cents must be whole-cent 1..=99, got {price_u64}"),
+                );
+            }
+            let price_cents = price_u64 as u8;
+            let count_opt: Option<u32> = match parsed.get("count") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => match v.as_u64() {
+                    Some(c) if c >= 1 && c <= u32::MAX as u64 => Some(c as u32),
+                    _ => {
+                        return json_ok_err_response(400, "count must be a positive integer >= 1");
+                    }
+                },
+            };
+
+            let (cfg, local_info, local_reserved) = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                if st.rails.killed {
+                    let msg = format!(
+                        "emergency kill switch is engaged ({})",
+                        st.rails.kill_reason.as_deref().unwrap_or("operator halt")
+                    );
+                    return json_ok_err_response(403, &msg);
+                }
+                if !st.rails.live_armed {
+                    return json_ok_err_response(
+                        403,
+                        "live trading is disarmed (live_armed=false); arm explicitly before amending orders",
+                    );
+                }
+                (
+                    st.config.clone(),
+                    st.executions.latest_order_info(order_id),
+                    st.reserved_order_exposure.get(order_id).copied(),
+                )
+            };
+            let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
+                Ok(c) => c,
+                Err(e) => return json_ok_err_response(412, &e),
+            };
+
+            let (ticker, side, action, old_price, old_count) = match local_info {
+                Some((t, s, a, p, c)) => (t, s, a, p, u32::try_from(c.max(1)).unwrap_or(1)),
+                None => {
+                    let orders = match client.get_orders(None) {
+                        Ok(list) => list,
+                        Err(e) => {
+                            let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                            st.rails.last_error = Some(e.clone());
+                            return json_ok_err_response(502, &e);
+                        }
+                    };
+                    let Some(ord) = orders.into_iter().find(|o| o.order_id == order_id) else {
+                        return json_ok_err_response(404, &format!("order {order_id} not found"));
+                    };
+                    if ord.status.eq_ignore_ascii_case("canceled")
+                        || ord.status.eq_ignore_ascii_case("cancelled")
+                        || ord.status.eq_ignore_ascii_case("executed")
+                    {
+                        return json_ok_err_response(
+                            409,
+                            &format!("order {order_id} is {}, cannot amend", ord.status),
+                        );
+                    }
+                    let old_p = if ord.side.eq_ignore_ascii_case("no") {
+                        ord.no_price.or_else(|| ord.yes_price.map(|p| 100 - p))
+                    } else {
+                        ord.yes_price.or_else(|| ord.no_price.map(|p| 100 - p))
+                    }
+                    .unwrap_or(50)
+                    .clamp(1, 99) as u8;
+                    let old_c = if ord.remaining_count > 0 {
+                        ord.remaining_count
+                    } else {
+                        ord.initial_count.max(1)
+                    };
+                    (
+                        ord.ticker,
+                        ord.side,
+                        if ord.action.is_empty() {
+                            "buy".to_string()
+                        } else {
+                            ord.action
+                        },
+                        old_p,
+                        u32::try_from(old_c.max(1)).unwrap_or(1),
+                    )
+                }
+            };
+
+            let target_count = count_opt.unwrap_or(old_count);
+            let old_reserved_eff = local_reserved.unwrap_or_else(|| {
+                if action.eq_ignore_ascii_case("buy") {
+                    (old_count as f64) * (old_price as f64 / 100.0)
+                } else {
+                    0.0
+                }
+            });
+            let is_upward = price_cents > old_price || target_count > old_count;
+
+            let check = {
+                let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                if st.rails.killed {
+                    let msg = format!(
+                        "emergency kill switch is engaged ({})",
+                        st.rails.kill_reason.as_deref().unwrap_or("operator halt")
+                    );
+                    return json_ok_err_response(403, &msg);
+                }
+                if !st.rails.live_armed {
+                    return json_ok_err_response(
+                        403,
+                        "live trading is disarmed (live_armed=false); arm explicitly before amending orders",
+                    );
+                }
+                let intent = risk_rails::LiveOrderIntent {
+                    ticker: ticker.clone(),
+                    action: action.clone(),
+                    side: side.clone(),
+                    count: target_count,
+                    price_cents,
+                    client_order_id: None,
+                    dry_run: false,
+                };
+                if is_upward {
+                    let res = st.rails.check_amend_order(&intent, old_reserved_eff);
+                    if !res.allowed {
+                        let body = format!(
+                            "{{\"ok\":false,\"error\":{},\"rail_violations\":{},\"order_notional_dollars\":{},\"projected_exposure_dollars\":{}}}",
+                            serde_json::to_string(&res.rail_violations.join("; ")).unwrap_or_else(|_| "\"\"".into()),
+                            serde_json::to_string(&res.rail_violations).unwrap_or_else(|_| "[]".into()),
+                            res.order_notional_dollars,
+                            res.projected_exposure_dollars,
+                        );
+                        return json_response(403, &body);
+                    }
+                    res
+                } else {
+                    let new_notional = (target_count as f64) * (price_cents as f64 / 100.0);
+                    let projected = if action.eq_ignore_ascii_case("buy") {
+                        (st.rails.open_exposure_dollars - old_reserved_eff + new_notional).max(0.0)
+                    } else {
+                        st.rails.open_exposure_dollars
+                    };
+                    risk_rails::RiskCheckResult {
+                        allowed: true,
+                        order_notional_dollars: new_notional,
+                        projected_exposure_dollars: projected,
+                        rail_violations: Vec::new(),
+                    }
+                }
+            };
+
+            match client.amend_order_with_side(order_id, Some(&side), price_cents, count_opt) {
+                Ok(amended) => {
+                    let now_ts = now_unix();
+                    let final_price = if side.eq_ignore_ascii_case("no") {
+                        amended.no_price.or_else(|| amended.yes_price.map(|p| 100 - p))
+                    } else {
+                        amended.yes_price.or_else(|| amended.no_price.map(|p| 100 - p))
+                    }
+                    .unwrap_or(price_cents as i64)
+                    .clamp(1, 99) as u8;
+                    let final_count = if amended.remaining_count > 0 {
+                        u32::try_from(amended.remaining_count).unwrap_or(target_count)
+                    } else if amended.initial_count > 0 {
+                        u32::try_from(amended.initial_count).unwrap_or(target_count)
+                    } else {
+                        target_count
+                    };
+                    let snap = {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.connected = true;
+                        st.rails.last_error = None;
+                        if action.eq_ignore_ascii_case("buy") {
+                            let new_reserved =
+                                (final_count as f64) * (final_price as f64 / 100.0);
+                            st.rails
+                                .apply_amended_exposure(old_reserved_eff, new_reserved);
+                            st.reserved_order_exposure
+                                .insert(order_id.to_string(), new_reserved);
+                        }
+                        let cid = amended
+                            .client_order_id
+                            .clone()
+                            .or_else(|| st.executions.client_order_id_for(order_id));
+                        st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                            kind: "order_amended".to_string(),
+                            venue_id: format!(
+                                "{}:{}:{}:{}",
+                                order_id,
+                                kalshi_live::now_millis_string(),
+                                final_price,
+                                final_count
+                            ),
+                            ts: now_ts,
+                            order_id: order_id.to_string(),
+                            client_order_id: cid,
+                            trade_id: None,
+                            ticker: if amended.ticker.is_empty() {
+                                ticker.clone()
+                            } else {
+                                amended.ticker.clone()
+                            },
+                            side: side.clone(),
+                            action: action.clone(),
+                            count: final_count as i64,
+                            price_cents: final_price,
+                            is_taker: None,
+                            fee_dollars: 0.0,
+                            revenue_cents: None,
+                            realized_pnl_dollars: None,
+                        });
+                        st.rails.status_snapshot(&st.config, st.connected)
+                    };
+                    app.runner
+                        .mark_live_order_amended(order_id, final_price, final_count, now_ts);
+                    app.invalidate_live_hot();
+                    let ev = format!(
+                        "{{\"type\":\"live_order\",\"action\":\"amended\",\"order_id\":{},\"ticker\":{},\"price_cents\":{},\"ts\":{}}}",
+                        serde_json::to_string(order_id).unwrap_or_else(|_| "\"\"".to_string()),
+                        serde_json::to_string(&ticker).unwrap_or_else(|_| "\"\"".to_string()),
+                        final_price,
+                        now_ts,
+                    );
+                    tape_hub().publish(ev);
+                    let body = format!(
+                        "{{\"ok\":true,\"order\":{},\"risk_check\":{},\"status\":{}}}",
+                        serde_json::to_string(&amended).unwrap_or_else(|_| "{}".into()),
+                        serde_json::to_string(&check).unwrap_or_else(|_| "{}".into()),
+                        serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()),
+                    );
+                    json_response(200, &body)
+                }
+                Err(e) => {
+                    {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.rails.last_error = Some(e.clone());
+                    }
+                    let code = if e.starts_with("Kalshi HTTP 409:") {
+                        409
+                    } else if e.starts_with("Kalshi HTTP 400:") {
+                        400
+                    } else {
+                        502
+                    };
+                    json_ok_err_response(code, &e)
+                }
+            }
+        }
+        ("POST", r) if r.starts_with("/api/live/positions/") && r.ends_with("/flatten") => {
+            let ticker_raw = &r["/api/live/positions/".len()..r.len() - "/flatten".len()];
+            let ticker = match kalshi_live::validate_ticker(ticker_raw) {
+                Ok(t) => t.to_string(),
+                Err(e) => return json_ok_err_response(400, &e),
+            };
+            let parsed = match parse_json_object_body(
+                body,
+                true,
+                "Flatten request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let req_side: Option<String> = match parsed.get("side") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => match v.as_str().map(|s| s.trim().to_ascii_lowercase()) {
+                    Some(s) if s == "yes" || s == "no" => Some(s),
+                    _ => return json_ok_err_response(400, "side must be \"yes\" or \"no\""),
+                },
+            };
+            let req_price_cents: Option<u8> = match parsed.get("price_cents") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => match v.as_u64() {
+                    Some(p) if (1..=99).contains(&p) => Some(p as u8),
+                    _ => {
+                        return json_ok_err_response(400, "price_cents must be whole-cent 1..=99");
+                    }
+                },
+            };
+            let post_only = match parsed.get("post_only") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(_) => {
+                    return json_ok_err_response(400, "post_only must be a boolean");
+                }
+            };
+
+            let cfg = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                if st.rails.killed {
+                    let msg = format!(
+                        "emergency kill switch is engaged ({})",
+                        st.rails.kill_reason.as_deref().unwrap_or("operator halt")
+                    );
+                    return json_ok_err_response(403, &msg);
+                }
+                if !st.rails.live_armed {
+                    return json_ok_err_response(
+                        403,
+                        "live trading is disarmed (live_armed=false); arm explicitly before flattening positions",
+                    );
+                }
+                if st.rails.is_venue_sync_stale(now_unix()) {
+                    return json_ok_err_response(
+                        403,
+                        "refusing position flatten: venue sync is stale (>30s) or pending; reconcile first",
+                    );
+                }
+                st.config.clone()
+            };
+            let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
+                Ok(c) => c,
+                Err(e) => return json_ok_err_response(412, &e),
+            };
+            let positions = match client.get_positions() {
+                Ok(p) => p,
+                Err(e) => {
+                    let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                    st.rails.last_error = Some(e.clone());
+                    return json_ok_err_response(502, &e);
+                }
+            };
+            let net_pos = positions
+                .iter()
+                .find(|p| p.ticker == ticker)
+                .map(|p| p.position)
+                .unwrap_or(0);
+            if net_pos == 0 {
+                return json_ok_err_response(
+                    404,
+                    &format!("no open venue position for {ticker}"),
+                );
+            }
+            let (open_side, open_count) = if net_pos > 0 {
+                ("yes".to_string(), u32::try_from(net_pos).unwrap_or(u32::MAX))
+            } else {
+                (
+                    "no".to_string(),
+                    u32::try_from(net_pos.saturating_neg()).unwrap_or(u32::MAX),
+                )
+            };
+            if let Some(ref wanted_side) = req_side {
+                if wanted_side != &open_side {
+                    return json_ok_err_response(
+                        400,
+                        &format!(
+                            "open position for {ticker} is {open_side}, cannot flatten {wanted_side}"
+                        ),
+                    );
+                }
+            }
+
+            let limit_cents = match req_price_cents {
+                Some(p) => p,
+                None => {
+                    let ob = app.orderbook.snapshot(&ticker);
+                    let ob_bid = if !ob.stale && !ob.needs_resync && ob.source != "empty" {
+                        if open_side == "yes" {
+                            ob.best_yes_bid
+                        } else {
+                            ob.no_bids.first().map(|l| l.price_cents)
+                        }
+                    } else {
+                        None
+                    };
+                    ob_bid
+                        .or_else(|| {
+                            client.get_market_orderbook(&ticker).ok().and_then(|book| {
+                                let levels = if open_side == "yes" {
+                                    &book.yes
+                                } else {
+                                    &book.no
+                                };
+                                levels
+                                    .iter()
+                                    .map(|l| l[0])
+                                    .max()
+                                    .and_then(|c| u8::try_from(c).ok())
+                                    .filter(|c| (1..=99).contains(c))
+                            })
+                        })
+                        .or_else(|| {
+                            let tape = app.tape(&app.live_snapshots_path);
+                            tape.grouped.get(ticker.as_str()).and_then(|snaps| {
+                                snaps.last().and_then(|s| {
+                                    let p = if open_side == "yes" {
+                                        s.yes_bid.get()
+                                    } else {
+                                        s.no_bid.get()
+                                    }?;
+                                    let c = (p * 100.0).round() as i64;
+                                    if (1..=99).contains(&c) {
+                                        Some(c as u8)
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                        })
+                        .unwrap_or(if post_only { 50 } else { 1 })
+                }
+            };
+
+            let intent = risk_rails::LiveOrderIntent {
+                ticker: ticker.clone(),
+                action: "sell".to_string(),
+                side: open_side.clone(),
+                count: open_count,
+                price_cents: limit_cents,
+                client_order_id: None,
+                dry_run: false,
+            };
+            let auth_res = {
+                let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                if st.rails.killed {
+                    let msg = format!(
+                        "emergency kill switch is engaged ({})",
+                        st.rails.kill_reason.as_deref().unwrap_or("operator halt")
+                    );
+                    return json_ok_err_response(403, &msg);
+                }
+                if !st.rails.live_armed {
+                    return json_ok_err_response(
+                        403,
+                        "live trading is disarmed (live_armed=false); arm explicitly before flattening positions",
+                    );
+                }
+                if st.rails.is_venue_sync_stale(now_unix()) {
+                    return json_ok_err_response(
+                        403,
+                        "refusing position flatten: venue sync is stale (>30s) or pending; reconcile first",
+                    );
+                }
+                st.rails.authorize_order(&intent)
+            };
+            let (kalshi_req, check) = match auth_res {
+                Ok((base_req, check)) => {
+                    if post_only {
+                        match kalshi_live::KalshiOrderRequest::maker_limit(
+                            &intent.ticker,
+                            &intent.action,
+                            &intent.side,
+                            intent.count,
+                            intent.price_cents,
+                            Some(base_req.client_order_id),
+                        ) {
+                            Ok(maker_req) => (maker_req, check),
+                            Err(e) => return json_ok_err_response(400, &e),
+                        }
+                    } else {
+                        (base_req, check)
+                    }
+                }
+                Err(check) => {
+                    let body = format!(
+                        "{{\"ok\":false,\"error\":{},\"rail_violations\":{},\"order_notional_dollars\":{},\"projected_exposure_dollars\":{}}}",
+                        serde_json::to_string(&check.rail_violations.join("; ")).unwrap_or_else(|_| "\"\"".into()),
+                        serde_json::to_string(&check.rail_violations).unwrap_or_else(|_| "[]".into()),
+                        check.order_notional_dollars,
+                        check.projected_exposure_dollars,
+                    );
+                    return json_response(403, &body);
+                }
+            };
+
+            match client.place_order(&kalshi_req) {
+                Ok(order) => {
+                    let now_ts = now_unix();
+                    let snap = {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.connected = true;
+                        st.rails.last_error = None;
+                        st.rails
+                            .record_submitted_order("sell", check.order_notional_dollars);
+                        st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                            kind: "order_submitted".to_string(),
+                            venue_id: order.order_id.clone(),
+                            ts: now_ts,
+                            order_id: order.order_id.clone(),
+                            client_order_id: order
+                                .client_order_id
+                                .clone()
+                                .or_else(|| Some(kalshi_req.client_order_id.clone())),
+                            trade_id: None,
+                            ticker: ticker.clone(),
+                            side: open_side.clone(),
+                            action: "sell".to_string(),
+                            count: open_count as i64,
+                            price_cents: limit_cents,
+                            is_taker: Some(!post_only),
+                            fee_dollars: 0.0,
+                            revenue_cents: None,
+                            realized_pnl_dollars: None,
+                        });
+                        st.rails.status_snapshot(&st.config, st.connected)
+                    };
+                    app.invalidate_live_hot();
+                    let ev = format!(
+                        "{{\"type\":\"live_order\",\"action\":\"flattened\",\"order_id\":{},\"ticker\":{},\"side\":{},\"count\":{},\"ts\":{}}}",
+                        serde_json::to_string(&order.order_id).unwrap_or_else(|_| "\"\"".to_string()),
+                        serde_json::to_string(&ticker).unwrap_or_else(|_| "\"\"".to_string()),
+                        serde_json::to_string(&open_side).unwrap_or_else(|_| "\"\"".to_string()),
+                        open_count,
+                        now_ts,
+                    );
+                    tape_hub().publish(ev);
+                    let body = format!(
+                        "{{\"ok\":true,\"order\":{},\"risk_check\":{},\"status\":{},\"flattened_contracts\":{},\"side\":{}}}",
+                        serde_json::to_string(&order).unwrap_or_else(|_| "{}".into()),
+                        serde_json::to_string(&check).unwrap_or_else(|_| "{}".into()),
+                        serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()),
+                        open_count,
+                        serde_json::to_string(&open_side).unwrap_or_else(|_| "\"\"".into()),
+                    );
+                    json_response(200, &body)
+                }
+                Err(e) => {
+                    {
+                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.rails.last_error = Some(e.clone());
+                    }
+                    json_ok_err_response(502, &e)
+                }
+            }
+        }
         ("DELETE", r) if r.starts_with("/api/live/orders/") => {
             let order_id = &r["/api/live/orders/".len()..];
             if let Err(e) = kalshi_live::validate_order_id(order_id) {
@@ -8752,11 +9304,32 @@ fn main() {
                                     let _ = stream.write_all(response.as_bytes());
                                     break;
                                 }
+                                let is_e1_live_mutation = !matches!(method.as_str(), "GET" | "HEAD")
+                                    && ((route.starts_with("/api/live/orders/")
+                                        && route.ends_with("/amend"))
+                                        || (route.starts_with("/api/live/positions/")
+                                            && route.ends_with("/flatten")));
+                                if is_e1_live_mutation {
+                                    let csrf = headers
+                                        .iter()
+                                        .find(|(n, _)| n == "x-openbell-csrf")
+                                        .map(|(_, v)| v.trim())
+                                        .unwrap_or("");
+                                    if csrf != "1" {
+                                        let response = json_err_response(
+                                            403,
+                                            "mutations require X-OpenBell-CSRF: 1",
+                                        );
+                                        let _ = stream.write_all(response.as_bytes());
+                                        break;
+                                    }
+                                }
                                 if (route == "/api/runner"
                                     || route.starts_with("/api/runner/")
                                     || route == "/api/orderbook/subscribe"
                                     || route == "/api/live/reconcile"
-                                    || route == "/api/live/reset-kill")
+                                    || route == "/api/live/reset-kill"
+                                    || is_e1_live_mutation)
                                     && !matches!(method.as_str(), "GET" | "HEAD")
                                 {
                                     let ct = headers

@@ -72,13 +72,21 @@ pub struct TickContext {
     pub pav_ev_yes_cents: f64,
     pub pav_ev_no_cents: f64,
     pub series: String,
+    #[serde(default)]
+    pub slot_position_contracts: i64,
+    #[serde(default)]
+    pub slot_avg_entry_cents: f64,
+    #[serde(default)]
+    pub slot_unrealized_pnl_cents: f64,
+    #[serde(default)]
+    pub slot_resting_cents: i64,
 }
 
 impl TickContext {
     /// Convert this `TickContext` into a Rune dynamic `Object` so scripts can
     /// read `ctx.yes_ask`, `ctx.pav_ev_yes_cents`, `ctx.book_imbalance`, etc.
     pub fn to_rune_object(&self) -> Result<rune::runtime::Object, String> {
-        let mut obj = rune::runtime::Object::with_capacity(20)
+        let mut obj = rune::runtime::Object::with_capacity(24)
             .map_err(|e| format!("rune object alloc failed: {e}"))?;
         fn insert_val<T: rune::runtime::ToValue>(
             obj: &mut rune::runtime::Object,
@@ -113,6 +121,18 @@ impl TickContext {
         let rv = rune::alloc::String::try_from(self.series.as_str())
             .map_err(|e| format!("rune string alloc failed: {e}"))?;
         insert_val(&mut obj, "series", rv)?;
+        insert_val(
+            &mut obj,
+            "slot_position_contracts",
+            self.slot_position_contracts,
+        )?;
+        insert_val(&mut obj, "slot_avg_entry_cents", self.slot_avg_entry_cents)?;
+        insert_val(
+            &mut obj,
+            "slot_unrealized_pnl_cents",
+            self.slot_unrealized_pnl_cents,
+        )?;
+        insert_val(&mut obj, "slot_resting_cents", self.slot_resting_cents)?;
         Ok(obj)
     }
 }
@@ -281,6 +301,10 @@ impl CausalFeatureTracker {
             pav_ev_yes_cents,
             pav_ev_no_cents,
             series: snap.series.to_string(),
+            slot_position_contracts: 0,
+            slot_avg_entry_cents: 0.0,
+            slot_unrealized_pnl_cents: 0.0,
+            slot_resting_cents: 0,
         })
     }
 }
@@ -464,6 +488,10 @@ fn sample_boundary_contexts() -> Vec<TickContext> {
             pav_ev_yes_cents: 2.53,
             pav_ev_no_cents: -7.52,
             series: "KXBTC15M".to_string(),
+            slot_position_contracts: 0,
+            slot_avg_entry_cents: 0.0,
+            slot_unrealized_pnl_cents: 0.0,
+            slot_resting_cents: 0,
         },
         TickContext {
             yes_bid: 0.49,
@@ -486,6 +514,10 @@ fn sample_boundary_contexts() -> Vec<TickContext> {
             pav_ev_yes_cents: -1.75,
             pav_ev_no_cents: -3.75,
             series: "KXETH15M".to_string(),
+            slot_position_contracts: 0,
+            slot_avg_entry_cents: 0.0,
+            slot_unrealized_pnl_cents: 0.0,
+            slot_resting_cents: 0,
         },
         TickContext {
             yes_bid: 0.01,
@@ -508,6 +540,10 @@ fn sample_boundary_contexts() -> Vec<TickContext> {
             pav_ev_yes_cents: 0.93,
             pav_ev_no_cents: -1.07,
             series: "KXSOL15M".to_string(),
+            slot_position_contracts: 0,
+            slot_avg_entry_cents: 0.0,
+            slot_unrealized_pnl_cents: 0.0,
+            slot_resting_cents: 0,
         },
         TickContext {
             yes_bid: 0.97,
@@ -530,6 +566,10 @@ fn sample_boundary_contexts() -> Vec<TickContext> {
             pav_ev_yes_cents: -1.07,
             pav_ev_no_cents: -0.14,
             series: "KXXRP15M".to_string(),
+            slot_position_contracts: 0,
+            slot_avg_entry_cents: 0.0,
+            slot_unrealized_pnl_cents: 0.0,
+            slot_resting_cents: 0,
         },
     ]
 }
@@ -1292,6 +1332,10 @@ mod tests {
         assert!((full[2].delta_60s_cents - 4.0).abs() < 1e-9);
         assert!(full[2].window_vol_cents > 0.0);
         assert!((full[2].book_imbalance - (50.0 / 70.0)).abs() < 1e-12);
+        assert_eq!(full[2].slot_position_contracts, 0);
+        assert_eq!(full[2].slot_avg_entry_cents, 0.0);
+        assert_eq!(full[2].slot_unrealized_pnl_cents, 0.0);
+        assert_eq!(full[2].slot_resting_cents, 0);
     }
 
     #[test]

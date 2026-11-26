@@ -556,6 +556,42 @@ impl RiskRailsState {
         }
     }
 
+    /// Evaluate `check_order` for an order amendment after backing out the order's
+    /// currently reserved exposure so it is not double-counted against exposure caps.
+    pub fn check_amend_order(
+        &mut self,
+        intent: &LiveOrderIntent,
+        existing_reserved_dollars: f64,
+    ) -> RiskCheckResult {
+        let prev_open = self.open_exposure_dollars;
+        let credit = if existing_reserved_dollars.is_finite() && existing_reserved_dollars > 0.0 {
+            existing_reserved_dollars
+        } else {
+            0.0
+        };
+        self.open_exposure_dollars = (prev_open - credit).max(0.0);
+        let res = self.check_order(intent);
+        self.open_exposure_dollars = prev_open;
+        res
+    }
+
+    /// Update open exposure after an accepted order amendment replaces `old_reserved`
+    /// with `new_reserved`.
+    pub fn apply_amended_exposure(&mut self, old_reserved_dollars: f64, new_reserved_dollars: f64) {
+        let old_safe = if old_reserved_dollars.is_finite() && old_reserved_dollars > 0.0 {
+            old_reserved_dollars
+        } else {
+            0.0
+        };
+        let new_safe = if new_reserved_dollars.is_finite() && new_reserved_dollars > 0.0 {
+            new_reserved_dollars
+        } else {
+            0.0
+        };
+        self.open_exposure_dollars = (self.open_exposure_dollars - old_safe + new_safe).max(0.0);
+        self.persist_if_backed();
+    }
+
     /// Fail-closed check of a `LiveOrderIntent` against every configured risk rail.
     ///
     /// When `intent.dry_run == true`, evaluates every numeric/prefix/kill-switch rail
@@ -1042,8 +1078,31 @@ impl LiveExecutionLedger {
     pub fn submitted_notional_for(&self, order_id: &str) -> Option<f64> {
         self.records
             .iter()
-            .find(|r| r.kind == "order_submitted" && r.order_id == order_id)
+            .rfind(|r| {
+                (r.kind == "order_submitted" || r.kind == "order_amended")
+                    && r.order_id == order_id
+            })
             .map(|r| (r.count.max(0) as f64) * (r.price_cents as f64 / 100.0))
+    }
+
+    /// Return the latest known `(ticker, side, action, price_cents, count)` for an order
+    /// from `order_amended` / `order_submitted` records.
+    pub fn latest_order_info(&self, order_id: &str) -> Option<(String, String, String, u8, i64)> {
+        self.records
+            .iter()
+            .rfind(|r| {
+                (r.kind == "order_amended" || r.kind == "order_submitted")
+                    && r.order_id == order_id
+            })
+            .map(|r| {
+                (
+                    r.ticker.clone(),
+                    r.side.clone(),
+                    r.action.clone(),
+                    r.price_cents,
+                    r.count,
+                )
+            })
     }
 
     /// Compute UTC-day P&L, loss, and fee breakdown from persisted `live_executions.jsonl`.
@@ -1548,5 +1607,45 @@ mod tests {
         assert_eq!(reloaded.records()[1].venue_id, "tr-new-2");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn amend_order_rail_check_credits_existing_reserved_exposure() {
+        let rails = RiskRailsConfig {
+            max_order_contracts: 20,
+            max_order_dollars: 20.0,
+            max_open_exposure_dollars: 10.0,
+            ..Default::default()
+        };
+        let mut st = RiskRailsState::new(rails);
+        st.arm(true, true).unwrap();
+        // Initial order: 10 @ 60c = $6.00 reserved.
+        st.record_submitted_order("buy", 6.0);
+        assert!((st.open_exposure_dollars - 6.0).abs() < 1e-9);
+
+        // Amend to 10 @ 80c = $8.00 (within $10 max_open_exposure once $6.00 is credited).
+        let ok_intent = LiveOrderIntent {
+            ticker: "KXBTC15M-AM1".to_string(),
+            action: "buy".to_string(),
+            side: "yes".to_string(),
+            count: 10,
+            price_cents: 80,
+            client_order_id: None,
+            dry_run: false,
+        };
+        let chk_ok = st.check_amend_order(&ok_intent, 6.0);
+        assert!(chk_ok.allowed, "unexpected rail violations: {:?}", chk_ok.rail_violations);
+        assert!((st.open_exposure_dollars - 6.0).abs() < 1e-9);
+
+        // Amend to 15 @ 80c = $12.00 (> $10 max_open_exposure) MUST be blocked!
+        let bad_intent = LiveOrderIntent {
+            count: 15,
+            ..ok_intent
+        };
+        let chk_bad = st.check_amend_order(&bad_intent, 6.0);
+        assert!(!chk_bad.allowed);
+
+        st.apply_amended_exposure(6.0, 8.0);
+        assert!((st.open_exposure_dollars - 8.0).abs() < 1e-9);
     }
 }

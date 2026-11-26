@@ -680,7 +680,7 @@ pub fn build_ws_signing_message(timestamp_ms: &str, ws_path: Option<&str>) -> St
     format!("{}GET{}", timestamp_ms.trim(), normalized)
 }
 
-fn now_millis_string() -> String {
+pub fn now_millis_string() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis().to_string())
@@ -1325,6 +1325,73 @@ impl KalshiLiveClient {
         let safe_id = validate_order_id(order_id)?;
         let path = format!("/portfolio/orders/{safe_id}");
         self.request_json("DELETE", &path, None)
+    }
+
+    /// Amend a resting order's limit price (whole-cent `1..=99`) and optional count
+    /// via `POST /portfolio/orders/{id}/amend`.
+    pub fn amend_order(
+        &self,
+        order_id: &str,
+        price_cents: u8,
+        count: Option<u32>,
+    ) -> Result<KalshiOrder, String> {
+        self.amend_order_with_side(order_id, None, price_cents, count)
+    }
+
+    /// Amend a resting order with explicit side (`"yes"` or `"no"`) when known,
+    /// sending the appropriate price field alongside `price_cents`.
+    pub fn amend_order_with_side(
+        &self,
+        order_id: &str,
+        side: Option<&str>,
+        price_cents: u8,
+        count: Option<u32>,
+    ) -> Result<KalshiOrder, String> {
+        let safe_id = validate_order_id(order_id)?;
+        if !(1..=99).contains(&price_cents) {
+            return Err(format!("price_cents must be 1..=99, got {price_cents}"));
+        }
+        if let Some(c) = count {
+            if c == 0 {
+                return Err("count must be >= 1".to_string());
+            }
+        }
+        let price_key = match side.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("no") => "no_price",
+            _ => "yes_price",
+        };
+        let mut payload = serde_json::json!({
+            price_key: price_cents,
+            "price_cents": price_cents,
+        });
+        if let Some(c) = count {
+            payload["count"] = serde_json::json!(c);
+        }
+        let path = format!("/portfolio/orders/{safe_id}/amend");
+        let val = self.request_json("POST", &path, Some(&payload))?;
+        let obj = val
+            .get("order")
+            .or_else(|| val.get("new_order"))
+            .unwrap_or(&val);
+        parse_kalshi_order(obj)
+            .ok_or_else(|| "Kalshi amend response missing order object".to_string())
+    }
+
+    /// Decrease a resting order's remaining contract count via
+    /// `POST /portfolio/orders/{id}/decrease`.
+    pub fn decrease_order(&self, order_id: &str, reduce_by: u32) -> Result<KalshiOrder, String> {
+        let safe_id = validate_order_id(order_id)?;
+        if reduce_by == 0 {
+            return Err("reduce_by must be >= 1".to_string());
+        }
+        let payload = serde_json::json!({
+            "reduce_by": reduce_by,
+        });
+        let path = format!("/portfolio/orders/{safe_id}/decrease");
+        let val = self.request_json("POST", &path, Some(&payload))?;
+        let obj = val.get("order").unwrap_or(&val);
+        parse_kalshi_order(obj)
+            .ok_or_else(|| "Kalshi decrease response missing order object".to_string())
     }
 
     /// Fetch L2 orderbook levels for a single market (`GET /markets/{ticker}/orderbook`).
@@ -2423,5 +2490,127 @@ pub(crate) mod tests {
         assert_eq!(settle_reqs.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         drop(handle);
+    }
+
+    #[test]
+    fn amend_and_decrease_order_validation_and_signed_requests() {
+        let (priv_pem, _pub_pem, pub_der) = generate_ephemeral_test_rsa();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pub_der_srv = pub_der;
+
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let mut headers = std::collections::HashMap::new();
+                let mut content_len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':') {
+                        let kl = k.trim().to_ascii_lowercase();
+                        let val = v.trim().to_string();
+                        if kl == "content-length" {
+                            content_len = val.parse().unwrap_or(0);
+                        }
+                        headers.insert(kl, val);
+                    }
+                }
+                let mut body = vec![0u8; content_len];
+                if content_len > 0 {
+                    let _ = reader.read_exact(&mut body);
+                }
+                let ts = headers.get("kalshi-access-timestamp").cloned().unwrap_or_default();
+                let sig_b64 = headers.get("kalshi-access-signature").cloned().unwrap_or_default();
+                let expected_msg = build_signing_message(&ts, &method, &path);
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let sig_raw = base64::engine::general_purpose::STANDARD
+                        .decode(&sig_b64)
+                        .expect("base64 sig");
+                    let pk = ring::signature::UnparsedPublicKey::new(
+                        &ring::signature::RSA_PSS_2048_8192_SHA256,
+                        &pub_der_srv,
+                    );
+                    pk.verify(expected_msg.as_bytes(), &sig_raw)
+                        .expect("verified RSA-PSS signature");
+                }
+                let req_v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let resp_json = if path.ends_with("/amend") {
+                    assert_eq!(req_v["yes_price"], 66);
+                    assert_eq!(req_v["count"], 4);
+                    serde_json::json!({
+                        "order": {
+                            "order_id": "ord-am-1",
+                            "ticker": "KXBTC15M-TEST",
+                            "status": "resting",
+                            "action": "buy",
+                            "side": "yes",
+                            "type": "limit",
+                            "yes_price": 66,
+                            "initial_count": 4,
+                            "remaining_count": 4,
+                            "fill_count": 0
+                        }
+                    })
+                } else {
+                    assert_eq!(req_v["reduce_by"], 2);
+                    serde_json::json!({
+                        "order": {
+                            "order_id": "ord-am-1",
+                            "ticker": "KXBTC15M-TEST",
+                            "status": "resting",
+                            "action": "buy",
+                            "side": "yes",
+                            "type": "limit",
+                            "yes_price": 66,
+                            "initial_count": 4,
+                            "remaining_count": 2,
+                            "fill_count": 0
+                        }
+                    })
+                };
+                let body_str = resp_json.to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
+                    body_str.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let client = KalshiLiveClient::from_parts(
+            "amend-key-1234",
+            &priv_pem,
+            KalshiEnv::Demo,
+            &format!("http://{addr}/trade-api/v2"),
+        )
+        .unwrap();
+
+        assert!(client.amend_order("../evil", 50, None).is_err());
+        assert!(client.amend_order("ord-am-1", 0, None).is_err());
+        assert!(client.amend_order("ord-am-1", 100, None).is_err());
+        assert!(client.amend_order("ord-am-1", 66, Some(0)).is_err());
+        assert!(client.decrease_order("../evil", 1).is_err());
+        assert!(client.decrease_order("ord-am-1", 0).is_err());
+
+        let amended = client.amend_order("ord-am-1", 66, Some(4)).unwrap();
+        assert_eq!(amended.yes_price, Some(66));
+        assert_eq!(amended.remaining_count, 4);
+
+        let decreased = client.decrease_order("ord-am-1", 2).unwrap();
+        assert_eq!(decreased.remaining_count, 2);
+
+        handle.join().unwrap();
     }
 }

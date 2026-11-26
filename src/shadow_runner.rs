@@ -98,10 +98,24 @@ pub struct RunnerSlotConfig {
     pub auto_pause_drawdown_dollars: f64,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub reprice_cooldown_secs: u64,
+    #[serde(default)]
+    pub max_replaces_per_window: u32,
+    #[serde(default)]
+    pub take_profit_cents: Option<u8>,
+    #[serde(default)]
+    pub stop_loss_cents: Option<u8>,
+    #[serde(default)]
+    pub exit_before_close_secs: u64,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_buy_action() -> String {
+    "buy".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -162,6 +176,11 @@ pub struct RunnerSlotState {
     pub execution_mode: String,
     pub auto_pause_drawdown_dollars: f64,
     pub enabled: bool,
+    pub reprice_cooldown_secs: u64,
+    pub max_replaces_per_window: u32,
+    pub take_profit_cents: Option<u8>,
+    pub stop_loss_cents: Option<u8>,
+    pub exit_before_close_secs: u64,
     pub paused: bool,
     pub pause_reason: Option<String>,
     pub open_quotes_count: usize,
@@ -181,6 +200,8 @@ pub struct VirtualOrLiveOrder {
     pub series: String,
     pub mode: String,
     pub execution_mode: String,
+    #[serde(default = "default_buy_action")]
+    pub action: String,
     pub side: String,
     pub limit_cents: u8,
     pub contracts: u32,
@@ -191,6 +212,8 @@ pub struct VirtualOrLiveOrder {
     pub close_epoch: i64,
     pub live_order_id: Option<String>,
     pub status: String,
+    #[serde(default)]
+    pub replace_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +278,8 @@ pub struct LedgerEvent {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_order_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +321,7 @@ struct RestingQuote {
     last_bid_cents: u8,
     last_l2_updated_ms: i64,
     last_l2_trade_ms: Option<i64>,
+    last_replaced_at: i64,
     replay_mode: bool,
 }
 
@@ -313,6 +339,8 @@ struct FilledPosition {
     contracts: u32,
     fee_dollars: f64,
     live_order_id: Option<String>,
+    close_epoch: i64,
+    replay_mode: bool,
 }
 
 struct RunnerState {
@@ -360,6 +388,33 @@ struct PendingLiveOrderIntent {
     posted_at: i64,
     close_epoch: i64,
     client_order_id: String,
+    replay_mode: bool,
+}
+
+struct PendingLiveAmend {
+    order_id: String,
+    live_order_id: String,
+    ticker: String,
+    side: String,
+    action: String,
+    old_limit_cents: u8,
+    new_limit_cents: u8,
+    contracts: u32,
+    eval_ts: i64,
+}
+
+struct PendingLiveExit {
+    slot_id: usize,
+    strategy: String,
+    ticker: String,
+    series: String,
+    side: String,
+    contracts: u32,
+    limit_cents: u8,
+    client_order_id: String,
+    reason: String,
+    eval_ts: i64,
+    close_epoch: i64,
     replay_mode: bool,
 }
 
@@ -415,6 +470,40 @@ fn normalize_slot(slot: &RunnerSlotConfig) -> Result<RunnerSlotConfig, String> {
             slot.slot_id
         ));
     }
+    if slot.reprice_cooldown_secs > 3600 {
+        return Err(format!(
+            "slot {} reprice_cooldown_secs must be <= 3600",
+            slot.slot_id
+        ));
+    }
+    if slot.max_replaces_per_window > 100 {
+        return Err(format!(
+            "slot {} max_replaces_per_window must be <= 100",
+            slot.slot_id
+        ));
+    }
+    if let Some(tp) = slot.take_profit_cents {
+        if !(1..=99).contains(&tp) {
+            return Err(format!(
+                "slot {} take_profit_cents must be 1..=99",
+                slot.slot_id
+            ));
+        }
+    }
+    if let Some(sl) = slot.stop_loss_cents {
+        if !(1..=99).contains(&sl) {
+            return Err(format!(
+                "slot {} stop_loss_cents must be 1..=99",
+                slot.slot_id
+            ));
+        }
+    }
+    if slot.exit_before_close_secs > 3600 {
+        return Err(format!(
+            "slot {} exit_before_close_secs must be <= 3600",
+            slot.slot_id
+        ));
+    }
     let series: Vec<String> = slot
         .series
         .iter()
@@ -429,6 +518,11 @@ fn normalize_slot(slot: &RunnerSlotConfig) -> Result<RunnerSlotConfig, String> {
         execution_mode: exec_mode,
         auto_pause_drawdown_dollars: slot.auto_pause_drawdown_dollars,
         enabled: slot.enabled,
+        reprice_cooldown_secs: slot.reprice_cooldown_secs,
+        max_replaces_per_window: slot.max_replaces_per_window,
+        take_profit_cents: slot.take_profit_cents,
+        stop_loss_cents: slot.stop_loss_cents,
+        exit_before_close_secs: slot.exit_before_close_secs,
     })
 }
 
@@ -622,8 +716,207 @@ impl RunnerState {
             result: None,
             reason: Some(reason.to_string()),
             live_order_id: q.live_order_id.clone(),
+            action: Some(q.action.clone()),
         };
         self.append_and_publish(ev, "quote_canceled");
+    }
+
+    fn emit_order_amended(
+        &mut self,
+        q: &VirtualOrLiveOrder,
+        ts: i64,
+        reason: &str,
+    ) {
+        let ev = LedgerEvent {
+            seq: 0,
+            ts,
+            event: "OrderAmended".to_string(),
+            mode: q.mode.clone(),
+            slot_id: q.slot_id,
+            strategy: q.strategy.clone(),
+            ticker: q.ticker.clone(),
+            series: q.series.clone(),
+            order_id: q.order_id.clone(),
+            side: q.side.clone(),
+            execution_mode: q.execution_mode.clone(),
+            limit_cents: q.limit_cents,
+            fill_cents: None,
+            contracts: q.contracts.saturating_sub(q.filled_contracts),
+            slippage_cents: None,
+            queue_wait_secs: None,
+            fee_dollars: None,
+            realized_pnl_dollars: None,
+            result: None,
+            reason: Some(reason.to_string()),
+            live_order_id: q.live_order_id.clone(),
+            action: Some(q.action.clone()),
+        };
+        self.append_and_publish(ev, "order_amended");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_slot_realized_pnl(
+        &mut self,
+        slot_id: usize,
+        net_pnl: f64,
+        mode: &str,
+        ticker: &str,
+        series: &str,
+        ts: i64,
+    ) {
+        let mut pause_trigger: Option<(usize, String, String, f64, f64)> = None;
+        if let Some(slot) = self.slots.iter_mut().find(|s| s.cfg.slot_id == slot_id) {
+            slot.realized_pnl_dollars += net_pnl;
+            if slot.realized_pnl_dollars > slot.peak_realized_pnl_dollars {
+                slot.peak_realized_pnl_dollars = slot.realized_pnl_dollars;
+            }
+            let drawdown = slot.peak_realized_pnl_dollars - slot.realized_pnl_dollars;
+            if slot.cfg.auto_pause_drawdown_dollars > 0.0
+                && drawdown >= slot.cfg.auto_pause_drawdown_dollars - 1e-9
+                && !slot.paused
+            {
+                let reason = format!(
+                    "auto-paused: realized drawdown ${drawdown:.2} >= limit ${:.2}",
+                    slot.cfg.auto_pause_drawdown_dollars
+                );
+                slot.paused = true;
+                slot.pause_reason = Some(reason.clone());
+                pause_trigger = Some((
+                    slot.cfg.slot_id,
+                    slot.cfg.strategy.clone(),
+                    reason,
+                    drawdown,
+                    slot.realized_pnl_dollars,
+                ));
+            }
+        }
+        if let Some((slot_id, strategy, reason, _dd, slot_pnl)) = pause_trigger {
+            let mut kept = Vec::with_capacity(self.open_quotes.len());
+            let mut paused_quotes = Vec::new();
+            for rq in self.open_quotes.drain(..) {
+                if rq.order.slot_id == slot_id {
+                    paused_quotes.push(rq.order);
+                } else {
+                    kept.push(rq);
+                }
+            }
+            self.open_quotes = kept;
+            for q in paused_quotes {
+                self.emit_quote_canceled(&q, ts, "slot_auto_paused");
+            }
+            let pause_ev = LedgerEvent {
+                seq: 0,
+                ts,
+                event: "SlotPaused".to_string(),
+                mode: mode.to_string(),
+                slot_id,
+                strategy,
+                ticker: ticker.to_string(),
+                series: series.to_string(),
+                order_id: String::new(),
+                side: String::new(),
+                execution_mode: String::new(),
+                limit_cents: 0,
+                fill_cents: None,
+                contracts: 0,
+                slippage_cents: None,
+                queue_wait_secs: None,
+                fee_dollars: None,
+                realized_pnl_dollars: Some(slot_pnl),
+                result: None,
+                reason: Some(reason),
+                live_order_id: None,
+                action: None,
+            };
+            self.append_and_publish(pause_ev, "slot_auto_paused");
+            let _ = self.persist_state();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn close_filled_positions_on_exit(
+        &mut self,
+        slot_id: usize,
+        ticker: &str,
+        side: &str,
+        exit_contracts: u32,
+        exit_cents: u8,
+        exit_exact_cents: f64,
+        exit_fee_dollars: f64,
+        exit_order_id: &str,
+        live_order_id: Option<String>,
+        mode: &str,
+        strategy: &str,
+        series: &str,
+        execution_mode: &str,
+        limit_cents: u8,
+        reason: &str,
+        ts: i64,
+    ) {
+        let mut remaining_to_close = exit_contracts;
+        let mut entry_cost = 0.0f64;
+        let mut entry_fee = 0.0f64;
+        let mut closed_total = 0u32;
+        let mut next_positions = Vec::with_capacity(self.filled_positions.len());
+        for mut pos in self.filled_positions.drain(..) {
+            if remaining_to_close > 0
+                && pos.slot_id == slot_id
+                && pos.ticker == ticker
+                && pos.side == side
+                && pos.contracts > 0
+            {
+                let take = remaining_to_close.min(pos.contracts);
+                let frac = take as f64 / pos.contracts as f64;
+                let part_fee = pos.fee_dollars * frac;
+                entry_cost += (pos.fill_cents as f64 / 100.0) * (take as f64);
+                entry_fee += part_fee;
+                closed_total = closed_total.saturating_add(take);
+                remaining_to_close -= take;
+                pos.contracts -= take;
+                pos.fee_dollars = (pos.fee_dollars - part_fee).max(0.0);
+                if pos.contracts > 0 {
+                    next_positions.push(pos);
+                }
+            } else {
+                next_positions.push(pos);
+            }
+        }
+        self.filled_positions = next_positions;
+        if closed_total == 0 {
+            return;
+        }
+        let proceeds = (exit_exact_cents / 100.0) * (closed_total as f64);
+        let net_pnl = proceeds - entry_cost - entry_fee - exit_fee_dollars;
+        self.total_realized_pnl_dollars += net_pnl;
+        self.mark_slot_ticker(slot_id, ticker);
+        let _ = self.mark_terminal_order(exit_order_id);
+
+        let ev = LedgerEvent {
+            seq: 0,
+            ts,
+            event: "PositionExited".to_string(),
+            mode: mode.to_string(),
+            slot_id,
+            strategy: strategy.to_string(),
+            ticker: ticker.to_string(),
+            series: series.to_string(),
+            order_id: exit_order_id.to_string(),
+            side: side.to_string(),
+            execution_mode: execution_mode.to_string(),
+            limit_cents,
+            fill_cents: Some(exit_cents.clamp(1, 99)),
+            contracts: closed_total,
+            slippage_cents: Some(((limit_cents as f64) - exit_exact_cents).max(0.0)),
+            queue_wait_secs: Some(0.0),
+            fee_dollars: Some(exit_fee_dollars),
+            realized_pnl_dollars: Some(net_pnl),
+            result: Some(format!("exited_{reason}")),
+            reason: Some(reason.to_string()),
+            live_order_id,
+            action: Some("sell".to_string()),
+        };
+        self.append_and_publish(ev, "position_exited");
+        self.apply_slot_realized_pnl(slot_id, net_pnl, mode, ticker, series, ts);
     }
 
     fn record_fill(
@@ -664,6 +957,7 @@ impl RunnerState {
             .and_modify(|prev| *prev = (*prev).max(filled_at))
             .or_insert(filled_at);
         self.audit_dirty = true;
+        let replay_mode = now_unix() >= q.close_epoch && filled_at < q.close_epoch;
         self.filled_positions.push(FilledPosition {
             order_id: q.order_id.clone(),
             slot_id: q.slot_id,
@@ -677,6 +971,8 @@ impl RunnerState {
             contracts: q.contracts,
             fee_dollars: safe_fee,
             live_order_id: q.live_order_id.clone(),
+            close_epoch: q.close_epoch,
+            replay_mode,
         });
         let ev = LedgerEvent {
             seq: 0,
@@ -700,6 +996,7 @@ impl RunnerState {
             result: None,
             reason: None,
             live_order_id: q.live_order_id.clone(),
+            action: Some(q.action.clone()),
         };
         self.append_and_publish(ev, "quote_filled");
     }
@@ -749,6 +1046,28 @@ impl RunnerState {
             .and_modify(|prev| *prev = (*prev).max(filled_at))
             .or_insert(filled_at);
         self.audit_dirty = true;
+        if q.action == "sell" {
+            self.close_filled_positions_on_exit(
+                q.slot_id,
+                &q.ticker,
+                &q.side,
+                applied,
+                fill_cents,
+                fill_cents as f64,
+                safe_fee,
+                &q.order_id,
+                q.live_order_id.clone(),
+                &q.mode,
+                &q.strategy,
+                &q.series,
+                &q.execution_mode,
+                q.limit_cents,
+                "live_exit_filled",
+                filled_at,
+            );
+            return;
+        }
+        let replay_mode = now_unix() >= q.close_epoch && filled_at < q.close_epoch;
         self.filled_positions.push(FilledPosition {
             order_id: q.order_id.clone(),
             slot_id: q.slot_id,
@@ -762,6 +1081,8 @@ impl RunnerState {
             contracts: applied,
             fee_dollars: safe_fee,
             live_order_id: q.live_order_id.clone(),
+            close_epoch: q.close_epoch,
+            replay_mode,
         });
         let ev = LedgerEvent {
             seq: 0,
@@ -785,6 +1106,7 @@ impl RunnerState {
             result: None,
             reason: None,
             live_order_id: q.live_order_id.clone(),
+            action: Some(q.action.clone()),
         };
         self.append_and_publish(ev, "quote_filled");
     }
@@ -846,77 +1168,18 @@ impl RunnerState {
                 result: Some(result.to_string()),
                 reason: None,
                 live_order_id: pos.live_order_id.clone(),
+                action: None,
             };
             self.append_and_publish(ev, "window_settled");
 
-            // Check per-slot realized drawdown circuit breaker.
-            let mut pause_trigger: Option<(usize, String, String, f64, f64)> = None;
-            if let Some(slot) = self.slots.iter_mut().find(|s| s.cfg.slot_id == pos.slot_id) {
-                slot.realized_pnl_dollars += net_pnl;
-                if slot.realized_pnl_dollars > slot.peak_realized_pnl_dollars {
-                    slot.peak_realized_pnl_dollars = slot.realized_pnl_dollars;
-                }
-                let drawdown = slot.peak_realized_pnl_dollars - slot.realized_pnl_dollars;
-                if slot.cfg.auto_pause_drawdown_dollars > 0.0
-                    && drawdown >= slot.cfg.auto_pause_drawdown_dollars - 1e-9
-                    && !slot.paused
-                {
-                    let reason = format!(
-                        "auto-paused: realized drawdown ${drawdown:.2} >= limit ${:.2}",
-                        slot.cfg.auto_pause_drawdown_dollars
-                    );
-                    slot.paused = true;
-                    slot.pause_reason = Some(reason.clone());
-                    pause_trigger = Some((
-                        slot.cfg.slot_id,
-                        slot.cfg.strategy.clone(),
-                        reason,
-                        drawdown,
-                        slot.realized_pnl_dollars,
-                    ));
-                }
-            }
-            if let Some((slot_id, strategy, reason, _dd, slot_pnl)) = pause_trigger {
-                // Cancel any resting shadow quotes for the paused slot.
-                let mut kept = Vec::with_capacity(self.open_quotes.len());
-                let mut paused_quotes = Vec::new();
-                for rq in self.open_quotes.drain(..) {
-                    if rq.order.slot_id == slot_id {
-                        paused_quotes.push(rq.order);
-                    } else {
-                        kept.push(rq);
-                    }
-                }
-                self.open_quotes = kept;
-                for q in paused_quotes {
-                    self.emit_quote_canceled(&q, ts, "slot_auto_paused");
-                }
-                let pause_ev = LedgerEvent {
-                    seq: 0,
-                    ts,
-                    event: "SlotPaused".to_string(),
-                    mode: pos.mode,
-                    slot_id,
-                    strategy,
-                    ticker: pos.ticker,
-                    series: pos.series,
-                    order_id: String::new(),
-                    side: String::new(),
-                    execution_mode: String::new(),
-                    limit_cents: 0,
-                    fill_cents: None,
-                    contracts: 0,
-                    slippage_cents: None,
-                    queue_wait_secs: None,
-                    fee_dollars: None,
-                    realized_pnl_dollars: Some(slot_pnl),
-                    result: None,
-                    reason: Some(reason),
-                    live_order_id: None,
-                };
-                self.append_and_publish(pause_ev, "slot_auto_paused");
-                let _ = self.persist_state();
-            }
+            self.apply_slot_realized_pnl(
+                pos.slot_id,
+                net_pnl,
+                &pos.mode,
+                &pos.ticker,
+                &pos.series,
+                ts,
+            );
         }
     }
 
@@ -938,7 +1201,7 @@ impl RunnerState {
             let quote_exp: f64 = self
                 .open_quotes
                 .iter()
-                .filter(|rq| rq.order.slot_id == sid)
+                .filter(|rq| rq.order.slot_id == sid && rq.order.action != "sell")
                 .map(|rq| {
                     let rem = rq.order.contracts.saturating_sub(rq.order.filled_contracts);
                     (rq.order.limit_cents as f64 / 100.0) * (rem as f64)
@@ -960,6 +1223,11 @@ impl RunnerState {
                 execution_mode: slot.cfg.execution_mode.clone(),
                 auto_pause_drawdown_dollars: slot.cfg.auto_pause_drawdown_dollars,
                 enabled: slot.cfg.enabled,
+                reprice_cooldown_secs: slot.cfg.reprice_cooldown_secs,
+                max_replaces_per_window: slot.cfg.max_replaces_per_window,
+                take_profit_cents: slot.cfg.take_profit_cents,
+                stop_loss_cents: slot.cfg.stop_loss_cents,
+                exit_before_close_secs: slot.cfg.exit_before_close_secs,
                 paused: slot.paused,
                 pause_reason: slot.pause_reason.clone(),
                 open_quotes_count,
@@ -1160,6 +1428,29 @@ impl ShadowRunner {
                             .entry(ev.ticker.clone())
                             .or_default()
                             .insert(ev.slot_id);
+                    }
+                    if let Some(pnl) = ev.realized_pnl_dollars.filter(|v| v.is_finite()) {
+                        total_realized_pnl_dollars += pnl;
+                        entry.2 += pnl;
+                        if entry.2 > entry.3 {
+                            entry.3 = entry.2;
+                        }
+                    }
+                }
+                "PositionExited" => {
+                    if !ev.ticker.is_empty() {
+                        settled_or_filled_slot_tickers
+                            .entry(ev.ticker.clone())
+                            .or_default()
+                            .insert(ev.slot_id);
+                    }
+                    if !ev.order_id.is_empty() && terminal_order_ids.insert(ev.order_id.clone()) {
+                        terminal_order_queue.push_back(ev.order_id.clone());
+                        while terminal_order_queue.len() > MAX_TERMINAL_ORDER_IDS {
+                            if let Some(old) = terminal_order_queue.pop_front() {
+                                terminal_order_ids.remove(&old);
+                            }
+                        }
                     }
                     if let Some(pnl) = ev.realized_pnl_dollars.filter(|v| v.is_finite()) {
                         total_realized_pnl_dollars += pnl;
@@ -1485,6 +1776,11 @@ impl ShadowRunner {
                     execution_mode: exec_mode,
                     auto_pause_drawdown_dollars: auto_pause_drawdown,
                     enabled: true,
+                    reprice_cooldown_secs: 0,
+                    max_replaces_per_window: 0,
+                    take_profit_cents: None,
+                    stop_loss_cents: None,
+                    exit_before_close_secs: 0,
                 })?;
                 slots_out.push(slot);
                 next_slot_id += 1;
@@ -1726,6 +2022,14 @@ impl ShadowRunner {
                         a.realized_pnl_dollars += pnl;
                     }
                 }
+                "PositionExited" => {
+                    if let Some(fee) = ev.fee_dollars {
+                        a.total_fees_dollars += fee;
+                    }
+                    if let Some(pnl) = ev.realized_pnl_dollars {
+                        a.realized_pnl_dollars += pnl;
+                    }
+                }
                 "SlotPaused" => {
                     a.paused_count += 1;
                 }
@@ -1942,6 +2246,37 @@ impl ShadowRunner {
         }
     }
 
+    pub fn mark_live_order_amended(
+        &self,
+        live_order_id: &str,
+        new_limit_cents: u8,
+        new_contracts: u32,
+        now: i64,
+    ) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut amended_order: Option<(VirtualOrLiveOrder, u8)> = None;
+        for rq in &mut st.open_quotes {
+            if rq.order.live_order_id.as_deref() == Some(live_order_id) {
+                let old_c = rq.order.limit_cents;
+                rq.order.limit_cents = new_limit_cents.clamp(1, 99);
+                if new_contracts > 0 {
+                    rq.order.contracts = new_contracts.max(rq.order.filled_contracts);
+                }
+                rq.order.replace_count = rq.order.replace_count.saturating_add(1);
+                rq.last_replaced_at = now;
+                amended_order = Some((rq.order.clone(), old_c));
+                break;
+            }
+        }
+        if let Some((ord, old_c)) = amended_order {
+            st.emit_order_amended(
+                &ord,
+                now,
+                &format!("operator_amended:{old_c}->{}", ord.limit_cents),
+            );
+        }
+    }
+
     /// Execute one tick of the matching & strategy evaluation engine.
     pub fn step_once(&self, app: &App, cached_strats: &mut CachedStrategies) {
         let (live_armed, killed, live_cfg_opt) = {
@@ -2009,9 +2344,11 @@ impl ShadowRunner {
         };
 
         let mut pending_live_intents: Vec<PendingLiveOrderIntent> = Vec::new();
+        let mut pending_live_amends: Vec<PendingLiveAmend> = Vec::new();
+        let mut pending_live_exits: Vec<PendingLiveExit> = Vec::new();
         let mut live_cancels: Vec<(String, VirtualOrLiveOrder, i64, String)> = Vec::new();
 
-        // Snapshot current L2 orderbooks for all resting quotes + active tape tickers OUTSIDE state lock.
+        // Snapshot current L2 orderbooks for all resting quotes + filled positions OUTSIDE state lock.
         let open_tickers: Vec<String> = {
             let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if st.mode == RunnerMode::Stopped {
@@ -2020,6 +2357,9 @@ impl ShadowRunner {
             let mut set = HashSet::new();
             for rq in &st.open_quotes {
                 set.insert(rq.order.ticker.clone());
+            }
+            for pos in &st.filled_positions {
+                set.insert(pos.ticker.clone());
             }
             set.into_iter().collect()
         };
@@ -2088,6 +2428,40 @@ impl ShadowRunner {
                 kept_quotes.push(rq);
             }
             st.open_quotes = kept_quotes;
+
+            // Evaluate L2-driven TP/SL/exit-before-close for filled positions in Phase 1.
+            let pos_tickers: Vec<String> = st
+                .filled_positions
+                .iter()
+                .map(|p| p.ticker.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            for t in pos_tickers {
+                if let Some(ob) = ob_snapshots.get(&t) {
+                    if !ob.stale && !ob.needs_resync && ob.source != "empty" {
+                        if let (Some(yb_c), Some(ya_c)) = (ob.best_yes_bid, ob.best_yes_ask) {
+                            let nb_c = ob
+                                .no_bids
+                                .first()
+                                .map(|l| l.price_cents)
+                                .unwrap_or_else(|| 100u8.saturating_sub(ya_c).max(1));
+                            evaluate_exits_for_market(
+                                &mut st,
+                                &t,
+                                wall_now,
+                                None,
+                                yb_c,
+                                nb_c,
+                                Some(ob),
+                                true,
+                                &mut live_cancels,
+                                &mut pending_live_exits,
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         let tape = app.tape(&app.live_snapshots_path);
@@ -2196,6 +2570,26 @@ impl ShadowRunner {
                                         } else {
                                             None
                                         };
+                                        evaluate_reprices_for_market(
+                                            &mut st,
+                                            app,
+                                            cached_strats,
+                                            ticker,
+                                            last.series.as_str(),
+                                            wall_now,
+                                            secs_to_close,
+                                            cancel_before,
+                                            (ya_c as f64) / 100.0,
+                                            (na_c as f64) / 100.0,
+                                            ya_c,
+                                            na_c,
+                                            yb_c,
+                                            nb_c,
+                                            yb_sz,
+                                            nb_sz,
+                                            cur_ctx.as_ref(),
+                                            &mut pending_live_amends,
+                                        );
                                         if allow_live_entries {
                                             evaluate_slots_for_market(
                                                 &mut st,
@@ -2398,6 +2792,45 @@ impl ShadowRunner {
                     }
                     st.open_quotes = kept_quotes;
 
+                    // 1b. Evaluate intra-window TP / SL / exit-before-close on filled positions.
+                    let fresh_ob = ob_snapshots
+                        .get(ticker)
+                        .filter(|ob| !ob.stale && !ob.needs_resync && ob.source != "empty");
+                    evaluate_exits_for_market(
+                        &mut st,
+                        ticker,
+                        snap.fetched_at,
+                        Some(secs_to_close),
+                        yb_c,
+                        nb_c,
+                        fresh_ob,
+                        false,
+                        &mut live_cancels,
+                        &mut pending_live_exits,
+                    );
+
+                    // 1c. Dynamic maker repricing on resting quotes (cooldown & max_replaces_per_window).
+                    evaluate_reprices_for_market(
+                        &mut st,
+                        app,
+                        cached_strats,
+                        ticker,
+                        snap.series.as_str(),
+                        snap.fetched_at,
+                        secs_to_close,
+                        cancel_before,
+                        ya,
+                        na,
+                        ya_c,
+                        na_c,
+                        yb_c,
+                        nb_c,
+                        snap.yes_bid_size,
+                        snap.no_bid_size,
+                        cur_ctx.as_ref(),
+                        &mut pending_live_amends,
+                    );
+
                     // 2. Evaluate active slots without a quote or filled position on this ticker.
                     if secs_to_close <= cancel_before || !allow_live_entries {
                         continue;
@@ -2468,6 +2901,286 @@ impl ShadowRunner {
                         st.open_quotes.retain(|rq| rq.order.order_id != q.order_id);
                         st.emit_quote_canceled(&q, ts, &reason);
                     }
+                }
+            }
+        }
+
+        // Execute pending guarded live order amendments (dynamic maker repricing).
+        for amend_info in pending_live_amends {
+            if self.halted.load(Ordering::SeqCst) {
+                break;
+            }
+            let auth_res = {
+                let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                if !ld.rails.live_armed || ld.rails.killed {
+                    Err("disarmed or killed".to_string())
+                } else if ld.rails.is_venue_sync_stale(now_unix()) {
+                    let msg = "refusing live_auto amend: venue sync is stale (>30s) or pending".to_string();
+                    ld.rails.last_error = Some(msg.clone());
+                    Err(msg)
+                } else {
+                    let old_reserved = ld
+                        .reserved_order_exposure
+                        .get(&amend_info.live_order_id)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            (amend_info.contracts as f64) * (amend_info.old_limit_cents as f64 / 100.0)
+                        });
+                    if amend_info.new_limit_cents > amend_info.old_limit_cents {
+                        let intent = risk_rails::LiveOrderIntent {
+                            ticker: amend_info.ticker.clone(),
+                            action: amend_info.action.clone(),
+                            side: amend_info.side.clone(),
+                            count: amend_info.contracts,
+                            price_cents: amend_info.new_limit_cents,
+                            client_order_id: Some(amend_info.order_id.clone()),
+                            dry_run: false,
+                        };
+                        let check = ld.rails.check_amend_order(&intent, old_reserved);
+                        if !check.allowed {
+                            let msg = check.rail_violations.join("; ");
+                            ld.rails.last_error = Some(msg.clone());
+                            Err(msg)
+                        } else {
+                            Ok((ld.config.clone(), old_reserved))
+                        }
+                    } else {
+                        Ok((ld.config.clone(), old_reserved))
+                    }
+                }
+            };
+            let (cfg, old_reserved) = match auth_res {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Ok(client) = kalshi_live::KalshiLiveClient::from_config(&cfg) else {
+                continue;
+            };
+            match client.amend_order_with_side(
+                &amend_info.live_order_id,
+                Some(&amend_info.side),
+                amend_info.new_limit_cents,
+                None,
+            ) {
+                Ok(_) => {
+                    {
+                        let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        ld.connected = true;
+                        ld.rails.last_error = None;
+                        if amend_info.action.eq_ignore_ascii_case("buy") {
+                            let new_reserved = (amend_info.contracts as f64)
+                                * (amend_info.new_limit_cents as f64 / 100.0);
+                            ld.rails.apply_amended_exposure(old_reserved, new_reserved);
+                            ld.reserved_order_exposure
+                                .insert(amend_info.live_order_id.clone(), new_reserved);
+                        }
+                        ld.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                            kind: "order_amended".to_string(),
+                            venue_id: format!(
+                                "{}:{}:{}:{}",
+                                amend_info.live_order_id,
+                                kalshi_live::now_millis_string(),
+                                amend_info.new_limit_cents,
+                                amend_info.contracts
+                            ),
+                            ts: amend_info.eval_ts,
+                            order_id: amend_info.live_order_id.clone(),
+                            client_order_id: Some(amend_info.order_id.clone()),
+                            trade_id: None,
+                            ticker: amend_info.ticker.clone(),
+                            side: amend_info.side.clone(),
+                            action: amend_info.action.clone(),
+                            count: amend_info.contracts as i64,
+                            price_cents: amend_info.new_limit_cents,
+                            is_taker: None,
+                            fee_dollars: 0.0,
+                            revenue_cents: None,
+                            realized_pnl_dollars: None,
+                        });
+                    }
+                    let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut amended_ord = None;
+                    for rq in &mut st.open_quotes {
+                        if rq.order.order_id == amend_info.order_id {
+                            rq.order.limit_cents = amend_info.new_limit_cents;
+                            rq.order.replace_count = rq.order.replace_count.saturating_add(1);
+                            rq.last_replaced_at = amend_info.eval_ts;
+                            amended_ord = Some(rq.order.clone());
+                            break;
+                        }
+                    }
+                    if let Some(ord) = amended_ord {
+                        st.emit_order_amended(
+                            &ord,
+                            amend_info.eval_ts,
+                            &format!(
+                                "reprice:{}->{}",
+                                amend_info.old_limit_cents, amend_info.new_limit_cents
+                            ),
+                        );
+                    }
+                }
+                Err(e) => {
+                    let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                    ld.rails.last_error = Some(e);
+                }
+            }
+        }
+
+        // Execute pending guarded live position exits (TP / SL / exit-before-close).
+        for exit_info in pending_live_exits {
+            if self.halted.load(Ordering::SeqCst) {
+                break;
+            }
+            let sell_intent = risk_rails::LiveOrderIntent {
+                ticker: exit_info.ticker.clone(),
+                action: "sell".to_string(),
+                side: exit_info.side.clone(),
+                count: exit_info.contracts,
+                price_cents: exit_info.limit_cents,
+                client_order_id: Some(exit_info.client_order_id.clone()),
+                dry_run: false,
+            };
+            let auth_res = {
+                let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                if !ld.rails.live_armed || ld.rails.killed {
+                    Err("disarmed or killed".to_string())
+                } else if ld.rails.is_venue_sync_stale(now_unix()) {
+                    let msg = "refusing live_auto exit order: venue sync is stale (>30s) or pending".to_string();
+                    ld.rails.last_error = Some(msg.clone());
+                    Err(msg)
+                } else {
+                    match ld.rails.authorize_order(&sell_intent) {
+                        Ok((req, check)) => Ok((req, check, ld.config.clone())),
+                        Err(check) => Err(check.rail_violations.join("; ")),
+                    }
+                }
+            };
+            let (kalshi_req, check, cfg) = match auth_res {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Ok(client) = kalshi_live::KalshiLiveClient::from_config(&cfg) else {
+                continue;
+            };
+            match client.place_order(&kalshi_req) {
+                Ok(placed) => {
+                    {
+                        let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        ld.connected = true;
+                        ld.rails.last_error = None;
+                        ld.rails
+                            .record_submitted_order("sell", check.order_notional_dollars);
+                        ld.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                            kind: "order_submitted".to_string(),
+                            venue_id: placed.order_id.clone(),
+                            ts: exit_info.eval_ts,
+                            order_id: placed.order_id.clone(),
+                            client_order_id: Some(exit_info.client_order_id.clone()),
+                            trade_id: None,
+                            ticker: exit_info.ticker.clone(),
+                            side: exit_info.side.clone(),
+                            action: "sell".to_string(),
+                            count: exit_info.contracts as i64,
+                            price_cents: exit_info.limit_cents,
+                            is_taker: Some(true),
+                            fee_dollars: 0.0,
+                            revenue_cents: None,
+                            realized_pnl_dollars: None,
+                        });
+                    }
+                    let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let immediate_full = placed.status == "executed"
+                        || (placed.remaining_count == 0 && placed.fill_count > 0);
+                    let exit_order = VirtualOrLiveOrder {
+                        order_id: exit_info.client_order_id.clone(),
+                        slot_id: exit_info.slot_id,
+                        strategy: exit_info.strategy.clone(),
+                        ticker: exit_info.ticker.clone(),
+                        series: exit_info.series.clone(),
+                        mode: "live".to_string(),
+                        execution_mode: "taker".to_string(),
+                        action: "sell".to_string(),
+                        side: exit_info.side.clone(),
+                        limit_cents: exit_info.limit_cents,
+                        contracts: exit_info.contracts,
+                        filled_contracts: if immediate_full { exit_info.contracts } else { 0 },
+                        queue_ahead_initial: 0,
+                        queue_ahead_remaining: 0,
+                        posted_at: exit_info.eval_ts,
+                        close_epoch: exit_info.close_epoch,
+                        live_order_id: Some(placed.order_id.clone()),
+                        status: placed.status.clone(),
+                        replace_count: 0,
+                    };
+                    if immediate_full {
+                        let actual_c = if exit_info.side == "yes" {
+                            placed.yes_price.or_else(|| placed.no_price.map(|p| 100 - p))
+                        } else {
+                            placed.no_price.or_else(|| placed.yes_price.map(|p| 100 - p))
+                        }
+                        .unwrap_or(exit_info.limit_cents as i64)
+                        .clamp(1, 99) as u8;
+                        let exit_fee = taker_fee_dollars(actual_c as f64 / 100.0)
+                            * (exit_info.contracts as f64);
+                        st.close_filled_positions_on_exit(
+                            exit_info.slot_id,
+                            &exit_info.ticker,
+                            &exit_info.side,
+                            exit_info.contracts,
+                            actual_c,
+                            actual_c as f64,
+                            exit_fee,
+                            &exit_info.client_order_id,
+                            Some(placed.order_id),
+                            "live",
+                            &exit_info.strategy,
+                            &exit_info.series,
+                            "taker",
+                            exit_info.limit_cents,
+                            &exit_info.reason,
+                            exit_info.eval_ts,
+                        );
+                    } else {
+                        let post_ev = LedgerEvent {
+                            seq: 0,
+                            ts: exit_info.eval_ts,
+                            event: "QuotePosted".to_string(),
+                            mode: "live".to_string(),
+                            slot_id: exit_info.slot_id,
+                            strategy: exit_info.strategy.clone(),
+                            ticker: exit_info.ticker.clone(),
+                            series: exit_info.series.clone(),
+                            order_id: exit_info.client_order_id.clone(),
+                            side: exit_info.side.clone(),
+                            execution_mode: "taker".to_string(),
+                            limit_cents: exit_info.limit_cents,
+                            fill_cents: None,
+                            contracts: exit_info.contracts,
+                            slippage_cents: None,
+                            queue_wait_secs: None,
+                            fee_dollars: None,
+                            realized_pnl_dollars: None,
+                            result: None,
+                            reason: Some(exit_info.reason.clone()),
+                            live_order_id: Some(placed.order_id.clone()),
+                            action: Some("sell".to_string()),
+                        };
+                        st.append_and_publish(post_ev, "quote_posted");
+                        st.open_quotes.push(RestingQuote {
+                            order: exit_order,
+                            last_bid_size: 0.0,
+                            last_bid_cents: 0,
+                            last_l2_updated_ms: 0,
+                            last_l2_trade_ms: None,
+                            last_replaced_at: exit_info.eval_ts,
+                            replay_mode: exit_info.replay_mode,
+                        });
+                    }
+                }
+                Err(e) => {
+                    let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                    ld.rails.last_error = Some(e);
                 }
             }
         }
@@ -2581,6 +3294,7 @@ impl ShadowRunner {
                         series: intent_info.series.clone(),
                         mode: "live".to_string(),
                         execution_mode: intent_info.execution_mode.clone(),
+                        action: "buy".to_string(),
                         side: intent_info.side.clone(),
                         limit_cents: intent_info.limit_cents,
                         contracts: intent_info.contracts,
@@ -2591,6 +3305,7 @@ impl ShadowRunner {
                         close_epoch: intent_info.close_epoch,
                         live_order_id: Some(placed.order_id.clone()),
                         status: placed.status.clone(),
+                        replace_count: 0,
                     };
                     let post_ev = LedgerEvent {
                         seq: 0,
@@ -2614,6 +3329,7 @@ impl ShadowRunner {
                         result: None,
                         reason: None,
                         live_order_id: Some(placed.order_id),
+                        action: Some("buy".to_string()),
                     };
                     st.append_and_publish(post_ev, "quote_posted");
 
@@ -2646,6 +3362,7 @@ impl ShadowRunner {
                             last_bid_cents: 0,
                             last_l2_updated_ms: 0,
                             last_l2_trade_ms: None,
+                            last_replaced_at: intent_info.posted_at,
                             replay_mode: intent_info.replay_mode,
                         });
                     }
@@ -2833,6 +3550,447 @@ fn match_resting_quote_against_l2(
     (strict_cross || touch) && rq.order.queue_ahead_remaining == 0
 }
 
+fn resolve_bid_exit_execution(
+    ob: Option<&crate::orderbook::OrderbookSnapshotPayload>,
+    side: &str,
+    contracts: u32,
+    fallback_bid_c: u8,
+) -> (u8, f64) {
+    let fb = fallback_bid_c.clamp(1, 99);
+    if contracts == 0 {
+        return (fb, fb as f64);
+    }
+    if let Some(book) = ob {
+        if !book.stale && !book.needs_resync && book.source != "empty" {
+            let levels = if side == "yes" {
+                &book.yes_bids
+            } else {
+                &book.no_bids
+            };
+            let mut rem = contracts as u64;
+            let mut filled = 0u64;
+            let mut notional_c = 0.0f64;
+            for lvl in levels {
+                if rem == 0 {
+                    break;
+                }
+                let take = rem.min(lvl.qty);
+                if take > 0 {
+                    notional_c += (lvl.price_cents as f64) * (take as f64);
+                    filled += take;
+                    rem -= take;
+                }
+            }
+            if filled > 0 {
+                let vwap = notional_c / (filled as f64);
+                let c = vwap.round().clamp(1.0, 99.0) as u8;
+                return (c, vwap);
+            }
+        }
+    }
+    (fb, fb as f64)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_slot_tick_context(
+    st: &RunnerState,
+    slot_id: usize,
+    ticker: &str,
+    series: &str,
+    secs_to_close: i64,
+    ya: f64,
+    na: f64,
+    yb_c: u8,
+    nb_c: u8,
+    base_ctx: Option<&crate::strategy_v2::TickContext>,
+    need_v2: bool,
+) -> Option<crate::strategy_v2::TickContext> {
+    if base_ctx.is_none() && !need_v2 {
+        return None;
+    }
+    let mut pos_contracts = 0i64;
+    let mut cost_sum = 0.0f64;
+    let mut unreal_sum = 0.0f64;
+    for pos in &st.filled_positions {
+        if pos.slot_id == slot_id && pos.ticker == ticker && pos.contracts > 0 {
+            let qty = pos.contracts as i64;
+            let cur_bid = if pos.side == "yes" { yb_c } else { nb_c };
+            pos_contracts += qty;
+            cost_sum += (pos.fill_cents as f64) * (qty as f64);
+            unreal_sum += ((cur_bid as f64) - (pos.fill_cents as f64)) * (qty as f64);
+        }
+    }
+    let avg_entry = if pos_contracts > 0 {
+        cost_sum / (pos_contracts as f64)
+    } else {
+        0.0
+    };
+    let resting_cents = st
+        .open_quotes
+        .iter()
+        .find(|rq| rq.order.slot_id == slot_id && rq.order.ticker == ticker && rq.order.action != "sell")
+        .map(|rq| rq.order.limit_cents as i64)
+        .unwrap_or(0);
+
+    let mut ctx = match base_ctx {
+        Some(c) => c.clone(),
+        None => {
+            let yb = (yb_c as f64 / 100.0).clamp(0.01, 0.99);
+            let nb = (nb_c as f64 / 100.0).clamp(0.01, 0.99);
+            crate::strategy_v2::TickContext {
+                yes_bid: yb,
+                yes_ask: ya,
+                no_bid: nb,
+                no_ask: na,
+                secs_to_close,
+                spread_cents: ((ya - yb) * 100.0).max(0.0),
+                yes_bid_size: 0.0,
+                no_bid_size: 0.0,
+                book_imbalance: 0.0,
+                tick_index: 0,
+                open_yes_ask: ya,
+                prev_yes_ask: ya,
+                high_yes_ask: ya,
+                low_yes_ask: ya,
+                delta_60s_cents: 0.0,
+                window_vol_cents: 0.0,
+                pav_yes_prob: ya.clamp(0.01, 0.99),
+                pav_ev_yes_cents: 0.0,
+                pav_ev_no_cents: 0.0,
+                series: series.to_string(),
+                slot_position_contracts: 0,
+                slot_avg_entry_cents: 0.0,
+                slot_unrealized_pnl_cents: 0.0,
+                slot_resting_cents: 0,
+            }
+        }
+    };
+    ctx.slot_position_contracts = pos_contracts;
+    ctx.slot_avg_entry_cents = avg_entry;
+    ctx.slot_unrealized_pnl_cents = unreal_sum;
+    ctx.slot_resting_cents = resting_cents;
+    Some(ctx)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_exits_for_market(
+    st: &mut RunnerState,
+    ticker: &str,
+    eval_ts: i64,
+    secs_to_close_opt: Option<i64>,
+    yb_c: u8,
+    nb_c: u8,
+    ob: Option<&crate::orderbook::OrderbookSnapshotPayload>,
+    respect_replay_guard: bool,
+    live_cancels: &mut Vec<(String, VirtualOrLiveOrder, i64, String)>,
+    pending_live_exits: &mut Vec<PendingLiveExit>,
+) {
+    let candidates: Vec<FilledPosition> = st
+        .filled_positions
+        .iter()
+        .filter(|p| p.ticker == ticker && p.contracts > 0)
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+
+    for pos in candidates {
+        if st.open_quotes.iter().any(|rq| {
+            rq.order.slot_id == pos.slot_id
+                && rq.order.ticker == ticker
+                && rq.order.action == "sell"
+        }) || pending_live_exits
+            .iter()
+            .any(|e| e.slot_id == pos.slot_id && e.ticker == ticker)
+        {
+            continue;
+        }
+        let Some((tp_opt, sl_opt, exit_before)) = st
+            .slots
+            .iter()
+            .find(|s| s.cfg.slot_id == pos.slot_id)
+            .map(|s| {
+                (
+                    s.cfg.take_profit_cents,
+                    s.cfg.stop_loss_cents,
+                    s.cfg.exit_before_close_secs,
+                )
+            })
+        else {
+            continue;
+        };
+        let bid_c = if pos.side == "yes" { yb_c } else { nb_c };
+        let pnl_cents = (bid_c as i64) - (pos.fill_cents as i64);
+        let secs_to_close = secs_to_close_opt.unwrap_or_else(|| pos.close_epoch - eval_ts);
+        let check_ebc = exit_before > 0 && (!respect_replay_guard || !pos.replay_mode);
+
+        let reason = if check_ebc && secs_to_close <= exit_before as i64 {
+            Some("exit_before_close")
+        } else if tp_opt.is_some_and(|tp| pnl_cents >= tp as i64) {
+            Some("take_profit")
+        } else if sl_opt.is_some_and(|sl| -pnl_cents >= sl as i64) {
+            Some("stop_loss")
+        } else {
+            None
+        };
+        let Some(reason) = reason else {
+            continue;
+        };
+
+        // Cancel any resting buy quote for this slot/ticker before exiting.
+        let mut kept_quotes = Vec::with_capacity(st.open_quotes.len());
+        let mut to_cancel_shadow = Vec::new();
+        for rq in st.open_quotes.drain(..) {
+            if rq.order.slot_id == pos.slot_id
+                && rq.order.ticker == ticker
+                && rq.order.action != "sell"
+            {
+                if rq.order.mode == "live" {
+                    if let Some(ref lid) = rq.order.live_order_id {
+                        live_cancels.push((
+                            lid.clone(),
+                            rq.order,
+                            eval_ts,
+                            reason.to_string(),
+                        ));
+                        continue;
+                    }
+                }
+                to_cancel_shadow.push(rq.order);
+            } else {
+                kept_quotes.push(rq);
+            }
+        }
+        st.open_quotes = kept_quotes;
+        for q in to_cancel_shadow {
+            st.emit_quote_canceled(&q, eval_ts, reason);
+        }
+
+        let exit_order_id = st.next_order_id();
+        if pos.mode == "live" {
+            pending_live_exits.push(PendingLiveExit {
+                slot_id: pos.slot_id,
+                strategy: pos.strategy.clone(),
+                ticker: pos.ticker.clone(),
+                series: pos.series.clone(),
+                side: pos.side.clone(),
+                contracts: pos.contracts,
+                limit_cents: bid_c.clamp(1, 99),
+                client_order_id: exit_order_id,
+                reason: reason.to_string(),
+                eval_ts,
+                close_epoch: pos.close_epoch,
+                replay_mode: pos.replay_mode,
+            });
+            continue;
+        }
+
+        let (exit_c, exit_exact_c) = resolve_bid_exit_execution(ob, &pos.side, pos.contracts, bid_c);
+        let exit_fee = taker_fee_dollars(exit_exact_c / 100.0) * (pos.contracts as f64);
+        st.close_filled_positions_on_exit(
+            pos.slot_id,
+            &pos.ticker,
+            &pos.side,
+            pos.contracts,
+            exit_c,
+            exit_exact_c,
+            exit_fee,
+            &exit_order_id,
+            None,
+            &pos.mode,
+            &pos.strategy,
+            &pos.series,
+            "taker",
+            bid_c.clamp(1, 99),
+            reason,
+            eval_ts,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_reprices_for_market(
+    st: &mut RunnerState,
+    app: &App,
+    cached_strats: &CachedStrategies,
+    ticker: &str,
+    series: &str,
+    eval_ts: i64,
+    secs_to_close: i64,
+    cancel_before: i64,
+    ya: f64,
+    na: f64,
+    ya_c: u8,
+    na_c: u8,
+    yb_c: u8,
+    nb_c: u8,
+    yes_bid_size: f32,
+    no_bid_size: f32,
+    cur_ctx: Option<&crate::strategy_v2::TickContext>,
+    pending_live_amends: &mut Vec<PendingLiveAmend>,
+) {
+    if secs_to_close <= cancel_before {
+        return;
+    }
+    let quote_len = st.open_quotes.len();
+    for q_idx in 0..quote_len {
+        let (
+            slot_id,
+            q_order_id,
+            q_mode,
+            q_exec_mode,
+            q_action,
+            q_side,
+            q_limit_cents,
+            q_contracts,
+            q_replace_count,
+            q_live_order_id,
+            q_status,
+            last_replaced_at,
+        ) = {
+            let rq = &st.open_quotes[q_idx];
+            if rq.order.ticker != ticker {
+                continue;
+            }
+            (
+                rq.order.slot_id,
+                rq.order.order_id.clone(),
+                rq.order.mode.clone(),
+                rq.order.execution_mode.clone(),
+                rq.order.action.clone(),
+                rq.order.side.clone(),
+                rq.order.limit_cents,
+                rq.order.contracts,
+                rq.order.replace_count,
+                rq.order.live_order_id.clone(),
+                rq.order.status.clone(),
+                rq.last_replaced_at,
+            )
+        };
+        if q_action == "sell" || (q_status != "resting" && q_status != "partial") {
+            continue;
+        }
+        let Some((strat_name, cooldown, max_replaces, exit_before)) = st
+            .slots
+            .iter()
+            .find(|s| s.cfg.slot_id == slot_id && s.cfg.enabled && !s.paused)
+            .map(|s| {
+                (
+                    s.cfg.strategy.clone(),
+                    s.cfg.reprice_cooldown_secs,
+                    s.cfg.max_replaces_per_window,
+                    s.cfg.exit_before_close_secs,
+                )
+            })
+        else {
+            continue;
+        };
+        if max_replaces == 0 || q_replace_count >= max_replaces {
+            continue;
+        }
+        if exit_before > 0 && secs_to_close <= exit_before as i64 {
+            continue;
+        }
+        if eval_ts.saturating_sub(last_replaced_at) < cooldown as i64 {
+            continue;
+        }
+        let Some(strat) = cached_strats.find(&strat_name) else {
+            continue;
+        };
+        let slot_ctx = build_slot_tick_context(
+            st,
+            slot_id,
+            ticker,
+            series,
+            secs_to_close,
+            ya,
+            na,
+            yb_c,
+            nb_c,
+            cur_ctx,
+            strat.is_v2(),
+        );
+        let Some((quote_dollars, eval_side, post_only)) = strat.entry_quote_with_ctx(
+            ya,
+            na,
+            secs_to_close,
+            slot_ctx.as_ref(),
+            q_exec_mode != "taker",
+        ) else {
+            continue;
+        };
+        if eval_side != q_side || (!post_only && q_exec_mode != "maker") {
+            continue;
+        }
+        let Some(quote_cents) = to_whole_cents(quote_dollars) else {
+            continue;
+        };
+        let (side_ask_c, side_bid_c, raw_bid_sz) = if q_side == "yes" {
+            (ya_c, yb_c, yes_bid_size)
+        } else {
+            (na_c, nb_c, no_bid_size)
+        };
+        let new_limit_cents = if quote_cents >= side_ask_c {
+            if side_ask_c <= 1 {
+                continue;
+            }
+            side_ask_c - 1
+        } else {
+            quote_cents
+        };
+        if !(1..=99).contains(&new_limit_cents) || new_limit_cents == q_limit_cents {
+            continue;
+        }
+        if q_mode == "live" {
+            if let Some(lid) = q_live_order_id {
+                if !pending_live_amends.iter().any(|a| a.order_id == q_order_id) {
+                    pending_live_amends.push(PendingLiveAmend {
+                        order_id: q_order_id,
+                        live_order_id: lid,
+                        ticker: ticker.to_string(),
+                        side: q_side,
+                        action: q_action,
+                        old_limit_cents: q_limit_cents,
+                        new_limit_cents,
+                        contracts: q_contracts,
+                        eval_ts,
+                    });
+                }
+            }
+            continue;
+        }
+
+        let side_bid_sz = sanitize_non_neg_size(raw_bid_sz);
+        let new_queue = if new_limit_cents > side_bid_c {
+            0
+        } else if let Some(l2_q) = app
+            .orderbook
+            .queue_ahead_at_fresh(ticker, &q_side, new_limit_cents)
+        {
+            l2_q.min(u32::MAX as u64) as u32
+        } else if new_limit_cents == side_bid_c {
+            side_bid_sz.round().max(0.0) as u32
+        } else {
+            (side_bid_sz.round().max(0.0) as u32).max(10)
+        };
+        let amended_order = {
+            let rq = &mut st.open_quotes[q_idx];
+            rq.order.limit_cents = new_limit_cents;
+            rq.order.replace_count = rq.order.replace_count.saturating_add(1);
+            rq.order.queue_ahead_initial = new_queue;
+            rq.order.queue_ahead_remaining = new_queue;
+            rq.last_replaced_at = eval_ts;
+            rq.order.clone()
+        };
+        st.emit_order_amended(
+            &amended_order,
+            eval_ts,
+            &format!("reprice:{q_limit_cents}->{new_limit_cents}"),
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_slots_for_market(
     st: &mut RunnerState,
@@ -2895,10 +4053,17 @@ fn evaluate_slots_for_market(
         {
             continue;
         }
-        let (strat_name, exec_mode) = {
+        let (strat_name, exec_mode, exit_before) = {
             let s = &st.slots[idx];
-            (s.cfg.strategy.clone(), s.cfg.execution_mode.clone())
+            (
+                s.cfg.strategy.clone(),
+                s.cfg.execution_mode.clone(),
+                s.cfg.exit_before_close_secs,
+            )
         };
+        if exit_before > 0 && secs_to_close <= exit_before as i64 {
+            continue;
+        }
         let q_mult = st.quarantine_state.throttle_mult(&strat_name);
         if q_mult <= 0.0 {
             continue;
@@ -2913,11 +4078,24 @@ fn evaluate_slots_for_market(
         let Some(strat) = cached_strats.find(&strat_name) else {
             continue;
         };
+        let slot_ctx = build_slot_tick_context(
+            st,
+            slot_id,
+            ticker,
+            series,
+            secs_to_close,
+            ya,
+            na,
+            yb_c,
+            nb_c,
+            cur_ctx,
+            strat.is_v2(),
+        );
         let Some((quote_dollars, entry_side, post_only)) = strat.entry_quote_with_ctx(
             ya,
             na,
             secs_to_close,
-            cur_ctx,
+            slot_ctx.as_ref(),
             exec_mode != "taker",
         ) else {
             continue;
@@ -3019,6 +4197,7 @@ fn evaluate_slots_for_market(
             series: series.to_string(),
             mode: "shadow".to_string(),
             execution_mode: eff_exec_mode.clone(),
+            action: "buy".to_string(),
             side: entry_side.clone(),
             limit_cents,
             contracts,
@@ -3037,6 +4216,7 @@ fn evaluate_slots_for_market(
             } else {
                 "resting".to_string()
             },
+            replace_count: 0,
         };
 
         st.total_quotes_posted = st.total_quotes_posted.saturating_add(1);
@@ -3065,6 +4245,7 @@ fn evaluate_slots_for_market(
             result: None,
             reason: None,
             live_order_id: None,
+            action: Some("buy".to_string()),
         };
         st.append_and_publish(post_ev, "quote_posted");
 
@@ -3078,6 +4259,7 @@ fn evaluate_slots_for_market(
                 last_bid_cents: side_bid_c,
                 last_l2_updated_ms: l2_updated_ms,
                 last_l2_trade_ms: l2_trade_ms,
+                last_replaced_at: eval_ts,
                 replay_mode,
             });
         }
@@ -3312,6 +4494,11 @@ pub fn entry_quote(yes_ask, no_ask, secs_to_close) { Some(0.55) }
                         execution_mode: "taker".to_string(),
                         auto_pause_drawdown_dollars: 50.0,
                         enabled: true,
+                        reprice_cooldown_secs: 0,
+                        max_replaces_per_window: 0,
+                        take_profit_cents: None,
+                        stop_loss_cents: None,
+                        exit_before_close_secs: 0,
                     }],
                     cancel_before_close_secs: 30,
                     bankroll_dollars: 500.0,
@@ -3419,6 +4606,7 @@ pub fn entry_quote(yes_ask, no_ask, secs_to_close) { Some(0.55) }
             series: "KXBTC15M".to_string(),
             mode: "shadow".to_string(),
             execution_mode: "maker".to_string(),
+            action: "buy".to_string(),
             side: "yes".to_string(),
             limit_cents: 55,
             contracts: 4,
@@ -3429,6 +4617,7 @@ pub fn entry_quote(yes_ask, no_ask, secs_to_close) { Some(0.55) }
             close_epoch: 1_800_000_900,
             live_order_id: None,
             status: "resting".to_string(),
+            replace_count: 0,
         };
         {
             let mut st = runner.state.lock().unwrap();
@@ -3498,6 +4687,11 @@ pub fn entry_quote(yes_ask, no_ask, secs_to_close) { Some(0.55) }
                         execution_mode: "maker".to_string(),
                         auto_pause_drawdown_dollars: 50.0,
                         enabled: true,
+                        reprice_cooldown_secs: 0,
+                        max_replaces_per_window: 0,
+                        take_profit_cents: None,
+                        stop_loss_cents: None,
+                        exit_before_close_secs: 0,
                     }],
                     cancel_before_close_secs: 30,
                     bankroll_dollars: 500.0,
@@ -3520,6 +4714,7 @@ pub fn entry_quote(yes_ask, no_ask, secs_to_close) { Some(0.55) }
                     series: "KXBTC15M".to_string(),
                     mode: "live".to_string(),
                     execution_mode: "maker".to_string(),
+                    action: "buy".to_string(),
                     side: "yes".to_string(),
                     limit_cents: 60,
                     contracts: 10,
@@ -3530,11 +4725,13 @@ pub fn entry_quote(yes_ask, no_ask, secs_to_close) { Some(0.55) }
                     close_epoch: 1_800_000_900,
                     live_order_id: Some("kalshi-ord-1".to_string()),
                     status: "resting".to_string(),
+                    replace_count: 0,
                 },
                 last_bid_size: 0.0,
                 last_bid_cents: 0,
                 last_l2_updated_ms: 0,
                 last_l2_trade_ms: None,
+                last_replaced_at: 1_800_000_000,
                 replay_mode: false,
             });
         }
@@ -3777,6 +4974,227 @@ pub fn entry_quote(yes_ask, no_ask, secs_to_close) { Some(0.55) }
         assert!(excluded_q.contains(&"winner-a".to_string()));
         assert_ne!(snap_q.mode, "live_auto");
         assert!(!snap_q.live_armed);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v033_runner_reprice_cooldown_inventory_and_tp_sl_exit_lifecycle() {
+        let dir = std::env::temp_dir().join(format!("ob-sr-e1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data_dir = dir.join("data");
+        let strat_dir = dir.join("strategies");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&strat_dir).unwrap();
+
+        // v2 strategy that quotes yes_bid and tracks inventory via ctx.slot_*
+        std::fs::write(
+            strat_dir.join("e1_maker_v2.rn"),
+            r#"
+pub fn name() { "e1-maker-v2" }
+pub fn side() { "yes" }
+pub fn describe() { "Active maker quoting yes_bid when flat." }
+pub fn evaluate(ctx) {
+    if ctx.slot_position_contracts > 0 {
+        return None;
+    }
+    let lc = (ctx.yes_bid * 100.0).round() as i64;
+    if lc >= 1 && lc <= 98 {
+        return Some(#{ enter: true, side: "yes", limit_cents: lc, post_only: true });
+    }
+    None
+}
+"#,
+        )
+        .unwrap();
+
+        let close_ts = 1_800_000_900i64;
+        let close_iso = iso_z(close_ts);
+        let snap1 = serde_json::json!({
+            "fetched_at": 1_800_000_000i64,
+            "ticker": "KXBTC15M-E1",
+            "event_ticker": "KXBTC15M-E1EV",
+            "series": "KXBTC15M",
+            "close_time": close_iso,
+            "status": "open",
+            "result": "",
+            "yes_bid": 0.45,
+            "yes_ask": 0.55,
+            "no_bid": 0.45,
+            "no_ask": 0.55,
+            "last_price": 0.50,
+            "yes_bid_size": 10.0,
+            "no_bid_size": 10.0
+        });
+        std::fs::write(data_dir.join("snapshots.jsonl"), format!("{snap1}\n")).unwrap();
+
+        let app = App::new(data_dir.clone(), strat_dir, 500.0, 60);
+        app.runner
+            .configure(
+                RunnerConfigRequest {
+                    slots: vec![RunnerSlotConfig {
+                        slot_id: 1,
+                        strategy: "e1-maker-v2".to_string(),
+                        series: vec!["KXBTC15M".to_string()],
+                        max_contracts: 5,
+                        execution_mode: "maker".to_string(),
+                        auto_pause_drawdown_dollars: 50.0,
+                        enabled: true,
+                        reprice_cooldown_secs: 10,
+                        max_replaces_per_window: 2,
+                        take_profit_cents: Some(15),
+                        stop_loss_cents: Some(10),
+                        exit_before_close_secs: 60,
+                    }],
+                    cancel_before_close_secs: 30,
+                    bankroll_dollars: 500.0,
+                    tick_interval_ms: Some(100),
+                },
+                false,
+                false,
+            )
+            .unwrap();
+        app.runner.start("shadow", false, false, false).unwrap();
+
+        let mut cached = CachedStrategies::new();
+        app.runner.step_once(&app, &mut cached);
+        let st1 = app.runner.status(false, false);
+        assert_eq!(st1.open_quotes.len(), 1);
+        assert_eq!(st1.open_quotes[0].limit_cents, 45);
+        assert_eq!(st1.open_quotes[0].action, "buy");
+        assert_eq!(st1.open_quotes[0].replace_count, 0);
+
+        // Tick 2 at +5s (inside 10s cooldown) with yes_bid=0.47 -> MUST NOT reprice yet!
+        let snap2 = serde_json::json!({
+            "fetched_at": 1_800_000_005i64,
+            "ticker": "KXBTC15M-E1",
+            "event_ticker": "KXBTC15M-E1EV",
+            "series": "KXBTC15M",
+            "close_time": close_iso,
+            "status": "open",
+            "result": "",
+            "yes_bid": 0.47,
+            "yes_ask": 0.55,
+            "no_bid": 0.45,
+            "no_ask": 0.53,
+            "last_price": 0.50,
+            "yes_bid_size": 10.0,
+            "no_bid_size": 10.0
+        });
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(data_dir.join("snapshots.jsonl"))
+            .unwrap();
+        writeln!(f, "{snap2}").unwrap();
+        app.runner.step_once(&app, &mut cached);
+        let st2 = app.runner.status(false, false);
+        assert_eq!(st2.open_quotes[0].limit_cents, 45);
+        assert_eq!(st2.open_quotes[0].replace_count, 0);
+
+        // Tick 3 at +12s (past 10s cooldown) with yes_bid=0.48 -> reprices to 48c, replace_count=1!
+        let snap3 = serde_json::json!({
+            "fetched_at": 1_800_000_012i64,
+            "ticker": "KXBTC15M-E1",
+            "event_ticker": "KXBTC15M-E1EV",
+            "series": "KXBTC15M",
+            "close_time": close_iso,
+            "status": "open",
+            "result": "",
+            "yes_bid": 0.48,
+            "yes_ask": 0.55,
+            "no_bid": 0.45,
+            "no_ask": 0.52,
+            "last_price": 0.50,
+            "yes_bid_size": 10.0,
+            "no_bid_size": 10.0
+        });
+        writeln!(f, "{snap3}").unwrap();
+        app.runner.step_once(&app, &mut cached);
+        let st3 = app.runner.status(false, false);
+        assert_eq!(st3.open_quotes[0].limit_cents, 48);
+        assert_eq!(st3.open_quotes[0].replace_count, 1);
+
+        // Tick 4 at +25s -> strict cross yes_ask=0.47 fills the 48c resting quote!
+        let snap4 = serde_json::json!({
+            "fetched_at": 1_800_000_025i64,
+            "ticker": "KXBTC15M-E1",
+            "event_ticker": "KXBTC15M-E1EV",
+            "series": "KXBTC15M",
+            "close_time": close_iso,
+            "status": "open",
+            "result": "",
+            "yes_bid": 0.46,
+            "yes_ask": 0.47,
+            "no_bid": 0.53,
+            "no_ask": 0.54,
+            "last_price": 0.47,
+            "yes_bid_size": 10.0,
+            "no_bid_size": 10.0
+        });
+        writeln!(f, "{snap4}").unwrap();
+        app.runner.step_once(&app, &mut cached);
+        let st4 = app.runner.status(false, false);
+        assert!(st4.open_quotes.is_empty());
+        assert_eq!(st4.active_slots[0].filled_positions_count, 1);
+
+        // Verify TickContext inventory injection on filled position
+        {
+            let st_lock = app.runner.state.lock().unwrap();
+            let ctx = build_slot_tick_context(
+                &st_lock,
+                1,
+                "KXBTC15M-E1",
+                "KXBTC15M",
+                800,
+                0.65,
+                0.35,
+                63,
+                34,
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(ctx.slot_position_contracts, 5);
+            assert!((ctx.slot_avg_entry_cents - 48.0).abs() < 1e-9);
+            assert!((ctx.slot_unrealized_pnl_cents - 75.0).abs() < 1e-9);
+            assert_eq!(ctx.slot_resting_cents, 0);
+        }
+
+        // Tick 5 at +40s -> yes_bid=0.63 (+15c >= take_profit_cents=15) -> triggers PositionExited!
+        let snap5 = serde_json::json!({
+            "fetched_at": 1_800_000_040i64,
+            "ticker": "KXBTC15M-E1",
+            "event_ticker": "KXBTC15M-E1EV",
+            "series": "KXBTC15M",
+            "close_time": close_iso,
+            "status": "open",
+            "result": "",
+            "yes_bid": 0.63,
+            "yes_ask": 0.65,
+            "no_bid": 0.35,
+            "no_ask": 0.37,
+            "last_price": 0.63,
+            "yes_bid_size": 10.0,
+            "no_bid_size": 10.0
+        });
+        writeln!(f, "{snap5}").unwrap();
+        app.runner.step_once(&app, &mut cached);
+
+        let st5 = app.runner.status(false, false);
+        assert_eq!(st5.active_slots[0].filled_positions_count, 0);
+        assert!(st5.stats.realized_pnl_dollars > 0.6);
+
+        let ledger = app.runner.ledger_query(50, None, None);
+        assert!(
+            ledger.entries.iter().any(|e| e.event == "OrderAmended" && e.limit_cents == 48),
+            "expected OrderAmended in ledger: {:?}",
+            ledger.entries
+        );
+        assert!(
+            ledger.entries.iter().any(|e| e.event == "PositionExited" && e.reason.as_deref() == Some("take_profit")),
+            "expected PositionExited(take_profit) in ledger: {:?}",
+            ledger.entries
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
