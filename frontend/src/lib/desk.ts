@@ -531,30 +531,43 @@ export const signedCents = (v: unknown): string =>
   isNum(v) ? (v > 0 ? "+" : "") + v.toFixed(2) + "c" : "-";
 
 export function ageWords(age: unknown): string {
-  if (!isNum(age)) return "none yet";
+  if (!isNum(age) || age < 0) return "none yet";
   if (age < 5) return "just now";
   if (age < 90) return Math.round(age) + "s ago";
   if (age < 5400) return Math.round(age / 60) + "m ago";
   return (age / 3600).toFixed(1) + "h ago";
 }
 
-export const dayLabel = (x: unknown): string =>
-  isNum(x) ? new Date(x * 1000).toISOString().slice(0, 10) : "-";
+function safeUtcIso(x: unknown): string | null {
+  if (!isNum(x) || x <= 0) return null;
+  const ms = x * 1000;
+  if (!Number.isFinite(ms) || Math.abs(ms) > 8_640_000_000_000_000) return null;
+  const d = new Date(ms);
+  return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+}
 
-export const timeUtcLabel = (x: unknown): string =>
-  isNum(x) ? new Date(x * 1000).toISOString().slice(11, 16) + "Z" : "-";
+export const dayLabel = (x: unknown): string => safeUtcIso(x)?.slice(0, 10) ?? "-";
 
-export const timeUtcFullLabel = (x: unknown): string =>
-  isNum(x) ? new Date(x * 1000).toISOString().slice(11, 19) + "Z" : "-";
+export const timeUtcLabel = (x: unknown): string => {
+  const iso = safeUtcIso(x);
+  return iso ? iso.slice(11, 16) + "Z" : "-";
+};
+
+export const timeUtcFullLabel = (x: unknown): string => {
+  const iso = safeUtcIso(x);
+  return iso ? iso.slice(11, 19) + "Z" : "-";
+};
 
 export function closeClock(
   iso: string | null | undefined,
   nowMs: number,
 ): { label: string; isOpen: boolean; secsRemaining: number | null } {
-  if (typeof iso !== "string" || !iso) return { label: "-", isOpen: false, secsRemaining: null };
-  const ms = Date.parse(iso);
-  if (!Number.isFinite(ms)) return { label: iso.slice(0, 16), isOpen: false, secsRemaining: null };
-  const diffSec = Math.floor((ms - nowMs) / 1000);
+  const clean = typeof iso === "string" ? iso.trim() : "";
+  if (!clean) return { label: "-", isOpen: false, secsRemaining: null };
+  const ms = Date.parse(clean);
+  if (!Number.isFinite(ms)) return { label: clean.slice(0, 16), isOpen: false, secsRemaining: null };
+  const safeNow = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const diffSec = Math.floor((ms - safeNow) / 1000);
   if (diffSec > 0) {
     if (diffSec < 3600) {
       const m = Math.floor(diffSec / 60);
@@ -569,7 +582,7 @@ export function closeClock(
     const m = Math.floor((diffSec % 3600) / 60);
     return { label: `${h}h ${String(m).padStart(2, "0")}m`, isOpen: true, secsRemaining: diffSec };
   }
-  return { label: iso.slice(5, 16).replace("T", " ") + "Z", isOpen: false, secsRemaining: 0 };
+  return { label: clean.slice(5, 16).replace("T", " ") + "Z", isOpen: false, secsRemaining: 0 };
 }
 
 const CANONICAL_SERIES = ["BTC", "ETH", "SOL", "XRP", "DOGE"];

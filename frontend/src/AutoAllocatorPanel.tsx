@@ -3,7 +3,7 @@
 // fractional-Kelly OOS winner weighting, automatic quarantine of negative/thin/correlated shapes,
 // $500/day Go/No-Go verdict, custom zero-bloat SVG equity comparison, and 1-click ticket staging
 // gated behind fail-closed Hard Risk Rails (live_armed: false on boot).
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowRightLeft, CheckCircle2, ChevronDown, Copy, Download, RefreshCw, ShieldAlert, ShieldCheck, ShieldOff, SlidersHorizontal, TrendingUp } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -60,7 +60,7 @@ const EXEC_LABELS: Record<AllocatorExecutionMode, string> = {
 };
 
 function fmtCents(v: number | null | undefined): string {
-  if (v === null || v === undefined || !Number.isFinite(v)) return "n/a";
+  if (v === null || v === undefined || !Number.isFinite(v)) return "N/A";
   return `${v >= 0 ? "+" : ""}${v.toFixed(2)}c`;
 }
 
@@ -106,7 +106,7 @@ function decayBadgeMeta(status: ExecutionHealthStatus | string | undefined): {
 }
 
 function fmtSignedPp(v: number | null | undefined): string {
-  if (v === null || v === undefined || !Number.isFinite(v)) return "n/a";
+  if (v === null || v === undefined || !Number.isFinite(v)) return "N/A";
   return `${v >= 0 ? "+" : ""}${v.toFixed(1)}pp`;
 }
 
@@ -160,7 +160,16 @@ export function AutoAllocatorPanel({
   const [syncBusy, setSyncBusy] = useState(false);
   const [syncResult, setSyncResult] = useState<SyncAllocatorResult | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const syncLockRef = useRef(false);
+  const mountedRef = useRef(true);
   const [quarantineOpen, setQuarantineOpen] = useState(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   const [preflightBusy, setPreflightBusy] = useState<string | null>(null);
   const [preflightState, setPreflightState] = useState<{
     strategy: string;
@@ -431,7 +440,8 @@ export function AutoAllocatorPanel({
   }, [dataset, report]);
 
   const handleSyncToRunner = useCallback(async () => {
-    if (syncBusy) return;
+    if (syncLockRef.current || syncBusy) return;
+    syncLockRef.current = true;
     setSyncBusy(true);
     setSyncError(null);
     try {
@@ -445,16 +455,19 @@ export function AutoAllocatorPanel({
         ),
         dataset,
       });
+      if (!mountedRef.current) return;
       setSyncResult(res);
       toast.success(
         `Synced ${res.synced_slots.length} slot${res.synced_slots.length === 1 ? "" : "s"} to Runner (live_armed: false, mode: ${res.mode}).`,
       );
     } catch (e) {
+      if (!mountedRef.current) return;
       const msg = e instanceof Error ? e.message : String(e);
       setSyncError(msg);
       toast.error(`Sync to Runner failed: ${msg}`);
     } finally {
-      setSyncBusy(false);
+      syncLockRef.current = false;
+      if (mountedRef.current) setSyncBusy(false);
     }
   }, [
     syncBusy,
@@ -893,14 +906,14 @@ export function AutoAllocatorPanel({
                     Dismiss
                   </Button>
                 </div>
-                <div id="allocator-runner-sync-slots" className="mono tabular-nums text-ink-2">
+                <div id="allocator-runner-sync-slots" className="mono min-w-0 break-words tabular-nums text-ink-2">
                   {syncResult.synced_slots.length > 0
                     ? syncResult.synced_slots
                         .map((s) => `#${s.slot_id} ${s.strategy} (${s.max_contracts} cts, ${s.execution_mode})`)
                         .join(", ")
                     : "No eligible active slots to sync."}
                   {syncResult.skipped_quarantined.length > 0 && (
-                    <span className="text-destructive-foreground">
+                    <span className="break-words text-destructive-foreground">
                       {" "}
                       (Excluded quarantined: {syncResult.skipped_quarantined.join(", ")})
                     </span>
@@ -2198,7 +2211,10 @@ export function AutoAllocatorPanel({
             <TableBody>
               {filteredWinners.map((w) => {
                 const intent = intentByStrategy.get(w.strategy);
-                const limitCents = intent?.max_limit_cents ?? Math.min(99, Math.max(1, Math.round(w.oos_avg_entry_price * 100)));
+                const fallbackPrice = Number.isFinite(w.oos_avg_entry_price)
+                  ? Math.round(w.oos_avg_entry_price * 100)
+                  : 50;
+                const limitCents = intent?.max_limit_cents ?? Math.min(99, Math.max(1, fallbackPrice));
                 const targetCts = Math.max(1, w.rail_clamped_contracts || 1);
                 const health = healthByStrategy.get(w.strategy);
                 const execStatus = health?.status ?? w.execution_status ?? "active";
@@ -2412,7 +2428,7 @@ export function AutoAllocatorPanel({
                       >
                         {fmtCents(item.oos_net_expectancy_cents)}
                       </TableCell>
-                      <TableCell className="text-xs text-ink-2">{item.reason}</TableCell>
+                      <TableCell className="break-words text-xs text-ink-2">{item.reason}</TableCell>
                     </TableRow>
                     );
                   })}

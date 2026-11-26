@@ -3,7 +3,7 @@
 // Rendered both inside Live 15m Tape and synchronized inside the Settings Vaul sheet. Strictly public GET only.
 import { Activity, AlertTriangle, Clock, ShieldCheck } from "lucide-react";
 import { StatusPill } from "@/components/ui";
-import { type CollectorScheduleStatus, ageWords } from "@/lib/desk";
+import { type CollectorScheduleStatus, ageWords, isNum } from "@/lib/desk";
 import type { OrderbookStreamStatus } from "@/lib/orderbook";
 
 type CadenceChoice = "off" | "60" | "180";
@@ -58,9 +58,12 @@ export function AutoCollectorStrip({
   variant?: "banner" | "compact";
 }) {
   const choice = activeChoice(status);
-  const settled = status?.settledWindows ?? 0;
-  const target = status?.readinessTargetWindows ?? 200;
-  const pct = Math.min(100, Math.round((settled / Math.max(1, target)) * 100));
+  const settled = isNum(status?.settledWindows) ? Math.max(0, status.settledWindows) : 0;
+  const target =
+    isNum(status?.readinessTargetWindows) && status.readinessTargetWindows > 0
+      ? status.readinessTargetWindows
+      : 200;
+  const pct = Math.min(100, Math.max(0, Math.round((settled / Math.max(1, target)) * 100)));
   const remaining = Math.max(0, target - settled);
 
   const badgeTone = status?.rateLimited
@@ -148,31 +151,34 @@ export function AutoCollectorStrip({
   }
 
   const l2Tickers = l2StreamStatus
-    ? l2StreamStatus.active_l2_tickers.length > 0
-      ? l2StreamStatus.active_l2_tickers
-      : l2StreamStatus.subscribed_tickers
+    ? (l2StreamStatus.active_l2_tickers.length > 0
+        ? l2StreamStatus.active_l2_tickers
+        : l2StreamStatus.subscribed_tickers)
     : [];
   const effectiveL2Ticker =
     selectedL2Ticker && l2Tickers.includes(selectedL2Ticker)
       ? selectedL2Ticker
       : (l2Tickers[0] ?? "");
   const l2Badge = l2FeedBadge(l2StreamStatus);
-  const autoSubscribedCount = l2StreamStatus?.auto_subscribed_count ?? 0;
-  const effectiveNowMs = nowMs ?? Date.now();
+  const autoSubscribedCount = isNum(l2StreamStatus?.auto_subscribed_count)
+    ? Math.max(0, l2StreamStatus.auto_subscribed_count)
+    : 0;
+  const effectiveNowMs = isNum(nowMs) ? nowMs : Date.now();
+  const rawLastTradeMs = l2StreamStatus?.last_trade_ms;
   const lastTradeAge =
-    l2StreamStatus?.last_trade_ms && l2StreamStatus.last_trade_ms > 0
-      ? ageWords(Math.max(0, (effectiveNowMs - l2StreamStatus.last_trade_ms) / 1000))
+    isNum(rawLastTradeMs) && rawLastTradeMs > 0 && rawLastTradeMs <= 8_640_000_000_000_000
+      ? ageWords(Math.max(0, (effectiveNowMs - rawLastTradeMs) / 1000))
       : "none yet";
   const syncHzLabel = formatSyncHz(l2StreamStatus?.tape_sync_rate_hz);
 
   return (
     <div
       id="auto-collector-strip"
-      className="space-y-2.5 rounded-[10px] border border-hairline bg-surface px-4 py-3"
+      className="min-w-0 space-y-2.5 rounded-[10px] border border-hairline bg-surface px-4 py-3"
     >
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+      <div className="flex min-w-0 flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         {/* Left: Auto-collector cadence toggle */}
-        <div className="flex flex-wrap items-center gap-2.5">
+        <div className="flex min-w-0 flex-wrap items-center gap-2.5">
           <div className="flex items-center gap-1.5">
             <Clock className="size-4 text-info-foreground" aria-hidden />
             <span className="text-xs font-semibold text-ink">Auto-Collector</span>
@@ -212,8 +218,8 @@ export function AutoCollectorStrip({
         </div>
 
         {/* Right: 200-Window Readiness Gate Progress Bar */}
-        <div id="readiness-progress" className="flex flex-1 flex-wrap items-center gap-3 lg:max-w-[460px] lg:justify-end">
-          <div className="min-w-[180px] flex-1 space-y-1">
+        <div id="readiness-progress" className="flex min-w-0 flex-1 flex-wrap items-center gap-3 lg:max-w-[460px] lg:justify-end">
+          <div className="min-w-[160px] max-w-full flex-1 space-y-1">
             <div className="flex items-center justify-between gap-2 font-mono text-xs">
               <span className="inline-flex items-center gap-1 text-ink-2">
                 <ShieldCheck className="size-3.5 text-info-foreground" aria-hidden />
@@ -254,9 +260,9 @@ export function AutoCollectorStrip({
       <div
         id="l2-telemetry-strip"
         data-l2-telemetry-strip
-        className="flex flex-col gap-2 border-t border-hairline pt-2.5 lg:flex-row lg:items-center lg:justify-between"
+        className="flex min-w-0 flex-col gap-2 border-t border-hairline pt-2.5 lg:flex-row lg:items-center lg:justify-between"
       >
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1.5 text-xs">
           <span data-l2-feed-pill className="inline-flex">
             <StatusPill
               id="l2-feed-pill"
@@ -281,7 +287,7 @@ export function AutoCollectorStrip({
           </span>
         </div>
 
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
           <label htmlFor="l2-active-ticker-select" className="shrink-0 text-xs font-medium text-ink-2">
             Active L2
           </label>
@@ -292,7 +298,7 @@ export function AutoCollectorStrip({
             value={effectiveL2Ticker}
             disabled={l2Tickers.length === 0}
             onChange={(e) => onSelectL2Ticker?.(e.target.value)}
-            className="mono min-h-11 min-w-0 max-w-full flex-1 cursor-pointer rounded-md border border-ink-3 bg-board px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-track disabled:text-ink-2 sm:min-h-8 sm:max-w-[240px] sm:flex-initial"
+            className="mono min-h-11 w-full min-w-0 max-w-full cursor-pointer rounded-md border border-ink-3 bg-board px-2.5 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-track disabled:text-ink-2 sm:min-h-8 sm:w-auto sm:max-w-[240px]"
           >
             {l2Tickers.length === 0 ? (
               <option value="">No active tickers</option>

@@ -187,32 +187,63 @@ export function OrderbookLadder({
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [selectedHistoryIdx, setSelectedHistoryIdx] = useState<number | null>(null);
   const historySeqRef = useRef(0);
+  const historyAbortRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      historyAbortRef.current?.abort();
+      historyAbortRef.current = null;
+    };
+  }, []);
 
   const loadHistory = useCallback(async () => {
+    historyAbortRef.current?.abort();
+    historyAbortRef.current = null;
+    const reqId = ++historySeqRef.current;
     if (!cleanTicker) {
-      setHistoryRecords([]);
-      setHistoryError(null);
-      setHistoryLoading(false);
+      if (mountedRef.current) {
+        setHistoryRecords([]);
+        setHistoryError(null);
+        setHistoryLoading(false);
+        setSelectedHistoryIdx(null);
+      }
       return;
     }
-    const reqId = ++historySeqRef.current;
+    const controller = new AbortController();
+    historyAbortRef.current = controller;
     setHistoryLoading(true);
+    setHistoryError(null);
     try {
-      const res = await fetchOrderbookHistory(cleanTicker, historyLimit);
-      if (reqId !== historySeqRef.current) return;
-      setHistoryRecords(res.records);
+      const res = await fetchOrderbookHistory(cleanTicker, historyLimit, controller.signal);
+      if (!mountedRef.current || controller.signal.aborted || reqId !== historySeqRef.current) return;
+      const safeRecords = Array.isArray(res.records) ? res.records : [];
+      setHistoryRecords(safeRecords);
+      setSelectedHistoryIdx((prev) =>
+        prev !== null && (prev < 0 || prev >= safeRecords.length) ? null : prev,
+      );
       setHistoryError(null);
     } catch (e) {
-      if (reqId !== historySeqRef.current) return;
+      if (!mountedRef.current || controller.signal.aborted || reqId !== historySeqRef.current) return;
+      if (e instanceof Error && e.name === "AbortError") return;
       setHistoryError(e instanceof Error ? e.message : String(e));
     } finally {
-      if (reqId === historySeqRef.current) setHistoryLoading(false);
+      if (historyAbortRef.current === controller) historyAbortRef.current = null;
+      if (mountedRef.current && reqId === historySeqRef.current) setHistoryLoading(false);
     }
   }, [cleanTicker, historyLimit]);
 
   useEffect(() => {
     setSelectedHistoryIdx(null);
+    setHistoryRecords([]);
+    setHistoryError(null);
     void loadHistory();
+    return () => {
+      historyAbortRef.current?.abort();
+      historyAbortRef.current = null;
+    };
   }, [loadHistory]);
 
   const handleRefreshAll = useCallback(() => {
@@ -275,13 +306,13 @@ export function OrderbookLadder({
     <section
       data-orderbook-ladder
       aria-label={`L2 orderbook depth ladder for ${cleanTicker || "selected market"}`}
-      className={`rounded-[10px] border border-hairline bg-surface p-3.5 ${className}`}
+      className={`min-w-0 rounded-[10px] border border-hairline bg-surface p-3.5 ${className}`}
     >
       {/* Header: Title + WS/REST/Stale status pill + Refresh */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline pb-2.5">
-        <div className="flex min-w-0 items-center gap-2">
+        <div className="flex min-w-0 max-w-full flex-1 items-center gap-2">
           <Layers className="size-4 shrink-0 text-info-foreground" strokeWidth={1.5} aria-hidden />
-          <div className="min-w-0">
+          <div className="min-w-0 flex-1">
             <h4 className="text-xs font-semibold text-ink sm:text-sm">L2 Depth Ladder</h4>
             <p className="mono truncate text-xs text-ink-3">{cleanTicker || "Select a market"}</p>
           </div>
@@ -400,17 +431,17 @@ export function OrderbookLadder({
           data-orderbook-history-banner
           className="mb-2.5 flex flex-wrap items-center justify-between gap-2 border-b border-hairline pb-2 text-xs text-info-foreground"
         >
-          <span className="mono font-medium">
-            Inspecting L2 history seq #{selectedHistorySnap.last_seq}{" "}
-            {selectedHistorySnap.updated_ms > 0
-              ? `(${timeUtcFullLabel(Math.floor(selectedHistorySnap.updated_ms / 1000))})`
+          <span className="mono min-w-0 break-words font-medium">
+            Inspecting L2 history seq #{selectedHistorySnap.last_seq}
+            {Number.isFinite(selectedHistorySnap.updated_ms) && selectedHistorySnap.updated_ms > 0
+              ? ` (${timeUtcFullLabel(Math.floor(selectedHistorySnap.updated_ms / 1000))})`
               : ""}
           </span>
           <button
             type="button"
             data-orderbook-history-live
             onClick={() => setSelectedHistoryIdx(null)}
-            className="min-h-11 cursor-pointer rounded border border-hairline bg-board px-2.5 text-xs font-medium text-ink hover:bg-surface sm:min-h-7"
+            className="min-h-11 shrink-0 cursor-pointer rounded border border-hairline bg-board px-2.5 text-xs font-medium text-ink hover:bg-surface sm:min-h-7"
           >
             Return to live
           </button>
@@ -424,9 +455,9 @@ export function OrderbookLadder({
           data-orderbook-crossed-banner
           className="mb-2.5 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dot-red/50 bg-board/60 px-3 py-2 text-xs text-destructive-foreground"
         >
-          <span className="flex items-center gap-1.5 font-medium">
+          <span className="flex min-w-0 items-center gap-1.5 font-medium">
             <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
-            <span>
+            <span className="min-w-0 break-words">
               Crossed L2 book (YES bid {activeSnapshot?.best_yes_bid}c &gt; YES ask {activeSnapshot?.best_yes_ask}c). Resync depth before staging orders.
             </span>
           </span>
@@ -434,7 +465,7 @@ export function OrderbookLadder({
             <button
               type="button"
               onClick={handleRefreshAll}
-              className="min-h-11 cursor-pointer rounded border border-hairline bg-surface px-2.5 text-xs font-medium text-ink hover:bg-canvas sm:min-h-7"
+              className="min-h-11 shrink-0 cursor-pointer rounded border border-hairline bg-surface px-2.5 text-xs font-medium text-ink hover:bg-canvas sm:min-h-7"
             >
               Resync
             </button>
@@ -448,9 +479,9 @@ export function OrderbookLadder({
           data-orderbook-stale-banner
           className="mb-2.5 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dot-amber/50 bg-board/60 px-3 py-2 text-xs text-warning-foreground"
         >
-          <span className="flex items-center gap-1.5 font-medium">
+          <span className="flex min-w-0 items-center gap-1.5 font-medium">
             <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
-            <span>
+            <span className="min-w-0 break-words">
               {error
                 ? `Orderbook refresh delayed (${error}). Showing cached depth.`
                 : "Orderbook snapshot is stale. Quotes and VWAP may lag venue L2."}
@@ -568,7 +599,9 @@ export function OrderbookLadder({
           </div>
 
           {historyError ? (
-            <p className="mt-1.5 text-xs text-ink-2">History unavailable ({historyError})</p>
+            <p className="mt-1.5 break-words text-xs text-ink-2">History unavailable ({historyError})</p>
+          ) : historyLoading && historyRecords.length === 0 ? (
+            <p className="mt-1.5 text-xs text-ink-2">Loading recorded L2 snapshots…</p>
           ) : historyRecords.length === 0 ? (
             <p className="mt-1.5 text-xs text-ink-2">No recorded L2 snapshots yet.</p>
           ) : (
@@ -577,9 +610,10 @@ export function OrderbookLadder({
                 <button
                   type="button"
                   aria-label="Previous L2 snapshot"
-                  disabled={selectedHistoryIdx === 0}
+                  disabled={historyRecords.length === 0 || selectedHistoryIdx === 0}
                   onClick={() => {
                     setSelectedHistoryIdx((prev) => {
+                      if (historyRecords.length === 0) return null;
                       if (prev === null) return Math.max(0, historyRecords.length - 1);
                       return Math.max(0, prev - 1);
                     });
@@ -592,11 +626,17 @@ export function OrderbookLadder({
                   type="range"
                   min={0}
                   max={Math.max(0, historyRecords.length - 1)}
-                  value={selectedHistoryIdx ?? historyRecords.length - 1}
-                  onChange={(e) => setSelectedHistoryIdx(Number(e.target.value))}
+                  value={Math.min(Math.max(0, historyRecords.length - 1), selectedHistoryIdx ?? Math.max(0, historyRecords.length - 1))}
+                  disabled={historyRecords.length <= 1}
+                  onChange={(e) => {
+                    const next = Number(e.target.value);
+                    if (Number.isFinite(next) && next >= 0 && next < historyRecords.length) {
+                      setSelectedHistoryIdx(next);
+                    }
+                  }}
                   aria-label="Scrub L2 snapshot history"
                   data-orderbook-history-scrubber
-                  className="min-h-11 min-w-0 flex-1 cursor-pointer accent-[var(--blue)] sm:min-h-7"
+                  className="min-h-11 min-w-0 flex-1 cursor-pointer accent-[var(--blue)] disabled:cursor-default sm:min-h-7"
                 />
                 <button
                   type="button"
@@ -626,7 +666,7 @@ export function OrderbookLadder({
                   .map(({ rec, origIdx }) => {
                     const active = selectedHistoryIdx === origIdx;
                     const tsLabel =
-                      rec.updated_ms > 0
+                      Number.isFinite(rec.updated_ms) && rec.updated_ms > 0
                         ? timeUtcFullLabel(Math.floor(rec.updated_ms / 1000))
                         : "-";
                     return (
@@ -639,17 +679,17 @@ export function OrderbookLadder({
                         aria-pressed={active}
                         onClick={() => setSelectedHistoryIdx(active ? null : origIdx)}
                         className={
-                          "mono flex min-h-11 w-full cursor-pointer flex-wrap items-center justify-between gap-2 px-2 py-1.5 text-left text-xs outline-none transition-[background-color,color] duration-(--dur-press) focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8 " +
+                          "mono flex min-h-11 w-full min-w-0 cursor-pointer flex-wrap items-center justify-between gap-2 px-2 py-1.5 text-left text-xs outline-none transition-[background-color,color] duration-(--dur-press) focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8 " +
                           (active
                             ? "bg-blue-soft font-semibold text-ink"
                             : "text-ink-2 hover:bg-board/70 hover:text-ink")
                         }
                       >
-                        <span className="flex items-center gap-2">
+                        <span className="flex min-w-0 flex-wrap items-center gap-2">
                           <span className="text-ink">#{rec.last_seq}</span>
                           <span>{tsLabel}</span>
                         </span>
-                        <span className="flex items-center gap-2">
+                        <span className="flex min-w-0 flex-wrap items-center gap-2">
                           <span className="text-ink">
                             YES {rec.best_yes_bid !== null ? `${rec.best_yes_bid}c` : "-"}/
                             {rec.best_yes_ask !== null ? `${rec.best_yes_ask}c` : "-"}

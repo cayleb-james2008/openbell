@@ -289,6 +289,14 @@ export function ResetKillLatchModal({
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const lockRef = useRef(false);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!open) {
@@ -314,12 +322,14 @@ export function ResetKillLatchModal({
     setErrorMsg(null);
     try {
       await onConfirmReset();
-      onOpenChange(false);
+      if (mountedRef.current) onOpenChange(false);
     } catch (e) {
-      setErrorMsg(e instanceof Error ? e.message : String(e));
+      if (mountedRef.current) {
+        setErrorMsg(e instanceof Error ? e.message : String(e));
+      }
     } finally {
       lockRef.current = false;
-      setSubmitting(false);
+      if (mountedRef.current) setSubmitting(false);
     }
   };
 
@@ -363,11 +373,11 @@ export function ResetKillLatchModal({
 
         <div className="space-y-3 px-5 py-4 text-xs">
           <dl className="grid grid-cols-2 gap-3 border-b border-hairline pb-3">
-            <div>
+            <div className="min-w-0">
               <dt className="text-ink-2">Active Kill Reason</dt>
-              <dd className="mt-0.5 font-medium text-ink">{status.killReason || "operator_kill_switch"}</dd>
+              <dd className="mt-0.5 break-words font-medium text-ink">{status.killReason || "operator_kill_switch"}</dd>
             </div>
-            <div>
+            <div className="min-w-0">
               <dt className="text-ink-2">Post-Reset State</dt>
               <dd className="mt-0.5 font-medium text-ink">
                 Paper Mode (<code className="text-xs">live_armed: false</code>)
@@ -462,22 +472,38 @@ export function VenueReconciliationPanel({
     return () => window.clearInterval(id);
   }, [reconcile.lastSyncEpoch, status.lastVenueSyncEpoch]);
 
-  const syncEpoch = reconcile.lastSyncEpoch ?? status.lastVenueSyncEpoch;
+  const rawSyncEpoch = reconcile.lastSyncEpoch ?? status.lastVenueSyncEpoch;
+  const syncEpoch =
+    isNum(rawSyncEpoch) && rawSyncEpoch > 0 && rawSyncEpoch <= 8_640_000_000_000
+      ? rawSyncEpoch
+      : null;
   const isStale = Boolean(status.venueSyncStale || reconcile.syncStale);
-  const syncAgeSecs = syncEpoch !== null ? Math.max(0, Math.floor(nowMs / 1000 - syncEpoch)) : null;
-  const utcDayLoss = reconcile.source === "server" ? reconcile.utcDayLossDollars : status.dailyRealizedLossDollars;
-  const openExposure = reconcile.source === "server" ? reconcile.openExposureDollars : status.openExposureDollars;
+  const syncAgeSecs =
+    syncEpoch !== null && isNum(nowMs) ? Math.max(0, Math.floor(nowMs / 1000 - syncEpoch)) : null;
+  const rawUtcDayLoss =
+    reconcile.source === "server" ? reconcile.utcDayLossDollars : status.dailyRealizedLossDollars;
+  const utcDayLoss = isNum(rawUtcDayLoss) ? rawUtcDayLoss : 0;
+  const rawOpenExposure =
+    reconcile.source === "server" ? reconcile.openExposureDollars : status.openExposureDollars;
+  const openExposure = isNum(rawOpenExposure) ? rawOpenExposure : 0;
+  const executions = Array.isArray(reconcile.executions) ? reconcile.executions : [];
+  const discrepancies = Array.isArray(reconcile.discrepancies) ? reconcile.discrepancies : [];
   const totalFees = useMemo(
     () =>
-      reconcile.utcDayFeesDollars ??
-      reconcile.executions.reduce((sum, ex) => sum + ex.feeDollars, 0),
-    [reconcile.utcDayFeesDollars, reconcile.executions],
+      isNum(reconcile.utcDayFeesDollars)
+        ? reconcile.utcDayFeesDollars
+        : executions.reduce((sum, ex) => sum + (isNum(ex.feeDollars) ? ex.feeDollars : 0), 0),
+    [reconcile.utcDayFeesDollars, executions],
   );
   const totalRealizedPnl = useMemo(
     () =>
-      reconcile.utcDayRealizedPnlDollars ??
-      reconcile.executions.reduce((sum, ex) => sum + ex.realizedPnlDollars, 0),
-    [reconcile.utcDayRealizedPnlDollars, reconcile.executions],
+      isNum(reconcile.utcDayRealizedPnlDollars)
+        ? reconcile.utcDayRealizedPnlDollars
+        : executions.reduce(
+            (sum, ex) => sum + (isNum(ex.realizedPnlDollars) ? ex.realizedPnlDollars : 0),
+            0,
+          ),
+    [reconcile.utcDayRealizedPnlDollars, executions],
   );
 
   return (
@@ -541,7 +567,7 @@ export function VenueReconciliationPanel({
       </div>
 
       <dl className="grid grid-cols-2 divide-y divide-hairline border-b border-hairline bg-board/25 text-xs sm:grid-cols-4 sm:divide-x sm:divide-y-0">
-        <div className="px-4 py-2.5">
+        <div className="min-w-0 px-4 py-2.5">
           <dt className="text-ink-2">UTC-Day Realized Loss</dt>
           <dd
             id="reconcile-utc-day-loss"
@@ -557,7 +583,7 @@ export function VenueReconciliationPanel({
           </dd>
         </div>
 
-        <div className="px-4 py-2.5">
+        <div className="min-w-0 px-4 py-2.5">
           <dt className="text-ink-2">Open Exposure</dt>
           <dd id="reconcile-open-exposure" className="mono mt-0.5 text-sm font-semibold tabular-nums text-ink">
             {money(openExposure)}
@@ -567,7 +593,7 @@ export function VenueReconciliationPanel({
           </dd>
         </div>
 
-        <div className="px-4 py-2.5">
+        <div className="min-w-0 px-4 py-2.5">
           <dt className="text-ink-2">UTC-Day Fees / Net P&amp;L</dt>
           <dd id="reconcile-utc-fees" className="mono mt-0.5 text-sm font-semibold tabular-nums text-ink">
             {money(totalFees)}
@@ -589,7 +615,7 @@ export function VenueReconciliationPanel({
           </dd>
         </div>
 
-        <div className="px-4 py-2.5">
+        <div className="min-w-0 px-4 py-2.5">
           <dt className="text-ink-2">Last Venue Sync</dt>
           <dd
             id="reconcile-sync-age"
@@ -633,7 +659,7 @@ export function VenueReconciliationPanel({
         </div>
       )}
 
-      {reconcile.discrepancies.length > 0 && (
+      {discrepancies.length > 0 && (
         <div
           id="live-reconcile-discrepancies"
           data-testid="reconcile-discrepancies"
@@ -643,23 +669,23 @@ export function VenueReconciliationPanel({
           <div className="flex items-center gap-1.5 font-semibold text-warning-foreground">
             <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
             <span>
-              {reconcile.discrepancies.length} reconciliation discrepancy alert
-              {reconcile.discrepancies.length === 1 ? "" : "s"}
+              {discrepancies.length} reconciliation discrepancy alert
+              {discrepancies.length === 1 ? "" : "s"}
             </span>
           </div>
           <ul className="mt-2 divide-y divide-hairline border-t border-hairline">
-            {reconcile.discrepancies.map((d, idx) => (
+            {discrepancies.map((d, idx) => (
               <li
                 key={`${d.kind}-${idx}`}
                 data-reconcile-discrepancy
                 className="flex flex-wrap items-center justify-between gap-2 py-2"
               >
-                <span className="flex flex-wrap items-center gap-2 text-ink">
+                <span className="flex min-w-0 flex-wrap items-center gap-2 text-ink">
                   <Badge variant="warning">{d.kind}</Badge>
-                  <span>{d.message}</span>
+                  <span className="min-w-0 break-words">{d.message}</span>
                 </span>
                 {(d.ticker || d.orderId) && (
-                  <span className="mono tabular-nums text-ink-2">
+                  <span className="mono break-all tabular-nums text-ink-2">
                     {[d.ticker, d.orderId].filter(Boolean).join(" / ")}
                   </span>
                 )}
@@ -670,7 +696,7 @@ export function VenueReconciliationPanel({
       )}
 
       <div id="live-executions-table" data-testid="live-executions-table">
-        {reconcile.executions.length === 0 ? (
+        {executions.length === 0 ? (
           <p role="status" className="px-4 py-4 text-xs text-ink-2">
             No reconciled live executions recorded for the current UTC day.
           </p>
@@ -689,13 +715,13 @@ export function VenueReconciliationPanel({
               </TableRow>
             </TableHeader>
             <TableBody>
-              {reconcile.executions.slice(0, 25).map((ex) => (
+              {executions.slice(0, 25).map((ex) => (
                 <TableRow
                   key={`${ex.tradeId}-${ex.orderId}-${ex.ts}`}
                   data-reconcile-execution-row={ex.tradeId}
                 >
                   <TableCell className="mono tabular-nums text-xs text-ink-2">
-                    {timeUtcFullLabel(ex.ts)}
+                    {ex.ts > 0 ? timeUtcFullLabel(ex.ts) : "-"}
                   </TableCell>
                   <TableCell className="mono m-grow max-w-[190px] break-all text-xs font-semibold text-ink">
                     {ex.ticker}
@@ -711,7 +737,7 @@ export function VenueReconciliationPanel({
                     </span>
                   </TableCell>
                   <TableCell className="mono tabular-nums text-right text-xs font-semibold text-ink">
-                    {ex.count} @ {ex.priceCents}c
+                    {isNum(ex.count) ? ex.count : 0} @ {isNum(ex.priceCents) ? ex.priceCents : 0}c
                   </TableCell>
                   <TableCell className="text-xs">
                     <Badge variant={ex.isTaker ? "warning" : "success"} className="text-xs">
@@ -733,7 +759,7 @@ export function VenueReconciliationPanel({
                   >
                     {moneySigned(ex.realizedPnlDollars)}
                   </TableCell>
-                  <TableCell className="mono tabular-nums text-xs text-ink-2">
+                  <TableCell className="mono break-all tabular-nums text-xs text-ink-2">
                     {ex.orderId || ex.tradeId || "-"}
                   </TableCell>
                 </TableRow>
@@ -781,7 +807,16 @@ export function LiveAccountStrip({
   const [reconciling, setReconciling] = useState(false);
   const [reconcileError, setReconcileError] = useState<string | null>(null);
   const reconcileLockRef = useRef(false);
+  const resetKillLockRef = useRef(false);
+  const mountedRef = useRef(true);
   const { status, account, positions, orders, fills } = bundle;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (bundle.reconcile && bundle.reconcile.source === "server") {
@@ -809,6 +844,7 @@ export function LiveAccountStrip({
     setReconcileError(null);
     try {
       const res = await triggerLiveReconcile("1");
+      if (!mountedRef.current) return;
       setReconcileState(res);
       onRefresh();
       if (res.discrepancies.length > 0) {
@@ -817,19 +853,27 @@ export function LiveAccountStrip({
         toast.success("Kalshi venue executions reconciled.");
       }
     } catch (e) {
+      if (!mountedRef.current) return;
       const msg = e instanceof Error ? e.message : String(e);
       setReconcileError(msg);
       toast.error(`Reconcile failed: ${msg}`);
     } finally {
       reconcileLockRef.current = false;
-      setReconciling(false);
+      if (mountedRef.current) setReconciling(false);
     }
   };
 
   const handleConfirmResetKill = async () => {
-    await resetKillSwitch("1");
-    onRefresh();
-    toast.success("Kill switch latch cleared. Live trading remains disarmed (Paper Mode).");
+    if (resetKillLockRef.current) return;
+    resetKillLockRef.current = true;
+    try {
+      await resetKillSwitch("1");
+      if (!mountedRef.current) return;
+      onRefresh();
+      toast.success("Kill switch latch cleared. Live trading remains disarmed (Paper Mode).");
+    } finally {
+      resetKillLockRef.current = false;
+    }
   };
 
   return (
@@ -1021,9 +1065,11 @@ export function LiveAccountStrip({
             role="alert"
             className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-2.5 text-xs text-destructive-foreground"
           >
-            <span className="flex items-center gap-1.5 font-medium">
+            <span className="flex min-w-0 items-center gap-1.5 font-medium">
               <AlertTriangle className="size-3.5 shrink-0" aria-hidden />
-              Emergency Kill Switch triggered{status.killReason ? ` (${status.killReason})` : ""}. All live routing is disarmed (live_armed: false).
+              <span className="min-w-0 break-words">
+                Emergency Kill Switch triggered{status.killReason ? ` (${status.killReason})` : ""}. All live routing is disarmed (live_armed: false).
+              </span>
             </span>
             <Button
               id="reset-kill-latch-btn"

@@ -1032,10 +1032,10 @@ function normalizeHealthStrategy(raw: unknown, idx: number): ExecutionHealthStra
     predicted_prob: finiteOrNull(o.predicted_prob),
     realized_win_rate: finiteOrNull(o.realized_win_rate),
     assumed_fill_rate_pct: finiteOrNull(o.assumed_fill_rate_pct),
-    realized_fill_rate_pct: pickNum(o, ["realized_fill_rate_pct", "actual_fill_rate_pct"]),
+    realized_fill_rate_pct: finiteOrNull(o.realized_fill_rate_pct ?? o.actual_fill_rate_pct),
     expected_slippage_cents: finiteOrNull(o.expected_slippage_cents),
     realized_slippage_cents: finiteOrNull(o.realized_slippage_cents),
-    rolling_net_pnl_dollars: pickNum(o, ["rolling_net_pnl_dollars", "net_pnl_dollars"]) ?? 0,
+    rolling_net_pnl_dollars: finiteOrNull(o.rolling_net_pnl_dollars ?? o.net_pnl_dollars) ?? 0,
   };
 }
 
@@ -1055,10 +1055,10 @@ function computeOverallHealth(
     if (s.status === "quarantined") quarantined += 1;
     else if (s.status === "throttled") throttled += 1;
     else active += 1;
-    rollingFills += s.rolling_fills;
-    netPnl += s.rolling_net_pnl_dollars;
-    if (s.markout_30s_cents !== null) m30.push(s.markout_30s_cents);
-    if (s.realized_slippage_cents !== null && s.expected_slippage_cents !== null) {
+    if (isNum(s.rolling_fills)) rollingFills += s.rolling_fills;
+    if (isNum(s.rolling_net_pnl_dollars)) netPnl += s.rolling_net_pnl_dollars;
+    if (isNum(s.markout_30s_cents)) m30.push(s.markout_30s_cents);
+    if (isNum(s.realized_slippage_cents) && isNum(s.expected_slippage_cents)) {
       slipRes.push(s.realized_slippage_cents - s.expected_slippage_cents);
     }
   }

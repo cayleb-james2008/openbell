@@ -195,6 +195,21 @@ export function defaultOrderbookStreamStatus(): OrderbookStreamStatus {
   };
 }
 
+function safeEpochMs(raw: unknown): number {
+  if (isNum(raw)) {
+    const rounded = Math.round(raw);
+    if (rounded > 0 && rounded <= 8_640_000_000_000_000) return rounded;
+    return 0;
+  }
+  if (typeof raw === "string" && raw.trim().length > 0) {
+    const parsed = Date.parse(raw.trim());
+    if (Number.isFinite(parsed) && parsed > 0 && parsed <= 8_640_000_000_000_000) {
+      return Math.round(parsed);
+    }
+  }
+  return 0;
+}
+
 export function normalizeOrderbookSnapshot(raw: unknown, fallbackTicker = ""): OrderbookSnapshot {
   if (!raw || typeof raw !== "object") {
     return emptyOrderbookSnapshot(fallbackTicker);
@@ -223,6 +238,8 @@ export function normalizeOrderbookSnapshot(raw: unknown, fallbackTicker = ""): O
 
   const hasLevels = yesBids.length > 0 || yesAsks.length > 0 || noBids.length > 0 || noAsks.length > 0;
   const vwap10 = pickNum(o, ["vwap_10"]) ?? walkBookLevels(yesAsks, 10).vwapCents;
+  const updatedMs =
+    safeEpochMs(o.updated_ms) || safeEpochMs(o.ts_ms) || safeEpochMs(o.updated_at) || safeEpochMs(o.ts);
 
   return {
     ok: typeof o.ok === "boolean" ? o.ok : hasLevels,
@@ -237,7 +254,7 @@ export function normalizeOrderbookSnapshot(raw: unknown, fallbackTicker = ""): O
     mid_cents: midCents !== null ? Number(midCents.toFixed(2)) : null,
     vwap_10: vwap10 !== null ? Number(vwap10.toFixed(2)) : null,
     last_seq: Math.max(0, Math.round(pickNum(o, ["last_seq", "seq"]) ?? 0)),
-    updated_ms: Math.max(0, Math.round(pickNum(o, ["updated_ms", "ts_ms"]) ?? 0)),
+    updated_ms: updatedMs,
     source: normalizeSource(o.source, hasLevels),
     stale: Boolean(o.stale),
   };
@@ -248,17 +265,25 @@ export function normalizeOrderbookStreamStatus(raw: unknown): OrderbookStreamSta
   const o = raw as Record<string, unknown>;
   const wsConnected = Boolean(o.ws_connected ?? o.connected);
   const subs = Array.isArray(o.subscribed_tickers)
-    ? o.subscribed_tickers
-        .map((t) => (typeof t === "string" ? t.trim().toUpperCase() : ""))
-        .filter((t) => t.length > 0)
+    ? [
+        ...new Set(
+          o.subscribed_tickers
+            .map((t) => (typeof t === "string" ? t.trim().toUpperCase() : ""))
+            .filter((t) => t.length > 0),
+        ),
+      ]
     : [];
   const activeL2Tickers = Array.isArray(o.active_l2_tickers)
-    ? o.active_l2_tickers
-        .map((t) => (typeof t === "string" ? t.trim().toUpperCase() : ""))
-        .filter((t) => t.length > 0)
+    ? [
+        ...new Set(
+          o.active_l2_tickers
+            .map((t) => (typeof t === "string" ? t.trim().toUpperCase() : ""))
+            .filter((t) => t.length > 0),
+        ),
+      ]
     : subs;
-  const rawLastTradeMs = pickNum(o, ["last_trade_ms"]);
-  const lastTradeMs = rawLastTradeMs !== null && rawLastTradeMs > 0 ? Math.round(rawLastTradeMs) : null;
+  const rawLastTradeMs = safeEpochMs(o.last_trade_ms);
+  const lastTradeMs = rawLastTradeMs > 0 ? rawLastTradeMs : null;
   const rawSyncRate = pickNum(o, ["tape_sync_rate_hz"]);
   const tapeSyncRateHz = rawSyncRate !== null && rawSyncRate >= 0 ? Number(rawSyncRate.toFixed(2)) : 0;
   return {
@@ -377,19 +402,23 @@ export async function fetchOrderbookStreamStatus(): Promise<OrderbookStreamStatu
 export async function fetchOrderbookHistory(
   ticker: string,
   limit = 20,
+  signal?: AbortSignal,
 ): Promise<OrderbookHistoryResponse> {
   const clean = ticker.trim().toUpperCase();
   if (!clean) return { ok: false, ticker: "", records: [] };
-  const safeLimit = Math.max(1, Math.min(200, Math.round(limit)));
+  const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(200, Math.round(limit))) : 20;
   const qs = new URLSearchParams({
     ticker: clean,
     limit: String(safeLimit),
   });
-  const r = await fetch(`/api/orderbook/history?${qs.toString()}`);
+  const r = await fetch(
+    `/api/orderbook/history?${qs.toString()}`,
+    signal ? { signal } : undefined,
+  );
   if (!r.ok) {
     throw new Error(`Orderbook history request answered ${r.status}`);
   }
-  const raw = (await r.json()) as Record<string, unknown> | null;
+  const raw = (await r.json().catch(() => null)) as Record<string, unknown> | null;
   const rawList = Array.isArray(raw?.records)
     ? raw.records
     : Array.isArray(raw?.snapshots)
@@ -398,6 +427,7 @@ export async function fetchOrderbookHistory(
         ? raw.history
         : [];
   const records = rawList
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
     .map((item) => normalizeOrderbookSnapshot(item, clean))
     .filter(
       (snap) =>
