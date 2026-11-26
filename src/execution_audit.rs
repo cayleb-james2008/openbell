@@ -326,31 +326,182 @@ fn check_regular_non_symlink(data_dir: &Path, path: &Path) -> Result<bool, Strin
     }
 }
 
+/// Replace unquoted non-standard JSON float literals (`NaN`, `Infinity`, `-Infinity`, etc.)
+/// with `null` while preserving quoted string contents intact.
+fn normalize_nonstandard_json_floats(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            let ch = raw[i..].chars().next().unwrap();
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            i += ch.len_utf8();
+            continue;
+        }
+        if b == b'"' {
+            in_str = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        let prev_delim = i == 0
+            || matches!(
+                bytes[i - 1],
+                b':' | b',' | b'[' | b' ' | b'\t' | b'\r' | b'\n'
+            );
+        if prev_delim {
+            let rest = &raw[i..];
+            let matched = [
+                "-Infinity",
+                "+Infinity",
+                "Infinity",
+                "-infinity",
+                "+infinity",
+                "infinity",
+                "-Inf",
+                "+Inf",
+                "Inf",
+                "-inf",
+                "+inf",
+                "inf",
+                "NaN",
+                "nan",
+            ]
+            .into_iter()
+            .find(|tok| {
+                rest.starts_with(tok)
+                    && rest.as_bytes().get(tok.len()).is_none_or(|&next| {
+                        matches!(next, b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n')
+                    })
+            });
+            if let Some(tok) = matched {
+                out.push_str("null");
+                i += tok.len();
+                continue;
+            }
+        }
+        let ch = raw[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn json_f64_lenient(val: Option<&serde_json::Value>, fallback: f64) -> f64 {
+    match val {
+        Some(v) => {
+            if let Some(n) = v.as_f64() {
+                finite_or(n, fallback)
+            } else if let Some(s) = v.as_str() {
+                match s.trim().parse::<f64>() {
+                    Ok(n) => finite_or(n, fallback),
+                    Err(_) => fallback,
+                }
+            } else {
+                fallback
+            }
+        }
+        None => fallback,
+    }
+}
+
 pub fn load_quarantine_state(data_dir: &Path) -> QuarantineStateFile {
     let path = quarantine_state_path(data_dir);
     if !matches!(check_regular_non_symlink(data_dir, &path), Ok(true)) {
         return QuarantineStateFile::default();
     }
-    let Ok(raw) = std::fs::read_to_string(&path) else {
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[openbell] WARNING: unreadable quarantine_state.json ({e}); using empty state");
+            return QuarantineStateFile::default();
+        }
+    };
+    let normalized = normalize_nonstandard_json_floats(&raw);
+    let root: serde_json::Value = match serde_json::from_str(&normalized) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[openbell] WARNING: corrupt quarantine_state.json ({e}); using empty state");
+            return QuarantineStateFile::default();
+        }
+    };
+    let Some(root_obj) = root.as_object() else {
+        eprintln!("[openbell] WARNING: quarantine_state.json root is not a JSON object; using empty state");
         return QuarantineStateFile::default();
     };
-    let mut parsed = serde_json::from_str::<QuarantineStateFile>(&raw).unwrap_or_default();
-    for entry in parsed.strategies.values_mut() {
-        entry.status = match entry.status.as_str() {
-            "quarantined" => "quarantined".to_string(),
-            "throttled" => "throttled".to_string(),
-            _ => "active".to_string(),
-        };
-        entry.throttle_mult = if entry.status == "quarantined" {
-            0.0
-        } else if entry.status == "throttled" {
-            finite_or(entry.throttle_mult, 0.5).clamp(0.05, 1.0)
-        } else {
-            1.0
-        };
-        entry.rolling_markout_30s_cents = finite_or(entry.rolling_markout_30s_cents, 0.0);
-        entry.rolling_fill_rate_pct = finite_or(entry.rolling_fill_rate_pct, 100.0).clamp(0.0, 100.0);
-        entry.rolling_net_pnl_dollars = finite_or(entry.rolling_net_pnl_dollars, 0.0);
+    let mut parsed = QuarantineStateFile {
+        updated_at: root_obj.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0),
+        strategies: BTreeMap::new(),
+    };
+    if let Some(strats_obj) = root_obj.get("strategies").and_then(|v| v.as_object()) {
+        for (name, ev) in strats_obj {
+            let Some(obj) = ev.as_object() else {
+                continue;
+            };
+            let manual_quarantine = obj
+                .get("manual_quarantine")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let raw_status = obj
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            let status = if manual_quarantine || raw_status == "quarantined" {
+                "quarantined".to_string()
+            } else if raw_status == "throttled" {
+                "throttled".to_string()
+            } else {
+                "active".to_string()
+            };
+            let raw_mult = json_f64_lenient(obj.get("throttle_mult"), if status == "throttled" { 0.5 } else { 1.0 });
+            let throttle_mult = if status == "quarantined" {
+                0.0
+            } else if status == "throttled" {
+                raw_mult.clamp(0.05, 1.0)
+            } else {
+                1.0
+            };
+            let entry = StrategyQuarantineEntry {
+                status,
+                throttle_mult,
+                reason: obj
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                triggered_at: obj.get("triggered_at").and_then(|v| v.as_i64()).unwrap_or(0),
+                rolling_fills: obj.get("rolling_fills").and_then(|v| v.as_u64()).unwrap_or(0),
+                rolling_markout_30s_cents: json_f64_lenient(
+                    obj.get("rolling_markout_30s_cents"),
+                    0.0,
+                ),
+                rolling_fill_rate_pct: json_f64_lenient(
+                    obj.get("rolling_fill_rate_pct"),
+                    100.0,
+                )
+                .clamp(0.0, 100.0),
+                rolling_net_pnl_dollars: json_f64_lenient(
+                    obj.get("rolling_net_pnl_dollars"),
+                    0.0,
+                ),
+                reset_after_ts: obj.get("reset_after_ts").and_then(|v| v.as_i64()),
+                reset_after_seq: obj.get("reset_after_seq").and_then(|v| v.as_u64()),
+                manual_quarantine,
+            };
+            parsed.strategies.insert(name.clone(), entry);
+        }
     }
     parsed
 }
@@ -435,23 +586,38 @@ pub fn append_markout_sample(data_dir: &Path, rec: &MarkoutSampleRecord) {
     }
 }
 
+fn read_lines_utf8_tolerant(path: &Path) -> Vec<String> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::with_capacity(512);
+    let mut out = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if let Ok(s) = std::str::from_utf8(&buf) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+        }
+    }
+    out
+}
+
 fn read_shadow_ledger(data_dir: &Path) -> Vec<LedgerEvent> {
     let path = data_dir.join("shadow_ledger.jsonl");
     if !matches!(check_regular_non_symlink(data_dir, &path), Ok(true)) {
         return Vec::new();
     }
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    raw.lines()
-        .filter_map(|l| {
-            let t = l.trim();
-            if t.is_empty() {
-                None
-            } else {
-                serde_json::from_str::<LedgerEvent>(t).ok()
-            }
-        })
+    read_lines_utf8_tolerant(&path)
+        .into_iter()
+        .filter_map(|t| serde_json::from_str::<LedgerEvent>(&t).ok())
         .collect()
 }
 
@@ -468,19 +634,19 @@ fn read_live_executions(data_dir: &Path) -> Vec<RawLiveExecLine> {
     if !matches!(check_regular_non_symlink(data_dir, &path), Ok(true)) {
         return Vec::new();
     }
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    raw.lines()
-        .filter_map(|l| {
-            let t = l.trim();
-            if t.is_empty() {
-                None
-            } else {
-                serde_json::from_str::<RawLiveExecLine>(t).ok()
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut out = Vec::new();
+    for t in read_lines_utf8_tolerant(&path) {
+        if let Ok(rec) = serde_json::from_str::<RawLiveExecLine>(&t) {
+            if rec.base.kind.trim().is_empty() || rec.base.venue_id.trim().is_empty() {
+                continue;
             }
-        })
-        .collect()
+            if seen.insert((rec.base.kind.clone(), rec.base.venue_id.clone())) {
+                out.push(rec);
+            }
+        }
+    }
+    out
 }
 
 fn read_orderbook_midpoints(
@@ -1707,6 +1873,42 @@ mod tests {
             rep2.quarantine_state.strategies.get("decay-strat").unwrap().status,
             "active"
         );
+
+        // Corrupt JSON & NaN/Inf recovery in quarantine_state.json
+        std::fs::write(
+            quarantine_state_path(&dir),
+            r#"{
+              "updated_at": 1700000000,
+              "strategies": {
+                "nan-quarantined": {
+                  "status": "quarantined",
+                  "throttle_mult": Infinity,
+                  "reason": "NaN should stay in string",
+                  "triggered_at": 1700000000,
+                  "rolling_fills": 6,
+                  "rolling_markout_30s_cents": NaN,
+                  "rolling_fill_rate_pct": -Infinity,
+                  "rolling_net_pnl_dollars": "NaN"
+                },
+                "bad-entry": "not-an-object"
+              }
+            }"#,
+        )
+        .unwrap();
+        let q_nan = load_quarantine_state(&dir);
+        let entry_q = q_nan.strategies.get("nan-quarantined").expect("quarantined entry recovered");
+        assert_eq!(entry_q.status, "quarantined");
+        assert_eq!(entry_q.throttle_mult, 0.0);
+        assert_eq!(entry_q.reason, "NaN should stay in string");
+        assert!(entry_q.rolling_markout_30s_cents.is_finite());
+        assert!(entry_q.rolling_fill_rate_pct.is_finite());
+        assert!(entry_q.rolling_net_pnl_dollars.is_finite());
+        assert!(!q_nan.strategies.contains_key("bad-entry"));
+
+        // Completely truncated corrupt JSON recovers cleanly to empty default without panic
+        std::fs::write(quarantine_state_path(&dir), r#"{"updated_at": 1, "strategies": {"#).unwrap();
+        let q_trunc = load_quarantine_state(&dir);
+        assert!(q_trunc.strategies.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

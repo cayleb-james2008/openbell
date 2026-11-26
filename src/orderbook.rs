@@ -12,7 +12,7 @@
 use crate::{kalshi_live, tape_hub, App};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -28,11 +28,14 @@ const RUNNER_NOTIFY_THROTTLE_MS: i64 = 250; // <= 4 Hz coalesced runner wakeup
 const SYNC_RATE_WINDOW_MS: i64 = 5_000;
 const MAX_HISTORY_LIMIT: usize = 500;
 const REST_POLL_INTERVAL_MS: u64 = 1_500;
+const WS_RECONNECT_INITIAL_MS: u64 = 1_000;
 const WS_RECONNECT_MAX_MS: u64 = 30_000;
+const MAX_CONSECUTIVE_MALFORMED_WS_FRAMES: usize = 8;
 const MAX_WS_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_WS_CONTINUATION_FRAMES: usize = 128;
 const MAX_CACHED_BOOKS: usize = 128;
 const MAX_ORDERBOOKS_JSONL_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_HISTORY_LINE_BYTES: usize = 512 * 1024;
 const MAX_LEVEL_QTY: u64 = 1_000_000_000;
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const KALSHI_PROD_WS: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
@@ -602,6 +605,7 @@ impl OrderbookStore {
     }
 
     /// Synchronize active open markets while preserving explicit UI-pinned tickers within `MAX_SUBSCRIBED_TICKERS`.
+    /// Deduplicates across pinned and active lists under rapid churn so `subscribed_tickers.len() <= 32`.
     pub fn sync_active_markets(
         &self,
         active_markets: &[String],
@@ -610,32 +614,33 @@ impl OrderbookStore {
         let mut changed = false;
         let out = {
             let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let mut pinned_clean: Vec<String> = Vec::new();
+            let mut next_subs: Vec<String> = Vec::with_capacity(MAX_SUBSCRIBED_TICKERS);
+            let mut seen: HashSet<String> = HashSet::with_capacity(MAX_SUBSCRIBED_TICKERS);
             for raw in pinned_tickers.iter().chain(st.ui_pinned_tickers.iter()) {
-                if pinned_clean.len() >= MAX_SUBSCRIBED_TICKERS {
+                if next_subs.len() >= MAX_SUBSCRIBED_TICKERS {
                     break;
                 }
                 if let Ok(valid) = kalshi_live::validate_ticker(raw) {
-                    if !pinned_clean.iter().any(|x| x == valid) {
-                        pinned_clean.push(valid.to_string());
+                    if seen.insert(valid.to_string()) {
+                        next_subs.push(valid.to_string());
                     }
                 }
             }
 
-            let mut next_subs = pinned_clean;
             let mut next_auto = BTreeSet::new();
             for raw in active_markets {
                 if next_subs.len() >= MAX_SUBSCRIBED_TICKERS {
                     break;
                 }
                 if let Ok(valid) = kalshi_live::validate_ticker(raw) {
-                    if !next_subs.iter().any(|x| x == valid) {
+                    if seen.insert(valid.to_string()) {
                         let s = valid.to_string();
                         next_auto.insert(s.clone());
                         next_subs.push(s);
                     }
                 }
             }
+            next_subs.truncate(MAX_SUBSCRIBED_TICKERS);
 
             if st.subscribed_tickers != next_subs || st.auto_subscribed_tickers != next_auto {
                 changed = st.subscribed_tickers != next_subs;
@@ -787,11 +792,24 @@ impl OrderbookStore {
             let is_subscribed = st.subscribed_tickers.iter().any(|t| t == clean_ticker);
             let needs_init = !st.books.contains_key(clean_ticker);
             if needs_init {
-                let b = TickerBook {
-                    needs_resync: true,
-                    ..Default::default()
-                };
-                st.books.insert(clean_ticker.to_string(), b);
+                if st.books.len() >= MAX_CACHED_BOOKS {
+                    let evict_key = st
+                        .books
+                        .iter()
+                        .filter(|(t, _)| !st.subscribed_tickers.iter().any(|s| s == *t))
+                        .min_by_key(|(_, b)| b.updated_ms)
+                        .map(|(t, _)| t.clone());
+                    if let Some(k) = evict_key {
+                        st.books.remove(&k);
+                    }
+                }
+                if st.books.len() < MAX_CACHED_BOOKS {
+                    let b = TickerBook {
+                        needs_resync: true,
+                        ..Default::default()
+                    };
+                    st.books.insert(clean_ticker.to_string(), b);
+                }
                 st.resync_count = st.resync_count.saturating_add(1);
                 return false;
             }
@@ -1165,17 +1183,17 @@ impl OrderbookStore {
             no_bids: Vec<[u64; 2]>,
         }
 
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
+        let mut reader = BufReader::new(file.take(MAX_ORDERBOOKS_JSONL_BYTES));
+        let mut raw_line = Vec::with_capacity(512);
         let mut out: VecDeque<OrderbookHistoryRecord> = VecDeque::with_capacity(eff_limit.min(128));
-        const MAX_SCAN_LINES: usize = 50_000;
+        const MAX_SCAN_LINES: usize = 250_000;
         let mut scanned = 0usize;
         loop {
             if scanned >= MAX_SCAN_LINES {
                 break;
             }
-            line.clear();
-            let n = match reader.read_line(&mut line) {
+            raw_line.clear();
+            let n = match reader.read_until(b'\n', &mut raw_line) {
                 Ok(n) => n,
                 Err(_) => break,
             };
@@ -1187,7 +1205,13 @@ impl OrderbookStore {
                 continue;
             }
             scanned += 1;
-            let trimmed = line.trim();
+            if raw_line.len() > MAX_HISTORY_LINE_BYTES {
+                continue;
+            }
+            let Ok(line_str) = std::str::from_utf8(&raw_line) else {
+                continue;
+            };
+            let trimmed = line_str.trim();
             if trimmed.is_empty() {
                 continue;
             }
@@ -1573,10 +1597,22 @@ impl WsConnection {
             self.read_exact_bytes(&mut hdr)?;
             let fin = (hdr[0] & 0x80) != 0;
             let opcode = hdr[0] & 0x0f;
+            if !matches!(opcode, 0x0..=0x2 | 0x8..=0xA) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ws unknown opcode",
+                ));
+            }
             if opcode == 0 && first_opcode == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "ws unexpected continuation frame",
+                ));
+            }
+            if first_opcode != 0 && opcode != 0 && opcode < 0x8 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ws interleaved data frame during continuation",
                 ));
             }
             if first_opcode == 0 && opcode != 0 {
@@ -1873,11 +1909,25 @@ fn poll_rest_once(
     (ok_count, last_err)
 }
 
+/// Compute the next bounded WebSocket reconnect backoff delay (ms).
+/// Resets to `WS_RECONNECT_INITIAL_MS` only when the session processed at least one valid frame;
+/// otherwise doubles up to `WS_RECONNECT_MAX_MS` (`30_000` ms).
+pub fn next_ws_reconnect_backoff_ms(current_backoff_ms: u64, had_valid_message: bool) -> u64 {
+    if had_valid_message {
+        WS_RECONNECT_INITIAL_MS
+    } else {
+        current_backoff_ms
+            .max(WS_RECONNECT_INITIAL_MS)
+            .saturating_mul(2)
+            .min(WS_RECONNECT_MAX_MS)
+    }
+}
+
 /// Start the background Kalshi L2 WebSocket + REST fallback worker thread.
 /// Parks idle at 0% CPU / 0 network when `subscribed_tickers` is empty.
 pub fn start_background_orderbook(app: Arc<App>) {
     std::thread::spawn(move || {
-        let mut backoff_ms = 1_000u64;
+        let mut backoff_ms = WS_RECONNECT_INITIAL_MS;
         let mut next_ws_attempt_ms = 0i64;
         let mut rest_seq = 0u64;
 
@@ -1912,7 +1962,8 @@ pub fn start_background_orderbook(app: Arc<App>) {
                     let hdrs = auth_headers_opt.unwrap_or_default();
                     match connect_ws(&ws_url, &hdrs) {
                         Ok(mut conn) => {
-                            backoff_ms = 1_000;
+                            let mut session_valid_msg = false;
+                            let mut consecutive_bad_frames = 0usize;
                             app.orderbook.set_transport_state(true, "ws", None);
                             let sub_cmd = serde_json::json!({
                                 "id": 1,
@@ -1964,15 +2015,37 @@ pub fn start_background_orderbook(app: Arc<App>) {
                                             match std::str::from_utf8(&payload) {
                                                 Ok(txt) => {
                                                     if let Err(e) = app.orderbook.ingest_ws_message(txt) {
+                                                        consecutive_bad_frames += 1;
+                                                        if consecutive_bad_frames >= MAX_CONSECUTIVE_MALFORMED_WS_FRAMES {
+                                                            app.orderbook.set_transport_state(
+                                                                false,
+                                                                "rest",
+                                                                Some(format!("WS malformed frame limit exceeded: {e}")),
+                                                            );
+                                                            break;
+                                                        }
                                                         let mut st = app
                                                             .orderbook
                                                             .inner
                                                             .lock()
                                                             .unwrap_or_else(|p| p.into_inner());
                                                         st.last_error = Some(e);
+                                                    } else {
+                                                        session_valid_msg = true;
+                                                        consecutive_bad_frames = 0;
+                                                        backoff_ms = WS_RECONNECT_INITIAL_MS;
                                                     }
                                                 }
                                                 Err(_) => {
+                                                    consecutive_bad_frames += 1;
+                                                    if consecutive_bad_frames >= MAX_CONSECUTIVE_MALFORMED_WS_FRAMES {
+                                                        app.orderbook.set_transport_state(
+                                                            false,
+                                                            "rest",
+                                                            Some("WS invalid UTF-8 frame limit exceeded".to_string()),
+                                                        );
+                                                        break;
+                                                    }
                                                     let mut st = app
                                                         .orderbook
                                                         .inner
@@ -2012,13 +2085,13 @@ pub fn start_background_orderbook(app: Arc<App>) {
                                     }
                                 }
                             }
+                            backoff_ms = next_ws_reconnect_backoff_ms(backoff_ms, session_valid_msg);
                             next_ws_attempt_ms = now_ms() + backoff_ms as i64;
-                            backoff_ms = (backoff_ms * 2).min(WS_RECONNECT_MAX_MS);
                         }
                         Err(e) => {
                             app.orderbook.set_transport_state(false, "rest", Some(e));
                             next_ws_attempt_ms = now_ms() + backoff_ms as i64;
-                            backoff_ms = (backoff_ms * 2).min(WS_RECONNECT_MAX_MS);
+                            backoff_ms = next_ws_reconnect_backoff_ms(backoff_ms, false);
                         }
                     }
                 }
@@ -2270,5 +2343,88 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cycle3_hardening_churn_read_history_corrupt_oversized_and_ws_backoff() {
+        // 1. sync_active_markets under rapid churn + duplicates + invalid tickers preserves UI pins <= 32
+        let store = OrderbookStore::new(PathBuf::new());
+        store
+            .subscribe_tickers(&["KXBTC15M-PIN1".to_string(), "KXETH15M-PIN2".to_string()], true)
+            .unwrap();
+        for round in 0..10 {
+            let mut churn = Vec::new();
+            churn.push("KXBTC15M-PIN1".to_string());
+            churn.push("bad/ticker".to_string());
+            for j in 0..60 {
+                let t = format!("KXSOL15M-R{round}-M{j}");
+                churn.push(t.clone());
+                churn.push(t);
+            }
+            let subs = store.sync_active_markets(&churn, &[]);
+            assert_eq!(subs.len(), MAX_SUBSCRIBED_TICKERS);
+            let unique: HashSet<&String> = subs.iter().collect();
+            assert_eq!(unique.len(), subs.len(), "duplicates must be eliminated");
+            assert!(subs.iter().any(|t| t == "KXBTC15M-PIN1"));
+            assert!(subs.iter().any(|t| t == "KXETH15M-PIN2"));
+        }
+
+        // 2. read_history recovers cleanly from corrupt trailing JSON, non-UTF-8 bytes, and >8MB oversized file
+        let dir = std::env::temp_dir().join(format!("ob-l2-c3hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ob_path = dir.join("orderbooks.jsonl");
+        {
+            let mut f = std::fs::File::create(&ob_path).unwrap();
+            let pad_line = "{\"ts_ms\":1000,\"ticker\":\"KXETH15M-PAD\",\"seq\":1,\"source\":\"ws\",\"yes_bids\":[[50,10]],\"no_bids\":[[48,10]]}\n";
+            let target_bytes = (MAX_ORDERBOOKS_JSONL_BYTES as usize) + 64 * 1024;
+            let mut written = 0usize;
+            while written < target_bytes {
+                f.write_all(pad_line.as_bytes()).unwrap();
+                written += pad_line.len();
+            }
+            writeln!(
+                f,
+                "{{\"ts_ms\":2000,\"ticker\":\"KXBTC15M-HIST\",\"seq\":2,\"source\":\"ws\",\"yes_bids\":[[55,10]],\"no_bids\":[[42,10]]}}"
+            )
+            .unwrap();
+            f.write_all(&[0xff, 0xfe, b'{', b'b', b'a', b'd', b'\n']).unwrap();
+            writeln!(
+                f,
+                "{{\"ts_ms\":3000,\"ticker\":\"KXBTC15M-HIST\",\"seq\":3,\"source\":\"rest\",\"yes_bids\":[[56,12]],\"no_bids\":[[41,8]]}}"
+            )
+            .unwrap();
+            f.write_all(b"{\"ts_ms\":4000,\"ticker\":\"KXBTC15M-HIST\",\"seq\":4,\"source\":\"ws\",\"yes_bids\":[[57,").unwrap();
+        }
+        let store_disk = OrderbookStore::new(dir.clone());
+        let hist = store_disk.read_history("KXBTC15M-HIST", 50).unwrap();
+        assert_eq!(hist.len(), 2, "must recover both valid records around non-UTF8 & truncated tail");
+        assert_eq!(hist[0].seq, 2);
+        assert_eq!(hist[1].seq, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 3. WS reconnect backoff stays strictly bounded on malformed frames
+        let mut b = WS_RECONNECT_INITIAL_MS;
+        for _ in 0..10 {
+            b = next_ws_reconnect_backoff_ms(b, false);
+            assert!(b <= WS_RECONNECT_MAX_MS);
+        }
+        assert_eq!(b, WS_RECONNECT_MAX_MS);
+        assert_eq!(next_ws_reconnect_backoff_ms(b, true), WS_RECONNECT_INITIAL_MS);
+
+        // 4. WsConnection::read_frame rejects unknown opcode cleanly
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = l.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (mut srv, _) = l.accept().unwrap();
+        srv.write_all(&[0x83, 0x02, b'h', b'i']).unwrap();
+        srv.flush().unwrap();
+        let mut conn = WsConnection {
+            io: WsTransport::Plain(client),
+            leftover: Vec::new(),
+            offset: 0,
+        };
+        let err = conn.read_frame().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

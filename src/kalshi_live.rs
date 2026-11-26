@@ -1182,25 +1182,28 @@ impl KalshiLiveClient {
         Ok(rows.iter().filter_map(parse_kalshi_fill).collect())
     }
 
+    /// Hard upper bound on cursor pagination requests per reconcile call to prevent infinite cursor loops.
+    pub const MAX_PAGINATION_PAGES: usize = 50;
+
     /// Fetch cursor-paginated fills from `GET /portfolio/fills`, optionally bounded by `min_ts`
-    /// and starting at `cursor`. Follows `cursor` until exhausted (capped at 50 pages).
+    /// and starting at `cursor`. Follows `cursor` until exhausted (capped at `MAX_PAGINATION_PAGES`).
     pub fn get_fills_since(
         &self,
         min_ts: Option<i64>,
         cursor: Option<&str>,
     ) -> Result<Vec<KalshiFill>, String> {
-        const MAX_PAGES: usize = 50;
+        const MAX_CURSOR_LEN: usize = 2048;
         let mut out = Vec::new();
         let mut cur_cursor = cursor
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && s.len() <= MAX_CURSOR_LEN)
             .map(ToString::to_string);
         let mut seen_cursors = std::collections::HashSet::new();
         if let Some(ref c) = cur_cursor {
             seen_cursors.insert(c.clone());
         }
 
-        for _ in 0..MAX_PAGES {
+        for page in 0..Self::MAX_PAGINATION_PAGES {
             let mut params = vec!["limit=200".to_string()];
             if let Some(ts) = min_ts.filter(|t| *t >= 0) {
                 params.push(format!("min_ts={ts}"));
@@ -1221,27 +1224,40 @@ impl KalshiLiveClient {
                 .get("cursor")
                 .and_then(|v| v.as_str())
                 .map(str::trim)
-                .filter(|c| !c.is_empty())
+                .filter(|c| !c.is_empty() && c.len() <= MAX_CURSOR_LEN)
                 .map(ToString::to_string);
             match next_cursor {
-                Some(next) if seen_cursors.insert(next.clone()) => cur_cursor = Some(next),
-                _ => break,
+                Some(next) if seen_cursors.insert(next.clone()) => {
+                    if page + 1 == Self::MAX_PAGINATION_PAGES {
+                        eprintln!(
+                            "[openbell] WARNING: get_fills_since reached MAX_PAGINATION_PAGES ({}); stopping pagination",
+                            Self::MAX_PAGINATION_PAGES
+                        );
+                        break;
+                    }
+                    cur_cursor = Some(next);
+                }
+                Some(dup) => {
+                    eprintln!("[openbell] WARNING: get_fills_since detected repeated cursor '{dup}'; stopping pagination");
+                    break;
+                }
+                None => break,
             }
         }
         Ok(out)
     }
 
-    /// Fetch cursor-paginated settlements from `GET /portfolio/settlements`.
+    /// Fetch cursor-paginated settlements from `GET /portfolio/settlements` (capped at `MAX_PAGINATION_PAGES`).
     pub fn get_settlements(
         &self,
         cursor: Option<&str>,
         limit: Option<u32>,
     ) -> Result<Vec<KalshiSettlement>, String> {
-        const MAX_PAGES: usize = 50;
+        const MAX_CURSOR_LEN: usize = 2048;
         let mut out = Vec::new();
         let mut cur_cursor = cursor
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && s.len() <= MAX_CURSOR_LEN)
             .map(ToString::to_string);
         let mut seen_cursors = std::collections::HashSet::new();
         if let Some(ref c) = cur_cursor {
@@ -1249,7 +1265,7 @@ impl KalshiLiveClient {
         }
         let clamped_limit = limit.map(|l| l.clamp(1, 200));
 
-        for _ in 0..MAX_PAGES {
+        for page in 0..Self::MAX_PAGINATION_PAGES {
             let mut params = Vec::new();
             if let Some(l) = clamped_limit {
                 params.push(format!("limit={l}"));
@@ -1274,11 +1290,24 @@ impl KalshiLiveClient {
                 .get("cursor")
                 .and_then(|v| v.as_str())
                 .map(str::trim)
-                .filter(|c| !c.is_empty())
+                .filter(|c| !c.is_empty() && c.len() <= MAX_CURSOR_LEN)
                 .map(ToString::to_string);
             match next_cursor {
-                Some(next) if seen_cursors.insert(next.clone()) => cur_cursor = Some(next),
-                _ => break,
+                Some(next) if seen_cursors.insert(next.clone()) => {
+                    if page + 1 == Self::MAX_PAGINATION_PAGES {
+                        eprintln!(
+                            "[openbell] WARNING: get_settlements reached MAX_PAGINATION_PAGES ({}); stopping pagination",
+                            Self::MAX_PAGINATION_PAGES
+                        );
+                        break;
+                    }
+                    cur_cursor = Some(next);
+                }
+                Some(dup) => {
+                    eprintln!("[openbell] WARNING: get_settlements detected repeated cursor '{dup}'; stopping pagination");
+                    break;
+                }
+                None => break,
             }
         }
         Ok(out)
@@ -2309,5 +2338,90 @@ pub(crate) mod tests {
         assert!((settles[1].realized_pnl_dollars() - 2.30).abs() < 1e-9);
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn cycle3_hardening_pagination_cursor_loop_cap() {
+        let (priv_pem, _pub_pem, _pkcs8) = generate_ephemeral_test_rsa();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fill_reqs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let settle_reqs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fill_reqs_bg = fill_reqs.clone();
+        let settle_reqs_bg = settle_reqs.clone();
+
+        // Adversarial server: fills returns an incrementing unique cursor forever;
+        // settlements returns a repeating cursor cycle ("loop-a" -> "loop-a").
+        let total_expected_max = KalshiLiveClient::MAX_PAGINATION_PAGES + 2;
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming().take(total_expected_max) {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                let _ = reader.read_line(&mut req_line);
+                loop {
+                    let mut l = String::new();
+                    if reader.read_line(&mut l).unwrap_or(0) == 0 || l == "\r\n" {
+                        break;
+                    }
+                }
+                let path = req_line.split_whitespace().nth(1).unwrap_or("");
+                let resp = if path.starts_with("/trade-api/v2/portfolio/fills") {
+                    let n = fill_reqs_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    serde_json::json!({
+                        "fills": [{
+                            "trade_id": format!("tr-loop-{n}"),
+                            "order_id": format!("ord-loop-{n}"),
+                            "ticker": "KXBTC15M-LOOP",
+                            "side": "yes",
+                            "action": "buy",
+                            "count": 1,
+                            "yes_price": 50
+                        }],
+                        "cursor": format!("next-{n}")
+                    })
+                } else {
+                    let n = settle_reqs_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    serde_json::json!({
+                        "settlements": [{
+                            "ticker": format!("KXBTC15M-SLOOP-{n}"),
+                            "market_result": "yes",
+                            "yes_count": 1,
+                            "no_count": 0,
+                            "revenue": 100
+                        }],
+                        "cursor": "repeat-forever"
+                    })
+                };
+                let body_str = resp.to_string();
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
+                    body_str.len()
+                );
+                let _ = stream.write_all(http.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let client = KalshiLiveClient::from_parts(
+            "loop-key-1234",
+            &priv_pem,
+            KalshiEnv::Demo,
+            &format!("http://{addr}/trade-api/v2"),
+        )
+        .unwrap();
+
+        let fills = client.get_fills_since(None, None).unwrap();
+        assert_eq!(fills.len(), KalshiLiveClient::MAX_PAGINATION_PAGES);
+        assert_eq!(
+            fill_reqs.load(std::sync::atomic::Ordering::SeqCst),
+            KalshiLiveClient::MAX_PAGINATION_PAGES
+        );
+
+        let settles = client.get_settlements(None, Some(50)).unwrap();
+        assert_eq!(settles.len(), 2, "repeating cursor cycle must stop after 2nd request");
+        assert_eq!(settle_reqs.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        drop(handle);
     }
 }
