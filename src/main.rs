@@ -17,6 +17,7 @@ mod open;
 mod recalibration;
 mod risk_rails;
 mod scaling;
+mod shadow_runner;
 mod tournament;
 mod update;
 
@@ -638,7 +639,7 @@ fn fetch_markets(series: &str, status: &str) -> Result<(Vec<Snapshot>, usize, bo
 const MAX_SSE_CLIENTS: usize = 64;
 
 struct TapeHub {
-    senders: std::sync::Mutex<Vec<std::sync::mpsc::SyncSender<String>>>,
+    senders: std::sync::Mutex<Vec<std::sync::mpsc::SyncSender<(String, String)>>>,
 }
 
 impl TapeHub {
@@ -648,26 +649,40 @@ impl TapeHub {
         }
     }
 
-    fn subscribe(&self) -> Option<std::sync::mpsc::Receiver<String>> {
+    fn subscribe(&self) -> Option<std::sync::mpsc::Receiver<(String, String)>> {
         let mut guard = self.senders.lock().unwrap_or_else(|p| p.into_inner());
         // Drop closed subscribers before enforcing the concurrent cap.
-        guard.retain(|tx| !matches!(tx.try_send(String::new()), Err(std::sync::mpsc::TrySendError::Disconnected(_))));
+        guard.retain(|tx| {
+            !matches!(
+                tx.try_send((String::new(), String::new())),
+                Err(std::sync::mpsc::TrySendError::Disconnected(_))
+            )
+        });
         if guard.len() >= MAX_SSE_CLIENTS {
             return None;
         }
-        let (tx, rx) = std::sync::mpsc::sync_channel(32);
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
         guard.push(tx);
         Some(rx)
     }
 
-    fn publish(&self, payload: String) {
+    fn publish_event(&self, event_name: &str, payload: String) {
+        let ev = event_name.to_string();
         let mut guard = self.senders.lock().unwrap_or_else(|p| p.into_inner());
         guard.retain(|tx| {
             !matches!(
-                tx.try_send(payload.clone()),
+                tx.try_send((ev.clone(), payload.clone())),
                 Err(std::sync::mpsc::TrySendError::Disconnected(_))
             )
         });
+    }
+
+    fn publish(&self, payload: String) {
+        self.publish_event("tape", payload);
+    }
+
+    fn publish_runner(&self, payload: String) {
+        self.publish_event("runner", payload);
     }
 }
 
@@ -1169,6 +1184,8 @@ struct Strategy {
     /// budget_open): direct evidence a script does not terminate,
     /// as opposed to a script that is merely slow.
     budget_deaths: std::cell::Cell<usize>,
+    /// Cached probe of whether this Rune unit exports `entry_quote`.
+    has_entry_quote: std::cell::Cell<Option<bool>>,
 }
 
 static SHARED_RUNTIME: std::sync::Mutex<Option<std::sync::Weak<rune::runtime::RuntimeContext>>> =
@@ -1259,6 +1276,7 @@ impl Strategy {
                     call_failures: std::cell::Cell::new(0),
                     vm: std::cell::RefCell::new(None),
                     budget_deaths: std::cell::Cell::new(0),
+                    has_entry_quote: std::cell::Cell::new(None),
                 });
             }
         }
@@ -1328,6 +1346,7 @@ impl Strategy {
             call_failures: std::cell::Cell::new(0),
             vm: std::cell::RefCell::new(None),
             budget_deaths: std::cell::Cell::new(0),
+            has_entry_quote: std::cell::Cell::new(None),
         };
         strat.name = strat.call_string("name")?;
         strat.side = strat.call_string("side")?;
@@ -1481,6 +1500,58 @@ impl Strategy {
                 false
             }
         }
+    }
+
+    /// Invoke optional `entry_quote(yes_ask, no_ask, secs_to_close)` returning a
+    /// whole-cent limit quote in `0.01..=0.99`, falling back to `allow_entry`
+    /// + side ask only when the script does not define `entry_quote`.
+    fn entry_quote(&self, yes_ask: f64, no_ask: f64, secs_to_close: i64) -> Option<f64> {
+        if !self.budget_open() {
+            return None;
+        }
+        if self.has_entry_quote.get() != Some(false) {
+            match self.call_budgeted("entry_quote", (yes_ask, no_ask, secs_to_close)) {
+                Ok(value) => {
+                    self.has_entry_quote.set(Some(true));
+                    match rune::from_value::<Option<f64>>(value) {
+                        Ok(Some(price)) => {
+                            if price.is_finite() && (0.01..=0.99).contains(&price) {
+                                let cents = (price * 100.0).round();
+                                if ((price * 100.0) - cents).abs() < 1e-6 {
+                                    return Some(cents / 100.0);
+                                }
+                            }
+                            self.call_failures.set(self.call_failures.get() + 1);
+                            return None;
+                        }
+                        Ok(None) => return None,
+                        Err(_) => {
+                            self.call_failures.set(self.call_failures.get() + 1);
+                            return None;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("Missing function") {
+                        self.has_entry_quote.set(Some(false));
+                    } else {
+                        self.call_failures.set(self.call_failures.get() + 1);
+                        return None;
+                    }
+                }
+            }
+        }
+        if self.allow_entry(yes_ask, no_ask, secs_to_close) {
+            let price = if self.side == "yes" { yes_ask } else { no_ask };
+            if price.is_finite() && (0.01..=0.99).contains(&price) {
+                let cents = (price * 100.0).round();
+                if ((price * 100.0) - cents).abs() < 1e-6 {
+                    return Some(cents / 100.0);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -2834,6 +2905,8 @@ struct App {
     collector_scheduler: Arc<CollectorScheduler>,
     /// Live Kalshi Trade API v2 connection config & fail-closed risk rails (always boots disarmed).
     live_desk: std::sync::Mutex<LiveDeskManager>,
+    /// Tick-driven Paper/Shadow Orderbook Matching Engine & Fail-Closed Automated Runner.
+    runner: Arc<shadow_runner::ShadowRunner>,
     tape_cache: std::sync::RwLock<Option<TapeEntry>>,
     /// Serializes cold tape parses so 30+ concurrent readers share one 100k-line parse.
     tape_compute_lock: std::sync::Mutex<()>,
@@ -2907,6 +2980,7 @@ impl App {
     ) -> Self {
         let live_cfg = kalshi_live::load_live_config(&data_dir);
         let live_rails = risk_rails::RiskRailsState::load(&data_dir);
+        let runner = Arc::new(shadow_runner::ShadowRunner::load(&data_dir, paper_pot));
         let live_snapshots_path = data_dir.join("snapshots.jsonl");
         Self {
             data_dir,
@@ -2923,6 +2997,7 @@ impl App {
                 rails: live_rails,
                 connected: false,
             }),
+            runner,
             tape_cache: std::sync::RwLock::new(None),
             tape_compute_lock: std::sync::Mutex::new(()),
             analysis_cache: std::sync::RwLock::new(None),
@@ -5084,12 +5159,13 @@ fn serve_sse_stream(stream: &mut std::net::TcpStream, app: &App) {
     }
     loop {
         match rx.recv_timeout(std::time::Duration::from_secs(15)) {
-            Ok(payload) => {
+            Ok((ev_name, payload)) => {
                 if payload.is_empty() {
                     continue;
                 }
+                let ev = if ev_name.is_empty() { "tape" } else { ev_name.as_str() };
                 if stream
-                    .write_all(format!("event: tape\ndata: {payload}\n\n").as_bytes())
+                    .write_all(format!("event: {ev}\ndata: {payload}\n\n").as_bytes())
                     .is_err()
                     || stream.flush().is_err()
                 {
@@ -5249,6 +5325,7 @@ fn home_json_body(app: &App) -> String {
             "auto_collector",
             "live_kalshi",
             "risk_rails",
+            "shadow_runner",
         ],
     };
     serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string())
@@ -5663,7 +5740,10 @@ fn try_handle_inline_get(
     let (Some("GET"), Some(path), Some(_ver)) = (parts.next(), parts.next(), parts.next()) else {
         return None;
     };
-    if path.starts_with("/api/live") || path.starts_with("/api/tape/stream") {
+    if path.starts_with("/api/live")
+        || path.starts_with("/api/runner")
+        || path.starts_with("/api/tape/stream")
+    {
         return None;
     }
     let mut host_ok = false;
@@ -5756,6 +5836,9 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let _ = app.collector_scheduler.record_pass_result(&res);
             match res {
                 Ok(rep) => {
+                    if rep.written > 0 {
+                        app.runner.notify_tick();
+                    }
                     #[derive(serde::Serialize)]
                     struct CollectResp {
                         snapshots_written: usize,
@@ -6718,6 +6801,8 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 };
                 (why, client_opt)
             };
+            // Atomically halt automated runner BEFORE calling venue cancel_all_orders().
+            app.runner.emergency_halt(&why);
             let report = match client_opt {
                 Some(c) => c.cancel_all_orders(),
                 None => kalshi_live::CancelAllReport {
@@ -6750,6 +6835,121 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()),
             );
             json_response(200, &body)
+        }
+        ("GET", "/api/runner/status") => {
+            let (live_armed, killed) = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                (st.rails.live_armed, st.rails.killed)
+            };
+            let snap = app.runner.status(live_armed, killed);
+            json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
+        }
+        ("POST", "/api/runner/config") => {
+            if let Err(resp) = parse_json_object_body(
+                body,
+                false,
+                "Runner config request body must be a JSON object",
+            ) {
+                return resp;
+            }
+            let req: shadow_runner::RunnerConfigRequest = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => {
+                    return json_ok_err_response(400, &format!("invalid runner config: {e}"));
+                }
+            };
+            let (live_armed, killed) = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                (st.rails.live_armed, st.rails.killed)
+            };
+            match app.runner.configure(req, live_armed, killed) {
+                Ok(status) => {
+                    let body = serde_json::json!({
+                        "ok": true,
+                        "status": status,
+                    });
+                    json_response(200, &body.to_string())
+                }
+                Err(e) => json_ok_err_response(400, &e),
+            }
+        }
+        ("POST", "/api/runner/start") => {
+            let parsed = match parse_json_object_body(
+                body,
+                false,
+                "Runner start request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let Some(mode) = parsed.get("mode").and_then(|v| v.as_str()) else {
+                return json_ok_err_response(400, "missing string field \"mode\"");
+            };
+            let confirm_auto_live = match parsed.get("confirm_auto_live") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(_) => {
+                    return json_ok_err_response(400, "confirm_auto_live must be a boolean");
+                }
+            };
+            let (live_armed, killed) = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                (st.rails.live_armed, st.rails.killed)
+            };
+            match app.runner.start(mode, confirm_auto_live, live_armed, killed) {
+                Ok(status) => {
+                    let body = serde_json::json!({
+                        "ok": true,
+                        "status": status,
+                    });
+                    json_response(200, &body.to_string())
+                }
+                Err((code, msg)) => json_ok_err_response(code, &msg),
+            }
+        }
+        ("POST", "/api/runner/stop") => {
+            let parsed = match parse_json_object_body(
+                body,
+                true,
+                "Runner stop request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let cancel_resting = match parsed.get("cancel_resting") {
+                None | Some(serde_json::Value::Null) => true,
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(_) => {
+                    return json_ok_err_response(400, "cancel_resting must be a boolean");
+                }
+            };
+            let (live_armed, killed, live_cfg) = {
+                let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                (st.rails.live_armed, st.rails.killed, st.config.clone())
+            };
+            match app.runner.stop(cancel_resting, Some(&live_cfg), live_armed, killed) {
+                Ok((status, cancelled_quotes, live_cancel_errors)) => {
+                    let body = serde_json::json!({
+                        "ok": true,
+                        "cancelled_quotes": cancelled_quotes,
+                        "live_cancel_errors": live_cancel_errors,
+                        "status": status,
+                    });
+                    json_response(200, &body.to_string())
+                }
+                Err(e) => json_ok_err_response(500, &e),
+            }
+        }
+        ("GET", "/api/runner/ledger") => {
+            let limit = query_param(query, "limit")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(200);
+            let strategy = query_param(query, "strategy");
+            let mode = query_param(query, "mode");
+            let resp = app
+                .runner
+                .ledger_query(limit, strategy.as_deref(), mode.as_deref());
+            json_response(200, &serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()))
         }
         _ => json_response(404, "{\"error\":\"not found\"}"),
     }
@@ -6932,6 +7132,7 @@ fn start_background_collector(app: Arc<App>) {
             Ok(rep) => {
                 if rep.written > 0 {
                     app.invalidate_live_hot();
+                    app.runner.notify_tick();
                 }
                 if rep.errors.is_empty() {
                     if rep.deduplicated > 0 {
@@ -7187,13 +7388,36 @@ fn main() {
                                 break;
                             }
                             let route = path.split_once('?').map(|(r, _)| r).unwrap_or(&path);
-                            if route == "/api/live" || route.starts_with("/api/live/") {
+                            if route == "/api/live"
+                                || route.starts_with("/api/live/")
+                                || route == "/api/runner"
+                                || route.starts_with("/api/runner/")
+                            {
                                 if let Some((status, message)) =
                                     refuse_live_request(&method, host, &headers)
                                 {
                                     let response = json_err_response(status, message);
                                     let _ = stream.write_all(response.as_bytes());
                                     break;
+                                }
+                                if (route == "/api/runner" || route.starts_with("/api/runner/"))
+                                    && !matches!(method.as_str(), "GET" | "HEAD")
+                                {
+                                    let ct = headers
+                                        .iter()
+                                        .find(|(n, _)| n == "content-type")
+                                        .map(|(_, v)| v.as_str())
+                                        .unwrap_or("");
+                                    if !(ct.len() >= 16
+                                        && ct[..16].eq_ignore_ascii_case("application/json"))
+                                    {
+                                        let response = json_err_response(
+                                            415,
+                                            "runner mutations require Content-Type: application/json",
+                                        );
+                                        let _ = stream.write_all(response.as_bytes());
+                                        break;
+                                    }
                                 }
                             }
                             if method == "GET" && route == "/api/tape/stream" {
@@ -7251,6 +7475,7 @@ fn main() {
         spawn_worker(pool.clone(), app.clone(), allowed_hosts.clone(), false);
     }
     start_background_collector(app.clone());
+    shadow_runner::start_background_runner(app.clone());
     updater().start_background();
     println!("{}", start_banner(&url, &data_dir, updater().cfg.mode, opening));
 
