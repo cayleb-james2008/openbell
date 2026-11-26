@@ -350,6 +350,44 @@ export type DryRunOrderPlan = {
   summary: string;
 };
 
+export type LiquidityScaleScenario = {
+  scale_label: string;
+  scale_factor: number;
+  target_contracts: number;
+  fill_ratio: number;
+  impact_drag_cents: number;
+  net_ev_after_impact_cents: number;
+  feasible: boolean;
+};
+
+export type LiquidityCapacityLeg = {
+  strategy: string;
+  side: string;
+  series: string;
+  base_contracts: number;
+  max_limit_cents: number;
+  causal_book_depth_contracts: number;
+  depth_source: string;
+  capacity_tier: "LIQUID" | "TIGHT" | "CROWDED" | "NO_DATA" | string;
+  max_scalable_contracts: number;
+  max_scalable_dollars: number;
+  scenarios: LiquidityScaleScenario[];
+};
+
+export type LiquidityCapacityReport = {
+  status: "LIQUID" | "TIGHT" | "CROWDED" | "NO_DATA" | string;
+  live_armed: boolean;
+  observed_depth_windows: number;
+  median_book_depth_contracts: number;
+  base_contracts: number;
+  max_scalable_contracts: number;
+  max_scalable_dollars: number;
+  max_scalable_bankroll: number;
+  portfolio_scenarios: LiquidityScaleScenario[];
+  legs: LiquidityCapacityLeg[];
+  summary: string;
+};
+
 export type DailyTargetVerdict = {
   target_daily_profit_dollars: number;
   verdict: "GO_500_DAY" | "NO_GO_PAPER" | string;
@@ -401,6 +439,7 @@ export type AutoAllocatorReport = {
   comparison: AllocatorComparison;
   planned_intents: PlannedAllocatorIntent[];
   dry_run_plan: DryRunOrderPlan;
+  liquidity_capacity: LiquidityCapacityReport;
   daily_target: DailyTargetVerdict;
   honesty_notes: string[];
   source?: "server" | "client";
@@ -512,6 +551,21 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
   const intentsRaw = Array.isArray(o.planned_intents) ? o.planned_intents : [];
   const dryPlanRaw = (o.dry_run_plan && typeof o.dry_run_plan === "object" ? o.dry_run_plan : {}) as Record<string, unknown>;
   const dryLegsRaw = Array.isArray(dryPlanRaw.legs) ? dryPlanRaw.legs : [];
+  const liqRaw = (o.liquidity_capacity && typeof o.liquidity_capacity === "object" ? o.liquidity_capacity : {}) as Record<string, unknown>;
+  const liqPortRaw = Array.isArray(liqRaw.portfolio_scenarios) ? liqRaw.portfolio_scenarios : [];
+  const liqLegsRaw = Array.isArray(liqRaw.legs) ? liqRaw.legs : [];
+  const normalizeLiqScenarios = (arr: unknown[]): LiquidityScaleScenario[] =>
+    arr
+      .filter((s): s is Record<string, unknown> => !!s && typeof s === "object")
+      .map((s) => ({
+        scale_label: strOr(s.scale_label, "1x"),
+        scale_factor: Math.max(1, Math.round(finiteOr(s.scale_factor, 1))),
+        target_contracts: Math.max(0, Math.round(finiteOr(s.target_contracts, 0))),
+        fill_ratio: finiteOr(s.fill_ratio, 0),
+        impact_drag_cents: finiteOr(s.impact_drag_cents, 0),
+        net_ev_after_impact_cents: finiteOr(s.net_ev_after_impact_cents, 0),
+        feasible: Boolean(s.feasible),
+      }));
   const notesRaw = Array.isArray(o.honesty_notes) ? o.honesty_notes : [];
   const compRaw = (o.comparison && typeof o.comparison === "object" ? o.comparison : {}) as Record<string, unknown>;
   const curveRaw = Array.isArray(compRaw.equity_curve) ? compRaw.equity_curve : [];
@@ -919,6 +973,33 @@ function normalizeReport(raw: unknown): AutoAllocatorReport | null {
         })),
       summary: strOr(dryPlanRaw.summary, "No active OOS winners available for a dry-run order plan."),
     },
+    liquidity_capacity: {
+      status: strOr(liqRaw.status, "NO_DATA"),
+      live_armed: Boolean(liqRaw.live_armed),
+      observed_depth_windows: Math.max(0, Math.round(finiteOr(liqRaw.observed_depth_windows, 0))),
+      median_book_depth_contracts: finiteOr(liqRaw.median_book_depth_contracts, 0),
+      base_contracts: Math.max(0, Math.round(finiteOr(liqRaw.base_contracts, 0))),
+      max_scalable_contracts: Math.max(0, Math.round(finiteOr(liqRaw.max_scalable_contracts, 0))),
+      max_scalable_dollars: finiteOr(liqRaw.max_scalable_dollars, 0),
+      max_scalable_bankroll: finiteOr(liqRaw.max_scalable_bankroll, 0),
+      portfolio_scenarios: normalizeLiqScenarios(liqPortRaw),
+      legs: liqLegsRaw
+        .filter((lg): lg is Record<string, unknown> => !!lg && typeof lg === "object")
+        .map((lg) => ({
+          strategy: strOr(lg.strategy, "unnamed"),
+          side: strOr(lg.side, "yes"),
+          series: strOr(lg.series, "KXBTC15M"),
+          base_contracts: Math.max(0, Math.round(finiteOr(lg.base_contracts, 0))),
+          max_limit_cents: Math.min(99, Math.max(1, Math.round(finiteOr(lg.max_limit_cents, 50)))),
+          causal_book_depth_contracts: finiteOr(lg.causal_book_depth_contracts, 0),
+          depth_source: strOr(lg.depth_source, "spread_heuristic"),
+          capacity_tier: strOr(lg.capacity_tier, "NO_DATA"),
+          max_scalable_contracts: Math.max(0, Math.round(finiteOr(lg.max_scalable_contracts, 0))),
+          max_scalable_dollars: finiteOr(lg.max_scalable_dollars, 0),
+          scenarios: normalizeLiqScenarios(Array.isArray(lg.scenarios) ? lg.scenarios : []),
+        })),
+      summary: strOr(liqRaw.summary, "Awaiting active OOS winners for causal liquidity capacity sizing."),
+    },
     daily_target: {
       target_daily_profit_dollars: finiteOr(dtRaw.target_daily_profit_dollars, 500),
       verdict: strOr(dtRaw.verdict, "NO_GO_PAPER"),
@@ -1128,6 +1209,151 @@ function makeOfflineDryRunPlan(
   };
 }
 
+function makeOfflineLiquidityCapacity(
+  params: AutoAllocatorRequest,
+  plan: DryRunOrderPlan,
+  markets: Market[],
+): LiquidityCapacityReport {
+  if (plan.legs.length === 0) {
+    return {
+      status: "NO_DATA",
+      live_armed: false,
+      observed_depth_windows: 0,
+      median_book_depth_contracts: 0,
+      base_contracts: 0,
+      max_scalable_contracts: 0,
+      max_scalable_dollars: 0,
+      max_scalable_bankroll: 0,
+      portfolio_scenarios: [],
+      legs: [],
+      summary: "NO_DATA: 0 active OOS legs for causal liquidity capacity sizing (live_armed=false)",
+    };
+  }
+  const spreads = markets
+    .map((m) =>
+      isNum(m.yes_bid) && isNum(m.yes_ask) && m.yes_ask >= m.yes_bid ? (m.yes_ask - m.yes_bid) * 100 : null,
+    )
+    .filter((v): v is number => v !== null && v > 0);
+  const meanSpread = spreads.length > 0 ? spreads.reduce((a, b) => a + b, 0) / spreads.length : 2.0;
+  const depth = Math.min(200, Math.max(15, 180 / Math.max(1, meanSpread)));
+  const halfSpread = Math.max(0.5, 0.5 * meanSpread);
+  const isMaker = params.execution_mode === "maker";
+  const rate = isMaker ? 0.0175 : 0.07;
+
+  const impactAt = (c: number) => {
+    if (c <= 0) return { fill: 1, impact: 0 };
+    const u = c / Math.max(1, depth);
+    const fill = Math.min(1, Math.max(0, depth / c));
+    const impact = halfSpread * (0.15 * u + 1.15 * Math.pow(Math.max(0, u - 0.25), 1.35));
+    return { fill, impact };
+  };
+
+  let maxContractsSum = 0;
+  let maxDollarsSum = 0;
+  const portFill = [0, 0, 0];
+  const portImp = [0, 0, 0];
+  const portEv = [0, 0, 0];
+  const portC = [0, 0, 0];
+  let wDen = 0;
+
+  const legs: LiquidityCapacityLeg[] = plan.legs.map((leg) => {
+    const p = leg.max_limit_cents / 100;
+    const preFeeEv = leg.gross_oos_ev_cents - leg.spread_cross_cost_cents - leg.slippage_cost_cents;
+    const netAt = (c: number) => {
+      if (c <= 0) return leg.net_oos_ev_after_all_cents;
+      const feeC = (Math.ceil(rate * c * p * (1 - p) * 100) / c);
+      return preFeeEv - feeC - impactAt(c).impact;
+    };
+    let bestC = 0;
+    for (let c = 1; c <= 2000; c++) {
+      if (netAt(c) > 0) bestC = c;
+      else if (c >= 32) break;
+    }
+    const legDollars = Number((bestC * p).toFixed(2));
+    maxContractsSum += bestC;
+    maxDollarsSum += legDollars;
+    const wt = Math.max(0.01, leg.notional_dollars);
+    wDen += wt;
+    const scenarios: LiquidityScaleScenario[] = [1, 2, 5].map((sf, idx) => {
+      const c = leg.target_contracts * sf;
+      const { fill, impact } = impactAt(c);
+      const net = Number(netAt(c).toFixed(2));
+      const feasible = c > 0 && fill >= 0.75 && net > 0;
+      portC[idx] += c;
+      portFill[idx] += fill * wt;
+      portImp[idx] += impact * wt;
+      portEv[idx] += net * wt;
+      return {
+        scale_label: `${sf}x`,
+        scale_factor: sf,
+        target_contracts: c,
+        fill_ratio: Number(fill.toFixed(4)),
+        impact_drag_cents: Number(impact.toFixed(2)),
+        net_ev_after_impact_cents: net,
+        feasible,
+      };
+    });
+    const tier = !scenarios[0].feasible
+      ? "CROWDED"
+      : scenarios[1].feasible && scenarios[2].feasible
+        ? "LIQUID"
+        : "TIGHT";
+    return {
+      strategy: leg.strategy,
+      side: leg.side,
+      series: leg.series,
+      base_contracts: leg.target_contracts,
+      max_limit_cents: leg.max_limit_cents,
+      causal_book_depth_contracts: Number(depth.toFixed(1)),
+      depth_source: "spread_heuristic",
+      capacity_tier: tier,
+      max_scalable_contracts: bestC,
+      max_scalable_dollars: legDollars,
+      scenarios,
+    };
+  });
+
+  const den = Math.max(1e-9, wDen);
+  const portfolio_scenarios: LiquidityScaleScenario[] = [1, 2, 5].map((sf, idx) => {
+    const fill = Number((portFill[idx] / den).toFixed(4));
+    const impact = Number((portImp[idx] / den).toFixed(2));
+    const net = Number((portEv[idx] / den).toFixed(2));
+    const c = portC[idx];
+    const feasible = c > 0 && legs.every((l) => l.scenarios[idx]?.feasible) && fill >= 0.75 && net > 0;
+    return {
+      scale_label: `${sf}x`,
+      scale_factor: sf,
+      target_contracts: c,
+      fill_ratio: fill,
+      impact_drag_cents: impact,
+      net_ev_after_impact_cents: net,
+      feasible,
+    };
+  });
+  const status = !portfolio_scenarios[0].feasible
+    ? "CROWDED"
+    : portfolio_scenarios[1].feasible && portfolio_scenarios[2].feasible
+      ? "LIQUID"
+      : "TIGHT";
+  const maxBankroll =
+    plan.total_notional_dollars > 1e-9
+      ? Number((params.starting_bankroll * (maxDollarsSum / plan.total_notional_dollars)).toFixed(2))
+      : 0;
+  return {
+    status,
+    live_armed: false,
+    observed_depth_windows: 0,
+    median_book_depth_contracts: Number(depth.toFixed(1)),
+    base_contracts: plan.total_contracts,
+    max_scalable_contracts: maxContractsSum,
+    max_scalable_dollars: Number(maxDollarsSum.toFixed(2)),
+    max_scalable_bankroll: maxBankroll,
+    portfolio_scenarios,
+    legs,
+    summary: `${status}: ${legs.length} offline leg(s), depth ${Math.round(depth)} cts, max scalable $${maxDollarsSum.toFixed(2)}/window (~$${Math.round(maxBankroll)} bankroll), live_armed=false`,
+  };
+}
+
 export function computeClientFallbackReport(
   params: AutoAllocatorRequest,
   slots: Slots | null,
@@ -1235,6 +1461,7 @@ export function computeClientFallbackReport(
       },
       planned_intents: [],
       dry_run_plan: makeOfflineDryRunPlan(params, []),
+      liquidity_capacity: makeOfflineLiquidityCapacity(params, makeOfflineDryRunPlan(params, []), markets),
       daily_target: {
         target_daily_profit_dollars: 500,
         verdict: "NO_GO_PAPER",
@@ -1570,6 +1797,7 @@ export function computeClientFallbackReport(
     },
     planned_intents,
     dry_run_plan: makeOfflineDryRunPlan(params, rawWinners),
+    liquidity_capacity: makeOfflineLiquidityCapacity(params, makeOfflineDryRunPlan(params, rawWinners), markets),
     daily_target: {
       target_daily_profit_dollars: 500,
       verdict: "NO_GO_PAPER",

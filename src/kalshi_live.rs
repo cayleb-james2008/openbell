@@ -940,7 +940,7 @@ impl KalshiLiveClient {
                     .into_string()
                     .map_err(|e| format!("failed reading Kalshi response body: {e}"))?;
                 if text.trim().is_empty() {
-                    Ok(serde_json::json!({}))
+                    Ok(serde_json::Value::Object(Default::default()))
                 } else {
                     serde_json::from_str(&text)
                         .map_err(|e| format!("Kalshi returned non-JSON body: {e}"))
@@ -1013,7 +1013,7 @@ impl KalshiLiveClient {
             return Err(format!("Kalshi HTTP {status}: {snippet}"));
         }
         if body_part.trim().is_empty() {
-            Ok(serde_json::json!({}))
+            Ok(serde_json::Value::Object(Default::default()))
         } else {
             serde_json::from_str(body_part)
                 .map_err(|e| format!("Kalshi returned non-JSON body: {e}"))

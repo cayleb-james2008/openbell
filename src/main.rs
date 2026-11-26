@@ -4359,6 +4359,35 @@ fn json_ok_err_response(status: u16, msg: &str) -> String {
 }
 
 #[inline(never)]
+fn publish_live_status_json(snap: &risk_rails::LiveStatusSnapshot) -> String {
+    let ev = format!(
+        "{{\"type\":\"live_status\",\"configured\":{},\"live_armed\":{},\"environment\":\"{}\",\"ts\":{}}}",
+        snap.configured,
+        snap.live_armed,
+        if snap.environment == "prod" { "prod" } else { "demo" },
+        now_unix(),
+    );
+    tape_hub().publish(ev);
+    json_response(200, &serde_json::to_string(snap).unwrap_or_else(|_| "{}".into()))
+}
+
+#[inline(never)]
+fn parse_json_object_body(
+    body: &str,
+    allow_empty: bool,
+    non_object_msg: &str,
+) -> Result<serde_json::Value, String> {
+    if allow_empty && body.trim().is_empty() {
+        return Ok(serde_json::Value::Object(Default::default()));
+    }
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(_) => Err(json_err_response(400, non_object_msg)),
+        Err(e) => Err(json_err_response(400, &format!("invalid JSON body: {e}"))),
+    }
+}
+
+#[inline(never)]
 fn live_err_response(status: u16, list_key: Option<&str>, msg: &str) -> String {
     let err_json = serde_json::to_string(msg).unwrap_or_else(|_| "\"error\"".to_string());
     let body = match list_key {
@@ -5694,43 +5723,30 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let Some(ticker) = query_param(query, "ticker") else {
                 return json_response(400, "{\"error\":\"missing ticker parameter\"}");
             };
-            #[derive(serde::Serialize)]
-            struct MarketHistoryResp<'a, T: serde::Serialize> {
-                ticker: &'a str,
-                dataset: &'a str,
-                points: T,
-            }
             let points = market_history_from(app, &dpath, &ticker);
-            let body = serde_json::to_string(&MarketHistoryResp {
-                ticker: &ticker,
-                dataset: &dataset,
-                points,
-            })
-            .unwrap_or_else(|_| "{}".to_string());
+            let body = format!(
+                "{{\"ticker\":{},\"dataset\":{},\"points\":{}}}",
+                serde_json::to_string(&ticker).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(&dataset).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(&points).unwrap_or_else(|_| "[]".into()),
+            );
             json_response(200, &body)
         }
         ("GET", "/api/strategy/source") => {
             let Some(name) = query_param(query, "name") else {
                 return json_response(400, "{\"error\":\"missing name parameter\"}");
             };
-            #[derive(serde::Serialize)]
-            struct StratSourceResp {
-                strategy: String,
-                file: String,
-                side: String,
-                source: String,
-            }
             match strategy_source_for(&app.strategies_dir, &name) {
-                Some((file, side, source)) => json_response(
-                    200,
-                    &serde_json::to_string(&StratSourceResp {
-                        strategy: name,
-                        file,
-                        side,
-                        source,
-                    })
-                    .unwrap_or_else(|_| "{}".to_string()),
-                ),
+                Some((file, side, source)) => {
+                    let body = format!(
+                        "{{\"strategy\":{},\"file\":{},\"side\":{},\"source\":{}}}",
+                        serde_json::to_string(&name).unwrap_or_else(|_| "\"\"".into()),
+                        serde_json::to_string(&file).unwrap_or_else(|_| "\"\"".into()),
+                        serde_json::to_string(&side).unwrap_or_else(|_| "\"\"".into()),
+                        serde_json::to_string(&source).unwrap_or_else(|_| "\"\"".into()),
+                    );
+                    json_response(200, &body)
+                }
                 None => json_err_response(404, &format!("no such strategy: {name}")),
             }
         }
@@ -5769,17 +5785,13 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             json_response(200, &app.collector_status_json())
         }
         ("POST", "/api/collector/schedule") => {
-            let parsed: serde_json::Value = match serde_json::from_str::<serde_json::Value>(body) {
-                Ok(v) if v.is_object() => v,
-                Ok(_) => {
-                    return json_response(
-                        400,
-                        "{\"error\":\"Collector schedule request body must be a JSON object\"}",
-                    );
-                }
-                Err(e) => {
-                    return json_err_response(400, &format!("invalid JSON body: {e}"));
-                }
+            let parsed = match parse_json_object_body(
+                body,
+                false,
+                "Collector schedule request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
             };
             let enabled = match parsed.get("enabled") {
                 None => None,
@@ -5854,15 +5866,12 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             json_response(200, &equity_json)
         }
         ("GET", "/api/report") => {
-            #[derive(serde::Serialize)]
-            struct ReportWrap<T: serde::Serialize> {
-                report: T,
-            }
             let report = daily_report(app);
-            json_response(
-                200,
-                &serde_json::to_string(&ReportWrap { report }).unwrap_or_else(|_| "{}".to_string()),
-            )
+            let body = format!(
+                "{{\"report\":{}}}",
+                serde_json::to_string(&report).unwrap_or_else(|_| "\"\"".into())
+            );
+            json_response(200, &body)
         }
         ("GET", "/api/export/report") => {
             let (dataset, dpath) = match resolve_dataset_checked(app, query, None) {
@@ -5926,21 +5935,13 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             json_response(200, &payload)
         }
         ("POST", "/api/allocator/plan") => {
-            let parsed: serde_json::Value = if body.trim().is_empty() {
-                serde_json::json!({})
-            } else {
-                match serde_json::from_str::<serde_json::Value>(body) {
-                    Ok(v) if v.is_object() => v,
-                    Ok(_) => {
-                        return json_response(
-                            400,
-                            "{\"error\":\"Allocator request body must be a JSON object\"}",
-                        );
-                    }
-                    Err(e) => {
-                        return json_err_response(400, &format!("invalid JSON body: {e}"));
-                    }
-                }
+            let parsed = match parse_json_object_body(
+                body,
+                true,
+                "Allocator request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
             };
             let (dataset, dpath) = match resolve_dataset_checked(
                 app,
@@ -5950,10 +5951,14 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
-            let req: auto_allocator::AutoAllocatorRequest = match serde_json::from_value(parsed) {
-                Ok(r) => r,
-                Err(e) => {
-                    return json_err_response(400, &format!("invalid allocator parameters: {e}"));
+            let req: auto_allocator::AutoAllocatorRequest = if body.trim().is_empty() {
+                Default::default()
+            } else {
+                match serde_json::from_str(body) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return json_err_response(400, &format!("invalid allocator parameters: {e}"));
+                    }
                 }
             };
             let payload = app.allocator_shared(&dpath, &dataset, &req);
@@ -5986,21 +5991,13 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             json_response(200, &payload)
         }
         ("POST", "/api/analytics/scale-plan") => {
-            let parsed: serde_json::Value = if body.trim().is_empty() {
-                serde_json::json!({})
-            } else {
-                match serde_json::from_str::<serde_json::Value>(body) {
-                    Ok(v) if v.is_object() => v,
-                    Ok(_) => {
-                        return json_response(
-                            400,
-                            "{\"error\":\"Scale plan request body must be a JSON object\"}",
-                        );
-                    }
-                    Err(e) => {
-                        return json_err_response(400, &format!("invalid JSON body: {e}"));
-                    }
-                }
+            let parsed = match parse_json_object_body(
+                body,
+                true,
+                "Scale plan request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
             };
             let (dataset, dpath) = match resolve_dataset_checked(
                 app,
@@ -6010,34 +6007,30 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
-            let req: scaling::ScalePlanRequest = match serde_json::from_value(parsed) {
-                Ok(r) => r,
-                Err(e) => {
-                    return json_err_response(
-                        400,
-                        &format!("invalid scale-plan parameters: {e}"),
-                    );
+            let req: scaling::ScalePlanRequest = if body.trim().is_empty() {
+                Default::default()
+            } else {
+                match serde_json::from_str(body) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return json_err_response(
+                            400,
+                            &format!("invalid scale-plan parameters: {e}"),
+                        );
+                    }
                 }
             };
             let payload = app.scale_plan_cached(&dpath, &dataset, &req);
             json_response(200, &payload)
         }
         ("POST", "/api/analytics/montecarlo") => {
-            let parsed: serde_json::Value = if body.trim().is_empty() {
-                serde_json::json!({})
-            } else {
-                match serde_json::from_str::<serde_json::Value>(body) {
-                    Ok(v) if v.is_object() => v,
-                    Ok(_) => {
-                        return json_response(
-                            400,
-                            "{\"error\":\"Monte Carlo request body must be a JSON object\"}",
-                        );
-                    }
-                    Err(e) => {
-                        return json_err_response(400, &format!("invalid JSON body: {e}"));
-                    }
-                }
+            let parsed = match parse_json_object_body(
+                body,
+                true,
+                "Monte Carlo request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
             };
             let (dataset, dpath) = match resolve_dataset_checked(
                 app,
@@ -6204,28 +6197,17 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         st.connected = true;
                         st.rails.last_error = None;
                     }
-                    #[derive(serde::Serialize)]
-                    struct AccountResp {
-                        configured: bool,
-                        connected: bool,
-                        balance_cents: i64,
-                        balance_dollars: f64,
-                        portfolio_value_cents: i64,
-                        portfolio_value_dollars: f64,
-                        payout_cents: Option<i64>,
-                        note: &'static str,
-                    }
-                    let body = serde_json::to_string(&AccountResp {
-                        configured: true,
-                        connected: true,
-                        balance_cents: bal.balance_cents,
-                        balance_dollars: bal.balance_dollars,
-                        portfolio_value_cents: bal.portfolio_value_cents,
-                        portfolio_value_dollars: bal.portfolio_value_dollars,
-                        payout_cents: bal.payout_cents,
-                        note: "Connected to Kalshi v2 REST portfolio.",
-                    })
-                    .unwrap_or_else(|_| "{}".to_string());
+                    let payout = bal
+                        .payout_cents
+                        .map_or_else(|| "null".to_string(), |v| v.to_string());
+                    let body = format!(
+                        "{{\"configured\":true,\"connected\":true,\"balance_cents\":{},\"balance_dollars\":{},\"portfolio_value_cents\":{},\"portfolio_value_dollars\":{},\"payout_cents\":{},\"note\":\"Connected to Kalshi v2 REST portfolio.\"}}",
+                        bal.balance_cents,
+                        bal.balance_dollars,
+                        bal.portfolio_value_cents,
+                        bal.portfolio_value_dollars,
+                        payout
+                    );
                     json_response(200, &body)
                 }
                 Err(e) => {
@@ -6270,20 +6252,10 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         st.rails.last_error = None;
                         st.rails.sync_venue_metrics(total_exposure, realized_loss);
                     }
-                    #[derive(serde::Serialize)]
-                    struct PositionsResp<'a, T: serde::Serialize> {
-                        configured: bool,
-                        connected: bool,
-                        positions: &'a [T],
-                        total_exposure_dollars: f64,
-                    }
-                    let body = serde_json::to_string(&PositionsResp {
-                        configured: true,
-                        connected: true,
-                        positions: &positions,
-                        total_exposure_dollars: total_exposure,
-                    })
-                    .unwrap_or_else(|_| "{}".to_string());
+                    let body = format!(
+                        "{{\"configured\":true,\"connected\":true,\"positions\":{},\"total_exposure_dollars\":{total_exposure}}}",
+                        serde_json::to_string(&positions).unwrap_or_else(|_| "[]".into()),
+                    );
                     json_response(200, &body)
                 }
                 Err(e) => {
@@ -6319,18 +6291,10 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         st.connected = true;
                         st.rails.last_error = None;
                     }
-                    #[derive(serde::Serialize)]
-                    struct OrdersResp<'a, T: serde::Serialize> {
-                        configured: bool,
-                        connected: bool,
-                        orders: &'a [T],
-                    }
-                    let body = serde_json::to_string(&OrdersResp {
-                        configured: true,
-                        connected: true,
-                        orders: &orders,
-                    })
-                    .unwrap_or_else(|_| "{}".to_string());
+                    let body = format!(
+                        "{{\"configured\":true,\"connected\":true,\"orders\":{}}}",
+                        serde_json::to_string(&orders).unwrap_or_else(|_| "[]".into()),
+                    );
                     json_response(200, &body)
                 }
                 Err(e) => {
@@ -6369,18 +6333,10 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         st.connected = true;
                         st.rails.last_error = None;
                     }
-                    #[derive(serde::Serialize)]
-                    struct FillsResp<'a, T: serde::Serialize> {
-                        configured: bool,
-                        connected: bool,
-                        fills: &'a [T],
-                    }
-                    let body = serde_json::to_string(&FillsResp {
-                        configured: true,
-                        connected: true,
-                        fills: &fills,
-                    })
-                    .unwrap_or_else(|_| "{}".to_string());
+                    let body = format!(
+                        "{{\"configured\":true,\"connected\":true,\"fills\":{}}}",
+                        serde_json::to_string(&fills).unwrap_or_else(|_| "[]".into()),
+                    );
                     json_response(200, &body)
                 }
                 Err(e) => {
@@ -6394,17 +6350,13 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             }
         }
         ("POST", "/api/live/config") => {
-            let parsed: serde_json::Value = match serde_json::from_str::<serde_json::Value>(body) {
-                Ok(v) if v.is_object() => v,
-                Ok(_) => {
-                    return json_response(
-                        400,
-                        "{\"error\":\"Live config request body must be a JSON object\"}",
-                    );
-                }
-                Err(e) => {
-                    return json_err_response(400, &format!("invalid JSON body: {e}"));
-                }
+            let parsed = match parse_json_object_body(
+                body,
+                false,
+                "Live config request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
             };
             let (mut next_cfg, mut next_rails) = {
                 let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
@@ -6510,16 +6462,11 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let validated_rails = match next_rails.validate() {
                 Ok(r) => r,
                 Err(errs) => {
-                    #[derive(serde::Serialize)]
-                    struct RailErr<'a> {
-                        error: String,
-                        rail_violations: &'a [String],
-                    }
-                    let body = serde_json::to_string(&RailErr {
-                        error: errs.join("; "),
-                        rail_violations: &errs,
-                    })
-                    .unwrap_or_else(|_| "{}".to_string());
+                    let body = format!(
+                        "{{\"error\":{},\"rail_violations\":{}}}",
+                        serde_json::to_string(&errs.join("; ")).unwrap_or_else(|_| "\"\"".into()),
+                        serde_json::to_string(&errs).unwrap_or_else(|_| "[]".into()),
+                    );
                     return json_response(400, &body);
                 }
             };
@@ -6549,28 +6496,16 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 st.rails.last_error = None;
                 st.rails.status_snapshot(&st.config, st.connected)
             };
-            let ev = format!(
-                "{{\"type\":\"live_status\",\"configured\":{},\"live_armed\":{},\"environment\":{},\"ts\":{}}}",
-                snap.configured,
-                snap.live_armed,
-                serde_json::to_string(&snap.environment).unwrap_or_else(|_| "\"demo\"".to_string()),
-                now_unix(),
-            );
-            tape_hub().publish(ev);
-            json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
+            publish_live_status_json(&snap)
         }
         ("POST", "/api/live/arm") => {
-            let parsed: serde_json::Value = match serde_json::from_str::<serde_json::Value>(body) {
-                Ok(v) if v.is_object() => v,
-                Ok(_) => {
-                    return json_response(
-                        400,
-                        "{\"error\":\"Arm request body must be a JSON object\"}",
-                    );
-                }
-                Err(e) => {
-                    return json_err_response(400, &format!("invalid JSON body: {e}"));
-                }
+            let parsed = match parse_json_object_body(
+                body,
+                false,
+                "Arm request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
             };
             let confirm_arm = match parsed.get("confirm_arm") {
                 None => false,
@@ -6589,27 +6524,14 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 (res, configured, snap)
             };
             match res {
-                Ok(()) => {
-                    let ev = format!(
-                        "{{\"type\":\"live_status\",\"live_armed\":true,\"environment\":{},\"ts\":{}}}",
-                        serde_json::to_string(&snap.environment).unwrap_or_else(|_| "\"demo\"".to_string()),
-                        now_unix(),
-                    );
-                    tape_hub().publish(ev);
-                    json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
-                }
+                Ok(()) => publish_live_status_json(&snap),
                 Err(e) => {
-                    #[derive(serde::Serialize)]
-                    struct ArmErr<'a> {
-                        error: &'a str,
-                        status: &'a risk_rails::LiveStatusSnapshot,
-                    }
+                    let body = format!(
+                        "{{\"error\":{},\"status\":{}}}",
+                        serde_json::to_string(&e).unwrap_or_else(|_| "\"\"".into()),
+                        serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()),
+                    );
                     let code = if !configured { 412 } else { 400 };
-                    let body = serde_json::to_string(&ArmErr {
-                        error: &e,
-                        status: &snap,
-                    })
-                    .unwrap_or_else(|_| "{}".to_string());
                     json_response(code, &body)
                 }
             }
@@ -6620,25 +6542,16 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 st.rails.disarm();
                 st.rails.status_snapshot(&st.config, st.connected)
             };
-            let ev = format!(
-                "{{\"type\":\"live_status\",\"live_armed\":false,\"ts\":{}}}",
-                now_unix()
-            );
-            tape_hub().publish(ev);
-            json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
+            publish_live_status_json(&snap)
         }
         ("POST", "/api/live/order") => {
-            let parsed: serde_json::Value = match serde_json::from_str::<serde_json::Value>(body) {
-                Ok(v) if v.is_object() => v,
-                Ok(_) => {
-                    return json_response(
-                        400,
-                        "{\"error\":\"Order request body must be a JSON object\"}",
-                    );
-                }
-                Err(e) => {
-                    return json_err_response(400, &format!("invalid JSON body: {e}"));
-                }
+            let parsed = match parse_json_object_body(
+                body,
+                false,
+                "Order request body must be a JSON object",
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
             };
             let post_only = match parsed.get("post_only") {
                 None | Some(serde_json::Value::Null) => false,
@@ -6650,7 +6563,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     );
                 }
             };
-            let intent: risk_rails::LiveOrderIntent = match serde_json::from_value(parsed) {
+            let intent: risk_rails::LiveOrderIntent = match serde_json::from_str(body) {
                 Ok(i) => i,
                 Err(e) => {
                     return json_ok_err_response(400, &format!("invalid order intent: {e}"));
@@ -6681,40 +6594,22 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     }
                 }
                 Err(check) => {
-                    #[derive(serde::Serialize)]
-                    struct OrderRailErr<'a> {
-                        ok: bool,
-                        error: String,
-                        rail_violations: &'a [String],
-                        order_notional_dollars: f64,
-                        projected_exposure_dollars: f64,
-                    }
-                    let body = serde_json::to_string(&OrderRailErr {
-                        ok: false,
-                        error: check.rail_violations.join("; "),
-                        rail_violations: &check.rail_violations,
-                        order_notional_dollars: check.order_notional_dollars,
-                        projected_exposure_dollars: check.projected_exposure_dollars,
-                    })
-                    .unwrap_or_else(|_| "{}".to_string());
+                    let body = format!(
+                        "{{\"ok\":false,\"error\":{},\"rail_violations\":{},\"order_notional_dollars\":{},\"projected_exposure_dollars\":{}}}",
+                        serde_json::to_string(&check.rail_violations.join("; ")).unwrap_or_else(|_| "\"\"".into()),
+                        serde_json::to_string(&check.rail_violations).unwrap_or_else(|_| "[]".into()),
+                        check.order_notional_dollars,
+                        check.projected_exposure_dollars,
+                    );
                     return json_response(403, &body);
                 }
             };
             if intent.dry_run {
-                #[derive(serde::Serialize)]
-                struct DryOrderResp<'a> {
-                    ok: bool,
-                    dry_run: bool,
-                    order_request: &'a kalshi_live::KalshiOrderRequest,
-                    risk_check: &'a risk_rails::RiskCheckResult,
-                }
-                let body = serde_json::to_string(&DryOrderResp {
-                    ok: true,
-                    dry_run: true,
-                    order_request: &kalshi_req,
-                    risk_check: &check,
-                })
-                .unwrap_or_else(|_| "{}".to_string());
+                let body = format!(
+                    "{{\"ok\":true,\"dry_run\":true,\"order_request\":{},\"risk_check\":{}}}",
+                    serde_json::to_string(&kalshi_req).unwrap_or_else(|_| "{}".into()),
+                    serde_json::to_string(&check).unwrap_or_else(|_| "{}".into()),
+                );
                 return json_response(200, &body);
             }
             let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
@@ -6740,20 +6635,12 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         now_unix(),
                     );
                     tape_hub().publish(ev);
-                    #[derive(serde::Serialize)]
-                    struct PlacedOrderResp<'a> {
-                        ok: bool,
-                        order: &'a kalshi_live::KalshiOrder,
-                        risk_check: &'a risk_rails::RiskCheckResult,
-                        status: &'a risk_rails::LiveStatusSnapshot,
-                    }
-                    let body = serde_json::to_string(&PlacedOrderResp {
-                        ok: true,
-                        order: &order,
-                        risk_check: &check,
-                        status: &snap,
-                    })
-                    .unwrap_or_else(|_| "{}".to_string());
+                    let body = format!(
+                        "{{\"ok\":true,\"order\":{},\"risk_check\":{},\"status\":{}}}",
+                        serde_json::to_string(&order).unwrap_or_else(|_| "{}".into()),
+                        serde_json::to_string(&check).unwrap_or_else(|_| "{}".into()),
+                        serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()),
+                    );
                     json_response(200, &body)
                 }
                 Err(e) => {
@@ -6788,20 +6675,11 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         now_unix(),
                     );
                     tape_hub().publish(ev);
-                    #[derive(serde::Serialize)]
-                    struct CancelOrderResp<'a> {
-                        ok: bool,
-                        order_id: &'a str,
-                        cancelled: bool,
-                        venue_response: &'a serde_json::Value,
-                    }
-                    let body = serde_json::to_string(&CancelOrderResp {
-                        ok: true,
-                        order_id,
-                        cancelled: true,
-                        venue_response: &venue_resp,
-                    })
-                    .unwrap_or_else(|_| "{}".to_string());
+                    let body = format!(
+                        "{{\"ok\":true,\"order_id\":{},\"cancelled\":true,\"venue_response\":{}}}",
+                        serde_json::to_string(order_id).unwrap_or_else(|_| "\"\"".into()),
+                        serde_json::to_string(&venue_resp).unwrap_or_else(|_| "{}".into()),
+                    );
                     json_response(200, &body)
                 }
                 Err(e) => {
@@ -6862,30 +6740,15 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 now_unix()
             );
             tape_hub().publish(ev);
-            #[derive(serde::Serialize)]
-            struct KillResp<'a> {
-                ok: bool,
-                disarmed: bool,
-                killed: bool,
-                kill_reason: &'a str,
-                attempted: usize,
-                cancelled_count: usize,
-                cancelled_ids: &'a [String],
-                errors: &'a [String],
-                status: &'a risk_rails::LiveStatusSnapshot,
-            }
-            let body = serde_json::to_string(&KillResp {
-                ok: true,
-                disarmed: true,
-                killed: true,
-                kill_reason: &why,
-                attempted: report.attempted,
-                cancelled_count: report.cancelled_count,
-                cancelled_ids: &report.cancelled_ids,
-                errors: &report.errors,
-                status: &snap,
-            })
-            .unwrap_or_else(|_| "{}".to_string());
+            let body = format!(
+                "{{\"ok\":true,\"disarmed\":true,\"killed\":true,\"kill_reason\":{},\"attempted\":{},\"cancelled_count\":{},\"cancelled_ids\":{},\"errors\":{},\"status\":{}}}",
+                serde_json::to_string(&why).unwrap_or_else(|_| "\"\"".into()),
+                report.attempted,
+                report.cancelled_count,
+                serde_json::to_string(&report.cancelled_ids).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&report.errors).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()),
+            );
             json_response(200, &body)
         }
         _ => json_response(404, "{\"error\":\"not found\"}"),

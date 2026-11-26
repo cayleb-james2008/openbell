@@ -23,6 +23,7 @@
 //!   `<PREFIX>_UPDATE_DEV`   `1` allows replacing a cargo-built binary (tests)
 
 use serde_json::{json, Value};
+#[cfg(target_os = "windows")]
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -224,8 +225,16 @@ pub fn hash_from_sums(sums: &str, asset: &str) -> Option<String> {
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    let d = Sha256::digest(bytes);
-    d.iter().map(|b| format!("{b:02x}")).collect()
+    #[cfg(not(target_os = "windows"))]
+    {
+        let d = ring::digest::digest(&ring::digest::SHA256, bytes);
+        d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let d = Sha256::digest(bytes);
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
 }
 
 // ---------------------------------------------------------------- network

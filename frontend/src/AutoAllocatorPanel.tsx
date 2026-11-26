@@ -317,6 +317,7 @@ export function AutoAllocatorPanel({
       slippage_ladder: report.slippage_ladder ?? [],
       diversification: report.diversification,
       dry_run_plan: report.dry_run_plan,
+      liquidity_capacity: report.liquidity_capacity,
       daily_target: report.daily_target,
     };
   }, [dataset, report]);
@@ -329,6 +330,10 @@ export function AutoAllocatorPanel({
       live_armed: false,
       dry_run_plan: {
         ...report.dry_run_plan,
+        live_armed: false,
+      },
+      liquidity_capacity: {
+        ...report.liquidity_capacity,
         live_armed: false,
       },
       correlation_ceiling: {
@@ -1414,6 +1419,159 @@ export function AutoAllocatorPanel({
             </div>
           )}
           <p className="text-xs text-ink-2">{report.dry_run_plan.summary}</p>
+        </div>
+      )}
+
+      {/* Causal Liquidity Depth & 1x / 2x / 5x Scalable Bankroll Capacity Check */}
+      {report?.liquidity_capacity && (
+        <div
+          id="allocator-liquidity-capacity"
+          role="region"
+          aria-label="Causal liquidity depth and scalable bankroll capacity"
+          className="mt-3.5 space-y-2.5 rounded-[10px] border border-hairline bg-board/50 p-3.5"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="font-semibold text-ink">Causal Liquidity &amp; Scale Capacity</span>
+              <StatusPill
+                id="allocator-liquidity-capacity-status"
+                tone={
+                  report.liquidity_capacity.status === "LIQUID"
+                    ? "success"
+                    : report.liquidity_capacity.status === "TIGHT"
+                      ? "warning"
+                      : report.liquidity_capacity.status === "CROWDED"
+                        ? "error"
+                        : "neutral"
+                }
+              >
+                {report.liquidity_capacity.status.replaceAll("_", " ")}
+              </StatusPill>
+              <Badge variant="outline" className="mono text-xs text-ink-2">
+                live_armed=false · {report.liquidity_capacity.observed_depth_windows > 0 ? `${report.liquidity_capacity.observed_depth_windows}w observed L1` : "spread heuristic"}
+              </Badge>
+            </div>
+            <span className="mono text-xs text-ink-2">
+              Ceiling: {money(report.liquidity_capacity.max_scalable_dollars)}/win (~{money(report.liquidity_capacity.max_scalable_bankroll)} bankroll)
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">Median Book Depth</div>
+              <div className="mono mt-0.5 font-semibold text-ink">
+                {Math.round(report.liquidity_capacity.median_book_depth_contracts)} cts/win
+              </div>
+            </div>
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">1x to 5x Fill Ratio</div>
+              <div className="mono mt-0.5 font-semibold text-ink">
+                {((report.liquidity_capacity.portfolio_scenarios[0]?.fill_ratio ?? 0) * 100).toFixed(0)}% →{" "}
+                {((report.liquidity_capacity.portfolio_scenarios[2]?.fill_ratio ?? 0) * 100).toFixed(0)}%
+              </div>
+            </div>
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">5x Net OOS EV</div>
+              <div
+                className={
+                  "mono mt-0.5 font-semibold " +
+                  ((report.liquidity_capacity.portfolio_scenarios[2]?.net_ev_after_impact_cents ?? 0) > 0
+                    ? "text-success-foreground"
+                    : "text-destructive-foreground")
+                }
+              >
+                {fmtCents(report.liquidity_capacity.portfolio_scenarios[2]?.net_ev_after_impact_cents ?? null)}/ct
+              </div>
+            </div>
+            <div className="rounded-lg border border-hairline bg-surface px-2.5 py-2">
+              <div className="text-ink-3">Max Scalable Notional</div>
+              <div className="mono mt-0.5 font-semibold text-success-foreground">
+                {money(report.liquidity_capacity.max_scalable_dollars)}{" "}
+                <span className="text-ink-3">({report.liquidity_capacity.max_scalable_contracts} cts)</span>
+              </div>
+            </div>
+          </div>
+          {report.liquidity_capacity.portfolio_scenarios.length > 0 && (
+            <div className="grid grid-cols-1 gap-2 text-xs sm:grid-cols-3">
+              {report.liquidity_capacity.portfolio_scenarios.map((sc) => (
+                <div
+                  key={sc.scale_label}
+                  data-scale-scenario={sc.scale_label}
+                  className="rounded-lg border border-hairline bg-surface px-2.5 py-1.5"
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="mono font-semibold text-ink">
+                      {sc.scale_label} Sizing ({sc.target_contracts} cts)
+                    </span>
+                    <StatusPill tone={sc.feasible ? "success" : "warning"}>
+                      {sc.feasible ? "FEASIBLE" : "CAPPED"}
+                    </StatusPill>
+                  </div>
+                  <div className="mono mt-0.5 text-ink-2">
+                    Fill {(sc.fill_ratio * 100).toFixed(0)}% · Impact -{sc.impact_drag_cents.toFixed(2)}c · Net{" "}
+                    {fmtCents(sc.net_ev_after_impact_cents)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          {report.liquidity_capacity.legs.length > 0 && (
+            <div className="overflow-x-auto rounded-lg border border-hairline bg-surface">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Slot / Series</TableHead>
+                    <TableHead className="text-right">Causal Depth</TableHead>
+                    <TableHead className="text-right">1x → 5x Fill</TableHead>
+                    <TableHead className="text-right">5x Impact</TableHead>
+                    <TableHead className="text-right">Max Scalable</TableHead>
+                    <TableHead className="text-right">Tier</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {report.liquidity_capacity.legs.map((leg) => {
+                    const s1 = leg.scenarios[0];
+                    const s5 = leg.scenarios[2];
+                    return (
+                      <TableRow key={leg.strategy} data-liquidity-leg={leg.strategy}>
+                        <TableCell className="m-grow text-xs">
+                          <div className="font-medium text-ink">{leg.strategy}</div>
+                          <div className="mono text-ink-3">
+                            {leg.series} · {leg.base_contracts} cts @ {leg.max_limit_cents}c ({leg.depth_source === "observed_l1" ? "L1" : "heuristic"})
+                          </div>
+                        </TableCell>
+                        <TableCell className="mono text-right text-xs text-ink">
+                          {Math.round(leg.causal_book_depth_contracts)} cts
+                        </TableCell>
+                        <TableCell className="mono text-right text-xs text-ink-2">
+                          {((s1?.fill_ratio ?? 0) * 100).toFixed(0)}% → {((s5?.fill_ratio ?? 0) * 100).toFixed(0)}%
+                        </TableCell>
+                        <TableCell className="mono text-right text-xs text-ink-2">
+                          -{(s5?.impact_drag_cents ?? 0).toFixed(2)}c ({fmtCents(s5?.net_ev_after_impact_cents ?? null)})
+                        </TableCell>
+                        <TableCell className="mono text-right text-xs text-ink">
+                          {money(leg.max_scalable_dollars)} ({leg.max_scalable_contracts} cts)
+                        </TableCell>
+                        <TableCell className="m-right text-right text-xs">
+                          <StatusPill
+                            tone={
+                              leg.capacity_tier === "LIQUID"
+                                ? "success"
+                                : leg.capacity_tier === "TIGHT"
+                                  ? "warning"
+                                  : "error"
+                            }
+                          >
+                            {leg.capacity_tier}
+                          </StatusPill>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+          <p className="text-xs text-ink-2">{report.liquidity_capacity.summary}</p>
         </div>
       )}
 

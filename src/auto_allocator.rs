@@ -433,6 +433,50 @@ pub struct DryRunOrderPlan {
     pub summary: String,
 }
 
+/// Partial-fill & orderbook impact projection at 1x, 2x, and 5x recommended contract sizing.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiquidityScaleScenario {
+    pub scale_label: String,
+    pub scale_factor: u32,
+    pub target_contracts: u32,
+    pub fill_ratio: f64,
+    pub impact_drag_cents: f64,
+    pub net_ev_after_impact_cents: f64,
+    pub feasible: bool,
+}
+
+/// Per-slot causal orderbook depth & scalable bankroll capacity telemetry.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiquidityCapacityLeg {
+    pub strategy: String,
+    pub side: String,
+    pub series: String,
+    pub base_contracts: u32,
+    pub max_limit_cents: u8,
+    pub causal_book_depth_contracts: f64,
+    pub depth_source: String,
+    pub capacity_tier: String,
+    pub max_scalable_contracts: u32,
+    pub max_scalable_dollars: f64,
+    pub scenarios: Vec<LiquidityScaleScenario>,
+}
+
+/// Causal orderbook depth, 1x/2x/5x scaling stress & max scalable dollar capacity (`live_armed: false`).
+#[derive(Debug, Clone, Serialize)]
+pub struct LiquidityCapacityReport {
+    pub status: String,
+    pub live_armed: bool,
+    pub observed_depth_windows: usize,
+    pub median_book_depth_contracts: f64,
+    pub base_contracts: u32,
+    pub max_scalable_contracts: u32,
+    pub max_scalable_dollars: f64,
+    pub max_scalable_bankroll: f64,
+    pub portfolio_scenarios: Vec<LiquidityScaleScenario>,
+    pub legs: Vec<LiquidityCapacityLeg>,
+    pub summary: String,
+}
+
 /// Honest $500/day capital-readiness verdict derived from fee-adjusted OOS expectancy.
 #[derive(Debug, Clone, Serialize)]
 pub struct DailyTargetVerdict {
@@ -632,6 +676,7 @@ pub struct AutoAllocatorReport {
     pub comparison: AllocatorComparison,
     pub planned_intents: Vec<PlannedAllocatorIntent>,
     pub dry_run_plan: DryRunOrderPlan,
+    pub liquidity_capacity: LiquidityCapacityReport,
     pub daily_target: DailyTargetVerdict,
     pub honesty_notes: Vec<String>,
 }
@@ -1334,6 +1379,8 @@ pub fn compute_auto_allocator_report(
         killed,
         live_armed,
     );
+    let liquidity_capacity =
+        compute_liquidity_capacity(ctx, &req, &oos_by_strat, &dry_run_plan, is_maker);
 
     // Compute $500/day net expectancy readiness verdict with concrete blockers.
     let daily_target = compute_daily_target_verdict(
@@ -1464,6 +1511,7 @@ pub fn compute_auto_allocator_report(
         comparison,
         planned_intents,
         dry_run_plan,
+        liquidity_capacity,
         daily_target,
         honesty_notes,
     }
@@ -1981,6 +2029,272 @@ fn compute_dry_run_order_plan(
         total_exact_fee_dollars: finite_or(total_fee, 0.0),
         weighted_net_oos_ev_after_all_cents,
         correlation_ceiling_status: diversification.ceiling_status.clone(),
+        legs,
+        summary,
+    }
+}
+
+fn median_f64_slice(vals: &mut [f64]) -> Option<f64> {
+    if vals.is_empty() {
+        return None;
+    }
+    vals.sort_unstable_by(|a, b| a.total_cmp(b));
+    let m = vals.len() / 2;
+    if vals.len() % 2 == 1 {
+        finite_opt(vals[m])
+    } else {
+        finite_opt((vals[m - 1] + vals[m]) * 0.5)
+    }
+}
+
+fn liquidity_impact_cents(contracts: u32, book_depth: f64, mean_spread_cents: f64) -> (f64, f64) {
+    if contracts == 0 {
+        return (1.0, 0.0);
+    }
+    let depth = book_depth.max(1.0);
+    let fill_ratio = (depth / (contracts as f64)).clamp(0.0, 1.0);
+    let util = (contracts as f64) / depth;
+    let half_spread = (0.5 * mean_spread_cents).max(0.5);
+    let impact = half_spread * (0.15 * util + 1.15 * (util - 0.25).max(0.0).powf(1.35));
+    (finite_or(fill_ratio, 0.0), finite_or(impact.max(0.0), 0.0))
+}
+
+fn tier_from_scenarios(scenarios: &[LiquidityScaleScenario]) -> String {
+    let s1 = scenarios.first().is_some_and(|s| s.feasible);
+    let s2 = scenarios.get(1).is_some_and(|s| s.feasible);
+    let s5 = scenarios.get(2).is_some_and(|s| s.feasible);
+    if !s1 {
+        "CROWDED".to_string()
+    } else if s2 && s5 {
+        "LIQUID".to_string()
+    } else {
+        "TIGHT".to_string()
+    }
+}
+
+/// Model causal orderbook depth and partial-fill impact drag at 1x, 2x, and 5x sizing (`live_armed: false`).
+#[inline(never)]
+fn compute_liquidity_capacity(
+    ctx: &TournamentTapeContext,
+    req: &AutoAllocatorRequest,
+    oos_by_strat: &[Vec<&TournamentEntry>],
+    plan: &DryRunOrderPlan,
+    is_maker: bool,
+) -> LiquidityCapacityReport {
+    if plan.legs.is_empty() {
+        return LiquidityCapacityReport {
+            status: "NO_DATA".to_string(),
+            live_armed: false,
+            observed_depth_windows: ctx.window_depth_contracts.len(),
+            median_book_depth_contracts: 0.0,
+            base_contracts: 0,
+            max_scalable_contracts: 0,
+            max_scalable_dollars: 0.0,
+            max_scalable_bankroll: 0.0,
+            portfolio_scenarios: Vec::new(),
+            legs: Vec::new(),
+            summary: "NO_DATA: 0 active OOS legs for causal liquidity capacity sizing (live_armed=false)"
+                .to_string(),
+        };
+    }
+
+    let scale_factors = [1u32, 2u32, 5u32];
+    let mut legs = Vec::with_capacity(plan.legs.len());
+    let mut port_c = [0u32; 3];
+    let mut port_fill_num = [0.0f64; 3];
+    let mut port_imp_num = [0.0f64; 3];
+    let mut port_ev_num = [0.0f64; 3];
+    let mut port_den = [0.0f64; 3];
+    let mut leg_depths = Vec::with_capacity(plan.legs.len());
+    let mut obs_depths = Vec::new();
+    let mut max_scalable_contracts_sum = 0u32;
+    let mut max_scalable_dollars_sum = 0.0f64;
+
+    for leg in &plan.legs {
+        let strat_entries = ctx
+            .strategies
+            .iter()
+            .position(|s| s.name == leg.strategy)
+            .and_then(|i| oos_by_strat.get(i));
+
+        let mut spread_sum = 0.0f64;
+        let mut spread_n = 0usize;
+        obs_depths.clear();
+        if let Some(entries) = strat_entries {
+            for e in entries {
+                if let Some(&sp) = ctx.window_spread_cents.get(&e.ticker) {
+                    spread_sum += sp;
+                    spread_n += 1;
+                }
+                if let Some(&d) = ctx.window_depth_contracts.get(&e.ticker) {
+                    if d.is_finite() && d > 0.0 {
+                        obs_depths.push(d);
+                    }
+                }
+            }
+        }
+        let mean_spread_cents = if spread_n > 0 {
+            finite_or(spread_sum / (spread_n as f64), 2.0)
+        } else {
+            2.0
+        };
+
+        if obs_depths.is_empty() && !ctx.window_depth_contracts.is_empty() {
+            for (ticker, &d) in &ctx.window_depth_contracts {
+                if d.is_finite() && d > 0.0 && ticker.split('-').next() == Some(leg.series.as_str()) {
+                    obs_depths.push(d);
+                }
+            }
+        }
+        let (causal_depth, depth_source) = if let Some(m) = median_f64_slice(&mut obs_depths) {
+            (m, "observed_l1")
+        } else {
+            (
+                (180.0 / mean_spread_cents.max(1.0)).clamp(15.0, 200.0),
+                "spread_heuristic",
+            )
+        };
+        leg_depths.push(causal_depth);
+
+        let p = (leg.max_limit_cents as f64) / 100.0;
+        let pre_impact_ev_no_fee =
+            leg.gross_oos_ev_cents - leg.spread_cross_cost_cents - leg.slippage_cost_cents;
+        let net_at = |c: u32| -> f64 {
+            if c == 0 {
+                return pre_impact_ev_no_fee - leg.maker_fee_per_ct_cents;
+            }
+            let fee_c = (kalshi_order_fee_dollars(c, p, is_maker) * 100.0) / (c as f64);
+            let (_, impact) = liquidity_impact_cents(c, causal_depth, mean_spread_cents);
+            finite_or(pre_impact_ev_no_fee - fee_c - impact, -100.0)
+        };
+
+        let mut best_c = 0u32;
+        for c in 1u32..=32u32 {
+            if net_at(c) > 0.0 {
+                best_c = c;
+            }
+        }
+        if best_c == 32 && net_at(33) > 0.0 {
+            let mut lo = 33u32;
+            let mut hi = 10_000u32;
+            while lo <= hi {
+                let mid = lo + (hi - lo) / 2;
+                if net_at(mid) > 0.0 {
+                    best_c = mid;
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+        }
+        let leg_max_dollars = finite_or((best_c as f64) * p, 0.0);
+        max_scalable_contracts_sum = max_scalable_contracts_sum.saturating_add(best_c);
+        max_scalable_dollars_sum += leg_max_dollars;
+
+        let mut scenarios = Vec::with_capacity(3);
+        let weight = if leg.notional_dollars > 1e-9 {
+            leg.notional_dollars
+        } else {
+            1.0
+        };
+        for (si, &sf) in scale_factors.iter().enumerate() {
+            let c = leg.target_contracts.saturating_mul(sf);
+            let (fill_ratio, impact_drag_cents) =
+                liquidity_impact_cents(c, causal_depth, mean_spread_cents);
+            let net_ev_after_impact_cents = if c > 0 {
+                net_at(c)
+            } else {
+                finite_or(leg.net_oos_ev_after_all_cents, 0.0)
+            };
+            let feasible = c > 0 && fill_ratio >= 0.75 && net_ev_after_impact_cents > 0.0;
+            port_c[si] = port_c[si].saturating_add(c);
+            port_fill_num[si] += fill_ratio * weight;
+            port_imp_num[si] += impact_drag_cents * weight;
+            port_ev_num[si] += net_ev_after_impact_cents * weight;
+            port_den[si] += weight;
+            scenarios.push(LiquidityScaleScenario {
+                scale_label: format!("{sf}x"),
+                scale_factor: sf,
+                target_contracts: c,
+                fill_ratio,
+                impact_drag_cents,
+                net_ev_after_impact_cents,
+                feasible,
+            });
+        }
+
+        let leg_tier = tier_from_scenarios(&scenarios);
+        legs.push(LiquidityCapacityLeg {
+            strategy: leg.strategy.clone(),
+            side: leg.side.clone(),
+            series: leg.series.clone(),
+            base_contracts: leg.target_contracts,
+            max_limit_cents: leg.max_limit_cents,
+            causal_book_depth_contracts: causal_depth,
+            depth_source: depth_source.to_string(),
+            capacity_tier: leg_tier,
+            max_scalable_contracts: best_c,
+            max_scalable_dollars: leg_max_dollars,
+            scenarios,
+        });
+    }
+
+    let portfolio_scenarios: Vec<LiquidityScaleScenario> = scale_factors
+        .iter()
+        .enumerate()
+        .map(|(si, &sf)| {
+            let den = port_den[si].max(1e-9);
+            let fill_ratio = finite_or(port_fill_num[si] / den, 0.0);
+            let impact_drag_cents = finite_or(port_imp_num[si] / den, 0.0);
+            let net_ev_after_impact_cents = finite_or(port_ev_num[si] / den, 0.0);
+            let target_contracts = port_c[si];
+            let leg_all_feasible = legs
+                .iter()
+                .all(|l| l.scenarios.get(si).is_some_and(|s| s.feasible));
+            let feasible = target_contracts > 0
+                && leg_all_feasible
+                && fill_ratio >= 0.75
+                && net_ev_after_impact_cents > 0.0;
+            LiquidityScaleScenario {
+                scale_label: format!("{sf}x"),
+                scale_factor: sf,
+                target_contracts,
+                fill_ratio,
+                impact_drag_cents,
+                net_ev_after_impact_cents,
+                feasible,
+            }
+        })
+        .collect();
+
+    let status = tier_from_scenarios(&portfolio_scenarios);
+    let median_book_depth_contracts = median_f64_slice(&mut leg_depths).unwrap_or(0.0);
+    let max_scalable_dollars = finite_or(max_scalable_dollars_sum, 0.0);
+    let max_scalable_bankroll = if plan.total_notional_dollars > 1e-9 {
+        finite_or(
+            req.starting_bankroll * (max_scalable_dollars / plan.total_notional_dollars),
+            0.0,
+        )
+    } else {
+        0.0
+    };
+    let s1_fill = portfolio_scenarios.first().map_or(0.0, |s| s.fill_ratio * 100.0);
+    let s5_fill = portfolio_scenarios.get(2).map_or(0.0, |s| s.fill_ratio * 100.0);
+    let summary = format!(
+        "{status}: {} leg(s), median depth {median_book_depth_contracts:.0} cts, 1x fill {s1_fill:.0}% / 5x fill {s5_fill:.0}%, max scalable ${max_scalable_dollars:.2}/window (~${max_scalable_bankroll:.0} bankroll), live_armed=false",
+        legs.len()
+    );
+
+    LiquidityCapacityReport {
+        status,
+        live_armed: false,
+        observed_depth_windows: ctx.window_depth_contracts.len(),
+        median_book_depth_contracts,
+        base_contracts: plan.total_contracts,
+        max_scalable_contracts: max_scalable_contracts_sum,
+        max_scalable_dollars,
+        max_scalable_bankroll,
+        portfolio_scenarios,
         legs,
         summary,
     }
@@ -4118,6 +4432,7 @@ mod tests {
             entries,
             window_vol_scores: HashMap::new(),
             window_spread_cents: HashMap::new(),
+            window_depth_contracts: HashMap::new(),
         }
     }
 
@@ -5546,5 +5861,108 @@ mod tests {
         assert!((t_strong.spread_cross_cost_cents - 2.0).abs() < 1e-6);
         assert_eq!(t_strong.slippage_cost_cents, 1.0);
         assert!(t_strong.net_oos_ev_after_all_cents < strong.net_oos_ev_after_all_cents);
+    }
+
+    #[test]
+    fn causal_liquidity_capacity_scales_1x_2x_5x_and_distinguishes_liquid_tight_crowded() {
+        let strats = vec![StrategyMeta {
+            name: "deep-maker".into(),
+            side: "yes".into(),
+        }];
+        let mut entries = Vec::new();
+        let mut spread_map = HashMap::new();
+        let mut deep_map = HashMap::new();
+        let mut tight_map = HashMap::new();
+        let mut crowded_map = HashMap::new();
+
+        for w in 0..100i64 {
+            let ticker = format!("KXBTC15M-LIQ{w:03}-30");
+            spread_map.insert(ticker.clone(), 2.0);
+            deep_map.insert(ticker.clone(), 250.0);
+            tight_map.insert(ticker.clone(), 20.0);
+            crowded_map.insert(ticker.clone(), 5.0);
+            entries.push(TournamentEntry {
+                close_epoch: 1_775_000_000 + w * 900,
+                ticker,
+                series: "KXBTC15M".into(),
+                strategy_idx: 0,
+                strategy: "deep-maker".into(),
+                side: "yes".into(),
+                entry_price: 0.72,
+                secs_to_close: 240,
+                won: (w % 10) < 8,
+            });
+        }
+
+        let base_ctx = make_ctx(strats, entries, 100, 40, 1_775_000_000 + 60 * 900);
+        let deep_ctx = TournamentTapeContext {
+            window_spread_cents: spread_map.clone(),
+            window_depth_contracts: deep_map,
+            ..base_ctx.clone()
+        };
+        let tight_ctx = TournamentTapeContext {
+            window_spread_cents: spread_map.clone(),
+            window_depth_contracts: tight_map,
+            ..base_ctx.clone()
+        };
+        let crowded_ctx = TournamentTapeContext {
+            window_spread_cents: spread_map,
+            window_depth_contracts: crowded_map,
+            ..base_ctx
+        };
+
+        let rails = RiskRailsConfig {
+            max_order_contracts: 50,
+            max_order_dollars: 50.0,
+            max_daily_loss_dollars: 500.0,
+            ..RiskRailsConfig::default()
+        };
+        let req = AutoAllocatorRequest {
+            execution_mode: "maker".into(),
+            sizing_mode: "quarter_kelly".into(),
+            maker_fill_rate: 1.0,
+            min_oos_trades: 20,
+            max_slot_risk_pct: 10.0,
+            max_total_heat_pct: 30.0,
+            starting_bankroll: 100.0,
+            require_stress_resilience: false,
+            enable_regime_throttle: false,
+            enable_diversification_guard: true,
+            ..AutoAllocatorRequest::default()
+        };
+
+        let deep_rep = compute_auto_allocator_report(&deep_ctx, &req, &rails, false, false);
+        let tight_rep = compute_auto_allocator_report(&tight_ctx, &req, &rails, false, false);
+        let crowded_rep = compute_auto_allocator_report(&crowded_ctx, &req, &rails, false, false);
+
+        assert!(!deep_rep.liquidity_capacity.live_armed);
+        assert!(!tight_rep.liquidity_capacity.live_armed);
+        assert!(!crowded_rep.liquidity_capacity.live_armed);
+        assert_eq!(deep_rep.liquidity_capacity.observed_depth_windows, 100);
+        assert_eq!(deep_rep.liquidity_capacity.status, "LIQUID");
+        assert_eq!(tight_rep.liquidity_capacity.status, "TIGHT");
+        assert_eq!(crowded_rep.liquidity_capacity.status, "CROWDED");
+        assert_eq!(deep_rep.liquidity_capacity.portfolio_scenarios.len(), 3);
+        assert_eq!(
+            deep_rep.liquidity_capacity.portfolio_scenarios[0].scale_label,
+            "1x"
+        );
+        assert_eq!(
+            deep_rep.liquidity_capacity.portfolio_scenarios[1].scale_label,
+            "2x"
+        );
+        assert_eq!(
+            deep_rep.liquidity_capacity.portfolio_scenarios[2].scale_label,
+            "5x"
+        );
+        assert!(
+            deep_rep.liquidity_capacity.max_scalable_dollars
+                > tight_rep.liquidity_capacity.max_scalable_dollars
+        );
+        assert!(
+            tight_rep.liquidity_capacity.max_scalable_dollars
+                > crowded_rep.liquidity_capacity.max_scalable_dollars
+        );
+        assert!(deep_rep.liquidity_capacity.max_scalable_dollars > 0.0);
     }
 }

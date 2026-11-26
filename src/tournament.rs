@@ -151,15 +151,23 @@ pub struct TournamentTapeContext {
     pub entries: Vec<TournamentEntry>,
     pub window_vol_scores: HashMap<String, f64>,
     pub window_spread_cents: HashMap<String, f64>,
+    pub window_depth_contracts: HashMap<String, f64>,
 }
 
-/// Compute observable pre-settlement microstructure turbulence `(vol_score, mean_spread_cents)`.
-fn compute_window_vol_and_spread(snaps: &[Snapshot]) -> (f64, f64) {
+/// Compute observable pre-settlement microstructure `(vol_score, mean_spread_cents, median_depth_contracts)`.
+fn compute_window_microstructure(snaps: &[Snapshot]) -> (f64, f64, f64) {
     let mut spread_sum = 0.0f64;
     let mut spread_n = 0usize;
     let mut min_mid = f64::INFINITY;
     let mut max_mid = f64::NEG_INFINITY;
+    let mut depths: Vec<f32> = Vec::new();
     for s in snaps {
+        if s.yes_bid_size.is_finite() && s.yes_bid_size > 0.0 {
+            depths.push(s.yes_bid_size);
+        }
+        if s.no_bid_size.is_finite() && s.no_bid_size > 0.0 {
+            depths.push(s.no_bid_size);
+        }
         if let (Some(yb), Some(ya)) = (s.yes_bid.get(), s.yes_ask.get()) {
             if ya >= yb {
                 spread_sum += (ya - yb) * 100.0;
@@ -192,7 +200,18 @@ fn compute_window_vol_and_spread(snaps: &[Snapshot]) -> (f64, f64) {
     } else {
         0.0
     };
-    (mean_spread + 0.35 * price_range, mean_spread)
+    let median_depth = if depths.is_empty() {
+        0.0
+    } else {
+        depths.sort_unstable_by(|a, b| a.total_cmp(b));
+        let mid = depths.len() / 2;
+        if depths.len() % 2 == 1 {
+            depths[mid] as f64
+        } else {
+            ((depths[mid - 1] as f64) + (depths[mid] as f64)) * 0.5
+        }
+    };
+    (mean_spread + 0.35 * price_range, mean_spread, median_depth)
 }
 
 /// Per-series (BTC/ETH/SOL/XRP) OOS performance breakdown for one strategy.
@@ -563,11 +582,15 @@ pub fn build_tournament_context(
 
     let mut window_vol_scores = HashMap::with_capacity(settled_windows.len());
     let mut window_spread_cents = HashMap::with_capacity(settled_windows.len());
+    let mut window_depth_contracts = HashMap::new();
     for w in &settled_windows {
-        let (vol, spread) = compute_window_vol_and_spread(w.snaps);
+        let (vol, spread, depth) = compute_window_microstructure(w.snaps);
         let t = w.ticker.to_string();
         window_vol_scores.insert(t.clone(), vol);
-        window_spread_cents.insert(t, spread);
+        window_spread_cents.insert(t.clone(), spread);
+        if depth > 0.0 {
+            window_depth_contracts.insert(t, depth);
+        }
     }
 
     TournamentTapeContext {
@@ -581,6 +604,7 @@ pub fn build_tournament_context(
         entries,
         window_vol_scores,
         window_spread_cents,
+        window_depth_contracts,
     }
 }
 
@@ -1455,6 +1479,7 @@ mod tests {
             entries,
             window_vol_scores: HashMap::new(),
             window_spread_cents: HashMap::new(),
+            window_depth_contracts: HashMap::new(),
         }
     }
 
@@ -1759,6 +1784,7 @@ mod tests {
             entries: Vec::new(),
             window_vol_scores: HashMap::new(),
             window_spread_cents: HashMap::new(),
+            window_depth_contracts: HashMap::new(),
         };
         let empty_rep = compute_tournament_from_context(&empty_ctx, 1.0);
         assert_eq!(empty_rep.rankings.len(), 1);

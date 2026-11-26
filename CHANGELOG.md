@@ -4,6 +4,13 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running desk shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.24.0 - 2026-11-25
+
+- Added Causal Liquidity Depth & Scalable Bankroll Capacity Check (`compute_liquidity_capacity`, `LiquidityCapacityReport`, `LiquidityCapacityLeg`, `LiquidityScaleScenario` in `src/auto_allocator.rs`) backed by pre-settlement orderbook depth extraction (`window_depth_contracts` in `src/tournament.rs`) to evaluate `1x`, `2x`, and `5x` sizing partial-fill ratios, convex queue impact drag, `LIQUID` / `TIGHT` / `CROWDED` capacity tiers, and exact `max_scalable_dollars` and `max_scalable_bankroll` ceilings before impact erases post-fee OOS expectancy, while keeping `live_armed: false`.
+- Wired the `#allocator-liquidity-capacity` card, 1x/2x/5x scaling stress cards, per-leg capacity table, and `makeOfflineLiquidityCapacity` parity into `frontend/src/AutoAllocatorPanel.tsx` and `frontend/src/lib/allocator.ts`.
+- Replaced Linux `sha2` crate hashing in `src/update.rs` with `ring::digest::SHA256` (moving `sha2` alongside `num-bigint` into dev and Windows target dependencies in `Cargo.toml`), deduplicated JSON object body parsing via `parse_json_object_body` and `publish_live_status_json` in `src/main.rs`, and eliminated `serde_json::from_value` and unused `Deserialize` derives in `src/edge_audit.rs` (`5.84 MiB` / `6,120,800 B` release binary, `3.73 ms` cold boot, `17.39 MB` / `17,804 KB` Peak `VmHWM`, `6,761.8 req/s` `3.29 ms` p95 across 16 workers and 5 SSE streams).
+- Updated `README.md` and refreshed light and dark `docs/screenshots/*.png`, verified `128/128` Rust tests, `25/25` raw-TCP security fuzz checks, `gate 101/101`, `replay 18/18`, and `sloplint 0/0/0`.
+
 ## 0.23.0 - 2026-11-25
 
 - Added an execution-ready dry-run order plan and fee/spread sanity audit (`compute_dry_run_order_plan`, `DryRunOrderPlan`, `DryRunOrderPlanLeg`) in `src/auto_allocator.rs` backed by pre-settlement bid-ask spread tracking (`window_spread_cents` in `src/tournament.rs`) that computes exact whole-cent Kalshi maker (`0.0175 * p * (1 - p)`) and taker (`0.07 * p * (1 - p)`) fee drag, maker vs taker spread crossing cost, minimum contract threshold (`1..=250`) to clear whole-cent rounding with positive net OOS expectancy after slippage, and correlated cluster cap enforcement while keeping `live_armed: false`.

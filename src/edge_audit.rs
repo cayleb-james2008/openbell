@@ -15,7 +15,7 @@ use crate::recalibration::DeskRecalibrationReport;
 use crate::scaling::{ReadinessGate, ScalePlanResponse};
 use crate::tournament::TournamentReport;
 use crate::ScoreReport;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 #[inline]
 fn finite_opt(v: f64) -> Option<f64> {
@@ -35,7 +35,7 @@ fn finite_or_zero(v: f64) -> f64 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EdgeAuditStrategySummary {
     pub strategy: String,
     pub side: String,
@@ -48,7 +48,7 @@ pub struct EdgeAuditStrategySummary {
     pub oos_max_drawdown_pct: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EdgeAuditSlot {
     pub slot_number: usize,
     pub strategy: String,
@@ -60,7 +60,7 @@ pub struct EdgeAuditSlot {
     pub max_abs_corr_with_lineup: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EdgeAuditLineup {
     pub slots: Vec<EdgeAuditSlot>,
     pub correlation_cap: f64,
@@ -72,7 +72,7 @@ pub struct EdgeAuditLineup {
     pub honesty_note: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EdgeAuditRecalibration {
     pub is_count: usize,
     pub oos_count: usize,
@@ -91,7 +91,7 @@ pub struct EdgeAuditRecalibration {
     pub ev_gate_pnl_delta_dollars: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EdgeAuditFeeBreakdown {
     pub avg_entry_price: Option<f64>,
     pub gross_edge_cents: Option<f64>,
@@ -102,7 +102,7 @@ pub struct EdgeAuditFeeBreakdown {
     pub break_even_win_rate_pct: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EdgeAuditMonteCarlo {
     pub seed: u64,
     pub paths: usize,
@@ -116,7 +116,7 @@ pub struct EdgeAuditMonteCarlo {
     pub prob_profit: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EdgeAuditReadiness {
     pub verdict: String,
     pub gates_passed: usize,
@@ -126,7 +126,7 @@ pub struct EdgeAuditReadiness {
     pub fill_ratio_at_target: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EdgeAuditStage {
     pub id: String,
     pub title: String,
@@ -135,7 +135,7 @@ pub struct EdgeAuditStage {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EdgeAuditReport {
     pub mode_notice: String,
     pub dataset: String,
