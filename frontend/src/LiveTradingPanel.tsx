@@ -2,9 +2,11 @@
 // Live Order Ticket with Real-Time Hard Risk Rails, Positions/Orders/Fills tables, Kill Switch,
 // and Settings API & Risk Rails configuration panel. NEVER echoes private key PEM bytes.
 import { useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 import {
   AlertOctagon,
   AlertTriangle,
+  Check,
   CheckCircle2,
   KeyRound,
   Layers,
@@ -29,14 +31,27 @@ import {
   TableRow,
 } from "@/components/ui";
 import { OrderbookLadder } from "@/OrderbookLadder";
-import { type Market, cleanStr, isNum, money, moneySigned } from "@/lib/desk";
+import {
+  type Market,
+  ageWords,
+  cleanStr,
+  isNum,
+  money,
+  moneySigned,
+  timeUtcFullLabel,
+} from "@/lib/desk";
 import {
   type LiveConfigPayload,
   type LiveDeskBundle,
   type LiveEnvironment,
   type LiveOrderPayload,
+  type LiveReconcileResponse,
   type LiveStatus,
+  defaultLiveReconcile,
   evaluateOrderRails,
+  fetchLiveReconcile,
+  resetKillSwitch,
+  triggerLiveReconcile,
 } from "@/lib/live";
 import { deriveSideBookLevels, useOrderbook, walkBookLevels } from "@/lib/orderbook";
 import type { RunnerMode } from "@/lib/runner";
@@ -57,6 +72,7 @@ export function ArmLiveModal({
   busy,
   onConfirmArm,
   onOpenSettings,
+  onOpenResetKill,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
@@ -64,6 +80,7 @@ export function ArmLiveModal({
   busy: boolean;
   onConfirmArm: () => void;
   onOpenSettings: () => void;
+  onOpenResetKill?: () => void;
 }) {
   const [acknowledged, setAcknowledged] = useState(false);
 
@@ -147,7 +164,11 @@ export function ArmLiveModal({
             </div>
           </div>
 
-          {!status.configured ? (
+          {status.killed ? (
+            <div role="alert" className="border-b border-hairline pb-3 text-xs text-destructive-foreground">
+              Kill switch latch is active{status.killReason ? ` (${status.killReason})` : ""}. Reset the kill latch first before arming live order routing; clearing the latch keeps live trading disarmed.
+            </div>
+          ) : !status.configured ? (
             <div role="alert" className="rounded-lg border border-dot-amber/50 bg-board p-3 text-xs text-warning-foreground">
               Kalshi v2 API credentials are not saved yet. Open Desk Settings to enter your API Key ID and local PEM file path before arming live trading.
             </div>
@@ -202,7 +223,19 @@ export function ArmLiveModal({
           >
             Stay in Paper Mode
           </Button>
-          {!status.configured ? (
+          {status.killed && onOpenResetKill ? (
+            <Button
+              variant="default"
+              className="min-h-11 gap-1.5 text-xs sm:min-h-9"
+              onClick={() => {
+                onOpenChange(false);
+                onOpenResetKill();
+              }}
+            >
+              <ShieldCheck className="size-3.5" strokeWidth={1.5} aria-hidden />
+              Reset Kill Latch
+            </Button>
+          ) : !status.configured ? (
             <Button
               variant="default"
               className="min-h-11 gap-1.5 text-xs sm:min-h-9"
@@ -218,7 +251,7 @@ export function ArmLiveModal({
             <Button
               id="confirm-arm-live-btn"
               variant="default"
-              disabled={!acknowledged || busy}
+              disabled={!acknowledged || busy || status.killed}
               className="min-h-11 gap-1.5 text-xs sm:min-h-9"
               onClick={() => {
                 onConfirmArm();
@@ -232,6 +265,480 @@ export function ArmLiveModal({
         </div>
       </div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Explicit Fail-Closed Kill Latch Reset Confirmation Modal
+// ---------------------------------------------------------------------------
+
+export function ResetKillLatchModal({
+  open,
+  onOpenChange,
+  status,
+  busy,
+  onConfirmReset,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  status: LiveStatus;
+  busy: boolean;
+  onConfirmReset: () => Promise<void>;
+}) {
+  const [acknowledged, setAcknowledged] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const lockRef = useRef(false);
+
+  useEffect(() => {
+    if (!open) {
+      setAcknowledged(false);
+      setSubmitting(false);
+      setErrorMsg(null);
+      lockRef.current = false;
+      return;
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onOpenChange(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onOpenChange]);
+
+  if (!open) return null;
+
+  const handleConfirm = async () => {
+    if (!acknowledged || submitting || busy || lockRef.current) return;
+    lockRef.current = true;
+    setSubmitting(true);
+    setErrorMsg(null);
+    try {
+      await onConfirmReset();
+      onOpenChange(false);
+    } catch (e) {
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      lockRef.current = false;
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh]">
+      <div
+        aria-hidden="true"
+        className="fixed inset-0 bg-ink/40"
+        onClick={() => onOpenChange(false)}
+      />
+      <div
+        id="reset-kill-modal"
+        data-testid="reset-kill-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="reset-kill-title"
+        className="relative z-10 w-[calc(100%-24px)] max-w-[500px] overflow-hidden rounded-[12px] border border-hairline bg-surface text-ink shadow-(--elev-lift) outline-none"
+      >
+        <div className="flex items-start justify-between gap-3 border-b border-hairline px-5 py-4">
+          <div className="flex items-start gap-2.5">
+            <ShieldAlert className="mt-0.5 size-5 shrink-0 text-destructive-foreground" strokeWidth={1.5} aria-hidden />
+            <div>
+              <h2 id="reset-kill-title" className="text-base font-semibold text-ink">
+                Reset Kill Switch Latch
+              </h2>
+              <p className="mt-0.5 text-xs text-ink-2">
+                Clear the persistent kill latch while keeping live order routing disarmed.
+              </p>
+            </div>
+          </div>
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Close reset kill latch modal"
+            className="size-11 shrink-0 sm:size-9"
+            onClick={() => onOpenChange(false)}
+          >
+            <X className="size-4" strokeWidth={1.5} aria-hidden />
+          </Button>
+        </div>
+
+        <div className="space-y-3 px-5 py-4 text-xs">
+          <dl className="grid grid-cols-2 gap-3 border-b border-hairline pb-3">
+            <div>
+              <dt className="text-ink-2">Active Kill Reason</dt>
+              <dd className="mt-0.5 font-medium text-ink">{status.killReason || "operator_kill_switch"}</dd>
+            </div>
+            <div>
+              <dt className="text-ink-2">Post-Reset State</dt>
+              <dd className="mt-0.5 font-medium text-ink">
+                Paper Mode (<code className="text-xs">live_armed: false</code>)
+              </dd>
+            </div>
+          </dl>
+
+          <p className="text-ink-2">
+            I verified open positions, resting orders, and UTC-day realized loss. Resetting the kill switch latch clears the halt state while keeping{" "}
+            <code className="text-xs text-ink">live_armed: false</code> (Paper Mode), so live Kalshi order routing remains blocked until you explicitly arm live trading.
+          </p>
+
+          {errorMsg && (
+            <div id="reset-kill-error" role="alert" className="border-l-2 border-dot-red bg-board px-3 py-2 text-destructive-foreground">
+              {errorMsg}
+            </div>
+          )}
+
+          <button
+            id="reset-kill-checkbox"
+            data-testid="reset-kill-checkbox"
+            type="button"
+            role="checkbox"
+            aria-checked={acknowledged}
+            onClick={() => setAcknowledged((v) => !v)}
+            className="flex min-h-11 w-full cursor-pointer items-center gap-2.5 border-t border-hairline pt-3 text-left text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <span
+              aria-hidden="true"
+              className={
+                "inline-flex size-4 shrink-0 items-center justify-center rounded border " +
+                (acknowledged
+                  ? "border-ink-button bg-ink-button text-ink-button-fg"
+                  : "border-hairline bg-board text-transparent")
+              }
+            >
+              <Check className="size-3" strokeWidth={2.25} />
+            </span>
+            <span>Acknowledge latch reset</span>
+          </button>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-end gap-2 border-t border-hairline bg-board/50 px-5 py-3">
+          <Button
+            variant="outline"
+            className="min-h-11 text-xs sm:min-h-9"
+            onClick={() => onOpenChange(false)}
+          >
+            Keep Latch Active
+          </Button>
+          <Button
+            id="confirm-reset-kill-btn"
+            data-testid="confirm-reset-kill-btn"
+            variant="default"
+            disabled={!acknowledged || submitting || busy}
+            className="min-h-11 gap-1.5 text-xs sm:min-h-9"
+            onClick={() => void handleConfirm()}
+          >
+            <ShieldCheck className="size-3.5" strokeWidth={1.5} aria-hidden />
+            <span>{submitting ? "Resetting..." : "Confirm Reset Kill Latch"}</span>
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Closed-Loop Live Venue Reconciliation Panel
+// ---------------------------------------------------------------------------
+
+export function VenueReconciliationPanel({
+  status,
+  reconcile,
+  reconciling,
+  busy,
+  reconcileError,
+  onReconcileNow,
+}: {
+  status: LiveStatus;
+  reconcile: LiveReconcileResponse;
+  reconciling: boolean;
+  busy: boolean;
+  reconcileError: string | null;
+  onReconcileNow: () => void;
+}) {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 15000);
+    return () => window.clearInterval(id);
+  }, [reconcile.lastSyncEpoch, status.lastVenueSyncEpoch]);
+
+  const syncEpoch = reconcile.lastSyncEpoch ?? status.lastVenueSyncEpoch;
+  const isStale = Boolean(status.venueSyncStale || reconcile.syncStale);
+  const syncAgeSecs = syncEpoch !== null ? Math.max(0, Math.floor(nowMs / 1000 - syncEpoch)) : null;
+  const utcDayLoss = reconcile.source === "server" ? reconcile.utcDayLossDollars : status.dailyRealizedLossDollars;
+  const openExposure = reconcile.source === "server" ? reconcile.openExposureDollars : status.openExposureDollars;
+  const totalFees = useMemo(
+    () => reconcile.executions.reduce((sum, ex) => sum + ex.feeDollars, 0),
+    [reconcile.executions],
+  );
+  const totalRealizedPnl = useMemo(
+    () => reconcile.executions.reduce((sum, ex) => sum + ex.realizedPnlDollars, 0),
+    [reconcile.executions],
+  );
+
+  return (
+    <section
+      id="live-reconcile-panel"
+      data-testid="live-reconcile-panel"
+      aria-labelledby="live-reconcile-heading"
+      className="overflow-hidden rounded-[10px] border border-hairline bg-surface"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-board/50 px-4 py-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <ShieldCheck className="size-4 shrink-0 text-info-foreground" strokeWidth={1.5} aria-hidden />
+          <h3 id="live-reconcile-heading" className="text-sm font-semibold text-ink">
+            Venue Reconciliation
+          </h3>
+          {isStale ? (
+            <StatusPill
+              id="live-reconcile-stale-badge"
+              data-testid="stale-venue-sync-badge"
+              tone="warning"
+              className="min-h-7 px-2.5 py-0.5 text-xs text-warning-foreground"
+            >
+              Stale Venue Sync
+            </StatusPill>
+          ) : (
+            <StatusPill
+              id="live-reconcile-status-pill"
+              tone={
+                reconcile.discrepancies.length > 0
+                  ? "warning"
+                  : syncEpoch !== null
+                    ? "success"
+                    : "neutral"
+              }
+              className="min-h-7 px-2.5 py-0.5 text-xs text-ink-2"
+            >
+              {reconcile.discrepancies.length > 0
+                ? "Discrepancy Alert"
+                : syncEpoch !== null
+                  ? "Venue Synced"
+                  : "Awaiting Sync"}
+            </StatusPill>
+          )}
+        </div>
+
+        <Button
+          id="reconcile-now-btn"
+          data-testid="reconcile-now-btn"
+          variant="outline"
+          disabled={reconciling || busy}
+          onClick={onReconcileNow}
+          className="min-h-11 gap-1.5 px-3 text-xs sm:min-h-8"
+        >
+          <RefreshCw
+            className={"size-3.5 " + (reconciling ? "motion-safe:animate-spin" : "")}
+            strokeWidth={1.5}
+            aria-hidden
+          />
+          <span>{reconciling ? "Reconciling..." : "Reconcile Now"}</span>
+        </Button>
+      </div>
+
+      <dl className="grid grid-cols-2 divide-y divide-hairline border-b border-hairline bg-board/25 text-xs sm:grid-cols-4 sm:divide-x sm:divide-y-0">
+        <div className="px-4 py-2.5">
+          <dt className="text-ink-2">UTC-Day Realized Loss</dt>
+          <dd
+            id="reconcile-utc-day-loss"
+            className={
+              "mono mt-0.5 text-sm font-semibold tabular-nums " +
+              (utcDayLoss >= status.rails.maxDailyLossDollars ? "text-destructive-foreground" : "text-ink")
+            }
+          >
+            {money(utcDayLoss)}
+          </dd>
+          <dd className="mt-0.5 text-xs text-ink-3">
+            Cap <span className="mono tabular-nums">{money(status.rails.maxDailyLossDollars)}</span>
+          </dd>
+        </div>
+
+        <div className="px-4 py-2.5">
+          <dt className="text-ink-2">Open Exposure</dt>
+          <dd id="reconcile-open-exposure" className="mono mt-0.5 text-sm font-semibold tabular-nums text-ink">
+            {money(openExposure)}
+          </dd>
+          <dd className="mt-0.5 text-xs text-ink-3">
+            Cap <span className="mono tabular-nums">{money(status.rails.maxOpenExposureDollars)}</span>
+          </dd>
+        </div>
+
+        <div className="px-4 py-2.5">
+          <dt className="text-ink-2">UTC-Day Fees / Net P&amp;L</dt>
+          <dd id="reconcile-utc-fees" className="mono mt-0.5 text-sm font-semibold tabular-nums text-ink">
+            {money(totalFees)}
+          </dd>
+          <dd className="mt-0.5 text-xs text-ink-3">
+            Net{" "}
+            <span
+              className={
+                "mono tabular-nums font-medium " +
+                (totalRealizedPnl > 0
+                  ? "text-success-foreground"
+                  : totalRealizedPnl < 0
+                    ? "text-destructive-foreground"
+                    : "text-ink-2")
+              }
+            >
+              {moneySigned(totalRealizedPnl)}
+            </span>
+          </dd>
+        </div>
+
+        <div className="px-4 py-2.5">
+          <dt className="text-ink-2">Last Venue Sync</dt>
+          <dd
+            id="reconcile-sync-age"
+            className={
+              "mt-0.5 text-sm font-semibold " +
+              (isStale ? "text-warning-foreground" : "text-ink")
+            }
+          >
+            {syncEpoch !== null ? ageWords(syncAgeSecs) : "Not synced"}
+          </dd>
+          <dd className="mt-0.5 text-xs text-ink-3">
+            {syncEpoch !== null ? (
+              <span className="mono tabular-nums">{timeUtcFullLabel(syncEpoch)}</span>
+            ) : (
+              "Run Reconcile Now"
+            )}
+          </dd>
+        </div>
+      </dl>
+
+      {reconcileError && (
+        <div
+          id="live-reconcile-error"
+          role="alert"
+          className="border-b border-hairline bg-board px-4 py-2.5 text-xs text-destructive-foreground"
+        >
+          Venue reconciliation failed: {reconcileError}
+        </div>
+      )}
+
+      {isStale && (
+        <div
+          id="live-reconcile-stale-warning"
+          role="status"
+          className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-pill-warn-bg/50 px-4 py-2 text-xs text-warning-foreground"
+        >
+          <span className="flex items-center gap-1.5 font-medium">
+            <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
+            Venue execution sync is stale. Trigger Reconcile Now to refresh Kalshi fills and UTC-day loss before routing live orders.
+          </span>
+        </div>
+      )}
+
+      {reconcile.discrepancies.length > 0 && (
+        <div
+          id="live-reconcile-discrepancies"
+          data-testid="reconcile-discrepancies"
+          role="alert"
+          className="border-b border-hairline bg-board/60 px-4 py-3 text-xs"
+        >
+          <div className="flex items-center gap-1.5 font-semibold text-warning-foreground">
+            <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
+            <span>
+              {reconcile.discrepancies.length} reconciliation discrepancy alert
+              {reconcile.discrepancies.length === 1 ? "" : "s"}
+            </span>
+          </div>
+          <ul className="mt-2 divide-y divide-hairline border-t border-hairline">
+            {reconcile.discrepancies.map((d, idx) => (
+              <li
+                key={`${d.kind}-${idx}`}
+                data-reconcile-discrepancy
+                className="flex flex-wrap items-center justify-between gap-2 py-2"
+              >
+                <span className="flex flex-wrap items-center gap-2 text-ink">
+                  <Badge variant="warning">{d.kind}</Badge>
+                  <span>{d.message}</span>
+                </span>
+                {(d.ticker || d.orderId) && (
+                  <span className="mono tabular-nums text-ink-2">
+                    {[d.ticker, d.orderId].filter(Boolean).join(" / ")}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <div id="live-executions-table" data-testid="live-executions-table">
+        {reconcile.executions.length === 0 ? (
+          <p role="status" className="px-4 py-4 text-xs text-ink-2">
+            No reconciled live executions recorded for the current UTC day.
+          </p>
+        ) : (
+          <Table className="stack">
+            <TableHeader>
+              <TableRow>
+                <TableHead>Time (UTC)</TableHead>
+                <TableHead>Ticker</TableHead>
+                <TableHead>Side / Kind</TableHead>
+                <TableHead className="text-right">Qty @ Price</TableHead>
+                <TableHead>Schedule</TableHead>
+                <TableHead className="text-right">Fee</TableHead>
+                <TableHead className="text-right">Realized P&amp;L</TableHead>
+                <TableHead>Order / Trade</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {reconcile.executions.slice(0, 25).map((ex) => (
+                <TableRow
+                  key={`${ex.tradeId}-${ex.orderId}-${ex.ts}`}
+                  data-reconcile-execution-row={ex.tradeId}
+                >
+                  <TableCell className="mono tabular-nums text-xs text-ink-2">
+                    {timeUtcFullLabel(ex.ts)}
+                  </TableCell>
+                  <TableCell className="mono m-grow max-w-[190px] break-all text-xs font-semibold text-ink">
+                    {ex.ticker}
+                  </TableCell>
+                  <TableCell className="text-xs text-ink-2">
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="font-medium text-ink">
+                        {ex.action === "sell" ? "Sell" : "Buy"} {ex.side === "no" ? "No" : "Yes"}
+                      </span>
+                      <Badge variant="outline" className="text-xs">
+                        {ex.kind}
+                      </Badge>
+                    </span>
+                  </TableCell>
+                  <TableCell className="mono tabular-nums text-right text-xs font-semibold text-ink">
+                    {ex.count} @ {ex.priceCents}c
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    <Badge variant={ex.isTaker ? "warning" : "success"} className="text-xs">
+                      {ex.isTaker ? "Taker" : "Maker"}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="mono tabular-nums text-right text-xs text-ink-2">
+                    {money(ex.feeDollars)}
+                  </TableCell>
+                  <TableCell
+                    className={
+                      "mono tabular-nums text-right text-xs font-semibold " +
+                      (ex.realizedPnlDollars > 0
+                        ? "text-success-foreground"
+                        : ex.realizedPnlDollars < 0
+                          ? "text-destructive-foreground"
+                          : "text-ink-2")
+                    }
+                  >
+                    {moneySigned(ex.realizedPnlDollars)}
+                  </TableCell>
+                  <TableCell className="mono tabular-nums text-xs text-ink-2">
+                    {ex.orderId || ex.tradeId || "-"}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -263,7 +770,63 @@ export function LiveAccountStrip({
   onOpenSettings: () => void;
 }) {
   const [armModalOpen, setArmModalOpen] = useState(false);
+  const [resetKillModalOpen, setResetKillModalOpen] = useState(false);
+  const [reconcileState, setReconcileState] = useState<LiveReconcileResponse>(
+    () => bundle.reconcile ?? defaultLiveReconcile("client"),
+  );
+  const [reconciling, setReconciling] = useState(false);
+  const [reconcileError, setReconcileError] = useState<string | null>(null);
+  const reconcileLockRef = useRef(false);
   const { status, account, positions, orders, fills } = bundle;
+
+  useEffect(() => {
+    if (bundle.reconcile && bundle.reconcile.source === "server") {
+      setReconcileState(bundle.reconcile);
+    }
+  }, [bundle.reconcile]);
+
+  useEffect(() => {
+    if (bundle.reconcile?.source === "server") return;
+    let active = true;
+    void fetchLiveReconcile().then((res) => {
+      if (active && res.source === "server") {
+        setReconcileState(res);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [bundle.reconcile?.source, status.configured]);
+
+  const handleReconcileNow = async () => {
+    if (reconciling || reconcileLockRef.current) return;
+    reconcileLockRef.current = true;
+    setReconciling(true);
+    setReconcileError(null);
+    try {
+      const res = await triggerLiveReconcile("1");
+      setReconcileState(res);
+      onRefresh();
+      if (res.discrepancies.length > 0) {
+        toast.warning(`Venue synced with ${res.discrepancies.length} discrepancy alert(s).`);
+      } else {
+        toast.success("Kalshi venue executions reconciled.");
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setReconcileError(msg);
+      toast.error(`Reconcile failed: ${msg}`);
+    } finally {
+      reconcileLockRef.current = false;
+      setReconciling(false);
+    }
+  };
+
+  const handleConfirmResetKill = async () => {
+    await resetKillSwitch("1");
+    onRefresh();
+    toast.success("Kill switch latch cleared. Live trading remains disarmed (Paper Mode).");
+  };
 
   return (
     <>
@@ -332,7 +895,7 @@ export function LiveAccountStrip({
               }
               className="min-h-7 px-2.5 py-0.5 text-xs text-ink-2"
             >
-              <span className="mono">
+              <span>
                 {status.killed
                   ? "Kill switch active"
                   : status.connected
@@ -357,7 +920,7 @@ export function LiveAccountStrip({
                 }
                 className="min-h-7 px-2.5 py-0.5 text-xs text-ink-2"
               >
-                <span className="mono">
+                <span>
                   Runner:{" "}
                   {status.killed
                     ? "Halted"
@@ -431,7 +994,7 @@ export function LiveAccountStrip({
               disabled={busy}
               onClick={onRefresh}
             >
-              <RefreshCw className={`size-3.5 ${busy ? "animate-spin" : ""}`} aria-hidden />
+              <RefreshCw className={`size-3.5 ${busy ? "motion-safe:animate-spin" : ""}`} aria-hidden />
             </Button>
 
             <Button
@@ -450,23 +1013,37 @@ export function LiveAccountStrip({
 
         {status.killed && (
           <div
+            id="live-kill-latch-banner"
             role="alert"
-            className="mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dot-red/50 bg-board px-3 py-2 text-xs text-destructive-foreground"
+            className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-2.5 text-xs text-destructive-foreground"
           >
             <span className="flex items-center gap-1.5 font-medium">
               <AlertTriangle className="size-3.5 shrink-0" aria-hidden />
-              Emergency Kill Switch triggered{status.killReason ? ` (${status.killReason})` : ""}. All live routing is disarmed.
+              Emergency Kill Switch triggered{status.killReason ? ` (${status.killReason})` : ""}. All live routing is disarmed (live_armed: false).
             </span>
-            <button
-              type="button"
-              onClick={() => setArmModalOpen(true)}
-              className="min-h-11 cursor-pointer rounded border border-hairline bg-surface px-2.5 text-xs font-medium text-ink hover:bg-canvas sm:min-h-7"
+            <Button
+              id="reset-kill-latch-btn"
+              data-testid="reset-kill-latch-btn"
+              variant="outline"
+              disabled={busy}
+              onClick={() => setResetKillModalOpen(true)}
+              className="min-h-11 gap-1.5 border-hairline bg-surface px-3 text-xs font-medium text-ink sm:min-h-8"
             >
-              Re-arm Live
-            </button>
+              <ShieldCheck className="size-3.5" strokeWidth={1.5} aria-hidden />
+              <span>Reset Kill Latch</span>
+            </Button>
           </div>
         )}
       </section>
+
+      <VenueReconciliationPanel
+        status={status}
+        reconcile={reconcileState}
+        reconciling={reconciling}
+        busy={busy}
+        reconcileError={reconcileError}
+        onReconcileNow={() => void handleReconcileNow()}
+      />
 
       <ArmLiveModal
         open={armModalOpen}
@@ -475,6 +1052,15 @@ export function LiveAccountStrip({
         busy={busy}
         onConfirmArm={onArmConfirm}
         onOpenSettings={onOpenSettings}
+        onOpenResetKill={() => setResetKillModalOpen(true)}
+      />
+
+      <ResetKillLatchModal
+        open={resetKillModalOpen}
+        onOpenChange={setResetKillModalOpen}
+        status={status}
+        busy={busy}
+        onConfirmReset={handleConfirmResetKill}
       />
     </>
   );

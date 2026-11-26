@@ -196,6 +196,25 @@ async function open(w, h, theme = 'light', extra = {}) {
   p.on('pageerror', e => errs.push(`${w}-${theme}: pageerror ${e.message}`))
   p.on('console', m => { if (m.type() === 'error' && !p.__allow.test(m.text())) errs.push(`${w}-${theme}: ${m.text().slice(0, 140)} @ ${m.location().url}`) })
   await p.route('**/api/collect', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"snapshots_written":5}' }))
+  await p.route(/\/api\/live\/reconcile(\?.*)?$/, async r => {
+    try {
+      const res = await r.fetch()
+      if (res.status() !== 404) return r.fulfill({ response: res })
+    } catch {}
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        last_sync_epoch: null,
+        sync_stale: false,
+        utc_day_loss_dollars: 0,
+        open_exposure_dollars: 0,
+        executions: [],
+        discrepancies: [],
+      }),
+    })
+  })
   await p.route(/\/api\/orderbook(\/.*|\?.*)?$/, async r => {
     try {
       const res = await r.fetch()
@@ -665,10 +684,61 @@ for (const m of measures) {
       max_open_exposure_dollars: 100,
       allowed_ticker_prefix: 'KX',
     },
-    daily_realized_loss_dollars: 0,
+    daily_realized_loss_dollars: 1.25,
     open_exposure_dollars: 5.5,
-    orders_placed_today: 0,
+    orders_placed_today: 1,
+    last_venue_sync_epoch: Math.floor(Date.now() / 1000) - 420,
+    venue_sync_stale: true,
     last_error: null,
+  }
+  let reconcileState = {
+    ok: true,
+    last_sync_epoch: Math.floor(Date.now() / 1000) - 420,
+    sync_stale: true,
+    utc_day_loss_dollars: 1.25,
+    open_exposure_dollars: 5.5,
+    executions: [
+      {
+        ts: Math.floor(Date.now() / 1000) - 500,
+        order_id: 'ord-rec-1',
+        client_order_id: 'ob-rec-1',
+        trade_id: 'trd-rec-1',
+        ticker: 'KXBTC15M-MOCK',
+        side: 'yes',
+        action: 'buy',
+        count: 6,
+        price_cents: 54,
+        is_taker: false,
+        fee_dollars: 0.05,
+        revenue_cents: 0,
+        realized_pnl_dollars: 1.15,
+        kind: 'partial',
+      },
+      {
+        ts: Math.floor(Date.now() / 1000) - 430,
+        order_id: 'ord-rec-2',
+        client_order_id: 'ob-rec-2',
+        trade_id: 'trd-rec-2',
+        ticker: 'KXETH15M-MOCK',
+        side: 'no',
+        action: 'sell',
+        count: 4,
+        price_cents: 62,
+        is_taker: true,
+        fee_dollars: 0.16,
+        revenue_cents: 248,
+        realized_pnl_dollars: -2.4,
+        kind: 'full',
+      },
+    ],
+    discrepancies: [
+      {
+        kind: 'untracked_fill',
+        message: 'Venue reported fill absent from local resting queue',
+        ticker: 'KXETH15M-MOCK',
+        order_id: 'ord-rec-2',
+      },
+    ],
   }
   let liveOrders = [
     { order_id: 'ord-demo-1', client_order_id: 'ob-1', ticker: 'KXBTC15M-MOCK', action: 'buy', side: 'yes', status: 'resting', count: 5, remaining_count: 5, price_cents: 55, created_time: '2026-11-22T09:00:00Z' },
@@ -1020,6 +1090,26 @@ for (const m of measures) {
     liveState = { ...liveState, live_armed: false, killed: true, kill_reason: 'operator_kill_switch', mode: 'paper' }
     runnerState = { ...runnerState, mode: 'stopped', live_armed: false, killed: true, open_quotes: [] }
     return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, disarmed: true, cancelled_count: n, errors: [], status: liveState }) })
+  })
+  await p.route('**/api/live/reconcile*', r => {
+    if (r.request().method() === 'POST') {
+      checkCsrf(r)
+      hits.add('live-reconcile-post')
+      const nowEpoch = Math.floor(Date.now() / 1000)
+      liveState = { ...liveState, last_venue_sync_epoch: nowEpoch, venue_sync_stale: false }
+      reconcileState = { ...reconcileState, last_sync_epoch: nowEpoch, sync_stale: false }
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(reconcileState) })
+    }
+    hits.add('live-reconcile-get')
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(reconcileState) })
+  })
+  await p.route('**/api/live/reset-kill*', r => {
+    checkCsrf(r)
+    const b = JSON.parse(r.request().postData() || '{}')
+    if (b.confirm_reset_kill === true) hits.add('live-reset-kill')
+    liveState = { ...liveState, killed: false, kill_reason: null, live_armed: false, mode: 'paper' }
+    runnerState = { ...runnerState, killed: false, live_armed: false }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, status: liveState }) })
   })
   await p.route('**/api/runner/status*', r => {
     hits.add('runner-status')
@@ -1591,11 +1681,42 @@ for (const m of measures) {
   await p.locator('#live-ticket-price').fill('55')
   await p.waitForTimeout(100)
   await p.locator('#submit-live-order-btn').click(); await p.waitForTimeout(300)
+  const reconcilePanelVisible = await p.locator('#live-reconcile-panel[data-testid="live-reconcile-panel"]').isVisible()
+  const staleBadgeBefore = await p.locator('#live-reconcile-stale-badge').isVisible()
+  const reconcileLossOk = (await p.locator('#reconcile-utc-day-loss').innerText()).includes('$1.25')
+  const reconcileExpOk = (await p.locator('#reconcile-open-exposure').innerText()).includes('$5.50')
+  const execRowsCount = await p.locator('#live-executions-table [data-reconcile-execution-row]').count()
+  const discrepancyCount = await p.locator('#live-reconcile-discrepancies [data-reconcile-discrepancy]').count()
+  await p.locator('#reconcile-now-btn').click(); await p.waitForTimeout(250)
+  const staleClearedAfterReconcile = (await p.locator('#live-reconcile-stale-badge').count()) === 0
   await p.screenshot({ path: `${OUT}/live-armed-1440-light.png` })
   await p.locator('[data-cancel-order="ord-demo-1"]').click(); await p.waitForTimeout(250)
   await p.locator('#kill-switch-btn').click(); await p.waitForTimeout(300)
   const disarmedAfterKill = /KILLED|DISARMED/.test(await p.locator('#live-mode-pill').innerText())
   const runnerHaltedAfterKill = /Halted|Stopped/.test(await p.locator('#runner-mode-badge').innerText())
+  const resetKillBtnVisible = await p.locator('#reset-kill-latch-btn').isVisible()
+  await p.locator('#reset-kill-latch-btn').click(); await p.waitForTimeout(200)
+  const resetKillModalText = await p.locator('#reset-kill-modal').innerText()
+  await p.locator('#reset-kill-checkbox').check()
+  await p.locator('#confirm-reset-kill-btn').click(); await p.waitForTimeout(300)
+  const resetLatchCleared = (await p.locator('#reset-kill-latch-btn').count()) === 0
+  const staysDisarmedAfterReset = /DISARMED/.test(await p.locator('#live-mode-pill').innerText())
+  ok('Venue Reconciliation panel & explicit Reset Kill Latch modal execute CSRF-guarded sync and fail-closed unlatch (live_armed: false)',
+    hits.has('live-reconcile-get') &&
+      hits.has('live-reconcile-post') &&
+      hits.has('live-reset-kill') &&
+      reconcilePanelVisible &&
+      staleBadgeBefore &&
+      staleClearedAfterReconcile &&
+      reconcileLossOk &&
+      reconcileExpOk &&
+      execRowsCount === 2 &&
+      discrepancyCount === 1 &&
+      resetKillBtnVisible &&
+      resetKillModalText.includes('live_armed: false') &&
+      resetLatchCleared &&
+      staysDisarmedAfterReset,
+    `panel=${reconcilePanelVisible} stale=${staleBadgeBefore}->${staleClearedAfterReconcile} rows=${execRowsCount} disc=${discrepancyCount} resetBtn=${resetKillBtnVisible} cleared=${resetLatchCleared} disarmed=${staysDisarmedAfterReset}`)
   ok('Shadow Runner API wire contract & SSE runner stream enforce fail-closed Live Auto gating, config/start/stop/ledger & kill-switch halt',
     ['runner-status', 'runner-config', 'runner-start', 'runner-stop', 'runner-ledger'].every(k => hits.has(k)) &&
       runnerLockedBeforeArm && runnerShadowActive && runnerLiveActive && runnerHaltedAfterKill,
@@ -1926,6 +2047,120 @@ for (const m of measures) {
   await ctx.close()
 }
 
+// 5c. Venue Reconciliation & Kill Latch modal across 1440x900 & 390x844 Light & Dark: 0px overflow, contrast, zero Rune/RHL
+for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light', 390, 844], ['dark', 390, 844]]) {
+  const { ctx, p } = await open(w, h, theme)
+  await p.route('**/api/home*', async r => {
+    const res = await r.fetch()
+    const j = await res.json()
+    j.version = '0.30.0'
+    j.capabilities = ['sse', 'live_kalshi', 'risk_rails', 'shadow_runner', 'live_reconcile']
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
+  })
+  await p.route('**/api/live/status*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      configured: true,
+      environment: 'demo',
+      connected: true,
+      mode: 'paper',
+      live_armed: false,
+      killed: true,
+      kill_reason: 'daily_loss_cap_exceeded',
+      last_venue_sync_epoch: Math.floor(Date.now() / 1000) - 600,
+      venue_sync_stale: true,
+      daily_realized_loss_dollars: 52.4,
+      open_exposure_dollars: 14.2,
+      rails: { max_order_contracts: 25, max_order_dollars: 25, max_daily_loss_dollars: 50, max_open_exposure_dollars: 100, allowed_ticker_prefix: 'KX' },
+    }),
+  }))
+  await p.route('**/api/live/account*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"configured":true,"connected":true,"balance_dollars":947.6,"portfolio_value_dollars":961.8}' }))
+  await p.route('**/api/live/positions*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"market_positions":[]}' }))
+  await p.route('**/api/live/orders*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"orders":[]}' }))
+  await p.route('**/api/live/fills*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"fills":[]}' }))
+  await p.unroute(/\/api\/live\/reconcile(\?.*)?$/)
+  await p.route(/\/api\/live\/reconcile(\?.*)?$/, r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ok: true,
+      last_sync_epoch: Math.floor(Date.now() / 1000) - 600,
+      sync_stale: true,
+      utc_day_loss_dollars: 52.4,
+      open_exposure_dollars: 14.2,
+      executions: [
+        {
+          ts: Math.floor(Date.now() / 1000) - 900,
+          order_id: 'ord-e2-1',
+          client_order_id: 'ob-e2-1',
+          trade_id: 'trd-e2-1',
+          ticker: 'KXBTC15M-MOCK',
+          side: 'yes',
+          action: 'buy',
+          count: 10,
+          price_cents: 56,
+          is_taker: false,
+          fee_dollars: 0.08,
+          revenue_cents: 0,
+          realized_pnl_dollars: 2.35,
+          kind: 'partial',
+        },
+        {
+          ts: Math.floor(Date.now() / 1000) - 700,
+          order_id: 'ord-e2-2',
+          client_order_id: 'ob-e2-2',
+          trade_id: 'trd-e2-2',
+          ticker: 'KXETH15M-MOCK',
+          side: 'no',
+          action: 'sell',
+          count: 12,
+          price_cents: 64,
+          is_taker: true,
+          fee_dollars: 0.24,
+          revenue_cents: 768,
+          realized_pnl_dollars: -54.75,
+          kind: 'full',
+        },
+      ],
+      discrepancies: [
+        {
+          kind: 'exposure_mismatch',
+          message: 'Local exposure differed from venue portfolio snapshot',
+          ticker: 'KXETH15M-MOCK',
+          order_id: 'ord-e2-2',
+        },
+      ],
+    }),
+  }))
+
+  await p.goto(BASE); await ready(p); await p.waitForTimeout(300)
+  await p.locator('#tab-live').click(); await p.waitForTimeout(350)
+  const panelOk =
+    (await p.locator('#live-reconcile-panel[data-testid="live-reconcile-panel"]').isVisible()) &&
+    (await p.locator('#live-reconcile-stale-badge').isVisible()) &&
+    (await p.locator('#reconcile-now-btn').isVisible()) &&
+    (await p.locator('#reset-kill-latch-btn').isVisible())
+  const mPanel = await p.evaluate(MEASURE)
+  const panelTxt = await p.evaluate(() => document.body.innerText)
+  await p.locator('#reset-kill-latch-btn').click(); await p.waitForTimeout(200)
+  const modalVisible = await p.locator('#reset-kill-modal').isVisible()
+  const mModal = await p.evaluate(MEASURE)
+  const modalTxt = await p.locator('#reset-kill-modal').innerText()
+  await p.keyboard.press('Escape'); await p.waitForTimeout(150)
+  const noForbiddenTerms = !/\bRune\b/i.test(panelTxt) && !/\bRHL\b/.test(panelTxt) && !/\bRune\b/i.test(modalTxt) && !/\bRHL\b/.test(modalTxt)
+  ok(
+    `Venue Reconciliation & Kill Latch modal pass ${w}x${h} ${theme} (0px overflow, contrast, touch, zero Rune/RHL)`,
+    panelOk &&
+      modalVisible &&
+      noForbiddenTerms &&
+      mPanel.docOverflow <= 0 && mPanel.clipped.length === 0 && mPanel.textClipped.length === 0 && mPanel.smallTargets === 0 && mPanel.lowContrast === 0 &&
+      mModal.docOverflow <= 0 && mModal.clipped.length === 0 && mModal.textClipped.length === 0 && mModal.smallTargets === 0 && mModal.lowContrast === 0,
+    `panel=${panelOk} modal=${modalVisible} clean=${noForbiddenTerms} pOv=${mPanel.docOverflow} pClip=${mPanel.clipped.join('|')} pTClip=${mPanel.textClipped.join('|')} pLow=${mPanel.lowContrast}(${mPanel.lowSample.join('|')}) pSmall=${mPanel.smallTargets}(${mPanel.smallSample.join('|')}) mOv=${mModal.docOverflow} mClip=${mModal.clipped.join('|')} mTClip=${mModal.textClipped.join('|')} mLow=${mModal.lowContrast}(${mModal.lowSample.join('|')}) mSmall=${mModal.smallTargets}(${mModal.smallSample.join('|')})`,
+  )
+  await ctx.close()
+}
+
 // 6. Error, empty, and loading states
 {
   const { ctx, p } = await open(1440, 900)
@@ -2003,6 +2238,9 @@ for (const m of measures) {
     const u = new URL(r.request().url())
     if (u.pathname === '/api/update') return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(snap) })
     const upstream = await fetch(new URL(u.pathname + u.search, BASE).href, { method: r.request().method(), headers: { Host: new URL(BASE).host } })
+    if (u.pathname === '/api/live/reconcile' && upstream.status === 404) {
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, last_sync_epoch: null, sync_stale: false, utc_day_loss_dollars: 0, open_exposure_dollars: 0, executions: [], discrepancies: [] }) })
+    }
     const buf = Buffer.from(await upstream.arrayBuffer())
     return r.fulfill({ status: upstream.status, headers: Object.fromEntries(upstream.headers.entries()), body: buf })
   })

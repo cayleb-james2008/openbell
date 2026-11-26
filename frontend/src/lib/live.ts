@@ -29,6 +29,8 @@ export type LiveStatus = {
   dailyRealizedLossDollars: number;
   openExposureDollars: number;
   ordersPlacedToday: number;
+  lastVenueSyncEpoch: number | null;
+  venueSyncStale: boolean;
   lastError: string | null;
   source: "server" | "client";
 };
@@ -77,12 +79,48 @@ export type LiveFill = {
   createdTime: string;
 };
 
+export type ReconcileExecution = {
+  ts: number;
+  orderId: string;
+  clientOrderId: string;
+  tradeId: string;
+  ticker: string;
+  side: "yes" | "no";
+  action: "buy" | "sell";
+  count: number;
+  priceCents: number;
+  isTaker: boolean;
+  feeDollars: number;
+  revenueCents: number;
+  realizedPnlDollars: number;
+  kind: string;
+};
+
+export type ReconcileDiscrepancy = {
+  kind: string;
+  message: string;
+  ticker?: string | null;
+  orderId?: string | null;
+};
+
+export type LiveReconcileResponse = {
+  ok: boolean;
+  lastSyncEpoch: number | null;
+  syncStale: boolean;
+  utcDayLossDollars: number;
+  openExposureDollars: number;
+  executions: ReconcileExecution[];
+  discrepancies: ReconcileDiscrepancy[];
+  source: "server" | "client";
+};
+
 export type LiveDeskBundle = {
   status: LiveStatus;
   account: LiveAccount;
   positions: LivePosition[];
   orders: LiveOrder[];
   fills: LiveFill[];
+  reconcile?: LiveReconcileResponse | null;
 };
 
 export type LiveConfigPayload = {
@@ -151,6 +189,13 @@ const MUTATION_HEADERS: HeadersInit = {
   "X-OpenBell-CSRF": "1",
 };
 
+function mutationHeaders(csrfToken?: string): HeadersInit {
+  return {
+    "Content-Type": "application/json",
+    "X-OpenBell-CSRF": csrfToken && csrfToken.trim() ? csrfToken.trim() : "1",
+  };
+}
+
 function pickNum(o: Record<string, unknown>, keys: string[]): number | null {
   for (const k of keys) {
     if (isNum(o[k])) return o[k] as number;
@@ -182,6 +227,8 @@ export function defaultLiveStatus(source: "server" | "client" = "client"): LiveS
     dailyRealizedLossDollars: 0,
     openExposureDollars: 0,
     ordersPlacedToday: 0,
+    lastVenueSyncEpoch: null,
+    venueSyncStale: false,
     lastError: null,
     source,
   };
@@ -222,7 +269,83 @@ export function normalizeLiveStatus(raw: unknown, source: "server" | "client" = 
     dailyRealizedLossDollars: pickNum(o, ["daily_realized_loss_dollars", "daily_loss_dollars"]) ?? 0,
     openExposureDollars: pickNum(o, ["open_exposure_dollars"]) ?? 0,
     ordersPlacedToday: Math.max(0, Math.round(pickNum(o, ["orders_placed_today"]) ?? 0)),
+    lastVenueSyncEpoch: pickNum(o, ["last_venue_sync_epoch", "last_sync_epoch"]),
+    venueSyncStale: Boolean(o.venue_sync_stale ?? o.sync_stale ?? false),
     lastError: typeof o.last_error === "string" && o.last_error ? o.last_error : null,
+    source,
+  };
+}
+
+export function defaultLiveReconcile(source: "server" | "client" = "client"): LiveReconcileResponse {
+  return {
+    ok: false,
+    lastSyncEpoch: null,
+    syncStale: false,
+    utcDayLossDollars: 0,
+    openExposureDollars: 0,
+    executions: [],
+    discrepancies: [],
+    source,
+  };
+}
+
+function normalizeReconcileExecutions(raw: unknown): ReconcileExecution[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((x): x is Record<string, unknown> => !!x && typeof x === "object")
+    .map((x, idx) => {
+      const sideRaw = String(x.side ?? "yes").toLowerCase();
+      const side: "yes" | "no" = sideRaw === "no" ? "no" : "yes";
+      const actionRaw = String(x.action ?? "buy").toLowerCase();
+      const action: "buy" | "sell" = actionRaw === "sell" ? "sell" : "buy";
+      const priceCents =
+        pickNum(x, ["price_cents", side === "yes" ? "yes_price" : "no_price", "yes_price", "no_price"]) ?? 50;
+      return {
+        ts: Math.max(0, Math.round(pickNum(x, ["ts", "epoch", "created_epoch"]) ?? 0)),
+        orderId: cleanStr(x.order_id, ""),
+        clientOrderId: cleanStr(x.client_order_id, ""),
+        tradeId: cleanStr(x.trade_id ?? x.fill_id ?? x.id, `exec-${idx}`),
+        ticker: cleanStr(x.ticker ?? x.market_ticker, "unknown"),
+        side,
+        action,
+        count: Math.max(0, Math.round(pickNum(x, ["count", "contracts"]) ?? 0)),
+        priceCents: Math.round(priceCents),
+        isTaker: Boolean(x.is_taker),
+        feeDollars: centsOrDollars(x, ["fee_dollars", "fee_cost_dollars"], ["fee_cents"]) ?? 0,
+        revenueCents: Math.round(pickNum(x, ["revenue_cents"]) ?? 0),
+        realizedPnlDollars: centsOrDollars(x, ["realized_pnl_dollars"], ["realized_pnl_cents"]) ?? 0,
+        kind: cleanStr(x.kind, "fill"),
+      };
+    });
+}
+
+function normalizeReconcileDiscrepancies(raw: unknown): ReconcileDiscrepancy[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((x): x is Record<string, unknown> => !!x && typeof x === "object")
+    .map((x) => ({
+      kind: cleanStr(x.kind, "mismatch"),
+      message: cleanStr(x.message ?? x.detail, "Execution state discrepancy detected"),
+      ticker: typeof x.ticker === "string" && x.ticker.trim() ? x.ticker.trim() : null,
+      orderId: typeof x.order_id === "string" && x.order_id.trim() ? x.order_id.trim() : null,
+    }));
+}
+
+export function normalizeLiveReconcile(
+  raw: unknown,
+  source: "server" | "client" = "server",
+): LiveReconcileResponse {
+  if (!raw || typeof raw !== "object") return defaultLiveReconcile(source);
+  const o = raw as Record<string, unknown>;
+  return {
+    ok: Boolean(o.ok ?? true),
+    lastSyncEpoch: pickNum(o, ["last_sync_epoch", "last_venue_sync_epoch"]),
+    syncStale: Boolean(o.sync_stale ?? o.venue_sync_stale ?? false),
+    utcDayLossDollars:
+      pickNum(o, ["utc_day_loss_dollars", "daily_realized_loss_dollars", "daily_loss_dollars"]) ?? 0,
+    openExposureDollars: pickNum(o, ["open_exposure_dollars"]) ?? 0,
+    executions: normalizeReconcileExecutions(o.executions),
+    discrepancies: normalizeReconcileDiscrepancies(o.discrepancies),
     source,
   };
 }
@@ -478,15 +601,17 @@ export async function fetchLiveBundle(home: Home | null): Promise<LiveDeskBundle
       positions: [],
       orders: [],
       fills: [],
+      reconcile: defaultLiveReconcile("client"),
     };
   }
   try {
-    const [stRes, accRes, posRes, ordRes, fillRes] = await Promise.all([
+    const [stRes, accRes, posRes, ordRes, fillRes, recRes] = await Promise.all([
       fetch("/api/live/status").then((r) => (r.ok ? r.json() : null)).catch(() => null),
       fetch("/api/live/account").then((r) => (r.ok ? r.json() : null)).catch(() => null),
       fetch("/api/live/positions").then((r) => (r.ok ? r.json() : null)).catch(() => null),
       fetch("/api/live/orders").then((r) => (r.ok ? r.json() : null)).catch(() => null),
       fetch("/api/live/fills").then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      fetch("/api/live/reconcile").then((r) => (r.ok ? r.json() : null)).catch(() => null),
     ]);
     return {
       status: stRes ? normalizeLiveStatus(stRes, "server") : defaultLiveStatus("client"),
@@ -494,6 +619,7 @@ export async function fetchLiveBundle(home: Home | null): Promise<LiveDeskBundle
       positions: normalizePositions(posRes),
       orders: normalizeOrders(ordRes),
       fills: normalizeFills(fillRes),
+      reconcile: recRes ? normalizeLiveReconcile(recRes, "server") : defaultLiveReconcile("client"),
     };
   } catch {
     return {
@@ -502,6 +628,7 @@ export async function fetchLiveBundle(home: Home | null): Promise<LiveDeskBundle
       positions: [],
       orders: [],
       fills: [],
+      reconcile: defaultLiveReconcile("client"),
     };
   }
 }
@@ -716,5 +843,42 @@ export async function triggerKillSwitch(
   return {
     cancelledCount: isNum(body.cancelled_count) ? body.cancelled_count : 0,
     status: body.status ? normalizeLiveStatus(body.status, "server") : defaultLiveStatus("server"),
+  };
+}
+
+export async function fetchLiveReconcile(): Promise<LiveReconcileResponse> {
+  try {
+    const r = await fetch("/api/live/reconcile");
+    if (!r.ok) return defaultLiveReconcile("client");
+    return normalizeLiveReconcile(await r.json(), "server");
+  } catch {
+    return defaultLiveReconcile("client");
+  }
+}
+
+export async function triggerLiveReconcile(csrfToken?: string): Promise<LiveReconcileResponse> {
+  const r = await fetch("/api/live/reconcile", {
+    method: "POST",
+    headers: mutationHeaders(csrfToken),
+    body: JSON.stringify({}),
+  });
+  if (!r.ok) throw new Error(await parseErrorMessage(r, `Venue reconcile answered ${r.status}`));
+  return normalizeLiveReconcile(await r.json(), "server");
+}
+
+export async function resetKillSwitch(csrfToken?: string): Promise<LiveStatus> {
+  const r = await fetch("/api/live/reset-kill", {
+    method: "POST",
+    headers: mutationHeaders(csrfToken),
+    body: JSON.stringify({ confirm_reset_kill: true }),
+  });
+  if (!r.ok) throw new Error(await parseErrorMessage(r, `Reset kill latch answered ${r.status}`));
+  const body = (await r.json().catch(() => ({}))) as { status?: unknown };
+  const rawStatus = body.status ?? body;
+  const normalized = normalizeLiveStatus(rawStatus, "server");
+  return {
+    ...normalized,
+    liveArmed: false,
+    mode: "paper",
   };
 }
