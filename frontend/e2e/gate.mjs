@@ -903,7 +903,7 @@ for (const m of measures) {
         last_signal_epoch: null,
       })) : runnerState.active_slots,
     }
-    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(runnerState) })
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, status: runnerState }) })
   })
   await p.route('**/api/runner/start*', r => {
     checkCsrf(r)
@@ -937,7 +937,7 @@ for (const m of measures) {
         },
       ],
     }
-    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(runnerState) })
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, status: runnerState }) })
   })
   await p.route('**/api/runner/stop*', r => {
     checkCsrf(r)
@@ -948,7 +948,7 @@ for (const m of measures) {
       mode: 'stopped',
       open_quotes: b.cancel_resting === false ? runnerState.open_quotes : [],
     }
-    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(runnerState) })
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, status: runnerState }) })
   })
   await p.route('**/api/runner/ledger*', r => {
     hits.add('runner-ledger')

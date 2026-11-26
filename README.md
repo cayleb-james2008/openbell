@@ -67,18 +67,16 @@ flowchart LR
   R -- "confirm_arm = true" --> K["Kalshi Trade API v2 (RSA-PSS SHA-256)"]
 ```
 
-## Verified baseline (`v0.24.0`) and `v0.25.0` shadow runner
+## Verified baseline (`v0.25.0`)
 
-`v0.25.0` adds live tick-driven shadow orderbook execution (`ShadowRunner`), `entry_quote()` resting limit quotes, queue-ahead fill simulation, and persistent `shadow_ledger.jsonl` settlement grading under `/api/runner/*`, while preserving `live_armed: false` on every boot (`v0.24.0` baseline metrics measured under `#154` 16-worker isolation shown below; `v0.25.0` verified on 129 Rust tests + 103/103 UI gates).
-
-| Metric | `v0.10.0` Baseline | `v0.24.0` Verified | Delta |
+| Metric | `v0.10.0` Baseline | `v0.25.0` Verified | Delta |
 | --- | --- | --- | --- |
-| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`5.84 MiB`** (`6,120,800 B`) | **`-45.2%`** |
-| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`95,074 B`** / **`21,931 B`** (`21` `/chunks/*`) | **`-94.8%` wire bytes** |
-| Cold boot to first `HTTP 200` | `9.11 ms` | **`3.73 ms`** | **`-59.1%`** |
-| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`17.39 MB`** (`17,804 KB`) | **`-86.1%`** |
-| Concurrent HTTP throughput (16w, `5/5` SSE) | `4,921.3 req/s` (30w) | **`6,761.8 req/s`** (`2.21 ms` p50, `3.29 ms` p95, `0` errors) | **`5.74x` vs `1,178` v0.9.0** |
-| Security and test verification | `49/49` fuzz | **`128/128` Rust tests**, `25/25` raw-TCP fuzz, `gate 101/101`, `replay 18/18`, `sloplint 0 FAIL/WARN`, `RAILS OK`, `EQUITY OK` | Clean |
+| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`5.96 MiB`** (`6,247,776 B`) | **`-44.1%`** |
+| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`94 kB`** / **`22 kB`** (`22` `/chunks/*`) | **`-94.8%` wire bytes** |
+| Cold boot to first `HTTP 200` | `9.11 ms` | **`4.9 ms`** | **`-46.2%`** |
+| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`17.99 MB`** (`18,424 KB`) | **`-85.7%`** |
+| Concurrent HTTP throughput (30w, `5/5` SSE) | `4,921.3 req/s` | **`5,224.7 req/s`** (`4.68 ms` p95, `0` errors) | **Higher + `ShadowRunner`** |
+| Security and test verification | `49/49` fuzz | **`129/129` Rust tests**, `25/25` raw-TCP fuzz, `gate 103/103`, `replay 18/18`, `sloplint 0/0/0`, `RAILS OK`, `EQUITY OK` | Clean |
 
 ## Quick start (synthetic paper mode)
 

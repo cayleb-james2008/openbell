@@ -792,7 +792,15 @@ export async function saveRunnerConfig(
     body: JSON.stringify(payload),
   });
   if (!r.ok) throw new Error(await parseRunnerError(r, `Runner config answered ${r.status}`));
-  return normalizeRunnerStatus(await r.json(), "server");
+  return normalizeRunnerStatus(unwrapRunnerStatus(await r.json()), "server");
+}
+
+function unwrapRunnerStatus(raw: unknown): unknown {
+  if (raw && typeof raw === "object" && "status" in raw) {
+    const nested = (raw as { status?: unknown }).status;
+    if (nested && typeof nested === "object") return nested;
+  }
+  return raw;
 }
 
 export async function startRunner(
@@ -820,7 +828,7 @@ export async function startRunner(
     body: JSON.stringify(payload),
   });
   if (!r.ok) throw new Error(await parseRunnerError(r, `Runner start answered ${r.status}`));
-  return normalizeRunnerStatus(await r.json(), "server");
+  return normalizeRunnerStatus(unwrapRunnerStatus(await r.json()), "server");
 }
 
 export async function stopRunner(
@@ -843,7 +851,7 @@ export async function stopRunner(
     body: JSON.stringify(payload),
   });
   if (!r.ok) throw new Error(await parseRunnerError(r, `Runner stop answered ${r.status}`));
-  return normalizeRunnerStatus(await r.json(), "server");
+  return normalizeRunnerStatus(unwrapRunnerStatus(await r.json()), "server");
 }
 
 export function subscribeRunnerStream(
