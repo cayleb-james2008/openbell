@@ -3316,6 +3316,418 @@ for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light'
   await ctx.close()
 }
 
+// 6f. Cycle 4 E3: Private Venue WS Execution Stream UI & Live SSE Refresh (WS Stream / REST Poll / Offline + event: live_exec)
+for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light', 390, 844], ['dark', 390, 844]]) {
+  const { ctx, p } = await open(w, h, theme)
+  const nowSec = Math.floor(Date.now() / 1000)
+  await p.route('**/api/home*', async r => {
+    const res = await r.fetch()
+    const j = await res.json()
+    j.version = '0.35.0'
+    j.sse = true
+    j.capabilities = ['sse', 'live_kalshi', 'risk_rails', 'shadow_runner', 'live_reconcile', 'execution_health']
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
+  })
+  await p.route('**/api/tape/stream', r => r.fulfill({
+    status: 200,
+    headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+    body: 'event: tape\ndata: {"snapshots_written":0}\n\n',
+  }))
+  await p.route('**/api/live/status*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      configured: true,
+      environment: 'demo',
+      api_base_url: 'https://demo-api.kalshi.co/trade-api/v2',
+      key_id_masked: 'demo-key-…e3ws',
+      key_path_configured: true,
+      connected: true,
+      mode: 'paper',
+      live_armed: false,
+      killed: false,
+      kill_reason: null,
+      rails: {
+        max_order_contracts: 25,
+        max_order_dollars: 25,
+        max_daily_loss_dollars: 50,
+        max_open_exposure_dollars: 100,
+        allowed_ticker_prefix: 'KX',
+      },
+      daily_realized_loss_dollars: 0.45,
+      open_exposure_dollars: 5.5,
+      orders_placed_today: 1,
+      last_venue_sync_epoch: nowSec - 10,
+      venue_sync_stale: false,
+      private_ws_connected: true,
+      private_ws_last_event_epoch: nowSec - 12,
+      venue_sync_mode: 'ws_stream',
+      last_error: null,
+    }),
+  }))
+  await p.route('**/api/live/account*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      configured: true,
+      connected: true,
+      balance_dollars: 148.5,
+      portfolio_value_dollars: 154.0,
+      daily_pnl_dollars: 1.25,
+      note: 'Connected to Kalshi v2 private WS stream.',
+    }),
+  }))
+  await p.route('**/api/live/positions*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      positions: [
+        { ticker: 'KXBTC15M-E3WS', side: 'yes', position: 10, market_exposure_dollars: 5.5, realized_pnl_dollars: 1.25, resting_orders_count: 1 },
+      ],
+    }),
+  }))
+  await p.route('**/api/live/orders*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      orders: [
+        { order_id: 'ord-e3-1', client_order_id: 'ob-e3-1', ticker: 'KXBTC15M-E3WS', action: 'buy', side: 'yes', status: 'resting', count: 10, remaining_count: 10, price_cents: 55, created_time: '2026-11-26T10:00:00Z' },
+      ],
+    }),
+  }))
+  await p.route('**/api/live/fills*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      fills: [
+        { trade_id: 'fill-e3-1', order_id: 'ord-e3-0', ticker: 'KXBTC15M-E3WS', action: 'buy', side: 'yes', count: 5, price_cents: 54, fee_dollars: 0.05, created_time: '2026-11-26T09:58:00Z' },
+      ],
+    }),
+  }))
+  await p.unroute(/\/api\/live\/reconcile(\?.*)?$/)
+  await p.route(/\/api\/live\/reconcile(\?.*)?$/, r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ok: true,
+      last_sync_epoch: nowSec - 10,
+      sync_stale: false,
+      utc_day_loss_dollars: 0.45,
+      open_exposure_dollars: 5.5,
+      executions: [
+        {
+          ts: nowSec - 12,
+          order_id: 'ord-e3-0',
+          client_order_id: 'ob-e3-0',
+          trade_id: 'trd-e3-1',
+          ticker: 'KXBTC15M-E3WS',
+          side: 'yes',
+          action: 'buy',
+          count: 5,
+          price_cents: 54,
+          is_taker: false,
+          fee_dollars: 0.05,
+          revenue_cents: 0,
+          realized_pnl_dollars: 1.25,
+          kind: 'fill',
+        },
+      ],
+      discrepancies: [],
+    }),
+  }))
+  await p.route('**/api/runner/status*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ mode: 'stopped', live_armed: false, killed: false, tick_interval_ms: 2000, cancel_before_close_secs: 30, bankroll_dollars: 250, active_slots: [], open_quotes: [], total_realized_pnl_dollars: 0, drawdown_dollars: 0 }),
+  }))
+  await p.route('**/api/runner/ledger*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ ok: true, entries: [], summary_by_strategy: [] }),
+  }))
+
+  await p.goto(BASE); await ready(p); await p.waitForTimeout(200)
+  await p.locator('#tab-live').click(); await p.waitForTimeout(250)
+
+  const stripBadgeTxt = (await p.locator('#live-strip-sync-mode-pill').innerText()).trim()
+  const reconcileBadgeTxt = (await p.locator('#reconcile-sync-mode-pill').innerText()).trim()
+  const stripModeAttr = await p.locator('[data-live-ws-sync-badge]').getAttribute('data-venue-sync-mode')
+  const recModeAttr = await p.locator('[data-reconcile-sync-mode-badge]').getAttribute('data-venue-sync-mode')
+  const stripBadgeNonMono = await p.locator('#live-strip-sync-mode-pill').evaluate(el => !getComputedStyle(el).fontFamily.toLowerCase().includes('mono'))
+  const recBadgeNonMono = await p.locator('#reconcile-sync-mode-pill').evaluate(el => !getComputedStyle(el).fontFamily.toLowerCase().includes('mono'))
+  const stripWsAge = (await p.locator('#live-ws-last-event-age').innerText()).trim()
+  const recWsAge = (await p.locator('#reconcile-ws-event-age').innerText()).trim()
+  const bodyTxt = await p.evaluate(() => document.body.innerText)
+  const disarmedPreserved = bodyTxt.includes('Fail-Closed Disarmed (Paper Mode)') && !/\bNaN\b|\bundefined\b|\bRune\b|\bRHL\b/.test(bodyTxt)
+  const mWs = await p.evaluate(MEASURE)
+
+  ok(
+    `C4E3 WS Stream indicator & Private WS age pass ${w}x${h} ${theme} (0px overflow, contrast, touch, disarmed preserved)`,
+    stripBadgeTxt === 'WS Stream' &&
+      reconcileBadgeTxt === 'WS Stream' &&
+      stripModeAttr === 'ws_stream' &&
+      recModeAttr === 'ws_stream' &&
+      stripBadgeNonMono &&
+      recBadgeNonMono &&
+      /\ds ago|just now/.test(stripWsAge) &&
+      /\ds ago|just now/.test(recWsAge) &&
+      disarmedPreserved &&
+      mWs.docOverflow <= 0 && mWs.clipped.length === 0 && mWs.textClipped.length === 0 && mWs.smallTargets === 0 && mWs.lowContrast === 0 && mWs.svgBad === 0,
+    `strip=${stripBadgeTxt}(${stripModeAttr}) rec=${reconcileBadgeTxt}(${recModeAttr}) age=${stripWsAge}/${recWsAge} ov=${mWs.docOverflow} small=${mWs.smallTargets}(${mWs.smallSample.join('|')}) low=${mWs.lowContrast}(${mWs.lowSample.join('|')})`,
+  )
+  await ctx.close()
+}
+
+// 6g. Cycle 4 E3: SSE event: live_exec immediately refreshes Orders, Positions, Fills & Executions tables
+{
+  const { ctx, p } = await open(1440, 900, 'light')
+  const nowSec = Math.floor(Date.now() / 1000)
+  let execStep = 0
+  let releaseLiveExec
+  const liveExecGate = new Promise(resolve => { releaseLiveExec = resolve })
+  let liveExecCount = 0
+
+  await p.route('**/api/home*', async r => {
+    const res = await r.fetch()
+    const j = await res.json()
+    j.version = '0.35.0'
+    j.sse = true
+    j.capabilities = ['sse', 'live_kalshi', 'risk_rails', 'shadow_runner', 'live_reconcile', 'execution_health']
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
+  })
+  await p.route('**/api/tape/stream', async r => {
+    await liveExecGate
+    if (liveExecCount < 5) {
+      liveExecCount += 1
+      return r.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+        body: 'event: live_exec\ndata: {"kind":"fill","ticker":"KXETH15M-E3WS","trade_id":"trd-e3-2"}\n\n',
+      })
+    }
+    return r.fulfill({
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+      body: 'event: tape\ndata: {"snapshots_written":0}\n\n',
+    })
+  })
+  await p.route('**/api/live/status*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      configured: true,
+      environment: 'demo',
+      api_base_url: 'https://demo-api.kalshi.co/trade-api/v2',
+      key_id_masked: 'demo-key-…e3ws',
+      key_path_configured: true,
+      connected: true,
+      mode: 'paper',
+      live_armed: false,
+      killed: false,
+      kill_reason: null,
+      rails: { max_order_contracts: 25, max_order_dollars: 25, max_daily_loss_dollars: 50, max_open_exposure_dollars: 100, allowed_ticker_prefix: 'KX' },
+      daily_realized_loss_dollars: 0.45,
+      open_exposure_dollars: execStep === 0 ? 5.5 : 8.75,
+      orders_placed_today: execStep === 0 ? 1 : 2,
+      last_venue_sync_epoch: execStep === 0 ? nowSec - 45 : Math.floor(Date.now() / 1000),
+      venue_sync_stale: false,
+      private_ws_connected: true,
+      private_ws_last_event_epoch: execStep === 0 ? nowSec - 45 : Math.floor(Date.now() / 1000),
+      venue_sync_mode: 'ws_stream',
+      last_error: null,
+    }),
+  }))
+  await p.route('**/api/live/account*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ configured: true, connected: true, balance_dollars: 148.5, portfolio_value_dollars: 154.0, daily_pnl_dollars: 1.25, note: 'WS live.' }),
+  }))
+  await p.route('**/api/live/positions*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      positions: execStep === 0
+        ? [{ ticker: 'KXBTC15M-E3WS', side: 'yes', position: 10, market_exposure_dollars: 5.5, realized_pnl_dollars: 1.25, resting_orders_count: 1 }]
+        : [
+            { ticker: 'KXBTC15M-E3WS', side: 'yes', position: 10, market_exposure_dollars: 5.5, realized_pnl_dollars: 1.25, resting_orders_count: 1 },
+            { ticker: 'KXETH15M-E3WS', side: 'no', position: 5, market_exposure_dollars: 3.25, realized_pnl_dollars: 0.8, resting_orders_count: 1 },
+          ],
+    }),
+  }))
+  await p.route('**/api/live/orders*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      orders: execStep === 0
+        ? [{ order_id: 'ord-e3-1', client_order_id: 'ob-e3-1', ticker: 'KXBTC15M-E3WS', action: 'buy', side: 'yes', status: 'resting', count: 10, remaining_count: 10, price_cents: 55, created_time: '2026-11-26T10:00:00Z' }]
+        : [
+            { order_id: 'ord-e3-1', client_order_id: 'ob-e3-1', ticker: 'KXBTC15M-E3WS', action: 'buy', side: 'yes', status: 'resting', count: 10, remaining_count: 10, price_cents: 55, created_time: '2026-11-26T10:00:00Z' },
+            { order_id: 'ord-e3-2', client_order_id: 'ob-e3-2', ticker: 'KXETH15M-E3WS', action: 'buy', side: 'no', status: 'resting', count: 5, remaining_count: 5, price_cents: 65, created_time: '2026-11-26T10:01:00Z' },
+          ],
+    }),
+  }))
+  await p.route('**/api/live/fills*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      fills: execStep === 0
+        ? [{ trade_id: 'fill-e3-1', order_id: 'ord-e3-0', ticker: 'KXBTC15M-E3WS', action: 'buy', side: 'yes', count: 5, price_cents: 54, fee_dollars: 0.05, created_time: '2026-11-26T09:58:00Z' }]
+        : [
+            { trade_id: 'fill-e3-1', order_id: 'ord-e3-0', ticker: 'KXBTC15M-E3WS', action: 'buy', side: 'yes', count: 5, price_cents: 54, fee_dollars: 0.05, created_time: '2026-11-26T09:58:00Z' },
+            { trade_id: 'fill-e3-2', order_id: 'ord-e3-2', ticker: 'KXETH15M-E3WS', action: 'buy', side: 'no', count: 5, price_cents: 65, fee_dollars: 0.06, created_time: '2026-11-26T10:01:05Z' },
+          ],
+    }),
+  }))
+  await p.unroute(/\/api\/live\/reconcile(\?.*)?$/)
+  await p.route(/\/api\/live\/reconcile(\?.*)?$/, r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ok: true,
+      last_sync_epoch: execStep === 0 ? nowSec - 45 : Math.floor(Date.now() / 1000),
+      sync_stale: false,
+      utc_day_loss_dollars: 0.45,
+      open_exposure_dollars: execStep === 0 ? 5.5 : 8.75,
+      executions: execStep === 0
+        ? [{ ts: nowSec - 45, order_id: 'ord-e3-0', client_order_id: 'ob-e3-0', trade_id: 'trd-e3-1', ticker: 'KXBTC15M-E3WS', side: 'yes', action: 'buy', count: 5, price_cents: 54, is_taker: false, fee_dollars: 0.05, revenue_cents: 0, realized_pnl_dollars: 1.25, kind: 'fill' }]
+        : [
+            { ts: nowSec - 45, order_id: 'ord-e3-0', client_order_id: 'ob-e3-0', trade_id: 'trd-e3-1', ticker: 'KXBTC15M-E3WS', side: 'yes', action: 'buy', count: 5, price_cents: 54, is_taker: false, fee_dollars: 0.05, revenue_cents: 0, realized_pnl_dollars: 1.25, kind: 'fill' },
+            { ts: Math.floor(Date.now() / 1000), order_id: 'ord-e3-2', client_order_id: 'ob-e3-2', trade_id: 'trd-e3-2', ticker: 'KXETH15M-E3WS', side: 'no', action: 'buy', count: 5, price_cents: 65, is_taker: false, fee_dollars: 0.06, revenue_cents: 0, realized_pnl_dollars: 0.8, kind: 'fill' },
+          ],
+      discrepancies: [],
+    }),
+  }))
+  await p.route('**/api/runner/status*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ mode: 'stopped', live_armed: false, killed: false, tick_interval_ms: 2000, cancel_before_close_secs: 30, bankroll_dollars: 250, active_slots: [], open_quotes: [], total_realized_pnl_dollars: 0, drawdown_dollars: 0 }),
+  }))
+  await p.route('**/api/runner/ledger*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ ok: true, entries: [], summary_by_strategy: [] }),
+  }))
+
+  await p.goto(BASE); await ready(p); await p.waitForTimeout(250)
+  await p.locator('#tab-live').click(); await p.waitForTimeout(250)
+
+  const ordersBefore = await p.locator('#live-orders-table [data-live-order-row]').count()
+  const execsBefore = await p.locator('#live-executions-table [data-reconcile-execution-row]').count()
+  const ageBefore = (await p.locator('#live-ws-last-event-age').innerText()).trim()
+
+  execStep = 1
+  releaseLiveExec()
+  await p.waitForSelector('[data-live-order-row="ord-e3-2"]', { timeout: 5000 })
+  await p.waitForSelector('[data-reconcile-execution-row="trd-e3-2"]', { timeout: 5000 })
+  await p.waitForTimeout(150)
+
+  const ordersAfter = await p.locator('#live-orders-table [data-live-order-row]').count()
+  const execsAfter = await p.locator('#live-executions-table [data-reconcile-execution-row]').count()
+  const posCountTxt = (await p.locator('#live-positions-count').innerText()).trim()
+  const fillCountTxt = (await p.locator('#live-fills-count').innerText()).trim()
+  const ageAfter = (await p.locator('#live-ws-last-event-age').innerText()).trim()
+
+  await p.locator('[data-live-subtab="positions"]').click(); await p.waitForTimeout(100)
+  const newPosVisible = await p.locator('[data-live-position-row="KXETH15M-E3WS"]').isVisible()
+  await p.locator('[data-live-subtab="fills"]').click(); await p.waitForTimeout(100)
+  const newFillVisible = await p.locator('[data-live-fill-row="fill-e3-2"]').isVisible()
+
+  ok(
+    'C4E3 SSE event: live_exec immediately refreshes Orders, Positions, Fills, Executions & WS event age',
+    ordersBefore === 1 &&
+      execsBefore === 1 &&
+      ordersAfter === 2 &&
+      execsAfter === 2 &&
+      posCountTxt === '2' &&
+      fillCountTxt === '2' &&
+      newPosVisible &&
+      newFillVisible &&
+      ageBefore !== ageAfter &&
+      ageAfter === 'just now',
+    `orders=${ordersBefore}->${ordersAfter} execs=${execsBefore}->${execsAfter} pos=${posCountTxt}(${newPosVisible}) fills=${fillCountTxt}(${newFillVisible}) age=${ageBefore}->${ageAfter}`,
+  )
+  await ctx.close()
+}
+
+// 6h. Cycle 4 E3: REST Poll & Offline indicators + N/A WS event age fallback at 390px
+{
+  const { ctx, p } = await open(390, 844, 'light')
+  let modeState = 'rest_poll'
+  await p.route('**/api/home*', async r => {
+    const res = await r.fetch()
+    const j = await res.json()
+    j.version = '0.35.0'
+    j.capabilities = ['sse', 'live_kalshi', 'risk_rails', 'live_reconcile']
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
+  })
+  await p.route('**/api/live/status*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      configured: modeState === 'rest_poll',
+      environment: 'demo',
+      api_base_url: 'https://demo-api.kalshi.co/trade-api/v2',
+      key_id_masked: modeState === 'rest_poll' ? 'demo-key-…rest' : null,
+      key_path_configured: modeState === 'rest_poll',
+      connected: modeState === 'rest_poll',
+      mode: 'paper',
+      live_armed: false,
+      killed: false,
+      kill_reason: null,
+      rails: { max_order_contracts: 25, max_order_dollars: 25, max_daily_loss_dollars: 50, max_open_exposure_dollars: 100, allowed_ticker_prefix: 'KX' },
+      daily_realized_loss_dollars: 0,
+      open_exposure_dollars: 0,
+      orders_placed_today: 0,
+      last_venue_sync_epoch: null,
+      venue_sync_stale: false,
+      private_ws_connected: false,
+      private_ws_last_event_epoch: null,
+      venue_sync_mode: modeState,
+      last_error: null,
+    }),
+  }))
+  await p.route('**/api/live/account*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ configured: false, connected: false, balance_dollars: null, portfolio_value_dollars: null, daily_pnl_dollars: null, note: 'Paper mode.' }),
+  }))
+  await p.route('**/api/live/positions*', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ positions: [] }) }))
+  await p.route('**/api/live/orders*', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ orders: [] }) }))
+  await p.route('**/api/live/fills*', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ fills: [] }) }))
+
+  await p.goto(BASE); await ready(p); await p.waitForTimeout(200)
+  await p.locator('#tab-live').click(); await p.waitForTimeout(250)
+
+  const restStripLabel = (await p.locator('#live-strip-sync-mode-pill').innerText()).trim()
+  const restRecLabel = (await p.locator('#reconcile-sync-mode-pill').innerText()).trim()
+  const restAgeStrip = (await p.locator('#live-ws-last-event-age').innerText()).trim()
+  const restAgeRec = (await p.locator('#reconcile-ws-event-age').innerText()).trim()
+  const mRest = await p.evaluate(MEASURE)
+
+  modeState = 'offline'
+  await p.locator('[aria-label="Refresh live Kalshi account"]').click(); await p.waitForTimeout(250)
+  const offStripLabel = (await p.locator('#live-strip-sync-mode-pill').innerText()).trim()
+  const offRecLabel = (await p.locator('#reconcile-sync-mode-pill').innerText()).trim()
+  const offAgeStrip = (await p.locator('#live-ws-last-event-age').innerText()).trim()
+  const offTxt = await p.evaluate(() => document.body.innerText)
+
+  ok(
+    'C4E3 REST Poll & Offline badges render N/A age & fail-closed Paper messaging without overflow at 390px',
+    restStripLabel === 'REST Poll' &&
+      restRecLabel === 'REST Poll' &&
+      restAgeStrip === 'N/A' &&
+      restAgeRec === 'N/A' &&
+      offStripLabel === 'Offline' &&
+      offRecLabel === 'Offline' &&
+      offAgeStrip === 'N/A' &&
+      offTxt.includes('Fail-Closed Disarmed (Paper Mode)') &&
+      !/\bNaN\b|\bundefined\b/.test(offTxt) &&
+      mRest.docOverflow <= 0 && mRest.smallTargets === 0 && mRest.lowContrast === 0,
+    `rest=${restStripLabel}/${restRecLabel} age=${restAgeStrip}/${restAgeRec} off=${offStripLabel}/${offRecLabel} ov=${mRest.docOverflow} small=${mRest.smallTargets} low=${mRest.lowContrast}`,
+  )
+  await ctx.close()
+}
+
 // 7. Update strip (loopback + non-loopback shared host, BANNER-FIX-BRIEF)
 {
   const { ctx, p } = await open(1440, 900)

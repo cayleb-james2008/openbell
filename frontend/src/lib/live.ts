@@ -6,6 +6,37 @@ import { kalshiFeeDollars } from "@/lib/fees";
 
 export type LiveEnvironment = "demo" | "prod";
 
+export type VenueSyncMode = "ws_stream" | "rest_poll" | "offline";
+
+export type LiveStatusSnapshot = {
+  configured?: boolean;
+  environment?: string;
+  api_base_url?: string;
+  key_id_masked?: string | null;
+  key_path_configured?: boolean;
+  connected?: boolean;
+  mode?: string;
+  live_armed?: boolean;
+  killed?: boolean;
+  kill_reason?: string | null;
+  rails?: {
+    max_order_contracts?: number;
+    max_order_dollars?: number;
+    max_daily_loss_dollars?: number;
+    max_open_exposure_dollars?: number;
+    allowed_ticker_prefix?: string;
+  };
+  daily_realized_loss_dollars?: number;
+  open_exposure_dollars?: number;
+  orders_placed_today?: number;
+  last_venue_sync_epoch?: number | null;
+  venue_sync_stale?: boolean;
+  private_ws_connected?: boolean;
+  private_ws_last_event_epoch?: number | null;
+  venue_sync_mode?: VenueSyncMode;
+  last_error?: string | null;
+};
+
 export type RiskRailsConfig = {
   maxOrderContracts: number;
   maxOrderDollars: number;
@@ -31,6 +62,9 @@ export type LiveStatus = {
   ordersPlacedToday: number;
   lastVenueSyncEpoch: number | null;
   venueSyncStale: boolean;
+  privateWsConnected: boolean;
+  privateWsLastEventEpoch: number | null;
+  venueSyncMode: VenueSyncMode;
   lastError: string | null;
   source: "server" | "client";
 };
@@ -282,6 +316,9 @@ export function defaultLiveStatus(source: "server" | "client" = "client"): LiveS
     ordersPlacedToday: 0,
     lastVenueSyncEpoch: null,
     venueSyncStale: false,
+    privateWsConnected: false,
+    privateWsLastEventEpoch: null,
+    venueSyncMode: "offline",
     lastError: null,
     source,
   };
@@ -295,8 +332,22 @@ export function normalizeLiveStatus(raw: unknown, source: "server" | "client" = 
   const environment: LiveEnvironment = envRaw === "prod" || envRaw === "production" ? "prod" : "demo";
   const liveArmed = Boolean(o.live_armed);
   const modeRaw = String(o.mode ?? (liveArmed ? "live" : "paper")).toLowerCase();
+  const configured = Boolean(o.configured);
+  const connected = Boolean(o.connected);
+  const lastVenueSyncEpoch = safeEpochSecs(pickNum(o, ["last_venue_sync_epoch", "last_sync_epoch"]));
+  const rawSyncMode = typeof o.venue_sync_mode === "string" ? o.venue_sync_mode.trim().toLowerCase() : "";
+  const privateWsConnected = Boolean(o.private_ws_connected ?? rawSyncMode === "ws_stream");
+  const privateWsLastEventEpoch = safeEpochSecs(pickNum(o, ["private_ws_last_event_epoch"]));
+  const venueSyncMode: VenueSyncMode =
+    rawSyncMode === "ws_stream" || rawSyncMode === "rest_poll" || rawSyncMode === "offline"
+      ? rawSyncMode
+      : privateWsConnected
+        ? "ws_stream"
+        : connected || (configured && lastVenueSyncEpoch !== null)
+          ? "rest_poll"
+          : "offline";
   return {
-    configured: Boolean(o.configured),
+    configured,
     environment,
     apiBaseUrl:
       typeof o.api_base_url === "string" && o.api_base_url
@@ -306,7 +357,7 @@ export function normalizeLiveStatus(raw: unknown, source: "server" | "client" = 
           : "https://demo-api.kalshi.co/trade-api/v2",
     keyIdMasked: typeof o.key_id_masked === "string" && o.key_id_masked ? o.key_id_masked : null,
     keyPathConfigured: Boolean(o.key_path_configured ?? o.private_key_configured ?? o.configured),
-    connected: Boolean(o.connected),
+    connected,
     mode: modeRaw === "live" || liveArmed ? "live" : "paper",
     liveArmed,
     killed: Boolean(o.killed),
@@ -322,8 +373,11 @@ export function normalizeLiveStatus(raw: unknown, source: "server" | "client" = 
     dailyRealizedLossDollars: pickNum(o, ["daily_realized_loss_dollars", "daily_loss_dollars"]) ?? 0,
     openExposureDollars: pickNum(o, ["open_exposure_dollars"]) ?? 0,
     ordersPlacedToday: Math.max(0, Math.round(pickNum(o, ["orders_placed_today"]) ?? 0)),
-    lastVenueSyncEpoch: safeEpochSecs(pickNum(o, ["last_venue_sync_epoch", "last_sync_epoch"])),
+    lastVenueSyncEpoch,
     venueSyncStale: Boolean(o.venue_sync_stale ?? o.sync_stale ?? false),
+    privateWsConnected,
+    privateWsLastEventEpoch,
+    venueSyncMode,
     lastError: typeof o.last_error === "string" && o.last_error ? o.last_error : null,
     source,
   };

@@ -4,6 +4,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
+  Activity,
   AlertOctagon,
   AlertTriangle,
   Check,
@@ -51,6 +52,7 @@ import {
   type LivePosition,
   type LiveReconcileResponse,
   type LiveStatus,
+  type VenueSyncMode,
   amendLiveOrder,
   defaultLiveReconcile,
   evaluateOrderRails,
@@ -65,6 +67,65 @@ import type { RunnerMode } from "@/lib/runner";
 function shortTs(iso: string): string {
   if (!iso) return "-";
   return iso.length >= 19 ? iso.slice(5, 19).replace("T", " ") + "Z" : iso;
+}
+
+function validEpochSecs(raw: number | null | undefined): number | null {
+  return isNum(raw) && raw > 0 && raw <= 8_640_000_000_000 ? raw : null;
+}
+
+function epochAgeSecs(epoch: number | null, nowMs: number): number | null {
+  if (epoch === null || !isNum(nowMs)) return null;
+  return Math.max(0, Math.floor(nowMs / 1000 - epoch));
+}
+
+function useClockTickMs(resetKey: string): number {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 15000);
+    return () => window.clearInterval(id);
+  }, [resetKey]);
+  return nowMs;
+}
+
+function venueSyncBadgeInfo(status: LiveStatus): {
+  mode: VenueSyncMode;
+  label: string;
+  tone: "success" | "info" | "neutral";
+  pillClassName: string;
+  hint: string;
+} {
+  const mode: VenueSyncMode =
+    status.venueSyncMode === "ws_stream" || status.privateWsConnected
+      ? "ws_stream"
+      : status.venueSyncMode === "rest_poll"
+        ? "rest_poll"
+        : "offline";
+  if (mode === "ws_stream") {
+    return {
+      mode,
+      label: "WS Stream",
+      tone: "success",
+      pillClassName: "min-h-7 border-dot-green/50 px-2.5 py-0.5 text-xs text-success-foreground",
+      hint: "Private Kalshi WebSocket execution stream active",
+    };
+  }
+  if (mode === "rest_poll") {
+    return {
+      mode,
+      label: "REST Poll",
+      tone: "info",
+      pillClassName: "min-h-7 px-2.5 py-0.5 text-xs text-info-foreground",
+      hint: "REST polling fallback (private WS disconnected)",
+    };
+  }
+  return {
+    mode: "offline",
+    label: "Offline",
+    tone: "neutral",
+    pillClassName: "min-h-7 px-2.5 py-0.5 text-xs text-ink-2",
+    hint: "Private venue stream offline",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -470,22 +531,14 @@ export function VenueReconciliationPanel({
   reconcileError: string | null;
   onReconcileNow: () => void;
 }) {
-  const [nowMs, setNowMs] = useState(() => Date.now());
-
-  useEffect(() => {
-    setNowMs(Date.now());
-    const id = window.setInterval(() => setNowMs(Date.now()), 15000);
-    return () => window.clearInterval(id);
-  }, [reconcile.lastSyncEpoch, status.lastVenueSyncEpoch]);
-
   const rawSyncEpoch = reconcile.lastSyncEpoch ?? status.lastVenueSyncEpoch;
-  const syncEpoch =
-    isNum(rawSyncEpoch) && rawSyncEpoch > 0 && rawSyncEpoch <= 8_640_000_000_000
-      ? rawSyncEpoch
-      : null;
+  const syncEpoch = validEpochSecs(rawSyncEpoch);
+  const wsEventEpoch = validEpochSecs(status.privateWsLastEventEpoch);
+  const nowMs = useClockTickMs(`${syncEpoch ?? ""}:${wsEventEpoch ?? ""}`);
   const isStale = Boolean(status.venueSyncStale || reconcile.syncStale);
-  const syncAgeSecs =
-    syncEpoch !== null && isNum(nowMs) ? Math.max(0, Math.floor(nowMs / 1000 - syncEpoch)) : null;
+  const syncAgeSecs = epochAgeSecs(syncEpoch, nowMs);
+  const wsEventAgeSecs = epochAgeSecs(wsEventEpoch, nowMs);
+  const syncBadge = venueSyncBadgeInfo(status);
   const rawUtcDayLoss =
     reconcile.source === "server" ? reconcile.utcDayLossDollars : status.dailyRealizedLossDollars;
   const utcDayLoss = isNum(rawUtcDayLoss) ? rawUtcDayLoss : 0;
@@ -553,6 +606,25 @@ export function VenueReconciliationPanel({
                   : "Awaiting Sync"}
             </StatusPill>
           )}
+          <span
+            data-reconcile-sync-mode-badge
+            data-venue-sync-mode={syncBadge.mode}
+            className="inline-flex"
+          >
+            <StatusPill
+              id="reconcile-sync-mode-pill"
+              tone={syncBadge.tone}
+              title={
+                wsEventEpoch !== null
+                  ? `${syncBadge.hint} (${timeUtcFullLabel(wsEventEpoch)})`
+                  : syncBadge.hint
+              }
+              className={syncBadge.pillClassName}
+            >
+              <Activity className="size-3 shrink-0" strokeWidth={1.5} aria-hidden />
+              <span>{syncBadge.label}</span>
+            </StatusPill>
+          </span>
         </div>
 
         <Button
@@ -572,7 +644,7 @@ export function VenueReconciliationPanel({
         </Button>
       </div>
 
-      <dl className="grid grid-cols-2 divide-y divide-hairline border-b border-hairline bg-board/25 text-xs sm:grid-cols-4 sm:divide-x sm:divide-y-0">
+      <dl className="grid grid-cols-2 divide-y divide-hairline border-b border-hairline bg-board/25 text-xs sm:grid-cols-4 sm:divide-x sm:divide-y-0 lg:grid-cols-5">
         <div className="min-w-0 px-4 py-2.5">
           <dt className="text-ink-2">UTC-Day Realized Loss</dt>
           <dd
@@ -637,6 +709,31 @@ export function VenueReconciliationPanel({
               <span className="mono tabular-nums">{timeUtcFullLabel(syncEpoch)}</span>
             ) : (
               "Run Reconcile Now"
+            )}
+          </dd>
+        </div>
+
+        <div className="col-span-2 min-w-0 border-t border-hairline px-4 py-2.5 sm:col-span-4 lg:col-span-1 lg:border-t-0">
+          <dt className="text-ink-2">Private WS Event</dt>
+          <dd
+            id="reconcile-ws-event-age"
+            data-reconcile-ws-age
+            className={
+              "mt-0.5 text-sm font-semibold " +
+              (syncBadge.mode === "ws_stream" ? "text-success-foreground" : "text-ink")
+            }
+          >
+            {wsEventEpoch !== null ? ageWords(wsEventAgeSecs) : "N/A"}
+          </dd>
+          <dd className="mt-0.5 text-xs text-ink-3">
+            {wsEventEpoch !== null ? (
+              <span className="mono tabular-nums">{timeUtcFullLabel(wsEventEpoch)}</span>
+            ) : syncBadge.mode === "ws_stream" ? (
+              "Awaiting stream event"
+            ) : syncBadge.mode === "rest_poll" ? (
+              "REST polling fallback"
+            ) : (
+              "Stream offline"
             )}
           </dd>
         </div>
@@ -816,6 +913,10 @@ export function LiveAccountStrip({
   const resetKillLockRef = useRef(false);
   const mountedRef = useRef(true);
   const { status, account, positions, orders, fills } = bundle;
+  const wsEventEpoch = validEpochSecs(status.privateWsLastEventEpoch);
+  const nowMs = useClockTickMs(String(wsEventEpoch ?? ""));
+  const wsEventAgeSecs = epochAgeSecs(wsEventEpoch, nowMs);
+  const syncBadge = venueSyncBadgeInfo(status);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -960,6 +1061,26 @@ export function LiveAccountStrip({
               </span>
             </StatusPill>
 
+            <span
+              data-live-ws-sync-badge
+              data-venue-sync-mode={syncBadge.mode}
+              className="inline-flex"
+            >
+              <StatusPill
+                id="live-strip-sync-mode-pill"
+                tone={syncBadge.tone}
+                title={
+                  wsEventEpoch !== null
+                    ? `${syncBadge.hint} (${timeUtcFullLabel(wsEventEpoch)})`
+                    : syncBadge.hint
+                }
+                className={syncBadge.pillClassName}
+              >
+                <Activity className="size-3 shrink-0" strokeWidth={1.5} aria-hidden />
+                <span>{syncBadge.label}</span>
+              </StatusPill>
+            </span>
+
             {runnerMode && (
               <StatusPill
                 id="live-runner-mode-pill"
@@ -1004,7 +1125,7 @@ export function LiveAccountStrip({
             </div>
             <div>
               <dt className="text-ink-3">Positions</dt>
-              <dd className="mono font-semibold text-ink">{positions.length}</dd>
+              <dd id="live-positions-count" className="mono font-semibold text-ink">{positions.length}</dd>
             </div>
             <div>
               <dt className="text-ink-3">Resting Orders</dt>
@@ -1012,7 +1133,22 @@ export function LiveAccountStrip({
             </div>
             <div>
               <dt className="text-ink-3">Fills</dt>
-              <dd className="mono font-semibold text-ink">{fills.length}</dd>
+              <dd id="live-fills-count" className="mono font-semibold text-ink">{fills.length}</dd>
+            </div>
+            <div>
+              <dt className="text-ink-3">WS Event</dt>
+              <dd
+                id="live-ws-last-event-age"
+                data-live-ws-age
+                className={
+                  "mono font-semibold " +
+                  (syncBadge.mode === "ws_stream" && wsEventEpoch !== null
+                    ? "text-success-foreground"
+                    : "text-ink")
+                }
+              >
+                {wsEventEpoch !== null ? ageWords(wsEventAgeSecs) : "N/A"}
+              </dd>
             </div>
           </dl>
 
