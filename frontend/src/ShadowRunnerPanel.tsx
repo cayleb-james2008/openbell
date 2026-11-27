@@ -413,6 +413,7 @@ export function ShadowRunnerPanel({
   const actionLockRef = useRef(false);
   const overrideLockRef = useRef(false);
   const mountedRef = useRef(true);
+  const refreshSeqRef = useRef(0);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -444,6 +445,7 @@ export function ShadowRunnerPanel({
 
   const refreshAll = useCallback(
     async (syncConfig = false) => {
+      const reqSeq = ++refreshSeqRef.current;
       const fb = {
         strategies,
         markets,
@@ -460,11 +462,11 @@ export function ShadowRunnerPanel({
         ),
         fetchExecutionHealth(dataset, strategies),
       ]);
+      if (!mountedRef.current || reqSeq !== refreshSeqRef.current) return;
       setStatus(nextStatus);
       setLedger(nextLedger);
       setExecutionHealth(nextHealth);
       onRunnerStatusChange?.(nextStatus);
-      if (!mountedRef.current) return;
       if (syncConfig || !configDirty) {
         syncDraftFromStatus(nextStatus);
       }
@@ -544,6 +546,7 @@ export function ShadowRunnerPanel({
       return;
     }
     actionLockRef.current = true;
+    refreshSeqRef.current += 1;
     setBusy(true);
     setRunnerError(null);
     try {
@@ -560,6 +563,7 @@ export function ShadowRunnerPanel({
       };
       const next = await saveRunnerConfig(payload, home);
       if (!mountedRef.current) return;
+      refreshSeqRef.current += 1;
       setStatus(next);
       syncDraftFromStatus(next);
       onRunnerStatusChange?.(next);
@@ -575,11 +579,13 @@ export function ShadowRunnerPanel({
   const handleStartShadow = async () => {
     if (actionLockRef.current || busy || effectiveKilled) return;
     actionLockRef.current = true;
+    refreshSeqRef.current += 1;
     setBusy(true);
     setRunnerError(null);
     try {
       const next = await startRunner({ mode: "shadow" }, home, status);
       if (!mountedRef.current) return;
+      refreshSeqRef.current += 1;
       setStatus(next);
       onRunnerStatusChange?.(next);
       toast.success("Shadow runner started.");
@@ -595,6 +601,7 @@ export function ShadowRunnerPanel({
   const handleStartLiveAuto = async () => {
     if (actionLockRef.current || busy || !liveAutoAllowed) return;
     actionLockRef.current = true;
+    refreshSeqRef.current += 1;
     setBusy(true);
     setRunnerError(null);
     try {
@@ -604,6 +611,7 @@ export function ShadowRunnerPanel({
         killed: effectiveKilled,
       });
       if (!mountedRef.current) return;
+      refreshSeqRef.current += 1;
       setStatus(next);
       onRunnerStatusChange?.(next);
       toast.success("Live Auto runner started under hard risk rails.");
@@ -619,11 +627,13 @@ export function ShadowRunnerPanel({
   const handleStopRunner = async () => {
     if (actionLockRef.current || busy) return;
     actionLockRef.current = true;
+    refreshSeqRef.current += 1;
     setBusy(true);
     setRunnerError(null);
     try {
       const next = await stopRunner({ cancel_resting: true }, home, status);
       if (!mountedRef.current) return;
+      refreshSeqRef.current += 1;
       setStatus(next);
       onRunnerStatusChange?.(next);
       toast.success("Runner stopped and resting quotes canceled.");
@@ -723,11 +733,13 @@ export function ShadowRunnerPanel({
     async (strategy: string, action: "reset" | "quarantine") => {
       if (overrideLockRef.current || overrideBusy !== null) return;
       overrideLockRef.current = true;
+      refreshSeqRef.current += 1;
       setOverrideBusy(strategy);
       setOverrideError(null);
       try {
         const nextHealth = await overrideQuarantine(strategy, action, "1", undefined, dataset);
         if (!mountedRef.current) return;
+        refreshSeqRef.current += 1;
         setExecutionHealth(nextHealth);
         toast.success(
           action === "quarantine"

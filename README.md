@@ -218,9 +218,9 @@ flowchart LR
 | --- | --- | --- | --- |
 | Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`6.61 MiB`** (`6,935,912 B`) | **`-38.0%`** |
 | Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`101,964 B`** (`100 kB`) / **`23,478 B`** (`23 kB`, `25` chunks) | **`-94.5%` wire bytes** |
-| Cold boot to first `HTTP 200` | `9.11 ms` | **`15.24 ms`** | Under `20 ms` |
-| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`25.01 MB`** (`25,612 KB`) | **`-80.1%`** |
-| Concurrent HTTP throughput (`16w`, `5/5` SSE) | `4,921.3 req/s` | **`6,132.0 req/s`** (`3.63 ms` p95, `0/15,337` errors) | **`+24.6%`** |
+| Cold boot to first `HTTP 200` | `9.11 ms` | **`4.19 ms`** | **`-54.0%`** |
+| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`25.25 MB`** (`25,856 KB`) | **`-79.9%`** |
+| Concurrent HTTP throughput (`16w`, `5/5` SSE) | `4,921.3 req/s` | **`7,194.0 req/s`** (`3.04 ms` p95, `0/17,996` errors) | **`+46.2%`** |
 | Security and test verification | `49/49` fuzz | **`194/194` Rust tests**, `25/25` raw-TCP fuzz, `gate 147/147`, `replay 18/18`, `sloplint 0/0/0`, `RAILS OK`, `EQUITY OK` | Clean |
 
 ## Quick start (synthetic paper mode)

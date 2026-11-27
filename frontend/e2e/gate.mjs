@@ -457,9 +457,11 @@ for (const m of measures) {
     (await p.locator('#live-order-ticket').isVisible()) &&
     (await p.locator('#live-risk-rails-check [data-risk-rail]').count()) === 7
   ok('Live & Rails view renders Account Strip, Order Ticket, 7 Hard Risk Rails & Emergency Kill Switch', liveTicketOk)
-  await p.locator('#runner-start-shadow-btn').click(); await p.waitForTimeout(200)
+  await p.locator('#runner-start-shadow-btn').click()
+  await p.waitForFunction(() => /shadow/i.test(document.querySelector('#runner-mode-badge')?.textContent || ''), { timeout: 5000 }).catch(() => {})
   const shadowModeText = await p.locator('#runner-mode-badge').innerText().catch(() => '')
-  await p.locator('#runner-stop-btn').click(); await p.waitForTimeout(200)
+  await p.locator('#runner-stop-btn').click()
+  await p.waitForFunction(() => /stop/i.test(document.querySelector('#runner-mode-badge')?.textContent || ''), { timeout: 5000 }).catch(() => {})
   const stoppedModeText = await p.locator('#runner-mode-badge').innerText().catch(() => '')
   const runnerDeckOk =
     (await p.locator('#shadow-runner-deck').isVisible()) &&
