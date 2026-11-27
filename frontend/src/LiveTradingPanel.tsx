@@ -150,10 +150,12 @@ export function ArmLiveModal({
   onOpenResetKill?: () => void;
 }) {
   const [acknowledged, setAcknowledged] = useState(false);
+  const confirmLockRef = useRef(false);
 
   useEffect(() => {
     if (!open) {
       setAcknowledged(false);
+      confirmLockRef.current = false;
       return;
     }
     const onKey = (e: KeyboardEvent) => {
@@ -180,7 +182,7 @@ export function ArmLiveModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="arm-live-title"
-        className="relative z-10 w-[calc(100%-24px)] max-w-[520px] overflow-hidden rounded-[12px] border border-hairline bg-surface text-ink shadow-(--elev-lift) outline-none"
+        className="relative z-10 max-h-[85dvh] w-[calc(100%-24px)] max-w-[520px] overflow-y-auto rounded-[12px] border border-hairline bg-surface text-ink shadow-(--elev-lift) outline-none"
       >
         <div className="flex items-start justify-between gap-3 border-b border-hairline px-5 py-4">
           <div className="flex items-start gap-2.5">
@@ -242,25 +244,25 @@ export function ArmLiveModal({
           ) : (
             <>
               <dl className="grid grid-cols-2 gap-3 border-b border-hairline pb-3 text-xs">
-                <div>
+                <div className="min-w-0">
                   <dt className="text-ink-3">Max Contracts / Order</dt>
-                  <dd className="mono mt-0.5 font-semibold text-ink">{status.rails.maxOrderContracts}</dd>
+                  <dd className="mono mt-0.5 font-semibold tabular-nums text-ink">{status.rails.maxOrderContracts}</dd>
                 </div>
-                <div>
+                <div className="min-w-0">
                   <dt className="text-xs text-ink-3">Max Order Notional</dt>
-                  <dd className="mono mt-0.5 font-semibold text-ink">{money(status.rails.maxOrderDollars)}</dd>
+                  <dd className="mono mt-0.5 font-semibold tabular-nums text-ink">{money(status.rails.maxOrderDollars)}</dd>
                 </div>
-                <div>
+                <div className="min-w-0">
                   <dt className="text-ink-3">Max Daily Loss</dt>
-                  <dd className="mono mt-0.5 font-semibold text-ink">{money(status.rails.maxDailyLossDollars)}</dd>
+                  <dd className="mono mt-0.5 font-semibold tabular-nums text-ink">{money(status.rails.maxDailyLossDollars)}</dd>
                 </div>
-                <div>
+                <div className="min-w-0">
                   <dt className="text-ink-3">Max Open Exposure</dt>
-                  <dd className="mono mt-0.5 font-semibold text-ink">{money(status.rails.maxOpenExposureDollars)}</dd>
+                  <dd className="mono mt-0.5 font-semibold tabular-nums text-ink">{money(status.rails.maxOpenExposureDollars)}</dd>
                 </div>
-                <div className="col-span-2">
+                <div className="col-span-2 min-w-0">
                   <dt className="text-ink-3">Allowed Ticker Prefix</dt>
-                  <dd className="mono mt-0.5 font-semibold text-ink">
+                  <dd className="mono mt-0.5 break-all font-semibold text-ink">
                     {status.rails.allowedTickerPrefix || "(any Kalshi ticker)"}
                   </dd>
                 </div>
@@ -321,6 +323,8 @@ export function ArmLiveModal({
               disabled={!acknowledged || busy || status.killed}
               className="min-h-11 gap-1.5 text-xs sm:min-h-9"
               onClick={() => {
+                if (confirmLockRef.current || !acknowledged || busy || status.killed) return;
+                confirmLockRef.current = true;
                 onConfirmArm();
                 onOpenChange(false);
               }}
@@ -374,7 +378,7 @@ export function ResetKillLatchModal({
       return;
     }
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onOpenChange(false);
+      if (e.key === "Escape" && !lockRef.current) onOpenChange(false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -405,7 +409,9 @@ export function ResetKillLatchModal({
       <div
         aria-hidden="true"
         className="fixed inset-0 bg-ink/40"
-        onClick={() => onOpenChange(false)}
+        onClick={() => {
+          if (!lockRef.current) onOpenChange(false);
+        }}
       />
       <div
         id="reset-kill-modal"
@@ -413,7 +419,7 @@ export function ResetKillLatchModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="reset-kill-title"
-        className="relative z-10 w-[calc(100%-24px)] max-w-[500px] overflow-hidden rounded-[12px] border border-hairline bg-surface text-ink shadow-(--elev-lift) outline-none"
+        className="relative z-10 max-h-[85dvh] w-[calc(100%-24px)] max-w-[500px] overflow-y-auto rounded-[12px] border border-hairline bg-surface text-ink shadow-(--elev-lift) outline-none"
       >
         <div className="flex items-start justify-between gap-3 border-b border-hairline px-5 py-4">
           <div className="flex items-start gap-2.5">
@@ -698,7 +704,7 @@ export function VenueReconciliationPanel({
           <dd
             id="reconcile-sync-age"
             className={
-              "mt-0.5 text-sm font-semibold " +
+              "mt-0.5 text-sm font-semibold tabular-nums " +
               (isStale ? "text-warning-foreground" : "text-ink")
             }
           >
@@ -719,7 +725,7 @@ export function VenueReconciliationPanel({
             id="reconcile-ws-event-age"
             data-reconcile-ws-age
             className={
-              "mt-0.5 text-sm font-semibold " +
+              "mt-0.5 text-sm font-semibold tabular-nums " +
               (syncBadge.mode === "ws_stream" ? "text-success-foreground" : "text-ink")
             }
           >
@@ -755,12 +761,41 @@ export function VenueReconciliationPanel({
           role="status"
           className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-pill-warn-bg/50 px-4 py-2 text-xs text-warning-foreground"
         >
-          <span className="flex items-center gap-1.5 font-medium">
+          <span className="flex min-w-0 items-center gap-1.5 font-medium">
             <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
-            Venue execution sync is stale. Trigger Reconcile Now to refresh Kalshi fills and UTC-day loss before routing live orders.
+            <span className="min-w-0 break-words">
+              Venue execution sync is stale. Trigger Reconcile Now to refresh Kalshi fills and UTC-day loss before routing live orders.
+            </span>
           </span>
         </div>
       )}
+
+      {!isStale &&
+        (status.lastError ||
+          (status.configured && (syncBadge.mode === "rest_poll" || syncBadge.mode === "offline"))) && (
+          <div
+            id="live-reconcile-degraded-banner"
+            role="status"
+            className={
+              "flex flex-wrap items-center justify-between gap-2 border-b border-hairline px-4 py-2 text-xs " +
+              (status.lastError || syncBadge.mode === "rest_poll"
+                ? "bg-pill-warn-bg/40 text-warning-foreground"
+                : "bg-board/60 text-ink-2")
+            }
+          >
+            <span className="flex min-w-0 items-center gap-1.5 font-medium">
+              <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
+              <span className="min-w-0 break-words">
+                {syncBadge.mode === "rest_poll"
+                  ? "Private venue WebSocket disconnected; reconciliation is falling back to REST polling."
+                  : syncBadge.mode === "offline"
+                    ? "Private venue stream is offline; click Reconcile Now for manual REST sync."
+                    : "Venue stream warning:"}
+                {status.lastError ? ` (${status.lastError})` : ""}
+              </span>
+            </span>
+          </div>
+        )}
 
       {discrepancies.length > 0 && (
         <div
@@ -992,12 +1027,12 @@ export function LiveAccountStrip({
       >
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           {/* Left: Paper / Live Mode Switcher + Connection Pill */}
-          <div className="flex flex-wrap items-center gap-2.5">
+          <div className="flex min-w-0 flex-wrap items-center gap-2.5">
             <div
               id="trading-mode-switch"
               role="group"
               aria-label="Paper or Live trading mode"
-              className="inline-flex items-center rounded-md border border-hairline bg-board p-0.5"
+              className="inline-flex max-w-full flex-wrap items-center rounded-md border border-hairline bg-board p-0.5"
             >
               <button
                 id="trading-mode-paper"
@@ -1110,38 +1145,38 @@ export function LiveAccountStrip({
           </div>
 
           {/* Center: Live Kalshi Account KPIs */}
-          <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:flex sm:flex-wrap sm:items-center sm:gap-5">
-            <div>
+          <dl className="grid min-w-0 grid-cols-2 gap-x-4 gap-y-2 text-xs sm:flex sm:flex-wrap sm:items-center sm:gap-5">
+            <div className="min-w-0">
               <dt className="text-ink-3">Kalshi Cash</dt>
-              <dd id="live-balance-val" className="mono font-semibold text-ink">
+              <dd id="live-balance-val" className="mono font-semibold tabular-nums text-ink">
                 {account.balanceDollars !== null ? money(account.balanceDollars) : "Not linked"}
               </dd>
             </div>
-            <div>
+            <div className="min-w-0">
               <dt className="text-ink-3">Portfolio</dt>
-              <dd id="live-portfolio-val" className="mono font-semibold text-ink">
+              <dd id="live-portfolio-val" className="mono font-semibold tabular-nums text-ink">
                 {account.portfolioValueDollars !== null ? money(account.portfolioValueDollars) : "-"}
               </dd>
             </div>
-            <div>
+            <div className="min-w-0">
               <dt className="text-ink-3">Positions</dt>
-              <dd id="live-positions-count" className="mono font-semibold text-ink">{positions.length}</dd>
+              <dd id="live-positions-count" className="mono font-semibold tabular-nums text-ink">{positions.length}</dd>
             </div>
-            <div>
+            <div className="min-w-0">
               <dt className="text-ink-3">Resting Orders</dt>
-              <dd id="live-orders-count" className="mono font-semibold text-ink">{orders.length}</dd>
+              <dd id="live-orders-count" className="mono font-semibold tabular-nums text-ink">{orders.length}</dd>
             </div>
-            <div>
+            <div className="min-w-0">
               <dt className="text-ink-3">Fills</dt>
-              <dd id="live-fills-count" className="mono font-semibold text-ink">{fills.length}</dd>
+              <dd id="live-fills-count" className="mono font-semibold tabular-nums text-ink">{fills.length}</dd>
             </div>
-            <div>
+            <div className="min-w-0">
               <dt className="text-ink-3">WS Event</dt>
               <dd
                 id="live-ws-last-event-age"
                 data-live-ws-age
                 className={
-                  "mono font-semibold " +
+                  "mono font-semibold tabular-nums " +
                   (syncBadge.mode === "ws_stream" && wsEventEpoch !== null
                     ? "text-success-foreground"
                     : "text-ink")
@@ -1153,7 +1188,7 @@ export function LiveAccountStrip({
           </dl>
 
           {/* Right: Order Ticket, API Settings & Emergency Kill Switch */}
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
             <Button
               id="toggle-live-ticket-btn"
               variant={workspaceOpen ? "default" : "outline"}
@@ -1200,6 +1235,32 @@ export function LiveAccountStrip({
             </Button>
           </div>
         </div>
+
+        {(status.lastError ||
+          (status.configured && (syncBadge.mode === "rest_poll" || syncBadge.mode === "offline"))) && (
+          <div
+            id="live-strip-sync-banner"
+            role="status"
+            className={
+              "mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-2.5 text-xs " +
+              (status.lastError || syncBadge.mode === "rest_poll"
+                ? "text-warning-foreground"
+                : "text-ink-2")
+            }
+          >
+            <span className="flex min-w-0 items-center gap-1.5 font-medium">
+              <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
+              <span className="min-w-0 break-words">
+                {syncBadge.mode === "rest_poll"
+                  ? "Private venue WebSocket disconnected; falling back to REST polling."
+                  : syncBadge.mode === "offline"
+                    ? "Private venue stream is offline."
+                    : "Venue stream degraded:"}
+                {status.lastError ? ` ${status.lastError}` : ""}
+              </span>
+            </span>
+          </div>
+        )}
 
         {status.killed && (
           <div
@@ -1330,6 +1391,7 @@ export function LiveDeskWorkspace({
   const [postOnly, setPostOnly] = useState<boolean>(true);
   const [subTab, setSubTab] = useState<"orders" | "positions" | "fills">("orders");
   const [submitting, setSubmitting] = useState(false);
+  const [ticketError, setTicketError] = useState<string | null>(null);
   const submitLockRef = useRef(false);
 
   const [amendingOrderId, setAmendingOrderId] = useState<string | null>(null);
@@ -1338,6 +1400,10 @@ export function LiveDeskWorkspace({
   const [pendingAmendId, setPendingAmendId] = useState<string | null>(null);
   const [amendError, setAmendError] = useState<string | null>(null);
   const amendLockRef = useRef(false);
+
+  const [pendingCancelId, setPendingCancelId] = useState<string | null>(null);
+  const [orderActionError, setOrderActionError] = useState<string | null>(null);
+  const cancelLockRef = useRef<Set<string>>(new Set());
 
   const [pendingFlattenKey, setPendingFlattenKey] = useState<string | null>(null);
   const [flattenFeedback, setFlattenFeedback] = useState<{ tone: "ok" | "error"; message: string } | null>(null);
@@ -1350,6 +1416,18 @@ export function LiveDeskWorkspace({
       mountedRef.current = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!amendingOrderId) return;
+    if (!canMutateLive || !displayOrders.some((o) => o.orderId === amendingOrderId)) {
+      setAmendingOrderId(null);
+      setAmendError(null);
+    }
+  }, [amendingOrderId, canMutateLive, displayOrders]);
+
+  useEffect(() => {
+    setTicketError(null);
+  }, [ticker, action, side, countInput, priceInput, postOnly]);
 
   useEffect(() => {
     if (prefillTicker) setTicker(prefillTicker);
@@ -1410,6 +1488,7 @@ export function LiveDeskWorkspace({
     if (!railEval.allPassed || submitting || submitLockRef.current) return;
     submitLockRef.current = true;
     setSubmitting(true);
+    setTicketError(null);
     try {
       await onSubmitOrder({
         ticker: ticker.trim().toUpperCase(),
@@ -1420,9 +1499,36 @@ export function LiveDeskWorkspace({
         post_only: postOnly ? true : undefined,
         client_order_id: `ob-${Date.now()}`,
       });
+    } catch (e) {
+      if (mountedRef.current) {
+        setTicketError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
       submitLockRef.current = false;
-      setSubmitting(false);
+      if (mountedRef.current) setSubmitting(false);
+    }
+  };
+
+  const handleCancel = async (orderId: string) => {
+    if (!orderId || busy || cancelLockRef.current.has(orderId) || pendingCancelId === orderId || pendingAmendId === orderId) {
+      return;
+    }
+    cancelLockRef.current.add(orderId);
+    setPendingCancelId(orderId);
+    setOrderActionError(null);
+    try {
+      await onCancelOrder(orderId);
+      if (mountedRef.current && amendingOrderId === orderId) {
+        setAmendingOrderId(null);
+        setAmendError(null);
+      }
+    } catch (e) {
+      if (mountedRef.current) {
+        setOrderActionError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      cancelLockRef.current.delete(orderId);
+      if (mountedRef.current) setPendingCancelId(null);
     }
   };
 
@@ -1527,6 +1633,12 @@ export function LiveDeskWorkspace({
       const payload: FlattenLivePositionPayload = { side: pos.side };
       if (onFlattenPosition) {
         await onFlattenPosition(pos.ticker, payload);
+        if (mountedRef.current) {
+          setFlattenFeedback({
+            tone: "ok",
+            message: `Flatten exit submitted for ${pos.ticker} (${pos.side.toUpperCase()}).`,
+          });
+        }
       } else {
         const res = await flattenLivePosition(pos.ticker, payload);
         if (!mountedRef.current) return;
@@ -1563,7 +1675,7 @@ export function LiveDeskWorkspace({
       <form
         id="live-order-ticket"
         onSubmit={(e) => void handleSubmit(e)}
-        className="flex flex-col justify-between gap-4 rounded-[10px] border border-hairline bg-surface p-4 lg:col-span-5"
+        className="flex min-w-0 flex-col justify-between gap-4 rounded-[10px] border border-hairline bg-surface p-4 lg:col-span-5"
       >
         <div className="space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1686,8 +1798,8 @@ export function LiveDeskWorkspace({
           </div>
 
           {/* Post-Only Maker Toggle */}
-          <div className="flex items-center justify-between gap-2 rounded-lg border border-hairline bg-board/60 px-3 py-2 text-xs">
-            <div>
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-hairline bg-board/60 px-3 py-2 text-xs">
+            <div className="min-w-0">
               <div className="font-medium text-ink">Post-Only Maker Order</div>
               <div className="text-ink-3">1.75% maker fee schedule (4x lower than 7% taker)</div>
             </div>
@@ -1713,13 +1825,13 @@ export function LiveDeskWorkspace({
 
           {/* Notional & Fee Preview */}
           <dl className="grid grid-cols-2 divide-x divide-hairline border-y border-hairline py-2 text-xs">
-            <div className="pr-3">
+            <div className="min-w-0 pr-3">
               <dt className="text-ink-3">Order Notional</dt>
-              <dd className="mono mt-0.5 font-semibold text-ink">{money(railEval.orderNotionalDollars)}</dd>
+              <dd className="mono mt-0.5 font-semibold tabular-nums text-ink">{money(railEval.orderNotionalDollars)}</dd>
             </div>
-            <div className="pl-3">
+            <div className="min-w-0 pl-3">
               <dt className="text-ink-3">Est. Kalshi Fee ({postOnly ? "1.75% maker" : "7% taker"})</dt>
-              <dd className="mono mt-0.5 font-semibold text-ink">{money(railEval.estFeeDollars)}</dd>
+              <dd className="mono mt-0.5 font-semibold tabular-nums text-ink">{money(railEval.estFeeDollars)}</dd>
             </div>
           </dl>
 
@@ -1731,7 +1843,7 @@ export function LiveDeskWorkspace({
             <span className="text-ink-3">
               L2 VWAP ({ticketOrderQty}ct {action.toUpperCase()} {side.toUpperCase()})
             </span>
-            <span className="mono font-semibold text-ink">
+            <span className="mono font-semibold tabular-nums text-ink">
               {ticketWalk.vwapCents !== null
                 ? `${ticketWalk.vwapCents.toFixed(2)}c (+${ticketWalk.slippageCents?.toFixed(2) ?? "0.00"}c slip)`
                 : "No resting depth"}
@@ -1740,12 +1852,12 @@ export function LiveDeskWorkspace({
 
           {/* Real-time Hard Risk Rails Indicator */}
           <div id="live-risk-rails-check" className="space-y-1.5 pt-1">
-            <div className="flex items-center justify-between text-xs">
+            <div className="flex items-center justify-between gap-2 text-xs">
               <span className="font-semibold text-ink">Hard Risk Rails Pre-Check</span>
               <button
                 type="button"
                 onClick={onOpenSettings}
-                className="min-h-11 cursor-pointer px-1 text-xs text-info-foreground hover:underline sm:min-h-6"
+                className="min-h-11 shrink-0 cursor-pointer px-1 text-xs text-info-foreground hover:underline sm:min-h-6"
               >
                 Edit Caps
               </button>
@@ -1756,9 +1868,9 @@ export function LiveDeskWorkspace({
                   key={chk.id}
                   data-risk-rail={chk.id}
                   data-rail-passed={chk.passed ? "true" : "false"}
-                  className="flex items-center justify-between gap-2"
+                  className="flex min-w-0 flex-wrap items-center justify-between gap-2"
                 >
-                  <span className="inline-flex items-center gap-1.5 text-ink-2">
+                  <span className="inline-flex min-w-0 items-center gap-1.5 text-ink-2">
                     {chk.passed ? (
                       <CheckCircle2 className="size-3.5 shrink-0 text-success-foreground" aria-hidden />
                     ) : (
@@ -1766,13 +1878,23 @@ export function LiveDeskWorkspace({
                     )}
                     <span>{chk.label}</span>
                   </span>
-                  <span className={"mono text-right " + (chk.passed ? "text-ink" : "text-destructive-foreground")}>
+                  <span className={"mono min-w-0 break-words text-right tabular-nums " + (chk.passed ? "text-ink" : "text-destructive-foreground")}>
                     {chk.detail}
                   </span>
                 </li>
               ))}
             </ul>
           </div>
+
+          {ticketError && (
+            <div
+              id="live-ticket-error"
+              role="alert"
+              className="border-l-2 border-dot-red bg-board px-3 py-2 text-xs break-words text-destructive-foreground"
+            >
+              Order rejected: {ticketError}
+            </div>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-3">
@@ -1806,7 +1928,7 @@ export function LiveDeskWorkspace({
       </form>
 
       {/* Right: L2 Orderbook Ladder + Resting Orders, Open Positions, Recent Fills */}
-      <div className="flex flex-col gap-4 lg:col-span-7">
+      <div className="flex min-w-0 flex-col gap-4 lg:col-span-7">
         <OrderbookLadder
           ticker={cleanTicketTicker}
           snapshot={orderbook.snapshot}
@@ -1828,15 +1950,15 @@ export function LiveDeskWorkspace({
 
         <div
           id="live-portfolio-panel"
-          className="flex flex-col justify-between overflow-hidden rounded-[10px] border border-hairline bg-surface"
+          className="flex min-w-0 flex-col justify-between overflow-hidden rounded-[10px] border border-hairline bg-surface"
         >
         <div>
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-board/50 px-4 py-3">
-            <div className="flex items-center gap-2">
-              <Layers className="size-4 text-info-foreground" aria-hidden />
+            <div className="flex min-w-0 items-center gap-2">
+              <Layers className="size-4 shrink-0 text-info-foreground" aria-hidden />
               <h3 className="text-sm font-semibold text-ink">Connected Kalshi Portfolio</h3>
             </div>
-            <div className="flex items-center gap-1" role="group" aria-label="Portfolio view">
+            <div className="flex min-w-0 flex-wrap items-center gap-1" role="group" aria-label="Portfolio view">
               {(
                 [
                   ["orders", `Orders (${displayOrders.length})`],
@@ -1884,6 +2006,15 @@ export function LiveDeskWorkspace({
 
           {subTab === "orders" && (
             <div id="live-orders-table">
+              {orderActionError && (
+                <div
+                  id="live-order-error"
+                  role="alert"
+                  className="border-b border-hairline bg-board px-4 py-2 text-xs break-words text-destructive-foreground"
+                >
+                  Order action failed: {orderActionError}
+                </div>
+              )}
               {displayOrders.length === 0 ? (
                 <p role="status" className="p-5 text-xs text-ink-2">
                   No resting Kalshi orders right now.
@@ -1904,6 +2035,7 @@ export function LiveDeskWorkspace({
                     {displayOrders.map((ord) => {
                       const isAmending = amendingOrderId === ord.orderId;
                       const isPendingAmend = pendingAmendId === ord.orderId;
+                      const isPendingCancel = pendingCancelId === ord.orderId;
                       const maxQty = Math.max(
                         1,
                         Number.isFinite(ord.remainingCount) && ord.remainingCount > 0 ? ord.remainingCount : ord.count,
@@ -1925,10 +2057,10 @@ export function LiveDeskWorkspace({
                             <TableCell className="mono text-xs text-ink-2">
                               {`${ord.action} ${ord.side}`.toUpperCase()}
                             </TableCell>
-                            <TableCell className="mono text-right text-xs font-semibold text-ink">
+                            <TableCell className="mono tabular-nums text-right text-xs font-semibold text-ink">
                               {Number.isFinite(ord.priceCents) ? `${ord.priceCents}c` : "-"}
                             </TableCell>
-                            <TableCell className="mono text-right text-xs text-ink-2">
+                            <TableCell className="mono tabular-nums text-right text-xs text-ink-2">
                               {Number.isFinite(ord.remainingCount) ? ord.remainingCount : 0}/
                               {Number.isFinite(ord.count) ? ord.count : 0}
                             </TableCell>
@@ -1943,7 +2075,7 @@ export function LiveDeskWorkspace({
                                   variant="outline"
                                   data-amend-order={ord.orderId}
                                   aria-expanded={isAmending}
-                                  disabled={busy || !canMutateLive || isPendingAmend}
+                                  disabled={busy || !canMutateLive || isPendingAmend || isPendingCancel}
                                   title={canMutateLive ? "Amend resting order price or reduce count" : liveGuardReason}
                                   onClick={() => openAmendPopover(ord)}
                                   className="min-h-11 px-2.5 text-xs sm:min-h-8"
@@ -1953,11 +2085,11 @@ export function LiveDeskWorkspace({
                                 <Button
                                   variant="outline"
                                   data-cancel-order={ord.orderId}
-                                  disabled={busy || isPendingAmend}
-                                  onClick={() => void onCancelOrder(ord.orderId)}
+                                  disabled={busy || isPendingAmend || isPendingCancel}
+                                  onClick={() => void handleCancel(ord.orderId)}
                                   className="min-h-11 border-dot-red/60 px-2.5 text-xs text-destructive-foreground sm:min-h-8"
                                 >
-                                  Cancel
+                                  {isPendingCancel ? "Canceling..." : "Cancel"}
                                 </Button>
                               </div>
                             </TableCell>
@@ -1965,8 +2097,8 @@ export function LiveDeskWorkspace({
                           {isAmending && (
                             <TableRow data-amend-popover={ord.orderId}>
                               <td colSpan={6} className="m-full bg-board/50 px-3 py-3 align-middle text-sm text-ink">
-                                <div className="w-full space-y-2.5">
-                                  <div className="flex flex-wrap items-end gap-2.5">
+                                <div className="w-full min-w-0 space-y-2.5">
+                                  <div className="flex min-w-0 flex-wrap items-end gap-2.5">
                                     <div className="min-w-[120px] flex-1">
                                       <label htmlFor={`amend-price-${ord.orderId}`} className="block text-xs text-ink-3">
                                         New Price (1-99c)
@@ -2104,15 +2236,15 @@ export function LiveDeskWorkspace({
                               {pos.side.toUpperCase()}
                             </Badge>
                           </TableCell>
-                          <TableCell className="mono text-right text-xs font-semibold text-ink">
+                          <TableCell className="mono tabular-nums text-right text-xs font-semibold text-ink">
                             {safeQty}
                           </TableCell>
-                          <TableCell className="mono text-right text-xs text-ink-2">
+                          <TableCell className="mono tabular-nums text-right text-xs text-ink-2">
                             {money(pos.marketExposureDollars)}
                           </TableCell>
                           <TableCell
                             className={
-                              "mono text-right text-xs font-semibold " +
+                              "mono tabular-nums text-right text-xs font-semibold " +
                               (pos.realizedPnlDollars > 0
                                 ? "text-success-foreground"
                                 : pos.realizedPnlDollars < 0
@@ -2168,17 +2300,17 @@ export function LiveDeskWorkspace({
                   <TableBody>
                     {fills.slice(0, 25).map((f) => (
                       <TableRow key={f.fillId} data-live-fill-row={f.fillId}>
-                        <TableCell className="mono text-xs text-ink-2">{shortTs(f.createdTime)}</TableCell>
+                        <TableCell className="mono tabular-nums text-xs text-ink-2">{shortTs(f.createdTime)}</TableCell>
                         <TableCell className="mono m-grow max-w-[200px] break-all text-xs font-semibold text-ink">
                           {f.ticker}
                         </TableCell>
                         <TableCell className="mono text-xs text-ink-2">
                           {`${f.action} ${f.side}`.toUpperCase()}
                         </TableCell>
-                        <TableCell className="mono text-right text-xs font-semibold text-ink">
+                        <TableCell className="mono tabular-nums text-right text-xs font-semibold text-ink">
                           {f.count} @ {f.priceCents}c
                         </TableCell>
-                        <TableCell className="mono text-right text-xs text-ink-2">
+                        <TableCell className="mono tabular-nums text-right text-xs text-ink-2">
                           {money(f.feeDollars)}
                         </TableCell>
                       </TableRow>
@@ -2191,8 +2323,8 @@ export function LiveDeskWorkspace({
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline px-4 py-2.5 text-xs text-ink-3">
-          <span>{status.apiBaseUrl}</span>
-          <span className="mono">
+          <span className="min-w-0 break-all">{status.apiBaseUrl}</span>
+          <span className="mono tabular-nums">
             Daily loss {money(status.dailyRealizedLossDollars)} / {money(status.rails.maxDailyLossDollars)}
           </span>
         </div>

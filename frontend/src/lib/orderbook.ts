@@ -621,7 +621,19 @@ export function useOrderbook(
       true,
       (snap) => {
         if (snap.ticker === cleanTicker) {
-          setSnapshot(snap);
+          setSnapshot((prev) => {
+            if (
+              prev &&
+              prev.ticker === snap.ticker &&
+              prev.last_seq > 0 &&
+              snap.last_seq > 0 &&
+              snap.last_seq < prev.last_seq &&
+              snap.updated_ms <= prev.updated_ms
+            ) {
+              return prev;
+            }
+            return snap;
+          });
           setError(null);
           setLoading(false);
         }

@@ -3728,6 +3728,189 @@ for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light'
   await ctx.close()
 }
 
+// 6i. Cycle 4 H1: Degraded WS->REST fallback banners, Spot Oracle offline banner, Cancel double-submit lock & Order/Ticket inline errors
+{
+  for (const [theme, w, h] of [['light', 390, 844], ['dark', 390, 844]]) {
+    const { ctx, p } = await open(w, h, theme)
+    p.__allow = /409|403|422|500/
+    let cancelDeletes = 0
+    await p.route('**/api/home*', async r => {
+      const res = await r.fetch()
+      const j = await res.json()
+      j.version = '0.35.0'
+      j.capabilities = ['sse', 'live_kalshi', 'risk_rails', 'live_reconcile']
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
+    })
+    await p.route('**/api/live/status*', r => r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        configured: true,
+        environment: 'demo',
+        api_base_url: 'https://demo-api.kalshi.co/trade-api/v2',
+        key_id_masked: 'demo-key-h1',
+        key_path_configured: true,
+        connected: true,
+        mode: 'live',
+        live_armed: true,
+        killed: false,
+        kill_reason: null,
+        rails: { max_order_contracts: 25, max_order_dollars: 25, max_daily_loss_dollars: 50, max_open_exposure_dollars: 100, allowed_ticker_prefix: 'KX' },
+        daily_realized_loss_dollars: 0,
+        open_exposure_dollars: 5.5,
+        orders_placed_today: 1,
+        last_venue_sync_epoch: Math.floor(Date.now() / 1000) - 5,
+        venue_sync_stale: false,
+        private_ws_connected: false,
+        private_ws_last_event_epoch: null,
+        venue_sync_mode: 'rest_poll',
+        last_error: null,
+      }),
+    }))
+    await p.route('**/api/live/account*', r => r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ configured: true, connected: true, balance_dollars: 150, portfolio_value_dollars: 155.5, daily_pnl_dollars: 0.5 }),
+    }))
+    await p.route('**/api/live/positions*', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ positions: [] }) }))
+    await p.route(/\/api\/live\/orders(\/[^/]+)?(\?.*)?$/, async r => {
+      if (r.request().method() === 'DELETE') {
+        cancelDeletes += 1
+        await new Promise(res => setTimeout(res, 180))
+        return r.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: 'Order already filled on venue' }) })
+      }
+      return r.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          orders: [
+            { order_id: 'ord-h1-cancel', client_order_id: 'ob-h1-1', ticker: 'KXBTC15M-H1', action: 'buy', side: 'yes', status: 'resting', count: 5, remaining_count: 5, price_cents: 50, created_time: '2026-11-26T20:00:00Z' },
+          ],
+        }),
+      })
+    })
+    await p.route('**/api/live/fills*', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ fills: [] }) }))
+    await p.route(/\/api\/live\/order(\?.*)?$/, r => r.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ error: 'Venue rejected post-only cross' }) }))
+
+    await p.goto(FX); await ready(p); await p.waitForTimeout(250)
+    const spotBannerTxt = await p.locator('#spot-oracle-degraded-banner').innerText({ timeout: 2000 }).catch(() => '')
+    await p.locator('#tab-live').click(); await p.waitForTimeout(250)
+
+    const stripBanner = await p.locator('#live-strip-sync-banner').innerText({ timeout: 2000 }).catch(() => '')
+    const recBanner = await p.locator('#live-reconcile-degraded-banner').innerText({ timeout: 2000 }).catch(() => '')
+    await p.evaluate(() => {
+      const btn = document.querySelector('[data-cancel-order="ord-h1-cancel"]')
+      if (btn) { btn.click(); btn.click() }
+    })
+    await p.waitForTimeout(300)
+    const cancelErr = await p.locator('#live-order-error').innerText({ timeout: 2000 }).catch(() => '')
+    await p.locator('#submit-live-order-btn').click(); await p.waitForTimeout(250)
+    const ticketErr = await p.locator('#live-ticket-error').innerText({ timeout: 2000 }).catch(() => '')
+    const mH1 = await p.evaluate(MEASURE)
+
+    ok(
+      `C4H1 degraded WS->REST & Spot banners, Cancel double-submit lock & inline order/ticket errors pass ${w}x${h} ${theme}`,
+      spotBannerTxt.includes('Spot Oracle') &&
+        stripBanner.includes('REST polling') &&
+        recBanner.includes('REST polling') &&
+        cancelDeletes === 1 &&
+        cancelErr.includes('Order already filled on venue') &&
+        ticketErr.includes('Venue rejected post-only cross') &&
+        mH1.docOverflow <= 0 && mH1.smallTargets === 0 && mH1.lowContrast === 0,
+      `spot=${spotBannerTxt.slice(0, 30)} strip=${stripBanner.slice(0, 30)} rec=${recBanner.slice(0, 30)} del=${cancelDeletes} cErr=${cancelErr.slice(0, 30)} tErr=${ticketErr.slice(0, 30)} ov=${mH1.docOverflow} small=${mH1.smallTargets} low=${mH1.lowContrast}`,
+    )
+    await ctx.close()
+  }
+}
+
+// 6j. Cycle 4 H1: SSE reconnects after transient failure & deduplicates duplicate live_exec frames
+{
+  const { ctx, p } = await open(1440, 900, 'light')
+  p.__allow = /503|EventSource/
+  let sseHits = 0
+  let liveStatusReads = 0
+  let streamDownUntil = Date.now() + 450
+  let execArrived = false
+
+  await p.route('**/api/home*', async r => {
+    const res = await r.fetch()
+    const j = await res.json()
+    j.version = '0.35.0'
+    j.sse = true
+    j.capabilities = ['sse', 'live_kalshi', 'risk_rails', 'live_reconcile']
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
+  })
+  await p.route('**/api/tape/stream', r => {
+    sseHits += 1
+    if (Date.now() < streamDownUntil) {
+      return r.fulfill({ status: 503, contentType: 'text/plain', body: 'temporary stream restart' })
+    }
+    execArrived = true
+    return r.fulfill({
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+      body: [
+        'event: live_exec\ndata: {"kind":"fill","ticker":"KXBTC15M-H1","trade_id":"trd-h1-dedup"}\n\n',
+        'event: live_exec\ndata: {"kind":"fill","ticker":"KXBTC15M-H1","trade_id":"trd-h1-dedup"}\n\n',
+        'event: live_exec\ndata: {"kind":"fill","ticker":"KXBTC15M-H1","trade_id":"trd-h1-dedup"}\n\n',
+      ].join(''),
+    })
+  })
+  await p.route('**/api/live/status*', r => {
+    liveStatusReads += 1
+    return r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        configured: true,
+        environment: 'demo',
+        connected: true,
+        mode: 'paper',
+        live_armed: false,
+        killed: false,
+        rails: { max_order_contracts: 25, max_order_dollars: 25, max_daily_loss_dollars: 50, max_open_exposure_dollars: 100, allowed_ticker_prefix: 'KX' },
+        venue_sync_mode: 'ws_stream',
+        private_ws_connected: true,
+        private_ws_last_event_epoch: Math.floor(Date.now() / 1000),
+      }),
+    })
+  })
+  await p.route('**/api/live/account*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"configured":true,"connected":true,"balance_dollars":100}' }))
+  await p.route('**/api/live/positions*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"positions":[]}' }))
+  await p.route('**/api/live/orders*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      orders: execArrived
+        ? [{ order_id: 'ord-h1-sse', client_order_id: 'ob-h1-sse', ticker: 'KXBTC15M-H1', action: 'buy', side: 'yes', status: 'resting', count: 3, remaining_count: 3, price_cents: 52, created_time: '2026-11-26T20:05:00Z' }]
+        : [],
+    }),
+  }))
+  await p.route('**/api/live/fills*', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"fills":[]}' }))
+
+  streamDownUntil = Date.now() + 450
+  await p.goto(BASE); await ready(p)
+  const pillInitial = (await p.locator('#tape-stream-pill').innerText()).trim()
+  const readsBefore = liveStatusReads
+  await p.locator('#tab-live').click()
+  await p.waitForSelector('[data-live-order-row="ord-h1-sse"]', { timeout: 5000 })
+  await p.waitForTimeout(300)
+  const readsAfter = liveStatusReads
+
+  const ordSseVisible = await p.locator('[data-live-order-row="ord-h1-sse"]').isVisible()
+
+  ok(
+    'C4H1 SSE recovers from 503 with exponential backoff and deduplicates repeated live_exec events',
+    sseHits >= 2 &&
+      (pillInitial === '30s poll' || pillInitial === 'SSE connecting') &&
+      ordSseVisible &&
+      readsAfter > readsBefore &&
+      readsAfter - readsBefore <= 3,
+    `sseHits=${sseHits} pillInitial=${pillInitial} ordVisible=${ordSseVisible} reads=${readsBefore}->${readsAfter}`,
+  )
+  await ctx.close()
+}
+
 // 7. Update strip (loopback + non-loopback shared host, BANNER-FIX-BRIEF)
 {
   const { ctx, p } = await open(1440, 900)

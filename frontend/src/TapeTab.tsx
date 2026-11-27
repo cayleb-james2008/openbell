@@ -535,16 +535,24 @@ export function TapeTab({
 
           <StatusPill
             id="tape-stream-pill"
-            tone={stream.mode === "sse" ? "success" : "info"}
+            tone={stream.mode === "sse" ? "success" : stream.mode === "polling" && stream.lastEventAt !== null ? "warning" : "info"}
             className="min-h-7 px-2.5 py-0.5 text-xs text-ink-2"
             title={
               stream.mode === "sse"
                 ? `Live SSE tape stream connected (${stream.eventCount} events)`
-                : "Polling /api/markets every 30s (auto-upgrades when /api/tape/stream is live)"
+                : stream.mode === "polling" && stream.lastEventAt !== null
+                  ? "SSE stream interrupted; polling /api/markets every 30s while reconnecting"
+                  : "Polling /api/markets every 30s (auto-upgrades when /api/tape/stream is live)"
             }
           >
             <Activity className="size-3" strokeWidth={1.5} aria-hidden />
-            <span>{stream.mode === "sse" ? "SSE live" : "30s poll"}</span>
+            <span>
+              {stream.mode === "sse"
+                ? "SSE live"
+                : stream.mode === "connecting"
+                  ? "SSE connecting"
+                  : "30s poll"}
+            </span>
           </StatusPill>
 
           <span data-tape-l2-pill className="inline-flex">
@@ -603,7 +611,7 @@ export function TapeTab({
               </span>
               <CountdownBadge closeTime={featuredMarket.close_time} nowMs={nowMs} />
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
               <span className="hidden text-xs text-ink-3 sm:inline">Hover chart for bid/ask &amp; spread</span>
               {onTradeMarket && (
                 <Button
@@ -744,10 +752,10 @@ export function TapeTab({
                     <TableCell className="m-full">
                       <ProbBar yesProb={prob} />
                     </TableCell>
-                    <TableCell className="mono text-right text-xs text-ink">
+                    <TableCell className="mono tabular-nums text-right text-xs text-ink">
                       {cents(m.yes_bid)} / {cents(m.yes_ask)}
                     </TableCell>
-                    <TableCell className="mono text-right text-xs text-ink-2">{spreadCentsLabel(m)}</TableCell>
+                    <TableCell className="mono tabular-nums text-right text-xs text-ink-2">{spreadCentsLabel(m)}</TableCell>
                     <TableCell className="text-right text-xs tabular-nums text-ink-2">
                       <CountdownBadge closeTime={m.close_time} nowMs={nowMs} />
                     </TableCell>

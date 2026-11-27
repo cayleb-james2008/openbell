@@ -249,11 +249,11 @@ function LiveAutoConfirmModal({
       return;
     }
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onOpenChange(false);
+      if (e.key === "Escape" && !busy) onOpenChange(false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, onOpenChange]);
+  }, [open, busy, onOpenChange]);
 
   if (!open) return null;
 
@@ -262,14 +262,16 @@ function LiveAutoConfirmModal({
       <div
         aria-hidden="true"
         className="fixed inset-0 bg-ink/40"
-        onClick={() => onOpenChange(false)}
+        onClick={() => {
+          if (!busy) onOpenChange(false);
+        }}
       />
       <div
         id="runner-live-confirm-modal"
         role="dialog"
         aria-modal="true"
         aria-labelledby="runner-live-confirm-title"
-        className="relative z-10 w-[calc(100%-24px)] max-w-[500px] overflow-hidden rounded-[12px] border border-hairline bg-surface text-ink shadow-(--elev-lift) outline-none"
+        className="relative z-10 max-h-[85dvh] w-[calc(100%-24px)] max-w-[500px] overflow-y-auto rounded-[12px] border border-hairline bg-surface text-ink shadow-(--elev-lift) outline-none"
       >
         <div className="flex items-start justify-between gap-3 border-b border-hairline px-5 py-4">
           <div className="flex items-start gap-2.5">
@@ -296,23 +298,23 @@ function LiveAutoConfirmModal({
 
         <div className="space-y-3 px-5 py-4 text-xs">
           <dl className="grid grid-cols-2 gap-3 border-b border-hairline pb-3">
-            <div>
+            <div className="min-w-0">
               <dt className="text-ink-3">Environment</dt>
               <dd className="mono mt-0.5 font-semibold text-ink">{liveStatus.environment.toUpperCase()}</dd>
             </div>
-            <div>
+            <div className="min-w-0">
               <dt className="text-ink-3">Max Daily Loss</dt>
-              <dd className="mono mt-0.5 font-semibold text-ink">{money(liveStatus.rails.maxDailyLossDollars)}</dd>
+              <dd className="mono mt-0.5 font-semibold tabular-nums text-ink">{money(liveStatus.rails.maxDailyLossDollars)}</dd>
             </div>
-            <div>
+            <div className="min-w-0">
               <dt className="text-ink-3">Max Order Cap</dt>
-              <dd className="mono mt-0.5 font-semibold text-ink">
+              <dd className="mono mt-0.5 font-semibold tabular-nums text-ink">
                 {liveStatus.rails.maxOrderContracts} cts / {money(liveStatus.rails.maxOrderDollars)}
               </dd>
             </div>
-            <div>
+            <div className="min-w-0">
               <dt className="text-ink-3">Max Exposure</dt>
-              <dd className="mono mt-0.5 font-semibold text-ink">{money(liveStatus.rails.maxOpenExposureDollars)}</dd>
+              <dd className="mono mt-0.5 font-semibold tabular-nums text-ink">{money(liveStatus.rails.maxOpenExposureDollars)}</dd>
             </div>
           </dl>
 
@@ -462,6 +464,7 @@ export function ShadowRunnerPanel({
       setLedger(nextLedger);
       setExecutionHealth(nextHealth);
       onRunnerStatusChange?.(nextStatus);
+      if (!mountedRef.current) return;
       if (syncConfig || !configDirty) {
         syncDraftFromStatus(nextStatus);
       }
@@ -556,15 +559,16 @@ export function ShadowRunnerPanel({
         bankroll_dollars: Math.max(10, Number(bankrollDollars) || 250),
       };
       const next = await saveRunnerConfig(payload, home);
+      if (!mountedRef.current) return;
       setStatus(next);
       syncDraftFromStatus(next);
       onRunnerStatusChange?.(next);
       toast.success(`Saved runner config (${next.active_slots.length} slots).`);
     } catch (e) {
-      handleRunnerMutationError("Save runner config", e);
+      if (mountedRef.current) handleRunnerMutationError("Save runner config", e);
     } finally {
       actionLockRef.current = false;
-      setBusy(false);
+      if (mountedRef.current) setBusy(false);
     }
   };
 
@@ -575,15 +579,16 @@ export function ShadowRunnerPanel({
     setRunnerError(null);
     try {
       const next = await startRunner({ mode: "shadow" }, home, status);
+      if (!mountedRef.current) return;
       setStatus(next);
       onRunnerStatusChange?.(next);
       toast.success("Shadow runner started.");
       if (serverSupported) void refreshAll(false);
     } catch (e) {
-      handleRunnerMutationError("Start shadow", e);
+      if (mountedRef.current) handleRunnerMutationError("Start shadow", e);
     } finally {
       actionLockRef.current = false;
-      setBusy(false);
+      if (mountedRef.current) setBusy(false);
     }
   };
 
@@ -598,15 +603,16 @@ export function ShadowRunnerPanel({
         live_armed: effectiveLiveArmed,
         killed: effectiveKilled,
       });
+      if (!mountedRef.current) return;
       setStatus(next);
       onRunnerStatusChange?.(next);
       toast.success("Live Auto runner started under hard risk rails.");
       if (serverSupported) void refreshAll(false);
     } catch (e) {
-      handleRunnerMutationError("Start Live Auto", e);
+      if (mountedRef.current) handleRunnerMutationError("Start Live Auto", e);
     } finally {
       actionLockRef.current = false;
-      setBusy(false);
+      if (mountedRef.current) setBusy(false);
     }
   };
 
@@ -617,15 +623,16 @@ export function ShadowRunnerPanel({
     setRunnerError(null);
     try {
       const next = await stopRunner({ cancel_resting: true }, home, status);
+      if (!mountedRef.current) return;
       setStatus(next);
       onRunnerStatusChange?.(next);
       toast.success("Runner stopped and resting quotes canceled.");
       if (serverSupported) void refreshAll(false);
     } catch (e) {
-      handleRunnerMutationError("Stop runner", e);
+      if (mountedRef.current) handleRunnerMutationError("Stop runner", e);
     } finally {
       actionLockRef.current = false;
-      setBusy(false);
+      if (mountedRef.current) setBusy(false);
     }
   };
 
@@ -896,24 +903,24 @@ export function ShadowRunnerPanel({
         )}
 
         <dl className="grid grid-cols-2 divide-y divide-hairline sm:grid-cols-3 sm:divide-x sm:divide-y-0 lg:grid-cols-6">
-          <div className="px-4 py-3">
+          <div className="min-w-0 px-4 py-3">
             <dt className="text-xs text-ink-3">Quotes Posted</dt>
-            <dd id="runner-stat-quotes" className="mono mt-0.5 text-sm font-semibold text-ink">
+            <dd id="runner-stat-quotes" className="mono mt-0.5 text-sm font-semibold tabular-nums text-ink">
               {status.stats.quotes_posted}
             </dd>
           </div>
-          <div className="px-4 py-3">
+          <div className="min-w-0 px-4 py-3">
             <dt className="text-xs text-ink-3">Fills (Rate)</dt>
-            <dd id="runner-stat-fills" className="mono mt-0.5 text-sm font-semibold text-ink">
+            <dd id="runner-stat-fills" className="mono mt-0.5 text-sm font-semibold tabular-nums text-ink">
               {status.stats.fills} ({status.stats.fill_rate_pct.toFixed(1)}%)
             </dd>
           </div>
-          <div className="px-4 py-3">
+          <div className="min-w-0 px-4 py-3">
             <dt className="text-xs text-ink-3">Realized PnL</dt>
             <dd
               id="runner-stat-pnl"
               className={
-                "mono mt-0.5 text-sm font-semibold " +
+                "mono mt-0.5 text-sm font-semibold tabular-nums " +
                 (status.stats.realized_pnl_dollars > 0
                   ? "text-success-foreground"
                   : status.stats.realized_pnl_dollars < 0
@@ -924,21 +931,21 @@ export function ShadowRunnerPanel({
               {moneySigned(status.stats.realized_pnl_dollars)}
             </dd>
           </div>
-          <div className="px-4 py-3">
+          <div className="min-w-0 px-4 py-3">
             <dt className="text-xs text-ink-3">Open Exposure</dt>
-            <dd className="mono mt-0.5 text-sm font-semibold text-ink">
+            <dd className="mono mt-0.5 text-sm font-semibold tabular-nums text-ink">
               {money(status.stats.unrealized_exposure_dollars)}
             </dd>
           </div>
-          <div className="px-4 py-3">
+          <div className="min-w-0 px-4 py-3">
             <dt className="text-xs text-ink-3">Avg Slippage</dt>
-            <dd className="mono mt-0.5 text-sm font-semibold text-ink">
+            <dd className="mono mt-0.5 text-sm font-semibold tabular-nums text-ink">
               {signedCents(status.stats.avg_fill_slippage_cents)}
             </dd>
           </div>
-          <div className="px-4 py-3">
+          <div className="min-w-0 px-4 py-3">
             <dt className="text-xs text-ink-3">Avg Queue Wait</dt>
-            <dd className="mono mt-0.5 text-sm font-semibold text-ink">
+            <dd className="mono mt-0.5 text-sm font-semibold tabular-nums text-ink">
               {Math.round(status.stats.avg_queue_wait_secs)}s
             </dd>
           </div>
@@ -1110,7 +1117,7 @@ export function ShadowRunnerPanel({
                       aria-label={`Slot ${slot.slot_id} strategy`}
                       value={slot.strategy}
                       onChange={(e) => updateSlot(idx, { strategy: e.target.value })}
-                      className="mono min-h-11 w-full max-w-[220px] rounded-md border border-hairline bg-board px-2 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+                      className="mono min-h-11 w-full rounded-md border border-hairline bg-board px-2 text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8 sm:max-w-[220px]"
                     >
                       {strategyChoices.map((st) => (
                         <option key={st} value={st}>
@@ -1161,7 +1168,7 @@ export function ShadowRunnerPanel({
                     />
                   </TableCell>
                   <TableCell>
-                    <div className="inline-flex rounded-md border border-hairline bg-board p-0.5" role="group" aria-label={`Slot ${slot.slot_id} execution mode`}>
+                    <div className="inline-flex max-w-full flex-wrap rounded-md border border-hairline bg-board p-0.5" role="group" aria-label={`Slot ${slot.slot_id} execution mode`}>
                       {(["maker", "taker"] as const).map((m) => (
                         <button
                           key={m}
@@ -1210,7 +1217,7 @@ export function ShadowRunnerPanel({
                       {slot.enabled ? "Enabled" : "Disabled"}
                     </button>
                   </TableCell>
-                  <TableCell className="mono text-right text-xs text-ink-2">
+                  <TableCell className="mono tabular-nums text-right text-xs text-ink-2">
                     {runtime ? (
                       <div className="space-y-0.5">
                         <div className={runtime.realized_pnl_dollars >= 0 ? "text-success-foreground" : "text-destructive-foreground"}>
@@ -1239,8 +1246,8 @@ export function ShadowRunnerPanel({
                 </TableRow>
                 <TableRow data-slot-lifecycle-row={slot.slot_id}>
                   <td colSpan={9} className="m-full bg-board/40 px-3 py-2.5 align-middle text-sm text-ink">
-                    <div className="grid w-full grid-cols-2 gap-2.5 sm:grid-cols-3 lg:grid-cols-5">
-                      <div>
+                    <div className="grid w-full min-w-0 grid-cols-2 gap-2.5 sm:grid-cols-3 lg:grid-cols-5">
+                      <div className="min-w-0">
                         <label
                           htmlFor={`slot-${slot.slot_id}-reprice-cooldown`}
                           className="block text-xs text-ink-3"
@@ -1730,14 +1737,14 @@ export function ShadowRunnerPanel({
                         </Badge>
                       </div>
                     </TableCell>
-                    <TableCell className="mono text-right text-xs font-semibold text-ink">
+                    <TableCell className="mono tabular-nums text-right text-xs font-semibold text-ink">
                       {ord.limit_cents}c x {ord.remaining_contracts}/{ord.contracts}
                     </TableCell>
                     <TableCell className="m-full min-w-[160px]">
                       <div className="space-y-1">
                         <div className="flex items-center justify-between gap-2 text-xs">
-                          <span className="mono text-ink-2">{qRem} / {ord.queue_ahead_initial} ahead</span>
-                          <span className="mono text-ink-3">{depletedPct}%</span>
+                          <span className="mono tabular-nums text-ink-2">{qRem} / {ord.queue_ahead_initial} ahead</span>
+                          <span className="mono tabular-nums text-ink-3">{depletedPct}%</span>
                         </div>
                         <div
                           role="progressbar"
@@ -1802,24 +1809,24 @@ export function ShadowRunnerPanel({
                   <TableCell className="mono m-grow max-w-[220px] break-all text-xs font-semibold text-ink">
                     {st.strategy}
                   </TableCell>
-                  <TableCell className="mono text-right text-xs text-ink-2">{st.quotes_posted}</TableCell>
-                  <TableCell className="mono text-right text-xs text-ink">{st.fills}</TableCell>
-                  <TableCell className="mono text-right text-xs text-ink">{st.fill_rate_pct.toFixed(1)}%</TableCell>
-                  <TableCell className="mono text-right text-xs text-ink-2">
+                  <TableCell className="mono tabular-nums text-right text-xs text-ink-2">{st.quotes_posted}</TableCell>
+                  <TableCell className="mono tabular-nums text-right text-xs text-ink">{st.fills}</TableCell>
+                  <TableCell className="mono tabular-nums text-right text-xs text-ink">{st.fill_rate_pct.toFixed(1)}%</TableCell>
+                  <TableCell className="mono tabular-nums text-right text-xs text-ink-2">
                     {st.windows_settled > 0 ? `${st.windows_settled} (${st.wins}/${st.losses})` : `${st.wins}/${st.losses}`}
                   </TableCell>
-                  <TableCell className="mono text-right text-xs text-ink-2">
+                  <TableCell className="mono tabular-nums text-right text-xs text-ink-2">
                     {signedCents(st.avg_fill_slippage_cents)}
                   </TableCell>
-                  <TableCell className="mono text-right text-xs text-ink-2">
+                  <TableCell className="mono tabular-nums text-right text-xs text-ink-2">
                     {Math.round(st.avg_queue_wait_secs)}s
                   </TableCell>
-                  <TableCell className="mono text-right text-xs text-ink-2">
+                  <TableCell className="mono tabular-nums text-right text-xs text-ink-2">
                     {money(st.total_fees_dollars)}
                   </TableCell>
                   <TableCell
                     className={
-                      "mono text-right text-xs font-semibold " +
+                      "mono tabular-nums text-right text-xs font-semibold " +
                       (st.realized_pnl_dollars > 0
                         ? "text-success-foreground"
                         : st.realized_pnl_dollars < 0
@@ -1952,11 +1959,11 @@ export function ShadowRunnerPanel({
                     {isNum(ev.contracts) ? ` x ${ev.contracts}` : ""}
                     {isNum(ev.replace_count) && ev.replace_count > 0 ? ` (R${ev.replace_count})` : ""}
                   </TableCell>
-                  <TableCell className="mono text-right text-xs text-ink-2">
+                  <TableCell className="mono tabular-nums text-right text-xs text-ink-2">
                     {isNum(ev.slippage_cents) ? signedCents(ev.slippage_cents) : "-"} /{" "}
                     {isNum(ev.queue_wait_secs) ? `${Math.round(ev.queue_wait_secs)}s` : "-"}
                   </TableCell>
-                  <TableCell className="mono text-right text-xs text-ink-2">
+                  <TableCell className="mono tabular-nums text-right text-xs text-ink-2">
                     {isNum(ev.fee_dollars) ? money(ev.fee_dollars) : "-"}
                   </TableCell>
                   <TableCell

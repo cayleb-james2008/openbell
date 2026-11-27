@@ -345,6 +345,7 @@ export function SpotOracleStrip({
 }) {
   const hasLive = !spotStatus.offline && spotStatus.assets.some((a) => a.price !== null && !a.stale);
   const hasAnyPrice = spotStatus.assets.some((a) => a.price !== null);
+  const staleCount = spotStatus.assets.filter((a) => a.stale || a.price === null).length;
   const statusTone = hasLive ? "success" : hasAnyPrice ? "warning" : "neutral";
   const statusLabel = hasLive ? "Spot Live" : hasAnyPrice ? "Spot Stale" : "Spot Offline";
 
@@ -355,6 +356,14 @@ export function SpotOracleStrip({
     featuredMarket,
     featuredSpot?.vol_bps ?? null,
   );
+  const degradedReason =
+    !hasAnyPrice
+      ? "Spot Oracle offline: external crypto spot feeds unreachable; displaying N/A until reconnected."
+      : !hasLive
+        ? "Spot Oracle stale: spot feed updates paused or delayed; strike divergence may lag."
+        : staleCount > 0
+          ? `Spot Oracle degraded: ${staleCount} asset feed${staleCount === 1 ? " is" : "s are"} stale or offline.`
+          : null;
 
   return (
     <div
@@ -373,19 +382,36 @@ export function SpotOracleStrip({
         </div>
 
         <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs">
-          <span data-spot-strike-readout className="mono text-ink-2">
+          <span data-spot-strike-readout className="mono tabular-nums text-ink-2">
             Strike <strong className="font-semibold text-ink">{formatSpotUsd(divergence.floorStrike)}</strong>
           </span>
           <span data-spot-divergence-badge className="inline-flex">
             <StatusPill tone={divergence.tone}>
               <span>
-                Div <span className="mono font-semibold">{divergence.label}</span>
-                {divergence.distanceBps !== null ? ` (${formatBps(divergence.distanceBps)})` : ""}
+                Div <span className="mono tabular-nums font-semibold">{divergence.label}</span>
+                {divergence.distanceBps !== null ? (
+                  <span className="tabular-nums">{` (${formatBps(divergence.distanceBps)})`}</span>
+                ) : null}
               </span>
             </StatusPill>
           </span>
         </div>
       </div>
+
+      {degradedReason && (
+        <div
+          id="spot-oracle-degraded-banner"
+          data-spot-oracle-banner
+          role="status"
+          className={
+            "flex min-w-0 flex-wrap items-center gap-1.5 rounded-md border border-hairline px-2.5 py-1.5 text-xs " +
+            (hasAnyPrice ? "bg-pill-warn-bg/40 text-warning-foreground" : "bg-board/70 text-ink-2")
+          }
+        >
+          <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
+          <span className="min-w-0 break-words">{degradedReason}</span>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-5">
         {spotStatus.assets.map((a) => {
@@ -412,17 +438,17 @@ export function SpotOracleStrip({
                   : "border-hairline bg-board/60 [@media(hover:hover)_and_(pointer:fine)]:hover:bg-board")
               }
             >
-              <div className="flex w-full items-center justify-between gap-1.5">
-                <span className="mono text-xs font-semibold text-ink">{a.asset}</span>
-                <span data-spot-delta={a.asset} className={`mono text-xs font-medium tabular-nums ${deltaCls}`}>
+              <div className="flex w-full min-w-0 items-center justify-between gap-1.5">
+                <span className="mono shrink-0 text-xs font-semibold text-ink">{a.asset}</span>
+                <span data-spot-delta={a.asset} className={`mono min-w-0 truncate text-xs font-medium tabular-nums ${deltaCls}`}>
                   {formatBps(a.delta_30s_bps)}
                 </span>
               </div>
-              <div className="flex w-full items-center justify-between gap-1.5">
-                <span data-spot-price={a.asset} className="mono text-xs font-semibold tabular-nums text-ink">
+              <div className="flex w-full min-w-0 items-center justify-between gap-1.5">
+                <span data-spot-price={a.asset} className="mono min-w-0 truncate text-xs font-semibold tabular-nums text-ink">
                   {formatSpotUsd(a.price)}
                 </span>
-                <span className="truncate text-xs text-ink-2">{sourceLabel}</span>
+                <span className="min-w-0 truncate text-xs text-ink-2">{sourceLabel}</span>
               </div>
             </button>
           );
