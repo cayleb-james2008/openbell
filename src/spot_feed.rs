@@ -15,16 +15,16 @@
 
 #![allow(dead_code)]
 
-use crate::{kalshi_live, orderbook, tape_hub, App};
-use base64::Engine as _;
+use crate::{kalshi_live, private_ws, tape_hub, App};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "windows")]
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const SPOT_ASSETS: [&str; 5] = ["BTC", "ETH", "SOL", "XRP", "DOGE"];
 pub const DEFAULT_STALE_AFTER_MS: i64 = 15_000;
@@ -33,17 +33,42 @@ const MAX_HISTORY_LIMIT: usize = 500;
 const MAX_HISTORY_LINE_BYTES: usize = 64 * 1024;
 const MAX_RING_TICKS_PER_ASSET: usize = 1024;
 const MAX_TICK_WINDOW_MS: i64 = 300_000;
+const MAX_FUTURE_CLOCK_SKEW_MS: i64 = 10_000;
+const MAX_OUTLIER_CLOCK_SKEW_MS: i64 = 30_000;
+const OUTLIER_FRESH_WINDOW_MS: i64 = 60_000;
+const OUTLIER_CONFIRM_WINDOW_MS: i64 = 30_000;
+const OUTLIER_MAX_RATIO: f64 = 2.5;
+const OUTLIER_MIN_RATIO: f64 = 0.4;
 const DELTA_WINDOW_MS: i64 = 30_000;
 const VOL_WINDOW_MS: i64 = 60_000;
 const SSE_THROTTLE_MS: i64 = 250;
 const RUNNER_NOTIFY_THROTTLE_MS: i64 = 250;
 const REST_POLL_INTERVAL_MS: u64 = 2_000;
 const WS_RECONNECT_INITIAL_MS: u64 = 1_000;
-const WS_RECONNECT_MAX_MS: u64 = 30_000;
+const WS_KEEPALIVE_PING_SECS: u64 = 15;
+const WS_KEEPALIVE_TIMEOUT_SECS: u64 = 30;
 const MAX_WS_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_WS_CONTINUATION_FRAMES: usize = 64;
 const COINBASE_PUBLIC_WS: &str = "wss://ws-feed.exchange.coinbase.com";
 const COINBASE_PUBLIC_REST_BASE: &str = "https://api.exchange.coinbase.com";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SpotFeedMode {
+    Offline = 0,
+    WsStream = 1,
+    RestPoll = 2,
+}
+
+impl SpotFeedMode {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::WsStream,
+            2 => Self::RestPoll,
+            _ => Self::Offline,
+        }
+    }
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -202,9 +227,41 @@ struct AssetState {
     updated_ms: Option<i64>,
     source: String,
     last_sse_emit_ms: i64,
+    pending_outlier: Option<(f64, i64)>,
 }
 
 impl AssetState {
+    fn check_outlier_or_confirm(&mut self, eff_ts: i64, price: f64, now: i64) -> bool {
+        let Some(prev_px) = finite_pos_opt(self.last_price) else {
+            self.pending_outlier = None;
+            return true;
+        };
+        let Some(prev_ts) = self.updated_ms else {
+            self.pending_outlier = None;
+            return true;
+        };
+        if now.saturating_sub(prev_ts) > OUTLIER_FRESH_WINDOW_MS || eff_ts < prev_ts {
+            self.pending_outlier = None;
+            return true;
+        }
+        let ratio = price / prev_px;
+        if (OUTLIER_MIN_RATIO..=OUTLIER_MAX_RATIO).contains(&ratio) {
+            self.pending_outlier = None;
+            return true;
+        }
+        if let Some((out_px, out_ts)) = self.pending_outlier {
+            if eff_ts.saturating_sub(out_ts).abs() <= OUTLIER_CONFIRM_WINDOW_MS {
+                let confirm_ratio = price / out_px;
+                if (0.75..=1.33).contains(&confirm_ratio) {
+                    self.pending_outlier = None;
+                    return true;
+                }
+            }
+        }
+        self.pending_outlier = Some((price, eff_ts));
+        false
+    }
+
     fn push_sample(&mut self, ts_ms: i64, price: f64, source: &str) {
         if let Some(&(last_ts, _)) = self.ticks.back() {
             if ts_ms >= last_ts {
@@ -316,7 +373,10 @@ impl AssetState {
     fn to_status(&self, asset: &str, now: i64, stale_after_ms: i64, offline: bool) -> SpotAssetStatus {
         let price = finite_pos_opt(self.last_price);
         let stale = match self.updated_ms {
-            Some(u) if price.is_some() => now.saturating_sub(u) > stale_after_ms,
+            Some(u) if price.is_some() => {
+                now.saturating_sub(u) > stale_after_ms
+                    || u.saturating_sub(now) > MAX_FUTURE_CLOCK_SKEW_MS
+            }
             _ => true,
         };
         let source = if !self.source.is_empty() {
@@ -370,42 +430,263 @@ impl Default for SpotFeedInner {
     }
 }
 
+#[cfg(unix)]
+fn same_regular_file(meta_a: &std::fs::Metadata, file: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(meta_b) = file.metadata() else {
+        return false;
+    };
+    meta_b.file_type().is_file()
+        && meta_a.dev() == meta_b.dev()
+        && meta_a.ino() == meta_b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_regular_file(_meta_a: &std::fs::Metadata, file: &std::fs::File) -> bool {
+    file.metadata().is_ok_and(|m| m.file_type().is_file())
+}
+
 pub struct SpotFeedStore {
     data_dir: PathBuf,
-    inner: Mutex<SpotFeedInner>,
+    inner: RwLock<SpotFeedInner>,
     disk_lock: Mutex<()>,
+    feed_mode: AtomicU8,
+    feed_generation: AtomicU64,
+    offline_override: AtomicU8,
+    url_override: RwLock<Option<String>>,
+    wake: (Mutex<u64>, Condvar),
 }
 
 impl SpotFeedStore {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self {
+        let store = Self {
             data_dir,
-            inner: Mutex::new(SpotFeedInner::default()),
+            inner: RwLock::new(SpotFeedInner::default()),
             disk_lock: Mutex::new(()),
-        }
+            feed_mode: AtomicU8::new(SpotFeedMode::Offline as u8),
+            feed_generation: AtomicU64::new(0),
+            offline_override: AtomicU8::new(0),
+            url_override: RwLock::new(None),
+            wake: (Mutex::new(0), Condvar::new()),
+        };
+        store.warm_load_from_disk();
+        store
     }
 
     pub fn set_stale_after_ms(&self, ms: i64) {
-        let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = self.inner.write().unwrap_or_else(|p| p.into_inner());
         st.stale_after_ms = ms.max(1_000);
     }
 
     pub fn set_runner_notify<F: Fn() + Send + Sync + 'static>(&self, cb: F) {
-        let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = self.inner.write().unwrap_or_else(|p| p.into_inner());
         st.runner_notify = Some(Arc::new(cb));
     }
 
+    /// Returns `true` when spot feed networking is disabled via override or env.
     pub fn is_offline(&self) -> bool {
-        spot_feed_offline()
+        match self.offline_override.load(Ordering::Acquire) {
+            1 => true,
+            2 => false,
+            _ => spot_feed_offline(),
+        }
+    }
+
+    /// Lock-free / non-blocking feed mode accessor (`Offline`, `WsStream`, `RestPoll`).
+    pub fn active_feed_mode(&self) -> SpotFeedMode {
+        SpotFeedMode::from_u8(self.feed_mode.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn set_feed_mode_lockfree(&self, mode: SpotFeedMode) {
+        self.feed_mode.store(mode as u8, Ordering::Release);
+    }
+
+    pub fn feed_generation(&self) -> u64 {
+        self.feed_generation.load(Ordering::Acquire)
+    }
+
+    /// Non-blocking lock-free feed switch: updates override flags and wakes the
+    /// background worker immediately without blocking on disk or network I/O.
+    pub fn switch_feed(&self, url_override: Option<String>, offline: Option<bool>) -> u64 {
+        if let Ok(mut guard) = self.url_override.write() {
+            *guard = url_override.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        }
+        if let Some(off) = offline {
+            self.offline_override
+                .store(if off { 1 } else { 2 }, Ordering::Release);
+            if off {
+                self.set_feed_mode_lockfree(SpotFeedMode::Offline);
+            }
+        } else {
+            self.offline_override.store(0, Ordering::Release);
+        }
+        let gen = self.feed_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        {
+            let (lock, cv) = &self.wake;
+            let mut seq = lock.lock().unwrap_or_else(|p| p.into_inner());
+            *seq = seq.saturating_add(1);
+            drop(seq);
+            cv.notify_all();
+        }
+        gen
+    }
+
+    fn effective_spot_url(&self) -> Option<String> {
+        if let Ok(guard) = self.url_override.read() {
+            if let Some(ref u) = *guard {
+                return Some(u.clone());
+            }
+        }
+        std::env::var("OPENBELL_SPOT_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn wait_wake_or_timeout(&self, dur: Duration) {
+        let (lock, cv) = &self.wake;
+        let gen_before = self.feed_generation.load(Ordering::Acquire);
+        let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        if self.feed_generation.load(Ordering::Acquire) != gen_before {
+            return;
+        }
+        let _ = cv.wait_timeout(guard, dur);
     }
 
     fn set_last_error(&self, err: Option<String>) {
-        let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = self.inner.write().unwrap_or_else(|p| p.into_inner());
         st.last_error = err;
     }
 
+    pub fn last_error(&self) -> Option<String> {
+        let st = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        st.last_error.clone()
+    }
+
+    /// Recover recent valid ticks within `MAX_TICK_WINDOW_MS` from `<data_dir>/spot_ticks.jsonl`
+    /// on startup, tolerating corrupt/truncated lines and enforcing CWE-59 confinement.
+    fn warm_load_from_disk(&self) {
+        if self.data_dir.as_os_str().is_empty() {
+            return;
+        }
+        let Ok(dir_meta) = std::fs::symlink_metadata(&self.data_dir) else {
+            return;
+        };
+        if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
+            return;
+        }
+        let path = self.data_dir.join("spot_ticks.jsonl");
+        let _disk_guard = self.disk_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            return;
+        };
+        if meta.file_type().is_symlink()
+            || !meta.file_type().is_file()
+            || !crate::is_confined_regular_file(&self.data_dir, &path)
+        {
+            return;
+        }
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            return;
+        };
+        if !same_regular_file(&meta, &file) {
+            return;
+        }
+        let file_len = meta.len();
+        let start_offset = file_len.saturating_sub(MAX_SPOT_TICKS_JSONL_BYTES);
+        let mut skip_first_partial = false;
+        if start_offset > 0 {
+            if file.seek(SeekFrom::Start(start_offset)).is_err() {
+                return;
+            }
+            skip_first_partial = true;
+        }
+
+        let mut reader = BufReader::new(file.take(MAX_SPOT_TICKS_JSONL_BYTES));
+        let mut raw_line = Vec::with_capacity(256);
+        let mut pos = start_offset;
+        let mut last_good_end = start_offset;
+        let mut saw_trailing_corrupt = false;
+        let now = now_ms();
+        let min_ts = now.saturating_sub(MAX_TICK_WINDOW_MS);
+        let max_ts = now.saturating_add(MAX_FUTURE_CLOCK_SKEW_MS);
+        let mut loaded_samples: Vec<(&'static str, i64, f64, String)> = Vec::new();
+        const MAX_WARM_LINES: usize = 100_000;
+        let mut scanned = 0usize;
+
+        loop {
+            if scanned >= MAX_WARM_LINES {
+                break;
+            }
+            raw_line.clear();
+            let n = match reader.read_until(b'\n', &mut raw_line) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if n == 0 {
+                break;
+            }
+            pos = pos.saturating_add(n as u64);
+            if skip_first_partial {
+                skip_first_partial = false;
+                last_good_end = pos;
+                continue;
+            }
+            scanned += 1;
+            if raw_line.len() > MAX_HISTORY_LINE_BYTES {
+                saw_trailing_corrupt = true;
+                continue;
+            }
+            let Ok(line_str) = std::str::from_utf8(&raw_line) else {
+                saw_trailing_corrupt = true;
+                continue;
+            };
+            let trimmed = line_str.trim();
+            if trimmed.is_empty() {
+                last_good_end = pos;
+                saw_trailing_corrupt = false;
+                continue;
+            }
+            let Ok(raw) = serde_json::from_str::<SpotDiskLine>(trimmed) else {
+                saw_trailing_corrupt = true;
+                continue;
+            };
+            let Some(canonical) = normalize_spot_asset(&raw.asset) else {
+                saw_trailing_corrupt = true;
+                continue;
+            };
+            if !raw.price.is_finite() || raw.price <= 0.0 || raw.ts_ms <= 0 {
+                saw_trailing_corrupt = true;
+                continue;
+            }
+            last_good_end = pos;
+            saw_trailing_corrupt = false;
+            if raw.ts_ms >= min_ts && raw.ts_ms <= max_ts {
+                loaded_samples.push((canonical, raw.ts_ms, raw.price, raw.source));
+            }
+        }
+        drop(reader);
+
+        if saw_trailing_corrupt && last_good_end < file_len {
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
+                if same_regular_file(&meta, &f) {
+                    let _ = f.set_len(last_good_end);
+                }
+            }
+        }
+
+        if !loaded_samples.is_empty() {
+            let mut st = self.inner.write().unwrap_or_else(|p| p.into_inner());
+            for (canonical, ts_ms, price, source) in loaded_samples {
+                let entry = st.assets.entry(canonical).or_default();
+                entry.push_sample(ts_ms, price, &source);
+            }
+        }
+    }
+
     /// Ingest a single external spot tick (`asset`, positive finite `price`, `ts_ms`, `source`).
-    /// Persists to `<data_dir>/spot_ticks.jsonl` (8 MiB rotation, CWE-59 symlink check) and
+    /// Enforces future clock-skew and single-tick outlier bounds, persists to
+    /// `<data_dir>/spot_ticks.jsonl` (8 MiB rotation, CWE-59 symlink check), and
     /// emits a throttled SSE `event: spot` payload when appropriate.
     pub fn ingest_tick(&self, asset: &str, price: f64, ts_ms: i64, source: &str) -> bool {
         let Some(canonical) = normalize_spot_asset(asset) else {
@@ -415,7 +696,19 @@ impl SpotFeedStore {
             return false;
         }
         let now = now_ms();
-        let eff_ts = if ts_ms > 0 { ts_ms } else { now };
+        let eff_ts = if ts_ms <= 0 {
+            now
+        } else if ts_ms > now.saturating_add(MAX_OUTLIER_CLOCK_SKEW_MS) {
+            self.set_last_error(Some(format!(
+                "rejected {canonical} spot tick with excessive future clock skew ({}ms ahead)",
+                ts_ms.saturating_sub(now)
+            )));
+            return false;
+        } else if ts_ms > now.saturating_add(MAX_FUTURE_CLOCK_SKEW_MS) {
+            now
+        } else {
+            ts_ms
+        };
         let clean_source: String = source
             .trim()
             .chars()
@@ -429,25 +722,36 @@ impl SpotFeedStore {
         };
         let offline = self.is_offline();
 
-        let (sse_payload, notify_cb) = {
-            let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let (accepted, sse_payload, notify_cb) = {
+            let mut st = self.inner.write().unwrap_or_else(|p| p.into_inner());
             let stale_after = st.stale_after_ms;
             let entry = st.assets.entry(canonical).or_default();
-            entry.push_sample(eff_ts, price, &src);
-            let sse = if now.saturating_sub(entry.last_sse_emit_ms) >= SSE_THROTTLE_MS {
-                entry.last_sse_emit_ms = now;
-                Some(entry.to_status(canonical, now, stale_after, offline))
+            if !entry.check_outlier_or_confirm(eff_ts, price, now) {
+                st.last_error = Some(format!(
+                    "rejected unconfirmed {canonical} outlier price {price}"
+                ));
+                (false, None, None)
             } else {
-                None
-            };
-            let cb = if now.saturating_sub(st.last_runner_notify_ms) >= RUNNER_NOTIFY_THROTTLE_MS {
-                st.last_runner_notify_ms = now;
-                st.runner_notify.clone()
-            } else {
-                None
-            };
-            (sse, cb)
+                entry.push_sample(eff_ts, price, &src);
+                let sse = if now.saturating_sub(entry.last_sse_emit_ms) >= SSE_THROTTLE_MS {
+                    entry.last_sse_emit_ms = now;
+                    Some(entry.to_status(canonical, now, stale_after, offline))
+                } else {
+                    None
+                };
+                let cb =
+                    if now.saturating_sub(st.last_runner_notify_ms) >= RUNNER_NOTIFY_THROTTLE_MS {
+                        st.last_runner_notify_ms = now;
+                        st.runner_notify.clone()
+                    } else {
+                        None
+                    };
+                (true, sse, cb)
+            }
         };
+        if !accepted {
+            return false;
+        }
 
         let _ = self.append_tick_record(canonical, price, eff_ts, &src);
 
@@ -483,6 +787,8 @@ impl SpotFeedStore {
         }
 
         let path = self.data_dir.join("spot_ticks.jsonl");
+        let mut needs_leading_newline = false;
+        let mut existing_meta = None;
         if let Ok(meta) = std::fs::symlink_metadata(&path) {
             if meta.file_type().is_symlink() || !meta.file_type().is_file() {
                 return Err("spot_ticks.jsonl must be a confined regular file".to_string());
@@ -492,12 +798,26 @@ impl SpotFeedStore {
             }
             if meta.len() >= MAX_SPOT_TICKS_JSONL_BYTES {
                 let backup = self.data_dir.join("spot_ticks.jsonl.1");
-                let backup_is_symlink = std::fs::symlink_metadata(&backup)
-                    .is_ok_and(|m| m.file_type().is_symlink());
-                if backup_is_symlink {
-                    return Err("spot_ticks.jsonl.1 must not be a symlink".to_string());
+                if let Ok(bm) = std::fs::symlink_metadata(&backup) {
+                    if bm.file_type().is_symlink() || !bm.file_type().is_file() {
+                        return Err(
+                            "spot_ticks.jsonl.1 must be a regular non-symlink file".to_string(),
+                        );
+                    }
                 }
                 let _ = std::fs::rename(&path, &backup);
+            } else {
+                if meta.len() > 0 {
+                    if let Ok(mut rf) = std::fs::File::open(&path) {
+                        if same_regular_file(&meta, &rf) && rf.seek(SeekFrom::End(-1)).is_ok() {
+                            let mut last = [0u8; 1];
+                            if rf.read_exact(&mut last).is_ok() && last[0] != b'\n' {
+                                needs_leading_newline = true;
+                            }
+                        }
+                    }
+                }
+                existing_meta = Some(meta);
             }
         }
 
@@ -514,6 +834,17 @@ impl SpotFeedStore {
             .append(true)
             .open(&path)
             .map_err(|e| format!("open spot_ticks.jsonl failed: {e}"))?;
+        if let Some(ref meta) = existing_meta {
+            if !same_regular_file(meta, &file) {
+                return Err("spot_ticks.jsonl changed during open".to_string());
+            }
+        } else if !crate::is_confined_regular_file(&self.data_dir, &path) {
+            return Err("spot_ticks.jsonl failed confinement check after create".to_string());
+        }
+        if needs_leading_newline {
+            file.write_all(b"\n")
+                .map_err(|e| format!("write spot_ticks.jsonl newline failed: {e}"))?;
+        }
         writeln!(file, "{line}").map_err(|e| format!("write spot_ticks.jsonl failed: {e}"))?;
         Ok(())
     }
@@ -521,7 +852,7 @@ impl SpotFeedStore {
     pub fn status_snapshot(&self) -> SpotStatusResponse {
         let now = now_ms();
         let offline = self.is_offline();
-        let st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let st = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let stale_after = st.stale_after_ms;
         let assets = SPOT_ASSETS
             .iter()
@@ -539,7 +870,7 @@ impl SpotFeedStore {
         let canonical = normalize_spot_asset(series_or_asset)?;
         let now = now_ms();
         let offline = self.is_offline();
-        let st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let st = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let stale_after = st.stale_after_ms;
         let entry = st.assets.get(canonical)?;
         let status = entry.to_status(canonical, now, stale_after, offline);
@@ -565,7 +896,7 @@ impl SpotFeedStore {
         let eff_limit = limit.clamp(1, MAX_HISTORY_LIMIT);
 
         if self.data_dir.as_os_str().is_empty() {
-            let st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let st = self.inner.read().unwrap_or_else(|p| p.into_inner());
             let Some(entry) = st.assets.get(canonical) else {
                 return Ok(Vec::new());
             };
@@ -583,40 +914,49 @@ impl SpotFeedStore {
                 .collect());
         }
 
-        let dir_meta = match std::fs::symlink_metadata(&self.data_dir) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err((500, format!("cannot stat data directory: {e}"))),
-        };
-        if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
-            return Err((403, "data_dir must be a regular directory".to_string()));
-        }
+        let (mut file, file_len) = {
+            let _disk_guard = self.disk_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let dir_meta = match std::fs::symlink_metadata(&self.data_dir) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err((500, format!("cannot stat data directory: {e}"))),
+            };
+            if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
+                return Err((403, "data_dir must be a regular directory".to_string()));
+            }
 
-        let path = self.data_dir.join("spot_ticks.jsonl");
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err((500, format!("cannot stat spot_ticks.jsonl: {e}"))),
+            let path = self.data_dir.join("spot_ticks.jsonl");
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err((500, format!("cannot stat spot_ticks.jsonl: {e}"))),
+            };
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                return Err((
+                    403,
+                    "spot_ticks.jsonl must be a confined regular file".to_string(),
+                ));
+            }
+            if !crate::is_confined_regular_file(&self.data_dir, &path) {
+                return Err((
+                    403,
+                    "spot_ticks.jsonl failed directory confinement check".to_string(),
+                ));
+            }
+            let file = std::fs::File::open(&path)
+                .map_err(|e| (500, format!("open spot_ticks.jsonl failed: {e}")))?;
+            if !same_regular_file(&meta, &file) {
+                return Err((
+                    403,
+                    "spot_ticks.jsonl changed unexpectedly during open".to_string(),
+                ));
+            }
+            (file, meta.len())
         };
-        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-            return Err((
-                403,
-                "spot_ticks.jsonl must be a confined regular file".to_string(),
-            ));
-        }
-        if !crate::is_confined_regular_file(&self.data_dir, &path) {
-            return Err((
-                403,
-                "spot_ticks.jsonl failed directory confinement check".to_string(),
-            ));
-        }
 
-        let _disk_guard = self.disk_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let mut file = std::fs::File::open(&path)
-            .map_err(|e| (500, format!("open spot_ticks.jsonl failed: {e}")))?;
         let mut skip_first_partial = false;
-        if meta.len() > MAX_SPOT_TICKS_JSONL_BYTES {
-            let start = meta.len().saturating_sub(MAX_SPOT_TICKS_JSONL_BYTES);
+        if file_len > MAX_SPOT_TICKS_JSONL_BYTES {
+            let start = file_len.saturating_sub(MAX_SPOT_TICKS_JSONL_BYTES);
             file.seek(SeekFrom::Start(start))
                 .map_err(|e| (500, format!("seek spot_ticks.jsonl failed: {e}")))?;
             skip_first_partial = true;
@@ -661,7 +1001,7 @@ impl SpotFeedStore {
             if normalize_spot_asset(&raw.asset) != Some(canonical) {
                 continue;
             }
-            if !raw.price.is_finite() || raw.price <= 0.0 {
+            if !raw.price.is_finite() || raw.price <= 0.0 || raw.ts_ms <= 0 {
                 continue;
             }
             if out.len() >= eff_limit {
@@ -813,7 +1153,11 @@ fn parse_pos_f64(v: &serde_json::Value) -> Option<f64> {
 }
 
 fn extract_ts_ms(val: &serde_json::Value) -> Option<i64> {
-    if let Some(ms) = val.get("ts_ms").or_else(|| val.get("updated_ms")).and_then(|v| v.as_i64()) {
+    if let Some(ms) = val
+        .get("ts_ms")
+        .or_else(|| val.get("updated_ms"))
+        .and_then(|v| v.as_i64())
+    {
         if ms > 0 {
             return Some(ms);
         }
@@ -821,6 +1165,13 @@ fn extract_ts_ms(val: &serde_json::Value) -> Option<i64> {
     if let Some(ms) = val.get("E").or_else(|| val.get("T")).and_then(|v| v.as_i64()) {
         if ms > 0 {
             return Some(ms);
+        }
+    }
+    if let Some(iso) = val.get("time").and_then(|v| v.as_str()) {
+        if let Some(sec) = crate::parse_iso_z(iso) {
+            if sec > 0 {
+                return Some(sec.saturating_mul(1_000));
+            }
         }
     }
     None
@@ -838,378 +1189,30 @@ enum SpotTarget {
 
 fn validate_spot_ws_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
-    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err("spot WS URL must not contain control or whitespace characters".to_string());
-    }
-    if trimmed.starts_with("wss://") {
-        let _ = parse_ws_url(trimmed)?;
-        return Ok(trimmed.to_string());
-    }
-    if trimmed.starts_with("ws://") {
-        let (_, host, _, _) = parse_ws_url(trimmed)?;
-        let h = host.to_ascii_lowercase();
-        if matches!(h.as_str(), "127.0.0.1" | "localhost" | "[::1]") {
-            return Ok(trimmed.to_string());
-        }
-        return Err("plain ws:// spot URL is permitted only on loopback".to_string());
-    }
-    Err("spot WS URL must start with wss:// or loopback ws://".to_string())
+    let _ = private_ws::parse_ws_url_with_default(trimmed, "/")?;
+    Ok(trimmed.to_string())
 }
 
-fn resolve_spot_target() -> Result<SpotTarget, String> {
-    if let Ok(raw) = std::env::var("OPENBELL_SPOT_URL") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
-                return validate_spot_ws_url(trimmed).map(|ws_url| SpotTarget::Ws { ws_url });
-            }
-            return kalshi_live::validate_api_base_url(trimmed)
-                .map(|rest_url| SpotTarget::Rest { rest_url });
+fn resolve_spot_target_for(store: &SpotFeedStore) -> Result<SpotTarget, String> {
+    if let Some(trimmed) = store.effective_spot_url() {
+        if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+            return validate_spot_ws_url(&trimmed).map(|ws_url| SpotTarget::Ws { ws_url });
         }
+        return kalshi_live::validate_api_base_url(&trimmed)
+            .map(|rest_url| SpotTarget::Rest { rest_url });
     }
     Ok(SpotTarget::DefaultCoinbase)
 }
 
-fn parse_ws_url(url: &str) -> Result<(bool, String, u16, String), String> {
-    let trimmed = url.trim();
-    let (tls, rest) = if let Some(r) = trimmed.strip_prefix("wss://") {
-        (true, r)
-    } else if let Some(r) = trimmed.strip_prefix("ws://") {
-        (false, r)
-    } else {
-        return Err("WS URL must start with ws:// or wss://".to_string());
-    };
-    let (authority, path) = match rest.split_once('/') {
-        Some((a, p)) => (a, format!("/{p}")),
-        None => (rest, "/".to_string()),
-    };
-    let (host, port) = if let Some((h, p_str)) = authority.rsplit_once(':') {
-        let port = p_str
-            .parse::<u16>()
-            .map_err(|_| "invalid WS port".to_string())?;
-        (h.to_string(), port)
-    } else {
-        (authority.to_string(), if tls { 443 } else { 80 })
-    };
-    if host.is_empty() {
-        return Err("WS URL missing host".to_string());
-    }
-    Ok((tls, host, port, path))
-}
-
-enum WsTransport {
-    Plain(TcpStream),
-    TlsProc {
-        child: Child,
-        stdin: std::process::ChildStdin,
-        stdout: std::process::ChildStdout,
-    },
-}
-
-impl WsTransport {
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        match self {
-            WsTransport::Plain(s) => s.write_all(buf),
-            WsTransport::TlsProc { stdin, .. } => stdin.write_all(buf),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            WsTransport::Plain(s) => s.flush(),
-            WsTransport::TlsProc { stdin, .. } => stdin.flush(),
-        }
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            WsTransport::Plain(s) => s.read(buf),
-            WsTransport::TlsProc { stdout, .. } => stdout.read(buf),
-        }
-    }
-}
-
-impl Drop for WsTransport {
-    fn drop(&mut self) {
-        if let WsTransport::TlsProc { child, .. } = self {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-struct WsConnection {
-    io: WsTransport,
-    leftover: Vec<u8>,
-    offset: usize,
-}
-
-impl WsConnection {
-    fn read_exact_bytes(&mut self, dst: &mut [u8]) -> std::io::Result<()> {
-        let mut filled = 0usize;
-        while filled < dst.len() {
-            if self.offset < self.leftover.len() {
-                let avail = self.leftover.len() - self.offset;
-                let take = avail.min(dst.len() - filled);
-                dst[filled..filled + take]
-                    .copy_from_slice(&self.leftover[self.offset..self.offset + take]);
-                self.offset += take;
-                filled += take;
-                continue;
-            }
-            let n = self.io.read(&mut dst[filled..])?;
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "websocket EOF",
-                ));
-            }
-            filled += n;
-        }
-        Ok(())
-    }
-
-    fn send_masked_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), String> {
-        let mut frame = Vec::with_capacity(payload.len() + 14);
-        frame.push(0x80 | (opcode & 0x0f));
-        let len = payload.len();
-        if len < 126 {
-            frame.push(0x80 | (len as u8));
-        } else if len <= 65_535 {
-            frame.push(0x80 | 126);
-            frame.extend_from_slice(&(len as u16).to_be_bytes());
-        } else {
-            frame.push(0x80 | 127);
-            frame.extend_from_slice(&(len as u64).to_be_bytes());
-        }
-        let mut mask = [0u8; 4];
-        let _ = getrandom::getrandom(&mut mask);
-        frame.extend_from_slice(&mask);
-        for (i, &b) in payload.iter().enumerate() {
-            frame.push(b ^ mask[i & 3]);
-        }
-        self.io
-            .write_all(&frame)
-            .and_then(|_| self.io.flush())
-            .map_err(|e| format!("spot WS write failed: {e}"))
-    }
-
-    fn send_text(&mut self, text: &str) -> Result<(), String> {
-        self.send_masked_frame(0x1, text.as_bytes())
-    }
-
-    fn read_frame(&mut self) -> std::io::Result<(u8, Vec<u8>)> {
-        let mut full_payload = Vec::new();
-        let mut first_opcode = 0u8;
-        let mut fragments = 0usize;
-        loop {
-            fragments += 1;
-            if fragments > MAX_WS_CONTINUATION_FRAMES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ws too many continuation frames",
-                ));
-            }
-            let mut hdr = [0u8; 2];
-            self.read_exact_bytes(&mut hdr)?;
-            let fin = (hdr[0] & 0x80) != 0;
-            let opcode = hdr[0] & 0x0f;
-            if !matches!(opcode, 0x0..=0x2 | 0x8..=0xA) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ws unknown opcode",
-                ));
-            }
-            if opcode == 0 && first_opcode == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ws unexpected continuation frame",
-                ));
-            }
-            if first_opcode != 0 && opcode != 0 && opcode < 0x8 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ws interleaved data frame during continuation",
-                ));
-            }
-            if first_opcode == 0 && opcode != 0 {
-                first_opcode = opcode;
-            }
-            let masked = (hdr[1] & 0x80) != 0;
-            let len7 = hdr[1] & 0x7f;
-            if opcode >= 0x8 && (!fin || len7 > 125) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ws invalid control frame",
-                ));
-            }
-            let payload_len: usize = match len7 {
-                0..=125 => len7 as usize,
-                126 => {
-                    let mut ext = [0u8; 2];
-                    self.read_exact_bytes(&mut ext)?;
-                    u16::from_be_bytes(ext) as usize
-                }
-                _ => {
-                    let mut ext = [0u8; 8];
-                    self.read_exact_bytes(&mut ext)?;
-                    let v = u64::from_be_bytes(ext);
-                    if v > MAX_WS_FRAME_BYTES as u64 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "ws frame too large",
-                        ));
-                    }
-                    v as usize
-                }
-            };
-            if payload_len > MAX_WS_FRAME_BYTES
-                || full_payload
-                    .len()
-                    .checked_add(payload_len)
-                    .is_none_or(|sum| sum > MAX_WS_FRAME_BYTES)
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ws payload exceeds limit",
-                ));
-            }
-            let mut mask_key = [0u8; 4];
-            if masked {
-                self.read_exact_bytes(&mut mask_key)?;
-            }
-            let start = full_payload.len();
-            full_payload.resize(start + payload_len, 0);
-            if payload_len > 0 {
-                self.read_exact_bytes(&mut full_payload[start..])?;
-                if masked {
-                    for (i, b) in full_payload[start..].iter_mut().enumerate() {
-                        *b ^= mask_key[i & 3];
-                    }
-                }
-            }
-            if opcode == 0x9 {
-                let _ = self.send_masked_frame(0xA, &full_payload[start..]);
-                full_payload.truncate(start);
-                continue;
-            }
-            if opcode == 0xA {
-                full_payload.truncate(start);
-                continue;
-            }
-            if fin {
-                return Ok((first_opcode, full_payload));
-            }
-        }
-    }
-}
-
-fn connect_public_ws(url: &str) -> Result<WsConnection, String> {
-    let (tls, host, port, path) = parse_ws_url(url)?;
-    let mut io = if !tls {
-        let addr = format!("{host}:{port}");
-        let stream =
-            TcpStream::connect(&addr).map_err(|e| format!("spot WS connect failed: {e}"))?;
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-        WsTransport::Plain(stream)
-    } else {
-        let target = format!("{host}:{port}");
-        let mut child = Command::new("openssl")
-            .args([
-                "s_client",
-                "-quiet",
-                "-servername",
-                &host,
-                "-connect",
-                &target,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("spot WS TLS transport unavailable: {e}"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "spot WS TLS stdin unavailable".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "spot WS TLS stdout unavailable".to_string())?;
-        WsTransport::TlsProc {
-            child,
-            stdin,
-            stdout,
-        }
-    };
-
-    let mut key_raw = [0u8; 16];
-    let _ = getrandom::getrandom(&mut key_raw);
-    let ws_key = base64::engine::general_purpose::STANDARD.encode(key_raw);
-    let expected_accept = orderbook::compute_ws_accept_key(&ws_key);
-
-    let host_header = if (tls && port == 443) || (!tls && port == 80) {
-        host.clone()
-    } else {
-        format!("{host}:{port}")
-    };
-    let req = format!(
-        "GET {path} HTTP/1.1\r\n\
-         Host: {host_header}\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Key: {ws_key}\r\n\
-         Sec-WebSocket-Version: 13\r\n\r\n"
-    );
-    io.write_all(req.as_bytes())
-        .and_then(|_| io.flush())
-        .map_err(|e| format!("spot WS handshake write failed: {e}"))?;
-
-    let mut resp_buf = Vec::with_capacity(2048);
-    let mut tmp = [0u8; 1024];
-    let hdr_end = loop {
-        if resp_buf.len() > 16_384 {
-            return Err("spot WS handshake response too large".to_string());
-        }
-        let n = io
-            .read(&mut tmp)
-            .map_err(|e| format!("spot WS handshake read failed: {e}"))?;
-        if n == 0 {
-            return Err("spot WS handshake closed before 101".to_string());
-        }
-        resp_buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = resp_buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos;
-        }
-    };
-
-    let hdr_str = std::str::from_utf8(&resp_buf[..hdr_end])
-        .map_err(|_| "spot WS handshake response not UTF-8".to_string())?;
-    let mut lines = hdr_str.split("\r\n");
-    let status_line = lines.next().unwrap_or("");
-    if !status_line.contains(" 101 ") {
-        return Err(format!("spot WS upgrade rejected: {status_line}"));
-    }
-    let mut accept_ok = false;
-    for l in lines {
-        if let Some((k, v)) = l.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("sec-websocket-accept")
-                && v.trim() == expected_accept
-            {
-                accept_ok = true;
-            }
-        }
-    }
-    if !accept_ok {
-        return Err("spot WS Sec-WebSocket-Accept mismatch".to_string());
-    }
-
-    Ok(WsConnection {
-        io,
-        leftover: resp_buf[hdr_end + 4..].to_vec(),
-        offset: 0,
-    })
+fn connect_public_ws(url: &str) -> Result<private_ws::WsConnection, String> {
+    private_ws::connect_ws_with_headers(
+        url,
+        "/",
+        &[],
+        MAX_WS_FRAME_BYTES,
+        MAX_WS_CONTINUATION_FRAMES,
+        "spot WS",
+    )
 }
 
 fn public_http_get(full_url: &str) -> Result<String, String> {
@@ -1258,10 +1261,13 @@ fn public_http_get(full_url: &str) -> Result<String, String> {
     }
 }
 
-fn poll_coinbase_rest_once(store: &SpotFeedStore) -> (usize, Option<String>) {
+fn poll_coinbase_rest_once(store: &SpotFeedStore, start_gen: u64) -> (usize, Option<String>) {
     let mut ok_count = 0usize;
     let mut last_err = None;
     for &asset in &SPOT_ASSETS {
+        if store.is_offline() || store.feed_generation() != start_gen {
+            break;
+        }
         let url = format!("{COINBASE_PUBLIC_REST_BASE}/products/{asset}-USD/ticker");
         match public_http_get(&url) {
             Ok(txt) => match store.ingest_rest_payload(&txt, Some(asset), Some("rest")) {
@@ -1276,29 +1282,42 @@ fn poll_coinbase_rest_once(store: &SpotFeedStore) -> (usize, Option<String>) {
 }
 
 /// Start the public unauthenticated crypto spot feed worker thread.
-/// Remains completely idle with zero outbound network traffic when `spot_feed_offline()` is true.
+/// Remains completely idle with zero outbound network traffic when `is_offline()` is true.
 pub fn start_background_spot_feed(app: Arc<App>) {
     std::thread::spawn(move || {
         let mut backoff_ms = WS_RECONNECT_INITIAL_MS;
         let mut next_ws_attempt_ms = 0i64;
+        let mut last_gen = app.spot_feed.feed_generation();
 
         loop {
-            if spot_feed_offline() {
-                std::thread::sleep(Duration::from_millis(1_500));
+            let cur_gen = app.spot_feed.feed_generation();
+            if cur_gen != last_gen {
+                last_gen = cur_gen;
+                backoff_ms = WS_RECONNECT_INITIAL_MS;
+                next_ws_attempt_ms = 0;
+            }
+
+            if app.spot_feed.is_offline() {
+                app.spot_feed.set_feed_mode_lockfree(SpotFeedMode::Offline);
+                app.spot_feed
+                    .wait_wake_or_timeout(Duration::from_millis(1_500));
                 continue;
             }
 
-            let target = match resolve_spot_target() {
+            let target = match resolve_spot_target_for(&app.spot_feed) {
                 Ok(t) => t,
                 Err(e) => {
+                    app.spot_feed.set_feed_mode_lockfree(SpotFeedMode::Offline);
                     app.spot_feed.set_last_error(Some(e));
-                    std::thread::sleep(Duration::from_millis(REST_POLL_INTERVAL_MS));
+                    app.spot_feed
+                        .wait_wake_or_timeout(Duration::from_millis(REST_POLL_INTERVAL_MS));
                     continue;
                 }
             };
 
             match target {
                 SpotTarget::Rest { rest_url } => {
+                    app.spot_feed.set_feed_mode_lockfree(SpotFeedMode::RestPoll);
                     match public_http_get(&rest_url) {
                         Ok(txt) => match app.spot_feed.ingest_rest_payload(&txt, None, Some("rest")) {
                             Ok(_) => app.spot_feed.set_last_error(None),
@@ -1306,15 +1325,24 @@ pub fn start_background_spot_feed(app: Arc<App>) {
                         },
                         Err(e) => app.spot_feed.set_last_error(Some(e)),
                     }
-                    std::thread::sleep(Duration::from_millis(REST_POLL_INTERVAL_MS));
+                    app.spot_feed
+                        .wait_wake_or_timeout(Duration::from_millis(REST_POLL_INTERVAL_MS));
                 }
                 SpotTarget::Ws { ws_url } => {
                     let now = now_ms();
                     if now < next_ws_attempt_ms {
-                        std::thread::sleep(Duration::from_millis(250));
+                        let wait_ms = (next_ws_attempt_ms - now).clamp(20, 250) as u64;
+                        app.spot_feed
+                            .wait_wake_or_timeout(Duration::from_millis(wait_ms));
                         continue;
                     }
-                    run_ws_session(&app.spot_feed, &ws_url, &mut backoff_ms, &mut next_ws_attempt_ms);
+                    run_ws_session(
+                        &app.spot_feed,
+                        &ws_url,
+                        cur_gen,
+                        &mut backoff_ms,
+                        &mut next_ws_attempt_ms,
+                    );
                 }
                 SpotTarget::DefaultCoinbase => {
                     let now = now_ms();
@@ -1322,15 +1350,18 @@ pub fn start_background_spot_feed(app: Arc<App>) {
                         run_ws_session(
                             &app.spot_feed,
                             COINBASE_PUBLIC_WS,
+                            cur_gen,
                             &mut backoff_ms,
                             &mut next_ws_attempt_ms,
                         );
                     } else {
-                        let (_, err) = poll_coinbase_rest_once(&app.spot_feed);
+                        app.spot_feed.set_feed_mode_lockfree(SpotFeedMode::RestPoll);
+                        let (_, err) = poll_coinbase_rest_once(&app.spot_feed, cur_gen);
                         if err.is_some() {
                             app.spot_feed.set_last_error(err);
                         }
-                        std::thread::sleep(Duration::from_millis(REST_POLL_INTERVAL_MS));
+                        app.spot_feed
+                            .wait_wake_or_timeout(Duration::from_millis(REST_POLL_INTERVAL_MS));
                     }
                 }
             }
@@ -1341,6 +1372,7 @@ pub fn start_background_spot_feed(app: Arc<App>) {
 fn run_ws_session(
     store: &SpotFeedStore,
     ws_url: &str,
+    start_gen: u64,
     backoff_ms: &mut u64,
     next_ws_attempt_ms: &mut i64,
 ) {
@@ -1352,19 +1384,42 @@ fn run_ws_session(
                 "channels": ["ticker"],
             });
             if let Err(e) = conn.send_text(&sub.to_string()) {
+                store.set_feed_mode_lockfree(SpotFeedMode::RestPoll);
                 store.set_last_error(Some(e));
-                *backoff_ms = (*backoff_ms).saturating_mul(2).min(WS_RECONNECT_MAX_MS);
-                *next_ws_attempt_ms = now_ms() + *backoff_ms as i64;
+                let (next_b, delay) = private_ws::next_ws_reconnect_delay_ms(*backoff_ms, false);
+                *backoff_ms = next_b;
+                *next_ws_attempt_ms = now_ms() + delay as i64;
                 return;
             }
+            store.set_feed_mode_lockfree(SpotFeedMode::WsStream);
             store.set_last_error(None);
             let mut session_valid = false;
+            let mut last_rx = Instant::now();
+            let mut last_ping_sent: Option<Instant> = None;
+
             loop {
-                if spot_feed_offline() {
+                if store.is_offline() || store.feed_generation() != start_gen {
+                    let _ = conn.send_masked_frame(0x8, &1000u16.to_be_bytes());
                     break;
+                }
+                if last_rx.elapsed() >= Duration::from_secs(WS_KEEPALIVE_TIMEOUT_SECS) {
+                    let _ = conn.send_masked_frame(0x8, &1001u16.to_be_bytes());
+                    store.set_last_error(Some("spot WS keepalive timeout".to_string()));
+                    break;
+                }
+                if last_rx.elapsed() >= Duration::from_secs(WS_KEEPALIVE_PING_SECS)
+                    && last_ping_sent
+                        .is_none_or(|t| t.elapsed() >= Duration::from_secs(WS_KEEPALIVE_PING_SECS))
+                {
+                    last_ping_sent = Some(Instant::now());
+                    if let Err(e) = conn.send_ping() {
+                        store.set_last_error(Some(e));
+                        break;
+                    }
                 }
                 match conn.read_frame() {
                     Ok((0x1, payload)) => {
+                        last_rx = Instant::now();
                         if let Ok(txt) = std::str::from_utf8(&payload) {
                             match store.ingest_ws_message(txt, Some("ws")) {
                                 Ok(n) => {
@@ -1378,11 +1433,25 @@ fn run_ws_session(
                             }
                         }
                     }
-                    Ok((0x8, _)) => {
-                        store.set_last_error(Some("spot WS closed by remote".to_string()));
+                    Ok((0x9, _)) | Ok((0xA, _)) => {
+                        last_rx = Instant::now();
+                    }
+                    Ok((0x8, close_payload)) => {
+                        let msg = match private_ws::parse_ws_close_info(&close_payload) {
+                            (Some(code), reason) if !reason.is_empty() => {
+                                format!("spot WS closed by remote (code {code}: {reason})")
+                            }
+                            (Some(code), _) => {
+                                format!("spot WS closed by remote (code {code})")
+                            }
+                            (None, _) => "spot WS closed by remote".to_string(),
+                        };
+                        store.set_last_error(Some(msg));
                         break;
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        last_rx = Instant::now();
+                    }
                     Err(ref e)
                         if matches!(
                             e.kind(),
@@ -1397,23 +1466,22 @@ fn run_ws_session(
                     }
                 }
             }
-            *backoff_ms = if session_valid {
-                WS_RECONNECT_INITIAL_MS
-            } else {
-                (*backoff_ms)
-                    .max(WS_RECONNECT_INITIAL_MS)
-                    .saturating_mul(2)
-                    .min(WS_RECONNECT_MAX_MS)
-            };
-            *next_ws_attempt_ms = now_ms() + *backoff_ms as i64;
+            if !store.is_offline() {
+                store.set_feed_mode_lockfree(SpotFeedMode::RestPoll);
+            }
+            let (next_b, delay) =
+                private_ws::next_ws_reconnect_delay_ms(*backoff_ms, session_valid);
+            *backoff_ms = next_b;
+            *next_ws_attempt_ms = now_ms() + delay as i64;
         }
         Err(e) => {
+            if !store.is_offline() {
+                store.set_feed_mode_lockfree(SpotFeedMode::RestPoll);
+            }
             store.set_last_error(Some(e));
-            *backoff_ms = (*backoff_ms)
-                .max(WS_RECONNECT_INITIAL_MS)
-                .saturating_mul(2)
-                .min(WS_RECONNECT_MAX_MS);
-            *next_ws_attempt_ms = now_ms() + *backoff_ms as i64;
+            let (next_b, delay) = private_ws::next_ws_reconnect_delay_ms(*backoff_ms, false);
+            *backoff_ms = next_b;
+            *next_ws_attempt_ms = now_ms() + delay as i64;
         }
     }
 }
@@ -1497,6 +1565,72 @@ mod tests {
             assert!(store.ingest_tick("ETH", 3150.0, now + 200, "ws"));
             assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spot_h1_corrupt_cache_recovery_outlier_clock_skew_and_feed_switch() {
+        let dir = std::env::temp_dir().join(format!("ob-spot-h1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let now = now_ms();
+        let path = dir.join("spot_ticks.jsonl");
+        let valid = format!(
+            "{{\"ts_ms\":{},\"asset\":\"BTC\",\"price\":94000.0,\"source\":\"ws\"}}\n",
+            now - 2_000
+        );
+        let mut raw = valid.into_bytes();
+        // Truncated trailing line without newline (crash mid-write)
+        raw.extend_from_slice(br#"{"ts_ms":1700000000,"asset":"BTC","price":99"#);
+        std::fs::write(&path, &raw).unwrap();
+
+        // Startup recovers valid tick and truncates corrupt trailing line
+        let store = SpotFeedStore::new(dir.clone());
+        let st = store.status_snapshot();
+        let btc = st.assets.iter().find(|a| a.asset == "BTC").unwrap();
+        assert_eq!(btc.price, Some(94_000.0));
+        assert!(!btc.stale);
+
+        // Outlier price guard: single 10x spike rejected; 2 consecutive confirming ticks accept regime shift
+        assert!(!store.ingest_tick("BTC", 940_000.0, now, "ws"));
+        assert_eq!(
+            store.latest_fresh_for_series("KXBTC15M").unwrap().price,
+            Some(94_000.0)
+        );
+        // Unconfirmed 3x spike rejected once, confirmed on second tick
+        assert!(!store.ingest_tick("BTC", 250_000.0, now + 50, "ws"));
+        assert!(store.ingest_tick("BTC", 255_000.0, now + 100, "ws"));
+        assert_eq!(
+            store.latest_fresh_for_series("KXBTC15M").unwrap().price,
+            Some(255_000.0)
+        );
+
+        // Excessive future clock skew (>30s ahead) rejected
+        assert!(!store.ingest_tick("ETH", 3200.0, now + 60_000, "ws"));
+        assert!(store.latest_fresh_for_series("ETH").is_none());
+
+        // Moderate future skew (15s ahead) clamped to `now` so it cannot poison staleness
+        assert!(store.ingest_tick("ETH", 3200.0, now + 15_000, "ws"));
+        let eth = store
+            .status_snapshot()
+            .assets
+            .into_iter()
+            .find(|a| a.asset == "ETH")
+            .unwrap();
+        assert_eq!(eth.price, Some(3200.0));
+        assert!(eth.updated_ms.unwrap() <= now + 1_000);
+
+        // Lock-free feed switch increments generation and updates offline state without blocking
+        let g0 = store.feed_generation();
+        let g1 = store.switch_feed(Some("http://127.0.0.1:19999/spot".to_string()), Some(false));
+        assert!(g1 > g0);
+        assert!(!store.is_offline());
+        let g2 = store.switch_feed(None, Some(true));
+        assert!(g2 > g1);
+        assert!(store.is_offline());
+        assert_eq!(store.active_feed_mode(), SpotFeedMode::Offline);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

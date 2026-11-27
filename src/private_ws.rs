@@ -20,7 +20,7 @@ use crate::{kalshi_live, orderbook, risk_rails, tape_hub, App};
 use base64::Engine as _;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -33,6 +33,10 @@ const MAX_WS_CONTINUATION_FRAMES: usize = 128;
 const MAX_CONSECUTIVE_MALFORMED_WS_FRAMES: usize = 8;
 const KEEPALIVE_PING_SECS: u64 = 15;
 const KEEPALIVE_TIMEOUT_SECS: u64 = 30;
+const WS_CONNECT_TIMEOUT_SECS: u64 = 5;
+const WS_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+const WS_RECONNECT_INITIAL_MS: u64 = 1_000;
+const WS_RECONNECT_MAX_MS: u64 = 30_000;
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -63,31 +67,34 @@ fn is_loopback_host(host: &str) -> bool {
     matches!(lower.as_str(), "127.0.0.1" | "localhost" | "[::1]")
 }
 
-/// Parse and validate a WebSocket URL (`wss://` anywhere, `ws://` loopback-only).
-/// Defaults an omitted path to `/trade-api/ws/v2`.
-pub fn parse_ws_url(url: &str) -> Result<(bool, String, u16, String), String> {
+/// Parse and validate a WebSocket URL (`wss://` anywhere, `ws://` loopback-only),
+/// using `default_path` when the path component is omitted.
+pub(crate) fn parse_ws_url_with_default(
+    url: &str,
+    default_path: &str,
+) -> Result<(bool, String, u16, String), String> {
     let trimmed = url.trim();
     if trimmed.is_empty()
         || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
     {
-        return Err("private WS URL is empty or contains invalid characters".to_string());
+        return Err("WS URL is empty or contains invalid characters".to_string());
     }
     let (tls, rest) = if let Some(r) = trimmed.strip_prefix("wss://") {
         (true, r)
     } else if let Some(r) = trimmed.strip_prefix("ws://") {
         (false, r)
     } else {
-        return Err("private WS URL must start with wss:// or ws://".to_string());
+        return Err("WS URL must start with wss:// or ws://".to_string());
     };
 
     let (authority, path) = match rest.split_once('/') {
         Some((a, p)) => (a, format!("/{p}")),
-        None => (rest, DEFAULT_WS_PATH.to_string()),
+        None => (rest, default_path.to_string()),
     };
 
     let (host, port) = if authority.starts_with('[') {
         let Some(end_bracket) = authority.find(']') else {
-            return Err("private WS URL has invalid IPv6 host".to_string());
+            return Err("WS URL has invalid IPv6 host".to_string());
         };
         let h = &authority[..=end_bracket];
         let tail = &authority[end_bracket + 1..];
@@ -96,30 +103,35 @@ pub fn parse_ws_url(url: &str) -> Result<(bool, String, u16, String), String> {
         } else if let Some(p_str) = tail.strip_prefix(':') {
             let port = p_str
                 .parse::<u16>()
-                .map_err(|_| "invalid private WS port".to_string())?;
+                .map_err(|_| "invalid WS port".to_string())?;
             (h.to_string(), port)
         } else {
-            return Err("invalid private WS authority".to_string());
+            return Err("invalid WS authority".to_string());
         }
     } else if let Some((h, p_str)) = authority.rsplit_once(':') {
         let port = p_str
             .parse::<u16>()
-            .map_err(|_| "invalid private WS port".to_string())?;
+            .map_err(|_| "invalid WS port".to_string())?;
         (h.to_string(), port)
     } else {
         (authority.to_string(), if tls { 443 } else { 80 })
     };
 
     if host.is_empty() {
-        return Err("private WS URL missing host".to_string());
+        return Err("WS URL missing host".to_string());
     }
     if !tls && !is_loopback_host(&host) {
         return Err(
-            "plain ws:// private WS URL is permitted only for loopback addresses; use wss://"
-                .to_string(),
+            "plain ws:// URL is permitted only for loopback addresses; use wss://".to_string(),
         );
     }
     Ok((tls, host, port, path))
+}
+
+/// Parse and validate a private WebSocket URL (`wss://` anywhere, `ws://` loopback-only).
+/// Defaults an omitted path to `/trade-api/ws/v2`.
+pub fn parse_ws_url(url: &str) -> Result<(bool, String, u16, String), String> {
+    parse_ws_url_with_default(url, DEFAULT_WS_PATH)
 }
 
 /// Resolve the target authenticated private WebSocket URL for `cfg`, or `None`
@@ -148,7 +160,7 @@ pub fn resolve_private_ws_url(cfg: &kalshi_live::PersistedLiveConfig) -> Option<
     }
 }
 
-enum WsTransport {
+pub(crate) enum WsTransport {
     Plain(TcpStream),
     TlsProc {
         child: Child,
@@ -189,40 +201,101 @@ impl Drop for WsTransport {
     }
 }
 
-struct WsConnection {
+/// Validates RFC 6455 section 7.4 close status codes allowed on the wire.
+pub(crate) fn is_valid_ws_close_code(code: u16) -> bool {
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
+}
+
+/// Formats a received RFC 6455 close frame payload `(code, reason)` into a safe diagnostic string.
+pub(crate) fn parse_ws_close_info(payload: &[u8]) -> (Option<u16>, String) {
+    if payload.len() < 2 {
+        return (None, String::new());
+    }
+    let code = u16::from_be_bytes([payload[0], payload[1]]);
+    let reason = if payload.len() > 2 {
+        String::from_utf8_lossy(&payload[2..]).trim().to_string()
+    } else {
+        String::new()
+    };
+    (Some(code), reason)
+}
+
+/// Computes `(next_base_backoff_ms, jittered_delay_ms)` for bounded exponential WS reconnects.
+pub fn next_ws_reconnect_delay_ms(current_backoff_ms: u64, had_valid_message: bool) -> (u64, u64) {
+    let next_base = if had_valid_message {
+        WS_RECONNECT_INITIAL_MS
+    } else {
+        current_backoff_ms
+            .max(WS_RECONNECT_INITIAL_MS)
+            .saturating_mul(2)
+            .min(WS_RECONNECT_MAX_MS)
+    };
+    let mut rand_bytes = [0u8; 8];
+    let _ = getrandom::getrandom(&mut rand_bytes);
+    let rand_u64 = u64::from_le_bytes(rand_bytes);
+    // Symmetric +/-12.5% bounded jitter around `next_base` (clamped 250ms..=30s).
+    let span = (next_base / 4).max(1);
+    let half = span / 2;
+    let offset = rand_u64 % (span + 1);
+    let jittered = next_base
+        .saturating_sub(half)
+        .saturating_add(offset)
+        .clamp(250, WS_RECONNECT_MAX_MS);
+    (next_base, jittered)
+}
+
+pub(crate) struct WsConnection {
     io: WsTransport,
     leftover: Vec<u8>,
     offset: usize,
+    frag_opcode: u8,
+    frag_buf: Vec<u8>,
+    frag_count: usize,
+    max_frame_bytes: usize,
+    max_continuation_frames: usize,
 }
 
 impl WsConnection {
-    fn read_exact_bytes(&mut self, dst: &mut [u8]) -> std::io::Result<()> {
-        let mut filled = 0usize;
-        while filled < dst.len() {
-            if self.offset < self.leftover.len() {
-                let avail = self.leftover.len() - self.offset;
-                let take = avail.min(dst.len() - filled);
-                dst[filled..filled + take]
-                    .copy_from_slice(&self.leftover[self.offset..self.offset + take]);
-                self.offset += take;
-                filled += take;
-                continue;
-            }
-            let n = self.io.read(&mut dst[filled..])?;
+    pub(crate) fn from_plain_stream(
+        stream: TcpStream,
+        leftover: Vec<u8>,
+        max_frame_bytes: usize,
+        max_continuation_frames: usize,
+    ) -> Self {
+        Self {
+            io: WsTransport::Plain(stream),
+            leftover,
+            offset: 0,
+            frag_opcode: 0,
+            frag_buf: Vec::new(),
+            frag_count: 0,
+            max_frame_bytes: max_frame_bytes.max(1024),
+            max_continuation_frames: max_continuation_frames.max(1),
+        }
+    }
+
+    fn ensure_buffered(&mut self, cursor: usize, need: usize) -> std::io::Result<()> {
+        let mut tmp = [0u8; 4096];
+        while self.leftover.len().saturating_sub(cursor) < need {
+            let n = self.io.read(&mut tmp)?;
             if n == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "websocket EOF",
                 ));
             }
-            filled += n;
+            self.leftover.extend_from_slice(&tmp[..n]);
         }
         Ok(())
     }
 
-    fn send_masked_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), String> {
+    pub(crate) fn send_masked_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), String> {
+        let op = opcode & 0x0f;
+        if op >= 0x8 && payload.len() > 125 {
+            return Err("WS control frame payload exceeds 125 bytes".to_string());
+        }
         let mut frame = Vec::with_capacity(payload.len() + 14);
-        frame.push(0x80 | (opcode & 0x0f));
+        frame.push(0x80 | op);
         let len = payload.len();
         if len < 126 {
             frame.push(0x80 | (len as u8));
@@ -242,32 +315,42 @@ impl WsConnection {
         self.io
             .write_all(&frame)
             .and_then(|_| self.io.flush())
-            .map_err(|e| format!("private WS write failed: {e}"))
+            .map_err(|e| format!("WS write failed: {e}"))
     }
 
-    fn send_text(&mut self, text: &str) -> Result<(), String> {
+    pub(crate) fn send_text(&mut self, text: &str) -> Result<(), String> {
         self.send_masked_frame(0x1, text.as_bytes())
     }
 
-    fn send_ping(&mut self) -> Result<(), String> {
+    pub(crate) fn send_ping(&mut self) -> Result<(), String> {
         self.send_masked_frame(0x9, b"ob-ping")
     }
 
-    fn read_frame(&mut self) -> std::io::Result<(u8, Vec<u8>)> {
-        let mut full_payload = Vec::new();
-        let mut first_opcode = 0u8;
-        let mut fragments = 0usize;
+    /// Reads one complete WS frame (reassembling fragmented data frames and handling
+    /// interleaved RFC 6455 Ping/Pong/Close control frames without losing partial reads
+    /// across `WouldBlock`/`TimedOut`).
+    pub(crate) fn read_frame(&mut self) -> std::io::Result<(u8, Vec<u8>)> {
         loop {
-            fragments += 1;
-            if fragments > MAX_WS_CONTINUATION_FRAMES {
+            if self.offset >= self.leftover.len() {
+                self.leftover.clear();
+                self.offset = 0;
+            } else if self.offset > 4096 {
+                self.leftover.drain(..self.offset);
+                self.offset = 0;
+            }
+
+            let mut cursor = self.offset;
+            self.ensure_buffered(cursor, 2)?;
+            let hdr = [self.leftover[cursor], self.leftover[cursor + 1]];
+            cursor += 2;
+
+            let fin = (hdr[0] & 0x80) != 0;
+            if (hdr[0] & 0x70) != 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "ws too many continuation frames",
+                    "ws reserved bits set",
                 ));
             }
-            let mut hdr = [0u8; 2];
-            self.read_exact_bytes(&mut hdr)?;
-            let fin = (hdr[0] & 0x80) != 0;
             let opcode = hdr[0] & 0x0f;
             if !matches!(opcode, 0x0..=0x2 | 0x8..=0xA) {
                 return Err(std::io::Error::new(
@@ -275,22 +358,26 @@ impl WsConnection {
                     "ws unknown opcode",
                 ));
             }
-            if opcode == 0 && first_opcode == 0 {
+            if opcode == 0 && self.frag_opcode == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "ws unexpected continuation frame",
                 ));
             }
-            if first_opcode != 0 && opcode != 0 && opcode < 0x8 {
+            if self.frag_opcode != 0 && opcode != 0 && opcode < 0x8 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "ws interleaved data frame during continuation",
                 ));
             }
-            if first_opcode == 0 && opcode != 0 && opcode < 0x8 {
-                first_opcode = opcode;
-            }
+
             let masked = (hdr[1] & 0x80) != 0;
+            if masked {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ws masked frame from server",
+                ));
+            }
             let len7 = hdr[1] & 0x7f;
             if opcode >= 0x8 && (!fin || len7 > 125) {
                 return Err(std::io::Error::new(
@@ -298,18 +385,25 @@ impl WsConnection {
                     "ws invalid control frame",
                 ));
             }
+
             let payload_len: usize = match len7 {
                 0..=125 => len7 as usize,
                 126 => {
-                    let mut ext = [0u8; 2];
-                    self.read_exact_bytes(&mut ext)?;
-                    u16::from_be_bytes(ext) as usize
+                    self.ensure_buffered(cursor, 2)?;
+                    let len = u16::from_be_bytes([
+                        self.leftover[cursor],
+                        self.leftover[cursor + 1],
+                    ]) as usize;
+                    cursor += 2;
+                    len
                 }
                 _ => {
+                    self.ensure_buffered(cursor, 8)?;
                     let mut ext = [0u8; 8];
-                    self.read_exact_bytes(&mut ext)?;
+                    ext.copy_from_slice(&self.leftover[cursor..cursor + 8]);
+                    cursor += 8;
                     let v = u64::from_be_bytes(ext);
-                    if v > MAX_WS_FRAME_BYTES as u64 {
+                    if (v & (1u64 << 63)) != 0 || v > self.max_frame_bytes as u64 {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "ws frame too large",
@@ -318,72 +412,140 @@ impl WsConnection {
                     v as usize
                 }
             };
-            if payload_len > MAX_WS_FRAME_BYTES
-                || full_payload
-                    .len()
-                    .checked_add(payload_len)
-                    .is_none_or(|sum| sum > MAX_WS_FRAME_BYTES)
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ws payload exceeds limit",
-                ));
-            }
-            let mut mask_key = [0u8; 4];
-            if masked {
-                self.read_exact_bytes(&mut mask_key)?;
-            }
-            let start = full_payload.len();
-            full_payload.resize(start + payload_len, 0);
-            if payload_len > 0 {
-                self.read_exact_bytes(&mut full_payload[start..])?;
-                if masked {
-                    for (i, b) in full_payload[start..].iter_mut().enumerate() {
-                        *b ^= mask_key[i & 3];
-                    }
+
+            if opcode < 0x8 {
+                if self.frag_count + 1 > self.max_continuation_frames {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "ws too many continuation frames",
+                    ));
+                }
+                if payload_len > self.max_frame_bytes
+                    || self
+                        .frag_buf
+                        .len()
+                        .checked_add(payload_len)
+                        .is_none_or(|sum| sum > self.max_frame_bytes)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "ws payload exceeds limit",
+                    ));
                 }
             }
+
+            self.ensure_buffered(cursor, payload_len)?;
+            let payload_start = cursor;
+            cursor += payload_len;
+            // Commit frame offset only once the full frame payload is present.
+            self.offset = cursor;
+
             if opcode == 0x9 {
-                let _ = self.send_masked_frame(0xA, &full_payload[start..]);
-                full_payload.truncate(start);
-                return Ok((0x9, Vec::new()));
+                let ping_payload = self.leftover[payload_start..cursor].to_vec();
+                let _ = self.send_masked_frame(0xA, &ping_payload);
+                return Ok((0x9, ping_payload));
             }
             if opcode == 0xA {
-                full_payload.truncate(start);
-                return Ok((0xA, Vec::new()));
+                let pong_payload = self.leftover[payload_start..cursor].to_vec();
+                return Ok((0xA, pong_payload));
             }
             if opcode == 0x8 {
-                return Ok((0x8, full_payload));
+                let close_payload = self.leftover[payload_start..cursor].to_vec();
+                self.frag_opcode = 0;
+                self.frag_buf.clear();
+                self.frag_count = 0;
+                if close_payload.len() == 1 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "ws invalid 1-byte close payload",
+                    ));
+                }
+                if close_payload.len() >= 2 {
+                    let code = u16::from_be_bytes([close_payload[0], close_payload[1]]);
+                    if !is_valid_ws_close_code(code) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("ws invalid close code {code}"),
+                        ));
+                    }
+                    if close_payload.len() > 2 && std::str::from_utf8(&close_payload[2..]).is_err()
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "ws close reason is not valid UTF-8",
+                        ));
+                    }
+                    let _ = self.send_masked_frame(0x8, &close_payload[..2]);
+                } else {
+                    let _ = self.send_masked_frame(0x8, &1000u16.to_be_bytes());
+                }
+                return Ok((0x8, close_payload));
             }
+
+            self.frag_count += 1;
+            if self.frag_opcode == 0 {
+                self.frag_opcode = opcode;
+            }
+            self.frag_buf
+                .extend_from_slice(&self.leftover[payload_start..cursor]);
             if fin {
-                return Ok((first_opcode, full_payload));
+                let out_opcode = self.frag_opcode;
+                let out_payload = std::mem::take(&mut self.frag_buf);
+                self.frag_opcode = 0;
+                self.frag_count = 0;
+                return Ok((out_opcode, out_payload));
             }
         }
     }
 }
 
-fn connect_private_ws(
+pub(crate) fn connect_ws_with_headers(
     url: &str,
-    client: &kalshi_live::KalshiLiveClient,
+    default_path: &str,
+    extra_headers: &[(String, String)],
+    max_frame_bytes: usize,
+    max_continuation_frames: usize,
+    label: &str,
 ) -> Result<WsConnection, String> {
-    let (tls, host, port, path) = parse_ws_url(url)?;
-    let auth_headers = client.sign_ws_handshake_headers(Some(&path))?;
+    let (tls, host, port, path) = parse_ws_url_with_default(url, default_path)?;
 
     let mut io = if !tls {
-        let addr = format!("{host}:{port}");
-        let stream = TcpStream::connect(&addr)
-            .map_err(|e| format!("private WS TCP connect failed: {e}"))?;
+        let addr_str = format!("{host}:{port}");
+        let addrs: Vec<_> = addr_str
+            .to_socket_addrs()
+            .map_err(|e| format!("{label} DNS resolve failed: {e}"))?
+            .collect();
+        let mut last_err = None;
+        let mut connected = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, Duration::from_secs(WS_CONNECT_TIMEOUT_SECS)) {
+                Ok(s) => {
+                    connected = Some(s);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let stream = connected.ok_or_else(|| {
+            format!(
+                "{label} TCP connect failed: {}",
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "no resolved addresses".to_string())
+            )
+        })?;
         let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
         WsTransport::Plain(stream)
     } else {
+        let clean_host = host.trim_start_matches('[').trim_end_matches(']');
         let target = format!("{host}:{port}");
         let mut child = Command::new("openssl")
             .args([
                 "s_client",
                 "-quiet",
                 "-servername",
-                &host,
+                clean_host,
                 "-connect",
                 &target,
             ])
@@ -391,15 +553,15 @@ fn connect_private_ws(
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("private WS TLS transport unavailable: {e}"))?;
+            .map_err(|e| format!("{label} TLS transport unavailable: {e}"))?;
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| "private WS TLS stdin unavailable".to_string())?;
+            .ok_or_else(|| format!("{label} TLS stdin unavailable"))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| "private WS TLS stdout unavailable".to_string())?;
+            .ok_or_else(|| format!("{label} TLS stdout unavailable"))?;
         WsTransport::TlsProc {
             child,
             stdin,
@@ -425,38 +587,50 @@ fn connect_private_ws(
          Sec-WebSocket-Key: {ws_key}\r\n\
          Sec-WebSocket-Version: 13\r\n"
     );
-    for (k, v) in auth_headers {
+    for (k, v) in extra_headers {
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("\r\n");
     io.write_all(req.as_bytes())
         .and_then(|_| io.flush())
-        .map_err(|e| format!("private WS handshake write failed: {e}"))?;
+        .map_err(|e| format!("{label} handshake write failed: {e}"))?;
 
     let mut resp_buf = Vec::with_capacity(2048);
     let mut tmp = [0u8; 1024];
+    let deadline = Instant::now() + Duration::from_secs(WS_HANDSHAKE_TIMEOUT_SECS);
     let hdr_end = loop {
         if resp_buf.len() > 16_384 {
-            return Err("private WS handshake response too large".to_string());
+            return Err(format!("{label} handshake response too large"));
         }
-        let n = io
-            .read(&mut tmp)
-            .map_err(|e| format!("private WS handshake read failed: {e}"))?;
-        if n == 0 {
-            return Err("private WS handshake closed before 101".to_string());
-        }
-        resp_buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = resp_buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos;
+        match io.read(&mut tmp) {
+            Ok(0) => return Err(format!("{label} handshake closed before 101")),
+            Ok(n) => {
+                resp_buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = resp_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos;
+                }
+            }
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(format!("{label} handshake timed out"));
+                }
+                continue;
+            }
+            Err(e) => return Err(format!("{label} handshake read failed: {e}")),
         }
     };
 
     let hdr_str = std::str::from_utf8(&resp_buf[..hdr_end])
-        .map_err(|_| "private WS handshake response not UTF-8".to_string())?;
+        .map_err(|_| format!("{label} handshake response not UTF-8"))?;
     let mut lines = hdr_str.split("\r\n");
     let status_line = lines.next().unwrap_or("");
-    if !status_line.contains(" 101 ") {
-        return Err(format!("private WS upgrade rejected: {status_line}"));
+    if status_line.split_whitespace().nth(1) != Some("101") {
+        return Err(format!("{label} upgrade rejected: {status_line}"));
     }
     let mut accept_ok = false;
     for l in lines {
@@ -469,7 +643,7 @@ fn connect_private_ws(
         }
     }
     if !accept_ok {
-        return Err("private WS Sec-WebSocket-Accept mismatch".to_string());
+        return Err(format!("{label} Sec-WebSocket-Accept mismatch"));
     }
 
     let leftover = resp_buf[hdr_end + 4..].to_vec();
@@ -477,7 +651,28 @@ fn connect_private_ws(
         io,
         leftover,
         offset: 0,
+        frag_opcode: 0,
+        frag_buf: Vec::new(),
+        frag_count: 0,
+        max_frame_bytes: max_frame_bytes.max(1024),
+        max_continuation_frames: max_continuation_frames.max(1),
     })
+}
+
+fn connect_private_ws(
+    url: &str,
+    client: &kalshi_live::KalshiLiveClient,
+) -> Result<WsConnection, String> {
+    let (_, _, _, path) = parse_ws_url(url)?;
+    let auth_headers = client.sign_ws_handshake_headers(Some(&path))?;
+    connect_ws_with_headers(
+        url,
+        DEFAULT_WS_PATH,
+        &auth_headers,
+        MAX_WS_FRAME_BYTES,
+        MAX_WS_CONTINUATION_FRAMES,
+        "private WS",
+    )
 }
 
 /// Tracks monotonic `seq` per subscription `sid` to detect missed WS frames.
@@ -587,10 +782,9 @@ fn ingest_fill_event(app: &App, payload: &serde_json::Value, now: i64) -> Result
     let Some(fill) = kalshi_live::parse_kalshi_fill(payload) else {
         return Err("private WS fill missing ticker/order_id".to_string());
     };
-    let _ = app
-        .runner
-        .reconcile_live_data(&[], std::slice::from_ref(&fill), &[], now);
-    app.runner.notify_tick();
+    if fill.count <= 0 {
+        return Err("private WS fill has non-positive count".to_string());
+    }
 
     let payload_cid = payload
         .get("client_order_id")
@@ -612,10 +806,15 @@ fn ingest_fill_event(app: &App, payload: &serde_json::Value, now: i64) -> Result
         if inserted {
             let fill_notional =
                 (fill.count.max(0) as f64) * (rec.price_cents as f64 / 100.0);
+            let signed_delta = if fill.side.eq_ignore_ascii_case("no") {
+                -fill.count
+            } else {
+                fill.count
+            };
             if fill.action.eq_ignore_ascii_case("sell") {
                 st.rails.release_exposure(fill_notional);
                 if let Some(pos) = st.ws_positions.get_mut(&fill.ticker) {
-                    pos.position = (pos.position.abs() - fill.count.max(0)).max(0);
+                    pos.position -= signed_delta;
                     pos.market_exposure_dollars =
                         (pos.market_exposure_dollars - fill_notional).max(0.0);
                     pos.market_exposure_cents =
@@ -662,7 +861,7 @@ fn ingest_fill_event(app: &App, payload: &serde_json::Value, now: i64) -> Result
                             fees_paid_dollars: 0.0,
                             total_traded_dollars: 0.0,
                         });
-                entry.position += fill.count.max(0);
+                entry.position += signed_delta;
                 entry.market_exposure_dollars += fill_notional;
                 entry.market_exposure_cents =
                     (entry.market_exposure_dollars * 100.0).round() as i64;
@@ -676,6 +875,10 @@ fn ingest_fill_event(app: &App, payload: &serde_json::Value, now: i64) -> Result
     };
 
     if inserted {
+        let _ = app
+            .runner
+            .reconcile_live_data(&[], std::slice::from_ref(&fill), &[], now);
+        app.runner.notify_tick();
         app.invalidate_live_hot();
         publish_live_exec_sse(
             "fill",
@@ -694,115 +897,166 @@ fn ingest_fill_event(app: &App, payload: &serde_json::Value, now: i64) -> Result
     Ok(())
 }
 
+fn is_terminal_order_status(status_lc: &str) -> bool {
+    matches!(status_lc, "canceled" | "cancelled" | "executed")
+}
+
 fn ingest_order_event(app: &App, payload: &serde_json::Value, now: i64) -> Result<(), String> {
     let Some(ord) = kalshi_live::parse_kalshi_order(payload) else {
         return Err("private WS order missing order_id".to_string());
     };
-    let _ = app
-        .runner
-        .reconcile_live_data(std::slice::from_ref(&ord), &[], &[], now);
-    app.runner.notify_tick();
-
+    let status_lc = ord.status.trim().to_ascii_lowercase();
     let price_c = order_price_cents(&ord);
-    let snap = {
+
+    let (should_emit, snap) = {
         let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
         st.private_ws_connected = true;
         st.private_ws_last_event_epoch = Some(now);
         st.connected = true;
         st.rails.last_error = None;
 
-        if ord.status.eq_ignore_ascii_case("canceled")
-            || ord.status.eq_ignore_ascii_case("cancelled")
-        {
-            let removed = st.reserved_order_exposure.remove(&ord.order_id);
-            let released = if let Some(r) = removed {
-                r
-            } else if ord.action.eq_ignore_ascii_case("buy") {
-                if ord.remaining_count > 0 {
-                    (ord.remaining_count as f64) * (price_c as f64 / 100.0)
+        let prev = st.ws_orders.get(&ord.order_id).cloned();
+        let prev_terminal = prev
+            .as_ref()
+            .is_some_and(|(s, _, _)| is_terminal_order_status(s));
+        let exact_dup = prev
+            .as_ref()
+            .is_some_and(|(s, rem, px)| s == &status_lc && *rem == ord.remaining_count && *px == price_c);
+        let stale_after_terminal = prev_terminal && !is_terminal_order_status(&status_lc);
+
+        let mut changed = !exact_dup && !stale_after_terminal;
+        if !exact_dup && !stale_after_terminal {
+            if status_lc == "canceled" || status_lc == "cancelled" {
+                let removed = st.reserved_order_exposure.remove(&ord.order_id);
+                let rec = risk_rails::execution_record_from_canceled_order(&ord, now);
+                let inserted = st.executions.append_idempotent(rec);
+                let released = if let Some(r) = removed {
+                    r
+                } else if inserted && ord.action.eq_ignore_ascii_case("buy") {
+                    if ord.remaining_count > 0 {
+                        (ord.remaining_count as f64) * (price_c as f64 / 100.0)
+                    } else {
+                        st.executions
+                            .submitted_notional_for(&ord.order_id)
+                            .unwrap_or(0.0)
+                    }
                 } else {
-                    st.executions
-                        .submitted_notional_for(&ord.order_id)
-                        .unwrap_or(0.0)
+                    0.0
+                };
+                if released > 0.0 {
+                    st.rails.release_exposure(released);
                 }
-            } else {
-                0.0
-            };
-            st.rails.release_exposure(released);
-            let rec = risk_rails::execution_record_from_canceled_order(&ord, now);
-            st.executions.append_idempotent(rec);
-        } else if ord.status.eq_ignore_ascii_case("executed") || ord.remaining_count <= 0 {
-            st.reserved_order_exposure.remove(&ord.order_id);
-        } else if ord.status.eq_ignore_ascii_case("resting")
-            && ord.action.eq_ignore_ascii_case("buy")
-            && ord.remaining_count > 0
-        {
-            let rem_notional = (ord.remaining_count as f64) * (price_c as f64 / 100.0);
-            if let Some(prev) = st
-                .reserved_order_exposure
-                .insert(ord.order_id.clone(), rem_notional)
+                changed = inserted || removed.is_some() || !prev_terminal;
+            } else if status_lc == "executed" || ord.remaining_count <= 0 {
+                st.reserved_order_exposure.remove(&ord.order_id);
+            } else if status_lc == "resting"
+                && ord.action.eq_ignore_ascii_case("buy")
+                && ord.remaining_count > 0
             {
-                let diff = rem_notional - prev;
-                st.rails.open_exposure_dollars =
-                    (st.rails.open_exposure_dollars + diff).max(0.0);
+                let rem_notional = (ord.remaining_count as f64) * (price_c as f64 / 100.0);
+                if let Some(prev_res) = st
+                    .reserved_order_exposure
+                    .insert(ord.order_id.clone(), rem_notional)
+                {
+                    let diff = rem_notional - prev_res;
+                    st.rails.open_exposure_dollars =
+                        (st.rails.open_exposure_dollars + diff).max(0.0);
+                }
             }
+            if st.ws_orders.len() > 20_000 {
+                st.ws_orders.retain(|_, (s, _, _)| !is_terminal_order_status(s));
+            }
+            st.ws_orders
+                .insert(ord.order_id.clone(), (status_lc.clone(), ord.remaining_count, price_c));
         }
 
         let open_exp = st.rails.open_exposure_dollars;
         let loss = st.rails.daily_realized_loss_dollars;
         st.rails.record_venue_sync(now, open_exp, loss);
-        st.status_snapshot()
+        (changed, st.status_snapshot())
     };
 
-    app.invalidate_live_hot();
-    publish_live_exec_sse(
-        "order",
-        "private_ws",
-        Some(&ord.ticker),
-        Some(&ord.order_id),
-        None,
-        Some(&ord.status),
-        Some(ord.remaining_count),
-        Some(price_c),
-        None,
-        &snap,
-        now,
-    );
+    if should_emit {
+        let _ = app
+            .runner
+            .reconcile_live_data(std::slice::from_ref(&ord), &[], &[], now);
+        app.runner.notify_tick();
+        app.invalidate_live_hot();
+        publish_live_exec_sse(
+            "order",
+            "private_ws",
+            Some(&ord.ticker),
+            Some(&ord.order_id),
+            None,
+            Some(&ord.status),
+            Some(ord.remaining_count),
+            Some(price_c),
+            None,
+            &snap,
+            now,
+        );
+    }
     Ok(())
+}
+
+fn position_unchanged(
+    prev: &kalshi_live::KalshiPosition,
+    next: &kalshi_live::KalshiPosition,
+) -> bool {
+    prev.position == next.position
+        && prev.market_exposure_cents == next.market_exposure_cents
+        && prev.realized_pnl_cents == next.realized_pnl_cents
+        && prev.resting_orders_count == next.resting_orders_count
+        && (prev.market_exposure_dollars - next.market_exposure_dollars).abs() <= 1e-6
+        && (prev.realized_pnl_dollars - next.realized_pnl_dollars).abs() <= 1e-6
+        && (prev.fees_paid_dollars - next.fees_paid_dollars).abs() <= 1e-6
+        && (prev.total_traded_dollars - next.total_traded_dollars).abs() <= 1e-6
 }
 
 fn ingest_position_event(app: &App, payload: &serde_json::Value, now: i64) -> Result<(), String> {
     let Some(pos) = kalshi_live::parse_kalshi_position(payload) else {
         return Err("private WS position missing ticker".to_string());
     };
-    app.runner.notify_tick();
 
-    let snap = {
+    let (changed, snap) = {
         let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
         st.private_ws_connected = true;
         st.private_ws_last_event_epoch = Some(now);
         st.connected = true;
         st.rails.last_error = None;
-        st.ws_positions.insert(pos.ticker.clone(), pos.clone());
-        let (open_exp, eff_loss) = recompute_live_exposure_and_loss(&mut st);
-        st.rails.record_venue_sync(now, open_exp, eff_loss);
-        st.status_snapshot()
+        let changed = st
+            .ws_positions
+            .get(&pos.ticker)
+            .is_none_or(|prev| !position_unchanged(prev, &pos));
+        if changed {
+            st.ws_positions.insert(pos.ticker.clone(), pos.clone());
+            let (open_exp, eff_loss) = recompute_live_exposure_and_loss(&mut st);
+            st.rails.record_venue_sync(now, open_exp, eff_loss);
+        } else {
+            let open_exp = st.rails.open_exposure_dollars;
+            let loss = st.rails.daily_realized_loss_dollars;
+            st.rails.record_venue_sync(now, open_exp, loss);
+        }
+        (changed, st.status_snapshot())
     };
 
-    app.invalidate_live_hot();
-    publish_live_exec_sse(
-        "position",
-        "private_ws",
-        Some(&pos.ticker),
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(pos.position),
-        &snap,
-        now,
-    );
+    if changed {
+        app.runner.notify_tick();
+        app.invalidate_live_hot();
+        publish_live_exec_sse(
+            "position",
+            "private_ws",
+            Some(&pos.ticker),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(pos.position),
+            &snap,
+            now,
+        );
+    }
     Ok(())
 }
 
@@ -897,14 +1151,31 @@ pub(crate) fn ingest_private_ws_message(
 }
 
 fn mark_ws_disconnected(app: &App, err: Option<String>, trigger_reconcile: bool) {
-    {
+    let (was_connected, snap) = {
         let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+        let was = st.private_ws_connected;
         st.private_ws_connected = false;
         if let Some(e) = err {
             st.rails.last_error = Some(e);
         }
-    }
+        (was, st.status_snapshot())
+    };
     app.invalidate_live_hot();
+    if was_connected && trigger_reconcile {
+        publish_live_exec_sse(
+            "ws_disconnected",
+            "private_ws",
+            None,
+            None,
+            None,
+            Some("disconnected"),
+            None,
+            None,
+            None,
+            &snap,
+            now_unix(),
+        );
+    }
     if trigger_reconcile {
         app.notify_reconcile_immediate();
     }
@@ -932,7 +1203,7 @@ fn wait_private_ws_or_timeout(app: &App, last_seen_seq: u64, dur: Option<Duratio
 /// Parks idle at 0% CPU / 0 network when offline or unconfigured.
 pub fn start_background_private_ws(app: Arc<App>) {
     std::thread::spawn(move || {
-        let mut backoff_ms = 1_000u64;
+        let mut backoff_ms = WS_RECONNECT_INITIAL_MS;
         let mut next_attempt_ms = 0i64;
 
         loop {
@@ -951,7 +1222,7 @@ pub fn start_background_private_ws(app: Arc<App>) {
             let (Some(cfg), Some(ws_url)) = (cfg_opt, ws_url_opt) else {
                 mark_ws_disconnected(&app, None, false);
                 wait_private_ws_or_timeout(&app, last_seen_wake, None);
-                backoff_ms = 1_000;
+                backoff_ms = WS_RECONNECT_INITIAL_MS;
                 next_attempt_ms = 0;
                 continue;
             };
@@ -967,8 +1238,9 @@ pub fn start_background_private_ws(app: Arc<App>) {
                 Ok(c) => c,
                 Err(e) => {
                     mark_ws_disconnected(&app, Some(e), false);
-                    backoff_ms = orderbook::next_ws_reconnect_backoff_ms(backoff_ms, false);
-                    next_attempt_ms = now_ms() + backoff_ms as i64;
+                    let (next_b, delay) = next_ws_reconnect_delay_ms(backoff_ms, false);
+                    backoff_ms = next_b;
+                    next_attempt_ms = now_ms() + delay as i64;
                     continue;
                 }
             };
@@ -980,14 +1252,6 @@ pub fn start_background_private_ws(app: Arc<App>) {
                     let mut seq_tracker = SeqTracker::default();
                     let mut last_rx = Instant::now();
                     let mut last_ping_sent: Option<Instant> = None;
-
-                    {
-                        let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
-                        st.private_ws_connected = true;
-                        st.rails.last_error = None;
-                    }
-                    app.invalidate_live_hot();
-                    app.notify_reconcile_reschedule();
 
                     let sub_cmd = serde_json::json!({
                         "id": 1,
@@ -1004,17 +1268,27 @@ pub fn start_background_private_ws(app: Arc<App>) {
                     if let Err(e) = conn.send_text(&sub_cmd.to_string()) {
                         mark_ws_disconnected(&app, Some(e), true);
                     } else {
+                        {
+                            let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                            st.private_ws_connected = true;
+                            st.rails.last_error = None;
+                        }
+                        app.invalidate_live_hot();
+                        app.notify_reconcile_reschedule();
+
                         loop {
                             let wake_now = {
                                 let (lock, _) = &*app.private_ws_wake;
                                 *lock.lock().unwrap_or_else(|p| p.into_inner())
                             };
                             if wake_now != last_seen_wake || private_ws_offline() {
+                                let _ = conn.send_masked_frame(0x8, &1000u16.to_be_bytes());
                                 mark_ws_disconnected(&app, None, false);
                                 break;
                             }
 
                             if last_rx.elapsed() >= Duration::from_secs(KEEPALIVE_TIMEOUT_SECS) {
+                                let _ = conn.send_masked_frame(0x8, &1001u16.to_be_bytes());
                                 mark_ws_disconnected(
                                     &app,
                                     Some("private WS keepalive timeout".to_string()),
@@ -1064,7 +1338,7 @@ pub fn start_background_private_ws(app: Arc<App>) {
                                             } else {
                                                 session_valid_msg = true;
                                                 consecutive_bad_frames = 0;
-                                                backoff_ms = 1_000;
+                                                backoff_ms = WS_RECONNECT_INITIAL_MS;
                                             }
                                         }
                                         Err(_) => {
@@ -1109,12 +1383,17 @@ pub fn start_background_private_ws(app: Arc<App>) {
                                         st.rails.record_venue_sync(ts, open_exp, loss);
                                     }
                                 }
-                                Ok((0x8, _)) => {
-                                    mark_ws_disconnected(
-                                        &app,
-                                        Some("private WS closed by remote".to_string()),
-                                        true,
-                                    );
+                                Ok((0x8, close_payload)) => {
+                                    let msg = match parse_ws_close_info(&close_payload) {
+                                        (Some(code), reason) if !reason.is_empty() => format!(
+                                            "private WS closed by remote (code {code}: {reason})"
+                                        ),
+                                        (Some(code), _) => {
+                                            format!("private WS closed by remote (code {code})")
+                                        }
+                                        (None, _) => "private WS closed by remote".to_string(),
+                                    };
+                                    mark_ws_disconnected(&app, Some(msg), true);
                                     break;
                                 }
                                 Ok(_) => {
@@ -1140,14 +1419,15 @@ pub fn start_background_private_ws(app: Arc<App>) {
                             }
                         }
                     }
-                    backoff_ms =
-                        orderbook::next_ws_reconnect_backoff_ms(backoff_ms, session_valid_msg);
-                    next_attempt_ms = now_ms() + backoff_ms as i64;
+                    let (next_b, delay) = next_ws_reconnect_delay_ms(backoff_ms, session_valid_msg);
+                    backoff_ms = next_b;
+                    next_attempt_ms = now_ms() + delay as i64;
                 }
                 Err(e) => {
                     mark_ws_disconnected(&app, Some(e), true);
-                    next_attempt_ms = now_ms() + backoff_ms as i64;
-                    backoff_ms = orderbook::next_ws_reconnect_backoff_ms(backoff_ms, false);
+                    let (next_b, delay) = next_ws_reconnect_delay_ms(backoff_ms, false);
+                    backoff_ms = next_b;
+                    next_attempt_ms = now_ms() + delay as i64;
                 }
             }
         }
@@ -1182,5 +1462,288 @@ mod tests {
         assert!(tracker.check(1, 4));
         assert!(!tracker.check(1, 5));
         assert!(!tracker.check(2, 1));
+    }
+
+    fn raw_ws_frame(fin: bool, rsv: u8, opcode: u8, masked: bool, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push((if fin { 0x80 } else { 0 }) | (rsv & 0x70) | (opcode & 0x0f));
+        let mask_bit = if masked { 0x80 } else { 0 };
+        if payload.len() < 126 {
+            out.push(mask_bit | (payload.len() as u8));
+        } else if payload.len() <= 65_535 {
+            out.push(mask_bit | 126);
+            out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            out.push(mask_bit | 127);
+            out.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        if masked {
+            let key = [0x11, 0x22, 0x33, 0x44];
+            out.extend_from_slice(&key);
+            for (i, &b) in payload.iter().enumerate() {
+                out.push(b ^ key[i & 3]);
+            }
+        } else {
+            out.extend_from_slice(payload);
+        }
+        out
+    }
+
+    #[test]
+    fn rfc6455_fragmentation_interleaved_ping_timeout_resume_and_close_codes() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            // 1. Fragmented text with multi-byte UTF-8 ("€" = E2 82 AC) split across fragments,
+            //    with interleaved Ping (0x9) and Pong (0xA) in between!
+            let f1 = raw_ws_frame(false, 0, 0x1, false, b"{\"msg\":\"\xe2");
+            let ping = raw_ws_frame(true, 0, 0x9, false, b"mid-frag");
+            let f2 = raw_ws_frame(false, 0, 0x0, false, b"\x82");
+            let pong = raw_ws_frame(true, 0, 0xA, false, b"unsolicited");
+            let f3 = raw_ws_frame(true, 0, 0x0, false, b"\xac\"}");
+
+            s.write_all(&f1).unwrap();
+            s.write_all(&ping).unwrap();
+            s.flush().unwrap();
+
+            // Verify client replies with masked Pong carrying "mid-frag"
+            let mut hdr = [0u8; 2];
+            s.read_exact(&mut hdr).unwrap();
+            assert_eq!(hdr[0] & 0x0f, 0xA);
+            assert_ne!(hdr[1] & 0x80, 0);
+            let plen = (hdr[1] & 0x7f) as usize;
+            let mut m = [0u8; 4];
+            s.read_exact(&mut m).unwrap();
+            let mut pbuf = vec![0u8; plen];
+            s.read_exact(&mut pbuf).unwrap();
+            for (i, b) in pbuf.iter_mut().enumerate() {
+                *b ^= m[i & 3];
+            }
+            assert_eq!(&pbuf, b"mid-frag");
+
+            s.write_all(&f2).unwrap();
+            s.write_all(&pong).unwrap();
+            // Send partial f3 (header + 2 bytes), pause > read_timeout so client hits TimedOut, then send rest!
+            s.write_all(&f3[..3]).unwrap();
+            s.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(120));
+            s.write_all(&f3[3..]).unwrap();
+            // Follow with Close 1001 "going away"
+            let mut close_body = 1001u16.to_be_bytes().to_vec();
+            close_body.extend_from_slice(b"going away");
+            let close_f = raw_ws_frame(true, 0, 0x8, false, &close_body);
+            s.write_all(&close_f).unwrap();
+            s.flush().unwrap();
+
+            // Expect echoed Close 1001
+            let mut chdr = [0u8; 2];
+            s.read_exact(&mut chdr).unwrap();
+            assert_eq!(chdr[0] & 0x0f, 0x8);
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut conn = WsConnection::from_plain_stream(stream, Vec::new(), 4096, 16);
+
+        let (op1, _) = conn.read_frame().unwrap();
+        assert_eq!(op1, 0x9);
+        let (op2, _) = conn.read_frame().unwrap();
+        assert_eq!(op2, 0xA);
+
+        // Next read_frame may hit TimedOut on partial f3, then succeed on retry without losing bytes!
+        let (op3, msg_bytes) = loop {
+            match conn.read_frame() {
+                Ok(v) => break v,
+                Err(ref e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => panic!("unexpected frame error: {e}"),
+            }
+        };
+        assert_eq!(op3, 0x1);
+        assert_eq!(std::str::from_utf8(&msg_bytes).unwrap(), "{\"msg\":\"€\"}");
+
+        let (op4, close_p) = conn.read_frame().unwrap();
+        assert_eq!(op4, 0x8);
+        assert_eq!(parse_ws_close_info(&close_p), (Some(1001), "going away".to_string()));
+        srv.join().unwrap();
+    }
+
+    #[test]
+    fn rfc6455_rejects_oversized_rsv_masked_server_and_bad_close_codes() {
+        use std::net::TcpListener;
+
+        let cases: Vec<Vec<u8>> = vec![
+            // RSV1 bit set
+            raw_ws_frame(true, 0x40, 0x1, false, b"hi"),
+            // Masked server-to-client frame
+            raw_ws_frame(true, 0, 0x1, true, b"hi"),
+            // Oversized frame > 2048 cap
+            raw_ws_frame(true, 0, 0x1, false, &vec![b'a'; 2049]),
+            // 1-byte close payload
+            raw_ws_frame(true, 0, 0x8, false, &[0x03]),
+            // Forbidden close code 1005
+            raw_ws_frame(true, 0, 0x8, false, &1005u16.to_be_bytes()),
+            // Invalid close code 999
+            raw_ws_frame(true, 0, 0x8, false, &999u16.to_be_bytes()),
+        ];
+
+        for bad in cases {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let srv = std::thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let _ = s.write_all(&bad);
+                let _ = s.flush();
+            });
+            let stream = TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut conn = WsConnection::from_plain_stream(stream, Vec::new(), 2048, 8);
+            let err = conn.read_frame().unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            srv.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn reconnect_backoff_with_jitter_is_bounded_and_non_constant() {
+        let mut delays = Vec::new();
+        for _ in 0..16 {
+            let (base, d) = next_ws_reconnect_delay_ms(4_000, false);
+            assert_eq!(base, 8_000);
+            assert!((7_000..=9_000).contains(&d), "delay {d} out of jitter bounds");
+            delays.push(d);
+        }
+        let min_d = *delays.iter().min().unwrap();
+        let max_d = *delays.iter().max().unwrap();
+        assert!(max_d > min_d, "expected jitter variation, got {delays:?}");
+        let (reset_b, reset_d) = next_ws_reconnect_delay_ms(16_000, true);
+        assert_eq!(reset_b, 1_000);
+        assert!((875..=1_125).contains(&reset_d));
+    }
+
+    #[test]
+    fn duplicate_fill_order_cancel_and_position_are_idempotent() {
+        let dir = std::env::temp_dir().join(format!("ob-pws-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data_dir = dir.join("data");
+        let strat_dir = dir.join("strats");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&strat_dir).unwrap();
+
+        let app = App::new(data_dir.clone(), strat_dir, 500.0, 3600);
+        {
+            let mut st = app.live_desk.lock().unwrap();
+            st.rails.arm(true, true).unwrap();
+            // Seed two resting buy orders: ord-A ($4.00) and ord-B ($3.00) -> total $7.00
+            st.rails.record_submitted_order("buy", 4.0);
+            st.reserved_order_exposure.insert("ord-A".to_string(), 4.0);
+            st.rails.record_submitted_order("buy", 3.0);
+            st.reserved_order_exposure.insert("ord-B".to_string(), 3.0);
+        }
+
+        let mut tracker = SeqTracker::default();
+        // Duplicate cancel of ord-A must release $4.00 ONCE, leaving ord-B's $3.00 intact!
+        let cancel_msg = serde_json::json!({
+            "type": "user_order",
+            "sid": 1,
+            "seq": 1,
+            "msg": {
+                "order_id": "ord-A",
+                "ticker": "KXBTC15M-DEDUP",
+                "status": "canceled",
+                "action": "buy",
+                "side": "yes",
+                "yes_price": 50,
+                "initial_count": 8,
+                "remaining_count": 8,
+                "fill_count": 0
+            }
+        })
+        .to_string();
+        ingest_private_ws_message(&app, &cancel_msg, &mut tracker).unwrap();
+        ingest_private_ws_message(&app, &cancel_msg, &mut tracker).unwrap();
+
+        {
+            let st = app.live_desk.lock().unwrap();
+            assert!((st.rails.open_exposure_dollars - 3.0).abs() < 1e-6);
+            assert_eq!(
+                st.executions
+                    .records()
+                    .iter()
+                    .filter(|r| r.kind == "order_canceled" && r.order_id == "ord-A")
+                    .count(),
+                1
+            );
+        }
+
+        // Duplicate NO-side fill must update signed position ONCE (-5 for NO buy).
+        let fill_msg = serde_json::json!({
+            "type": "fill",
+            "sid": 1,
+            "seq": 2,
+            "msg": {
+                "trade_id": "tr-no-1",
+                "order_id": "ord-B",
+                "market_ticker": "KXBTC15M-DEDUP",
+                "action": "buy",
+                "side": "no",
+                "count": 5,
+                "no_price": 60,
+                "ts": now_unix()
+            }
+        })
+        .to_string();
+        ingest_private_ws_message(&app, &fill_msg, &mut tracker).unwrap();
+        ingest_private_ws_message(&app, &fill_msg, &mut tracker).unwrap();
+
+        {
+            let st = app.live_desk.lock().unwrap();
+            assert_eq!(st.ws_positions["KXBTC15M-DEDUP"].position, -5);
+            assert_eq!(
+                st.executions
+                    .records()
+                    .iter()
+                    .filter(|r| r.kind == "fill" && r.venue_id == "tr-no-1")
+                    .count(),
+                1
+            );
+        }
+
+        // Duplicate market_position message stays idempotent.
+        let pos_msg = serde_json::json!({
+            "type": "market_position",
+            "sid": 1,
+            "seq": 3,
+            "msg": {
+                "ticker": "KXBTC15M-DEDUP",
+                "position": -5,
+                "market_exposure_dollars": "3.00",
+                "realized_pnl_dollars": "-0.50",
+                "resting_orders_count": 0
+            }
+        })
+        .to_string();
+        ingest_private_ws_message(&app, &pos_msg, &mut tracker).unwrap();
+        ingest_private_ws_message(&app, &pos_msg, &mut tracker).unwrap();
+        {
+            let st = app.live_desk.lock().unwrap();
+            assert!((st.rails.daily_realized_loss_dollars - 0.50).abs() < 1e-6);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

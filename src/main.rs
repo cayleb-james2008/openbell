@@ -3136,7 +3136,38 @@ pub(crate) struct LiveDeskManager {
     pub(crate) executions: risk_rails::LiveExecutionLedger,
     pub(crate) reserved_order_exposure: std::collections::HashMap<String, f64>,
     pub(crate) ws_positions: std::collections::HashMap<String, kalshi_live::KalshiPosition>,
+    pub(crate) ws_orders: std::collections::HashMap<String, (String, i64, u8)>,
     pub(crate) last_discrepancies: Vec<risk_rails::ReconcileDiscrepancy>,
+}
+
+/// RAII fail-closed per-key lock guard preventing concurrent amend/flatten operations on the
+/// same order ID or ticker across HTTP handlers and `ShadowRunner`.
+pub(crate) struct InFlightKeyGuard {
+    set: Arc<Mutex<std::collections::HashSet<String>>>,
+    key: String,
+}
+
+impl InFlightKeyGuard {
+    pub(crate) fn try_acquire(
+        set: &Arc<Mutex<std::collections::HashSet<String>>>,
+        key: &str,
+    ) -> Option<Self> {
+        let mut g = set.lock().unwrap_or_else(|p| p.into_inner());
+        if !g.insert(key.to_string()) {
+            return None;
+        }
+        Some(Self {
+            set: set.clone(),
+            key: key.to_string(),
+        })
+    }
+}
+
+impl Drop for InFlightKeyGuard {
+    fn drop(&mut self) {
+        let mut g = self.set.lock().unwrap_or_else(|p| p.into_inner());
+        g.remove(&self.key);
+    }
 }
 
 impl LiveDeskManager {
@@ -3201,6 +3232,10 @@ struct App {
     reconcile_wake: Arc<(Mutex<(u64, bool)>, Condvar)>,
     /// Wakeup signal for the background authenticated private WebSocket thread.
     private_ws_wake: Arc<(Mutex<u64>, Condvar)>,
+    /// Fail-closed in-flight order amendment lock set (keyed by order_id).
+    in_flight_amends: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Fail-closed in-flight position flatten/exit lock set (keyed by ticker).
+    in_flight_flattens: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Tick-driven Paper/Shadow Orderbook Matching Engine & Fail-Closed Automated Runner.
     runner: Arc<shadow_runner::ShadowRunner>,
     /// Live L2 Orderbook Depth Store, WebSocket/REST stream & book-walking engine.
@@ -3346,11 +3381,14 @@ impl App {
                 executions: live_executions,
                 reserved_order_exposure: std::collections::HashMap::new(),
                 ws_positions: std::collections::HashMap::new(),
+                ws_orders: std::collections::HashMap::new(),
                 last_discrepancies: Vec::new(),
             }),
             reconcile_sync_lock: std::sync::Mutex::new(()),
             reconcile_wake: Arc::new((Mutex::new((0, false)), Condvar::new())),
             private_ws_wake: Arc::new((Mutex::new(0), Condvar::new())),
+            in_flight_amends: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            in_flight_flattens: Arc::new(Mutex::new(std::collections::HashSet::new())),
             runner,
             orderbook,
             spot_feed,
@@ -7221,6 +7259,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     st.private_ws_connected = false;
                     st.private_ws_last_event_epoch = None;
                     st.ws_positions.clear();
+                    st.ws_orders.clear();
                     st.rails.last_venue_sync_epoch = None;
                     let _ = st.rails.save_runtime(&app.data_dir);
                     if !st.config.is_configured() {
@@ -7308,9 +7347,19 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     return json_ok_err_response(400, &format!("invalid order intent: {e}"));
                 }
             };
-            let (auth_res, cfg) = {
+            let (auth_res, cfg, pre_reserved) = {
                 let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
-                (st.rails.authorize_order(&intent), st.config.clone())
+                let res = st.rails.authorize_order(&intent);
+                let reserved = match &res {
+                    Ok((_, check))
+                        if !intent.dry_run && intent.action.eq_ignore_ascii_case("buy") =>
+                    {
+                        st.rails.reserve_pending_exposure(check.order_notional_dollars);
+                        check.order_notional_dollars
+                    }
+                    _ => 0.0,
+                };
+                (res, st.config.clone(), reserved)
             };
             let (kalshi_req, check) = match auth_res {
                 Ok((base_req, check)) => {
@@ -7325,6 +7374,8 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         ) {
                             Ok(maker_req) => (maker_req, check),
                             Err(e) => {
+                                let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                                st.rails.rollback_pending_exposure(pre_reserved);
                                 return json_ok_err_response(400, &e);
                             }
                         }
@@ -7354,43 +7405,60 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
                 Ok(c) => c,
                 Err(e) => {
+                    let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                    st.rails.rollback_pending_exposure(pre_reserved);
                     return json_ok_err_response(412, &e);
                 }
             };
             match client.place_order(&kalshi_req) {
                 Ok(order) => {
                     let now_ts = now_unix();
-                    let snap = {
+                    let snap_or_aborted = {
                         let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
-                        st.connected = true;
-                        st.rails.last_error = None;
-                        st.rails
-                            .record_submitted_order(&intent.action, check.order_notional_dollars);
-                        if intent.action.eq_ignore_ascii_case("buy") {
-                            st.reserved_order_exposure
-                                .insert(order.order_id.clone(), check.order_notional_dollars);
+                        st.rails.rollback_pending_exposure(pre_reserved);
+                        if st.rails.killed || !st.rails.live_armed {
+                            Err(())
+                        } else {
+                            st.connected = true;
+                            st.rails.last_error = None;
+                            st.rails
+                                .record_submitted_order(&intent.action, check.order_notional_dollars);
+                            if intent.action.eq_ignore_ascii_case("buy") {
+                                st.reserved_order_exposure
+                                    .insert(order.order_id.clone(), check.order_notional_dollars);
+                            }
+                            st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                                kind: "order_submitted".to_string(),
+                                venue_id: order.order_id.clone(),
+                                ts: now_ts,
+                                order_id: order.order_id.clone(),
+                                client_order_id: order
+                                    .client_order_id
+                                    .clone()
+                                    .or_else(|| Some(kalshi_req.client_order_id.clone())),
+                                trade_id: None,
+                                ticker: order.ticker.clone(),
+                                side: intent.side.clone(),
+                                action: intent.action.clone(),
+                                count: intent.count as i64,
+                                price_cents: intent.price_cents,
+                                is_taker: Some(!post_only),
+                                fee_dollars: 0.0,
+                                revenue_cents: None,
+                                realized_pnl_dollars: None,
+                            });
+                            Ok(st.status_snapshot())
                         }
-                        st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
-                            kind: "order_submitted".to_string(),
-                            venue_id: order.order_id.clone(),
-                            ts: now_ts,
-                            order_id: order.order_id.clone(),
-                            client_order_id: order
-                                .client_order_id
-                                .clone()
-                                .or_else(|| Some(kalshi_req.client_order_id.clone())),
-                            trade_id: None,
-                            ticker: order.ticker.clone(),
-                            side: intent.side.clone(),
-                            action: intent.action.clone(),
-                            count: intent.count as i64,
-                            price_cents: intent.price_cents,
-                            is_taker: Some(!post_only),
-                            fee_dollars: 0.0,
-                            revenue_cents: None,
-                            realized_pnl_dollars: None,
-                        });
-                        st.status_snapshot()
+                    };
+                    let snap = match snap_or_aborted {
+                        Ok(s) => s,
+                        Err(()) => {
+                            let _ = client.cancel_order(&order.order_id);
+                            return json_ok_err_response(
+                                403,
+                                "live trading was disarmed or kill switch engaged while order was in flight; cancel requested",
+                            );
+                        }
                     };
                     app.invalidate_live_hot();
                     let ev = format!(
@@ -7411,6 +7479,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 Err(e) => {
                     {
                         let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.rails.rollback_pending_exposure(pre_reserved);
                         st.rails.last_error = Some(e.clone());
                     }
                     json_ok_err_response(502, &e)
@@ -7450,7 +7519,15 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 },
             };
 
-            let (cfg, local_info, local_reserved) = {
+            let Some(_amend_guard) = InFlightKeyGuard::try_acquire(&app.in_flight_amends, order_id)
+            else {
+                return json_ok_err_response(
+                    409,
+                    &format!("amend already in progress for order {order_id}"),
+                );
+            };
+
+            let (cfg, local_info) = {
                 let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
                 if st.rails.killed {
                     let msg = format!(
@@ -7468,7 +7545,6 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 (
                     st.config.clone(),
                     st.executions.latest_order_info(order_id),
-                    st.reserved_order_exposure.get(order_id).copied(),
                 )
             };
             let client = match kalshi_live::KalshiLiveClient::from_config(&cfg) {
@@ -7526,16 +7602,9 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             };
 
             let target_count = count_opt.unwrap_or(old_count);
-            let old_reserved_eff = local_reserved.unwrap_or_else(|| {
-                if action.eq_ignore_ascii_case("buy") {
-                    (old_count as f64) * (old_price as f64 / 100.0)
-                } else {
-                    0.0
-                }
-            });
             let is_upward = price_cents > old_price || target_count > old_count;
 
-            let check = {
+            let (check, old_reserved_eff, pre_delta) = {
                 let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
                 if st.rails.killed {
                     let msg = format!(
@@ -7550,6 +7619,23 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         "live trading is disarmed (live_armed=false); arm explicitly before amending orders",
                     );
                 }
+                let old_reserved_eff = st
+                    .reserved_order_exposure
+                    .get(order_id)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        if action.eq_ignore_ascii_case("buy") {
+                            (old_count as f64) * (old_price as f64 / 100.0)
+                        } else {
+                            0.0
+                        }
+                    });
+                let new_notional = (target_count as f64) * (price_cents as f64 / 100.0);
+                let pre_delta = if action.eq_ignore_ascii_case("buy") {
+                    (new_notional - old_reserved_eff).max(0.0)
+                } else {
+                    0.0
+                };
                 let intent = risk_rails::LiveOrderIntent {
                     ticker: ticker.clone(),
                     action: action.clone(),
@@ -7559,7 +7645,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     client_order_id: None,
                     dry_run: false,
                 };
-                if is_upward {
+                let res = if is_upward {
                     let res = st.rails.check_amend_order(&intent, old_reserved_eff);
                     if !res.allowed {
                         let body = format!(
@@ -7573,7 +7659,6 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     }
                     res
                 } else {
-                    let new_notional = (target_count as f64) * (price_cents as f64 / 100.0);
                     let projected = if action.eq_ignore_ascii_case("buy") {
                         (st.rails.open_exposure_dollars - old_reserved_eff + new_notional).max(0.0)
                     } else {
@@ -7585,7 +7670,9 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         projected_exposure_dollars: projected,
                         rail_violations: Vec::new(),
                     }
-                }
+                };
+                st.rails.reserve_pending_exposure(pre_delta);
+                (res, old_reserved_eff, pre_delta)
             };
 
             match client.amend_order_with_side(order_id, Some(&side), price_cents, count_opt) {
@@ -7605,50 +7692,65 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     } else {
                         target_count
                     };
-                    let snap = {
+                    let snap_or_aborted = {
                         let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
-                        st.connected = true;
-                        st.rails.last_error = None;
-                        if action.eq_ignore_ascii_case("buy") {
-                            let new_reserved =
-                                (final_count as f64) * (final_price as f64 / 100.0);
-                            st.rails
-                                .apply_amended_exposure(old_reserved_eff, new_reserved);
-                            st.reserved_order_exposure
-                                .insert(order_id.to_string(), new_reserved);
+                        st.rails.rollback_pending_exposure(pre_delta);
+                        if st.rails.killed || !st.rails.live_armed {
+                            Err(())
+                        } else {
+                            st.connected = true;
+                            st.rails.last_error = None;
+                            if action.eq_ignore_ascii_case("buy") {
+                                let new_reserved =
+                                    (final_count as f64) * (final_price as f64 / 100.0);
+                                st.rails
+                                    .apply_amended_exposure(old_reserved_eff, new_reserved);
+                                st.reserved_order_exposure
+                                    .insert(order_id.to_string(), new_reserved);
+                            }
+                            let cid = amended
+                                .client_order_id
+                                .clone()
+                                .or_else(|| st.executions.client_order_id_for(order_id));
+                            st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                                kind: "order_amended".to_string(),
+                                venue_id: format!(
+                                    "{}:{}:{}:{}",
+                                    order_id,
+                                    kalshi_live::now_millis_string(),
+                                    final_price,
+                                    final_count
+                                ),
+                                ts: now_ts,
+                                order_id: order_id.to_string(),
+                                client_order_id: cid,
+                                trade_id: None,
+                                ticker: if amended.ticker.is_empty() {
+                                    ticker.clone()
+                                } else {
+                                    amended.ticker.clone()
+                                },
+                                side: side.clone(),
+                                action: action.clone(),
+                                count: final_count as i64,
+                                price_cents: final_price,
+                                is_taker: None,
+                                fee_dollars: 0.0,
+                                revenue_cents: None,
+                                realized_pnl_dollars: None,
+                            });
+                            Ok(st.status_snapshot())
                         }
-                        let cid = amended
-                            .client_order_id
-                            .clone()
-                            .or_else(|| st.executions.client_order_id_for(order_id));
-                        st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
-                            kind: "order_amended".to_string(),
-                            venue_id: format!(
-                                "{}:{}:{}:{}",
-                                order_id,
-                                kalshi_live::now_millis_string(),
-                                final_price,
-                                final_count
-                            ),
-                            ts: now_ts,
-                            order_id: order_id.to_string(),
-                            client_order_id: cid,
-                            trade_id: None,
-                            ticker: if amended.ticker.is_empty() {
-                                ticker.clone()
-                            } else {
-                                amended.ticker.clone()
-                            },
-                            side: side.clone(),
-                            action: action.clone(),
-                            count: final_count as i64,
-                            price_cents: final_price,
-                            is_taker: None,
-                            fee_dollars: 0.0,
-                            revenue_cents: None,
-                            realized_pnl_dollars: None,
-                        });
-                        st.status_snapshot()
+                    };
+                    let snap = match snap_or_aborted {
+                        Ok(s) => s,
+                        Err(()) => {
+                            let _ = client.cancel_order(order_id);
+                            return json_ok_err_response(
+                                403,
+                                "live trading was disarmed or kill switch engaged while amend was in flight; cancel requested",
+                            );
+                        }
                     };
                     app.runner
                         .mark_live_order_amended(order_id, final_price, final_count, now_ts);
@@ -7672,6 +7774,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 Err(e) => {
                     {
                         let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                        st.rails.rollback_pending_exposure(pre_delta);
                         st.rails.last_error = Some(e.clone());
                     }
                     let code = if e.starts_with("Kalshi HTTP 409:") {
@@ -7721,6 +7824,15 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 Some(_) => {
                     return json_ok_err_response(400, "post_only must be a boolean");
                 }
+            };
+
+            let Some(_flatten_guard) =
+                InFlightKeyGuard::try_acquire(&app.in_flight_flattens, &ticker)
+            else {
+                return json_ok_err_response(
+                    409,
+                    &format!("flatten already in progress for {ticker}"),
+                );
             };
 
             let cfg = {
@@ -7786,6 +7898,30 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                         ),
                     );
                 }
+            }
+
+            // Fail closed if a resting sell order is already open for this ticker on the venue.
+            let resting_orders = match client.get_orders(Some("resting")) {
+                Ok(list) => list,
+                Err(e) => {
+                    let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                    st.rails.last_error = Some(e.clone());
+                    return json_ok_err_response(502, &e);
+                }
+            };
+            if let Some(existing_sell) = resting_orders.iter().find(|o| {
+                o.ticker == ticker
+                    && o.status.eq_ignore_ascii_case("resting")
+                    && o.action.eq_ignore_ascii_case("sell")
+                    && o.remaining_count > 0
+            }) {
+                return json_ok_err_response(
+                    409,
+                    &format!(
+                        "resting sell order {} already open for {ticker}; cancel or await fill before flattening",
+                        existing_sell.order_id
+                    ),
+                );
             }
 
             let limit_cents = match req_price_cents {
@@ -7904,33 +8040,47 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             match client.place_order(&kalshi_req) {
                 Ok(order) => {
                     let now_ts = now_unix();
-                    let snap = {
+                    let snap_or_aborted = {
                         let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
-                        st.connected = true;
-                        st.rails.last_error = None;
-                        st.rails
-                            .record_submitted_order("sell", check.order_notional_dollars);
-                        st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
-                            kind: "order_submitted".to_string(),
-                            venue_id: order.order_id.clone(),
-                            ts: now_ts,
-                            order_id: order.order_id.clone(),
-                            client_order_id: order
-                                .client_order_id
-                                .clone()
-                                .or_else(|| Some(kalshi_req.client_order_id.clone())),
-                            trade_id: None,
-                            ticker: ticker.clone(),
-                            side: open_side.clone(),
-                            action: "sell".to_string(),
-                            count: open_count as i64,
-                            price_cents: limit_cents,
-                            is_taker: Some(!post_only),
-                            fee_dollars: 0.0,
-                            revenue_cents: None,
-                            realized_pnl_dollars: None,
-                        });
-                        st.status_snapshot()
+                        if st.rails.killed || !st.rails.live_armed {
+                            Err(())
+                        } else {
+                            st.connected = true;
+                            st.rails.last_error = None;
+                            st.rails
+                                .record_submitted_order("sell", check.order_notional_dollars);
+                            st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                                kind: "order_submitted".to_string(),
+                                venue_id: order.order_id.clone(),
+                                ts: now_ts,
+                                order_id: order.order_id.clone(),
+                                client_order_id: order
+                                    .client_order_id
+                                    .clone()
+                                    .or_else(|| Some(kalshi_req.client_order_id.clone())),
+                                trade_id: None,
+                                ticker: ticker.clone(),
+                                side: open_side.clone(),
+                                action: "sell".to_string(),
+                                count: open_count as i64,
+                                price_cents: limit_cents,
+                                is_taker: Some(!post_only),
+                                fee_dollars: 0.0,
+                                revenue_cents: None,
+                                realized_pnl_dollars: None,
+                            });
+                            Ok(st.status_snapshot())
+                        }
+                    };
+                    let snap = match snap_or_aborted {
+                        Ok(s) => s,
+                        Err(()) => {
+                            let _ = client.cancel_order(&order.order_id);
+                            return json_ok_err_response(
+                                403,
+                                "live trading was disarmed or kill switch engaged while flatten was in flight; cancel requested",
+                            );
+                        }
                     };
                     app.invalidate_live_hot();
                     let ev = format!(
