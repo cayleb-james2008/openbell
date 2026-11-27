@@ -681,17 +681,32 @@ impl TapeHub {
         }
     }
 
-    fn subscribe(&self) -> Option<std::sync::mpsc::Receiver<(String, String)>> {
-        let mut guard = self.senders.lock().unwrap_or_else(|p| p.into_inner());
-        // Drop closed subscribers before enforcing the concurrent cap.
+    /// Drop subscribers whose stream thread has ended. The empty frame also
+    /// wakes each live stream thread so it re-checks whether its client left.
+    fn prune(guard: &mut Vec<std::sync::mpsc::SyncSender<(String, String)>>) {
         guard.retain(|tx| {
             !matches!(
                 tx.try_send((String::new(), String::new())),
                 Err(std::sync::mpsc::TrySendError::Disconnected(_))
             )
         });
+    }
+
+    fn subscribe(&self) -> Option<std::sync::mpsc::Receiver<(String, String)>> {
+        let mut guard = self.senders.lock().unwrap_or_else(|p| p.into_inner());
+        // Drop closed subscribers before enforcing the concurrent cap.
+        Self::prune(&mut guard);
         if guard.len() >= MAX_SSE_CLIENTS {
-            return None;
+            // At the cap, some slots may belong to clients that just hung up and
+            // whose threads have not noticed yet (they check about once a second).
+            // The prune above woke them; give them a moment, then look again.
+            drop(guard);
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            guard = self.senders.lock().unwrap_or_else(|p| p.into_inner());
+            Self::prune(&mut guard);
+            if guard.len() >= MAX_SSE_CLIENTS {
+                return None;
+            }
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         guard.push(tx);
@@ -5582,6 +5597,26 @@ fn export_report_csv(app: &App, dpath: &Path, dataset: &str) -> String {
     out
 }
 
+/// True when an SSE client has hung up. SSE clients never send a body after
+/// the request, so a non-blocking `peek` that reads EOF (or a hard error)
+/// means the peer closed; `WouldBlock` means it is still connected.
+fn sse_peer_closed(stream: &std::net::TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 1];
+    let closed = match stream.peek(&mut buf) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ),
+    };
+    let _ = stream.set_nonblocking(false);
+    closed
+}
+
 /// True Server-Sent Events stream for `/api/tape/stream`. Emits an initial
 /// snapshot frame, then real-time `tape` frames on every collector pass plus
 /// periodic keepalive comments until the client disconnects.
@@ -5631,10 +5666,18 @@ fn serve_sse_stream(stream: &mut std::net::TcpStream, app: &App) {
     {
         return;
     }
+    // Wake every second to notice a client that hung up, so its hub slot frees
+    // within ~1s instead of after the next failed keepalive (15-30s). Pages that
+    // open and close quickly would otherwise pile dead slots up to the cap.
+    let mut last_write = std::time::Instant::now();
     loop {
-        match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+        if sse_peer_closed(stream) {
+            break;
+        }
+        match rx.recv_timeout(std::time::Duration::from_secs(1)) {
             Ok((ev_name, payload)) => {
                 if payload.is_empty() {
+                    // Liveness probe from `TapeHub::subscribe`; checked at loop top.
                     continue;
                 }
                 let ev = if ev_name.is_empty() { "tape" } else { ev_name.as_str() };
@@ -5645,11 +5688,16 @@ fn serve_sse_stream(stream: &mut std::net::TcpStream, app: &App) {
                 {
                     break;
                 }
+                last_write = std::time::Instant::now();
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if last_write.elapsed() < std::time::Duration::from_secs(15) {
+                    continue;
+                }
                 if stream.write_all(b": keepalive\n\n").is_err() || stream.flush().is_err() {
                     break;
                 }
+                last_write = std::time::Instant::now();
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
