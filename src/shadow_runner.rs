@@ -2279,16 +2279,26 @@ impl ShadowRunner {
 
     /// Execute one tick of the matching & strategy evaluation engine.
     pub fn step_once(&self, app: &App, cached_strats: &mut CachedStrategies) {
-        let (live_armed, killed, live_cfg_opt) = {
+        let (live_armed, killed, live_cfg_opt, private_ws_connected) = {
             let ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
             let cfg_opt = if ld.config.is_configured() {
                 Some(ld.config.clone())
             } else {
                 None
             };
-            (ld.rails.live_armed, ld.rails.killed, cfg_opt)
+            (
+                ld.rails.live_armed,
+                ld.rails.killed,
+                cfg_opt,
+                ld.private_ws_connected,
+            )
         };
 
+        let live_poll_interval = if private_ws_connected {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(2)
+        };
         let (mode, need_live_poll) = {
             let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if st.mode == RunnerMode::Stopped {
@@ -2315,7 +2325,7 @@ impl ShadowRunner {
                     || st.filled_positions.iter().any(|p| p.mode == "live"))
                 && st
                     .live_poll_last
-                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
+                    .is_none_or(|t| t.elapsed() >= live_poll_interval);
             if poll {
                 st.live_poll_last = Some(Instant::now());
             }

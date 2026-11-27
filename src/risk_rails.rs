@@ -12,8 +12,8 @@
 #![allow(dead_code)]
 
 use crate::kalshi_live::{
-    mask_api_key_id, write_secret_file_0600, CancelAllReport, KalshiLiveClient, KalshiOrderRequest,
-    PersistedLiveConfig,
+    mask_api_key_id, write_secret_file_0600, CancelAllReport, KalshiFill, KalshiLiveClient,
+    KalshiOrder, KalshiOrderRequest, PersistedLiveConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -192,6 +192,12 @@ pub struct LiveStatusSnapshot {
     pub last_venue_sync_epoch: Option<i64>,
     pub venue_sync_stale: bool,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub private_ws_connected: bool,
+    #[serde(default)]
+    pub private_ws_last_event_epoch: Option<i64>,
+    #[serde(default)]
+    pub venue_sync_mode: String,
 }
 
 /// Persisted runtime risk rail state (`<OPENBELL_DATA>/risk_rails_runtime.json`, `0600`).
@@ -788,12 +794,36 @@ impl RiskRailsState {
         cfg: &PersistedLiveConfig,
         connected: bool,
     ) -> LiveStatusSnapshot {
+        self.status_snapshot_with_ws(cfg, connected, false, None, false)
+    }
+
+    /// Build `GET /api/live/status` snapshot including private WebSocket telemetry.
+    pub fn status_snapshot_with_ws(
+        &self,
+        cfg: &PersistedLiveConfig,
+        connected: bool,
+        private_ws_connected: bool,
+        private_ws_last_event_epoch: Option<i64>,
+        private_ws_offline: bool,
+    ) -> LiveStatusSnapshot {
         let configured = cfg.is_configured();
         let now = current_unix_epoch();
         let mode = if self.live_armed && configured {
             "live".to_string()
         } else {
             "paper".to_string()
+        };
+        let ws_connected = configured && !private_ws_offline && private_ws_connected;
+        let venue_sync_mode = if !configured {
+            "offline".to_string()
+        } else if ws_connected {
+            "ws_stream".to_string()
+        } else if private_ws_offline && !connected {
+            "offline".to_string()
+        } else if connected || self.last_venue_sync_epoch.is_some() {
+            "rest_poll".to_string()
+        } else {
+            "offline".to_string()
         };
         LiveStatusSnapshot {
             configured,
@@ -814,6 +844,9 @@ impl RiskRailsState {
             last_venue_sync_epoch: self.last_venue_sync_epoch,
             venue_sync_stale: configured && self.is_venue_sync_stale(now),
             last_error: self.last_error.clone(),
+            private_ws_connected: ws_connected,
+            private_ws_last_event_epoch,
+            venue_sync_mode,
         }
     }
 }
@@ -821,6 +854,99 @@ impl RiskRailsState {
 // ---------------------------------------------------------------------------
 // Idempotent Live Venue Execution Ledger (`<OPENBELL_DATA>/live_executions.jsonl`)
 // ---------------------------------------------------------------------------
+
+/// Build an idempotent `"fill"` `LiveExecutionRecord` from a venue `KalshiFill`.
+pub fn execution_record_from_fill(
+    f: &KalshiFill,
+    client_order_id: Option<String>,
+    fallback_ts: i64,
+) -> LiveExecutionRecord {
+    let ts = f
+        .ts
+        .or_else(|| f.created_time.as_deref().and_then(crate::parse_iso_z))
+        .unwrap_or(fallback_ts);
+    let price_c = if f.side.eq_ignore_ascii_case("no") {
+        f.no_price.or_else(|| f.yes_price.map(|p| 100 - p))
+    } else {
+        f.yes_price.or_else(|| f.no_price.map(|p| 100 - p))
+    }
+    .unwrap_or(50)
+    .clamp(1, 99) as u8;
+    let fee_dollars = f
+        .fee_cost_dollars
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or_else(|| {
+            let p = price_c as f64 / 100.0;
+            let rate = if f.is_taker == Some(false) {
+                0.0175
+            } else {
+                0.07
+            };
+            rate * p * (1.0 - p) * (f.count.max(0) as f64)
+        });
+    let venue_id = if !f.trade_id.trim().is_empty() {
+        f.trade_id.clone()
+    } else {
+        format!("{}:{}:{}", f.order_id, ts, f.count)
+    };
+    LiveExecutionRecord {
+        kind: "fill".to_string(),
+        venue_id,
+        ts,
+        order_id: f.order_id.clone(),
+        client_order_id,
+        trade_id: if f.trade_id.trim().is_empty() {
+            None
+        } else {
+            Some(f.trade_id.clone())
+        },
+        ticker: f.ticker.clone(),
+        side: f.side.clone(),
+        action: f.action.clone(),
+        count: f.count,
+        price_cents: price_c,
+        is_taker: f.is_taker,
+        fee_dollars,
+        revenue_cents: None,
+        realized_pnl_dollars: None,
+    }
+}
+
+/// Build an idempotent `"order_canceled"` `LiveExecutionRecord` from a canceled `KalshiOrder`.
+pub fn execution_record_from_canceled_order(
+    o: &KalshiOrder,
+    fallback_ts: i64,
+) -> LiveExecutionRecord {
+    let price_c = if o.side.eq_ignore_ascii_case("no") {
+        o.no_price.or_else(|| o.yes_price.map(|p| 100 - p))
+    } else {
+        o.yes_price.or_else(|| o.no_price.map(|p| 100 - p))
+    }
+    .unwrap_or(50)
+    .clamp(1, 99) as u8;
+    let ts = o
+        .created_time
+        .as_deref()
+        .and_then(crate::parse_iso_z)
+        .unwrap_or(fallback_ts);
+    LiveExecutionRecord {
+        kind: "order_canceled".to_string(),
+        venue_id: o.order_id.clone(),
+        ts,
+        order_id: o.order_id.clone(),
+        client_order_id: o.client_order_id.clone(),
+        trade_id: None,
+        ticker: o.ticker.clone(),
+        side: o.side.clone(),
+        action: o.action.clone(),
+        count: o.remaining_count.max(0),
+        price_cents: price_c,
+        is_taker: None,
+        fee_dollars: 0.0,
+        revenue_cents: None,
+        realized_pnl_dollars: None,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveExecutionRecord {

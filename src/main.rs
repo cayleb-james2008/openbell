@@ -16,6 +16,7 @@ mod gzip_inflate;
 mod kalshi_live;
 mod open;
 mod orderbook;
+mod private_ws;
 mod recalibration;
 mod risk_rails;
 mod scaling;
@@ -68,7 +69,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-fn parse_iso_z(s: &str) -> Option<i64> {
+pub(crate) fn parse_iso_z(s: &str) -> Option<i64> {
     let t = s.get(..19)?;
     let (date, time) = t.split_once('T')?;
     let mut d = date.split('-');
@@ -3126,13 +3127,28 @@ const BACKTEST_CACHE_CAP: usize = 16;
 const SCALE_PLAN_CACHE_CAP: usize = 32;
 const SLIPPAGE_CACHE_CAP: usize = 16;
 
-struct LiveDeskManager {
-    config: kalshi_live::PersistedLiveConfig,
-    rails: risk_rails::RiskRailsState,
-    connected: bool,
-    executions: risk_rails::LiveExecutionLedger,
-    reserved_order_exposure: std::collections::HashMap<String, f64>,
-    last_discrepancies: Vec<risk_rails::ReconcileDiscrepancy>,
+pub(crate) struct LiveDeskManager {
+    pub(crate) config: kalshi_live::PersistedLiveConfig,
+    pub(crate) rails: risk_rails::RiskRailsState,
+    pub(crate) connected: bool,
+    pub(crate) private_ws_connected: bool,
+    pub(crate) private_ws_last_event_epoch: Option<i64>,
+    pub(crate) executions: risk_rails::LiveExecutionLedger,
+    pub(crate) reserved_order_exposure: std::collections::HashMap<String, f64>,
+    pub(crate) ws_positions: std::collections::HashMap<String, kalshi_live::KalshiPosition>,
+    pub(crate) last_discrepancies: Vec<risk_rails::ReconcileDiscrepancy>,
+}
+
+impl LiveDeskManager {
+    pub(crate) fn status_snapshot(&self) -> risk_rails::LiveStatusSnapshot {
+        self.rails.status_snapshot_with_ws(
+            &self.config,
+            self.connected,
+            self.private_ws_connected,
+            self.private_ws_last_event_epoch,
+            private_ws::private_ws_offline(),
+        )
+    }
 }
 
 #[derive(Default)]
@@ -3181,8 +3197,10 @@ struct App {
     live_desk: std::sync::Mutex<LiveDeskManager>,
     /// Serializes live venue reconciliation passes across HTTP calls and background polling.
     reconcile_sync_lock: std::sync::Mutex<()>,
-    /// Wakeup signal for the background live venue reconciler thread.
-    reconcile_wake: Arc<(Mutex<u64>, Condvar)>,
+    /// Wakeup signal `(seq, immediate_sync)` for the background live venue reconciler thread.
+    reconcile_wake: Arc<(Mutex<(u64, bool)>, Condvar)>,
+    /// Wakeup signal for the background authenticated private WebSocket thread.
+    private_ws_wake: Arc<(Mutex<u64>, Condvar)>,
     /// Tick-driven Paper/Shadow Orderbook Matching Engine & Fail-Closed Automated Runner.
     runner: Arc<shadow_runner::ShadowRunner>,
     /// Live L2 Orderbook Depth Store, WebSocket/REST stream & book-walking engine.
@@ -3252,12 +3270,38 @@ impl App {
         }
     }
 
-    fn notify_reconcile(&self) {
+    pub(crate) fn notify_reconcile(&self) {
+        self.notify_reconcile_immediate();
+    }
+
+    pub(crate) fn notify_reconcile_immediate(&self) {
         let (lock, cv) = &*self.reconcile_wake;
+        let mut st = lock.lock().unwrap_or_else(|p| p.into_inner());
+        st.0 = st.0.saturating_add(1);
+        st.1 = true;
+        drop(st);
+        cv.notify_all();
+    }
+
+    pub(crate) fn notify_reconcile_reschedule(&self) {
+        let (lock, cv) = &*self.reconcile_wake;
+        let mut st = lock.lock().unwrap_or_else(|p| p.into_inner());
+        st.0 = st.0.saturating_add(1);
+        drop(st);
+        cv.notify_all();
+    }
+
+    pub(crate) fn notify_private_ws(&self) {
+        let (lock, cv) = &*self.private_ws_wake;
         let mut seq = lock.lock().unwrap_or_else(|p| p.into_inner());
         *seq = seq.saturating_add(1);
         drop(seq);
         cv.notify_all();
+    }
+
+    pub(crate) fn is_private_ws_connected(&self) -> bool {
+        let st = self.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+        st.config.is_configured() && st.private_ws_connected && !private_ws::private_ws_offline()
     }
 
     fn new_with_auto_collect(
@@ -3297,12 +3341,16 @@ impl App {
                 config: live_cfg,
                 rails: live_rails,
                 connected: false,
+                private_ws_connected: false,
+                private_ws_last_event_epoch: None,
                 executions: live_executions,
                 reserved_order_exposure: std::collections::HashMap::new(),
+                ws_positions: std::collections::HashMap::new(),
                 last_discrepancies: Vec::new(),
             }),
             reconcile_sync_lock: std::sync::Mutex::new(()),
-            reconcile_wake: Arc::new((Mutex::new(0), Condvar::new())),
+            reconcile_wake: Arc::new((Mutex::new((0, false)), Condvar::new())),
+            private_ws_wake: Arc::new((Mutex::new(0), Condvar::new())),
             runner,
             orderbook,
             spot_feed,
@@ -5658,7 +5706,7 @@ fn home_json_body(app: &App) -> String {
     let (sim, _, lib_errors, _) = app.analysis_shared(&app.data_dir.join("snapshots.jsonl"));
     let live_snap = {
         let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
-        st.rails.status_snapshot(&st.config, st.connected)
+        st.status_snapshot()
     };
     let mode_str = if live_snap.live_armed && live_snap.configured {
         "live — Kalshi v2 armed under hard risk rails"
@@ -6847,7 +6895,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
         ("GET", "/api/live/status") => {
             let snap = {
                 let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
-                st.rails.status_snapshot(&st.config, st.connected)
+                st.status_snapshot()
             };
             json_response(200, &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
         }
@@ -7170,6 +7218,9 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 let _ = st.rails.update_rails(&validated_rails);
                 if creds_changed {
                     st.connected = false;
+                    st.private_ws_connected = false;
+                    st.private_ws_last_event_epoch = None;
+                    st.ws_positions.clear();
                     st.rails.last_venue_sync_epoch = None;
                     let _ = st.rails.save_runtime(&app.data_dir);
                     if !st.config.is_configured() {
@@ -7177,12 +7228,13 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     }
                 }
                 st.rails.last_error = None;
-                st.rails.status_snapshot(&st.config, st.connected)
+                st.status_snapshot()
             };
             app.invalidate_live_hot();
             if snap.configured {
                 app.notify_reconcile();
             }
+            app.notify_private_ws();
             publish_live_status_json(&snap)
         }
         ("POST", "/api/live/arm") => {
@@ -7207,7 +7259,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
                 let configured = st.config.is_configured();
                 let res = st.rails.arm(confirm_arm, configured);
-                let snap = st.rails.status_snapshot(&st.config, st.connected);
+                let snap = st.status_snapshot();
                 (res, configured, snap)
             };
             match res {
@@ -7227,7 +7279,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
             let snap = {
                 let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
                 st.rails.disarm();
-                st.rails.status_snapshot(&st.config, st.connected)
+                st.status_snapshot()
             };
             publish_live_status_json(&snap)
         }
@@ -7338,7 +7390,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                             revenue_cents: None,
                             realized_pnl_dollars: None,
                         });
-                        st.rails.status_snapshot(&st.config, st.connected)
+                        st.status_snapshot()
                     };
                     app.invalidate_live_hot();
                     let ev = format!(
@@ -7596,7 +7648,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                             revenue_cents: None,
                             realized_pnl_dollars: None,
                         });
-                        st.rails.status_snapshot(&st.config, st.connected)
+                        st.status_snapshot()
                     };
                     app.runner
                         .mark_live_order_amended(order_id, final_price, final_count, now_ts);
@@ -7878,7 +7930,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                             revenue_cents: None,
                             realized_pnl_dollars: None,
                         });
-                        st.rails.status_snapshot(&st.config, st.connected)
+                        st.status_snapshot()
                     };
                     app.invalidate_live_hot();
                     let ev = format!(
@@ -7972,7 +8024,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                             revenue_cents: None,
                             realized_pnl_dollars: None,
                         });
-                        st.rails.status_snapshot(&st.config, st.connected)
+                        st.status_snapshot()
                     };
                     app.runner
                         .mark_live_order_canceled(order_id, now_ts, "operator_canceled");
@@ -8046,7 +8098,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                 }
                 st.rails.last_error = None;
                 let _ = st.rails.save_runtime(&app.data_dir);
-                st.rails.status_snapshot(&st.config, st.connected)
+                st.status_snapshot()
             };
             app.invalidate_live_hot();
             let ev = format!(
@@ -8145,7 +8197,7 @@ fn handle_with_body(app: &App, method: &str, path: &str, body: &str) -> String {
                     st.rails.last_error = Some(report.errors.join("; "));
                 }
                 let _ = st.rails.save_runtime(&app.data_dir);
-                st.rails.status_snapshot(&st.config, st.connected)
+                st.status_snapshot()
             };
             app.invalidate_live_hot();
             let ev = format!(
@@ -8801,8 +8853,9 @@ pub(crate) fn reconcile_live_venue(
         .runner
         .reconcile_live_data(&orders, &fills, &settlements, now);
 
-    let resp = {
+    let (resp, live_snap, should_emit_live_exec) = {
         let mut st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+        let mut new_exec_count = 0usize;
         let mut order_cid_map: std::collections::HashMap<&str, Option<String>> =
             std::collections::HashMap::new();
         for o in &orders {
@@ -8811,60 +8864,15 @@ pub(crate) fn reconcile_live_venue(
 
         // 1. Append fills idempotently by trade_id.
         for f in &fills {
-            let ts = f
-                .ts
-                .or_else(|| f.created_time.as_deref().and_then(parse_iso_z))
-                .unwrap_or(now);
-            let price_c = if f.side.eq_ignore_ascii_case("no") {
-                f.no_price.or_else(|| f.yes_price.map(|p| 100 - p))
-            } else {
-                f.yes_price.or_else(|| f.no_price.map(|p| 100 - p))
-            }
-            .unwrap_or(50)
-            .clamp(1, 99) as u8;
-            let fee_dollars = f
-                .fee_cost_dollars
-                .filter(|v| v.is_finite() && *v >= 0.0)
-                .unwrap_or_else(|| {
-                    let p = price_c as f64 / 100.0;
-                    let rate = if f.is_taker == Some(false) {
-                        0.0175
-                    } else {
-                        0.07
-                    };
-                    rate * p * (1.0 - p) * (f.count.max(0) as f64)
-                });
-            let venue_id = if !f.trade_id.trim().is_empty() {
-                f.trade_id.clone()
-            } else {
-                format!("{}:{}:{}", f.order_id, ts, f.count)
-            };
             let cid = order_cid_map
                 .get(f.order_id.as_str())
                 .cloned()
                 .flatten()
                 .or_else(|| st.executions.client_order_id_for(&f.order_id));
-            st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
-                kind: "fill".to_string(),
-                venue_id,
-                ts,
-                order_id: f.order_id.clone(),
-                client_order_id: cid,
-                trade_id: if f.trade_id.trim().is_empty() {
-                    None
-                } else {
-                    Some(f.trade_id.clone())
-                },
-                ticker: f.ticker.clone(),
-                side: f.side.clone(),
-                action: f.action.clone(),
-                count: f.count,
-                price_cents: price_c,
-                is_taker: f.is_taker,
-                fee_dollars,
-                revenue_cents: None,
-                realized_pnl_dollars: None,
-            });
+            let rec = risk_rails::execution_record_from_fill(f, cid, now);
+            if st.executions.append_idempotent(rec) {
+                new_exec_count += 1;
+            }
         }
 
         // 2. Append canceled orders & prune reserved exposure for filled/canceled orders.
@@ -8873,35 +8881,10 @@ pub(crate) fn reconcile_live_venue(
                 || o.status.eq_ignore_ascii_case("cancelled")
             {
                 st.reserved_order_exposure.remove(&o.order_id);
-                let price_c = if o.side.eq_ignore_ascii_case("no") {
-                    o.no_price.or_else(|| o.yes_price.map(|p| 100 - p))
-                } else {
-                    o.yes_price.or_else(|| o.no_price.map(|p| 100 - p))
+                let rec = risk_rails::execution_record_from_canceled_order(o, now);
+                if st.executions.append_idempotent(rec) {
+                    new_exec_count += 1;
                 }
-                .unwrap_or(50)
-                .clamp(1, 99) as u8;
-                let ts = o
-                    .created_time
-                    .as_deref()
-                    .and_then(parse_iso_z)
-                    .unwrap_or(now);
-                st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
-                    kind: "order_canceled".to_string(),
-                    venue_id: o.order_id.clone(),
-                    ts,
-                    order_id: o.order_id.clone(),
-                    client_order_id: o.client_order_id.clone(),
-                    trade_id: None,
-                    ticker: o.ticker.clone(),
-                    side: o.side.clone(),
-                    action: o.action.clone(),
-                    count: o.remaining_count.max(0),
-                    price_cents: price_c,
-                    is_taker: None,
-                    fee_dollars: 0.0,
-                    revenue_cents: None,
-                    realized_pnl_dollars: None,
-                });
             } else if o.status.eq_ignore_ascii_case("executed") || o.remaining_count <= 0 {
                 st.reserved_order_exposure.remove(&o.order_id);
             }
@@ -8921,7 +8904,7 @@ pub(crate) fn reconcile_live_venue(
             };
             let count = s.yes_count.saturating_add(s.no_count).max(0);
             let pnl = s.realized_pnl_dollars();
-            st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+            if st.executions.append_idempotent(risk_rails::LiveExecutionRecord {
                 kind: "settlement".to_string(),
                 venue_id: s.ticker.clone(),
                 ts,
@@ -8937,8 +8920,24 @@ pub(crate) fn reconcile_live_venue(
                 fee_dollars: s.fee_cost_dollars,
                 revenue_cents: Some(s.revenue),
                 realized_pnl_dollars: Some(pnl),
-            });
+            }) {
+                new_exec_count += 1;
+            }
         }
+
+        // Update tracked venue positions snapshot and detect changes.
+        let mut next_positions = std::collections::HashMap::with_capacity(positions.len());
+        for p in &positions {
+            next_positions.insert(p.ticker.clone(), p.clone());
+        }
+        let positions_changed = next_positions.len() != st.ws_positions.len()
+            || next_positions.iter().any(|(k, v)| {
+                st.ws_positions.get(k).is_none_or(|prev| {
+                    prev.position != v.position
+                        || (prev.market_exposure_dollars - v.market_exposure_dollars).abs() > 1e-6
+                })
+            });
+        st.ws_positions = next_positions;
 
         // 4. Authoritative open exposure = filled position exposure + resting buy orders notional.
         let pos_exposure: f64 = positions
@@ -9030,8 +9029,9 @@ pub(crate) fn reconcile_live_venue(
         st.rails.last_error = None;
         st.last_discrepancies = discrepancies.clone();
         st.rails.record_venue_sync(now, open_exposure, effective_loss);
+        let live_snap = st.status_snapshot();
 
-        risk_rails::LiveReconcileResponse {
+        let resp = risk_rails::LiveReconcileResponse {
             ok: true,
             configured: true,
             connected: true,
@@ -9045,7 +9045,8 @@ pub(crate) fn reconcile_live_venue(
             executions: st.executions.records().to_vec(),
             discrepancies,
             last_error: None,
-        }
+        };
+        (resp, live_snap, new_exec_count > 0 || positions_changed)
     };
 
     app.invalidate_live_hot();
@@ -9058,11 +9059,30 @@ pub(crate) fn reconcile_live_venue(
         now,
     );
     tape_hub().publish(ev);
+    if should_emit_live_exec {
+        private_ws::publish_live_exec_sse(
+            "reconcile",
+            "rest_reconcile",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &live_snap,
+            now,
+        );
+    }
     Ok(resp)
 }
 
+const WS_BACKSTOP_RECONCILE_SECS: u64 = 60;
+
 /// Background reconciler thread polling Kalshi when live credentials are configured,
 /// keeping `last_venue_sync_epoch` < 30s and reconciling fills/settlements/exposure.
+/// Scales to a 60s consistency backstop while `private_ws_connected == true`, and runs
+/// immediate full REST reconciliation on WS disconnect or sequence gap.
 /// Parks idle on `Condvar` (0% CPU / 0 network) when live credentials are absent.
 fn start_background_reconciler(app: Arc<App>) {
     let poll_secs = std::env::var("OPENBELL_RECONCILE_SECS")
@@ -9072,6 +9092,7 @@ fn start_background_reconciler(app: Arc<App>) {
         .clamp(1, 25);
     std::thread::spawn(move || {
         let mut last_seen_seq = 0u64;
+        let mut skip_next_reconcile = false;
         loop {
             let configured = {
                 let st = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
@@ -9079,25 +9100,46 @@ fn start_background_reconciler(app: Arc<App>) {
             };
             if !configured {
                 let (lock, cv) = &*app.reconcile_wake;
-                let mut seq = lock.lock().unwrap_or_else(|p| p.into_inner());
-                while *seq == last_seen_seq {
-                    seq = cv.wait(seq).unwrap_or_else(|p| p.into_inner());
+                let mut wake = lock.lock().unwrap_or_else(|p| p.into_inner());
+                while wake.0 == last_seen_seq {
+                    wake = cv.wait(wake).unwrap_or_else(|p| p.into_inner());
                 }
-                last_seen_seq = *seq;
+                last_seen_seq = wake.0;
+                wake.1 = false;
+                skip_next_reconcile = false;
                 continue;
             }
 
-            let _ = reconcile_live_venue(&app);
+            if !skip_next_reconcile {
+                let _ = reconcile_live_venue(&app);
+            }
+            skip_next_reconcile = false;
+
+            let wait_secs = if app.is_private_ws_connected() {
+                WS_BACKSTOP_RECONCILE_SECS
+            } else {
+                poll_secs
+            };
 
             let (lock, cv) = &*app.reconcile_wake;
-            let seq = lock.lock().unwrap_or_else(|p| p.into_inner());
-            if *seq == last_seen_seq {
-                let (next_seq, _) = cv
-                    .wait_timeout(seq, std::time::Duration::from_secs(poll_secs))
+            let mut wake = lock.lock().unwrap_or_else(|p| p.into_inner());
+            if wake.0 == last_seen_seq {
+                let (mut next_wake, timeout_res) = cv
+                    .wait_timeout(wake, std::time::Duration::from_secs(wait_secs))
                     .unwrap_or_else(|p| p.into_inner());
-                last_seen_seq = *next_seq;
+                last_seen_seq = next_wake.0;
+                let imm = next_wake.1;
+                next_wake.1 = false;
+                if !timeout_res.timed_out() && !imm {
+                    skip_next_reconcile = true;
+                }
             } else {
-                last_seen_seq = *seq;
+                last_seen_seq = wake.0;
+                let imm = wake.1;
+                wake.1 = false;
+                if !imm {
+                    skip_next_reconcile = true;
+                }
             }
         }
     });
@@ -9489,6 +9531,7 @@ fn main() {
     start_background_collector(app.clone());
     shadow_runner::start_background_runner(app.clone());
     start_background_reconciler(app.clone());
+    private_ws::start_background_private_ws(app.clone());
     orderbook::start_background_orderbook(app.clone());
     spot_feed::start_background_spot_feed(app.clone());
     startup_discover_open_markets(app.clone());

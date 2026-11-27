@@ -1111,45 +1111,7 @@ impl KalshiLiveClient {
             .cloned()
             .unwrap_or_default();
 
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let ticker = r
-                .get("ticker")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if ticker.is_empty() {
-                continue;
-            }
-            let position = r.get("position").and_then(|v| v.as_i64()).unwrap_or(0);
-            let exp_c = r
-                .get("market_exposure")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let exp_d = parse_dollars_or_cents(&r, "market_exposure_dollars", exp_c);
-            let rpnl_c = r.get("realized_pnl").and_then(|v| v.as_i64()).unwrap_or(0);
-            let rpnl_d = parse_dollars_or_cents(&r, "realized_pnl_dollars", rpnl_c);
-            let resting = r
-                .get("resting_orders_count")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let fees_c = r.get("fees_paid").and_then(|v| v.as_i64()).unwrap_or(0);
-            let fees_d = parse_dollars_or_cents(&r, "fees_paid_dollars", fees_c);
-            let traded_c = r.get("total_traded").and_then(|v| v.as_i64()).unwrap_or(0);
-            let traded_d = parse_dollars_or_cents(&r, "total_traded_dollars", traded_c);
-            out.push(KalshiPosition {
-                ticker,
-                position,
-                market_exposure_cents: exp_c,
-                market_exposure_dollars: exp_d,
-                realized_pnl_cents: rpnl_c,
-                realized_pnl_dollars: rpnl_d,
-                resting_orders_count: resting,
-                fees_paid_dollars: fees_d,
-                total_traded_dollars: traded_d,
-            });
-        }
-        Ok(out)
+        Ok(rows.iter().filter_map(parse_kalshi_position).collect())
     }
 
     pub fn get_orders(&self, status_filter: Option<&str>) -> Result<Vec<KalshiOrder>, String> {
@@ -1643,7 +1605,7 @@ fn parse_cents_or_dollars(v: &serde_json::Value, cents_key: &str, dollars_key: &
     0
 }
 
-fn parse_kalshi_fill(r: &serde_json::Value) -> Option<KalshiFill> {
+pub(crate) fn parse_kalshi_fill(r: &serde_json::Value) -> Option<KalshiFill> {
     let trade_id = r
         .get("trade_id")
         .or_else(|| r.get("fill_id"))
@@ -1749,13 +1711,63 @@ fn parse_dollars_or_cents(v: &serde_json::Value, dollars_key: &str, cents_fallba
     cents_fallback as f64 / 100.0
 }
 
-fn parse_kalshi_order(v: &serde_json::Value) -> Option<KalshiOrder> {
+pub(crate) fn parse_kalshi_position(r: &serde_json::Value) -> Option<KalshiPosition> {
+    let ticker = r
+        .get("ticker")
+        .or_else(|| r.get("market_ticker"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let position = r.get("position").and_then(|v| v.as_i64()).unwrap_or(0);
+    let exp_c_raw = r.get("market_exposure").and_then(|v| v.as_i64());
+    let exp_d = parse_dollars_or_cents(r, "market_exposure_dollars", exp_c_raw.unwrap_or(0));
+    let exp_c = exp_c_raw.unwrap_or_else(|| (exp_d * 100.0).round() as i64);
+    let rpnl_c_raw = r.get("realized_pnl").and_then(|v| v.as_i64());
+    let rpnl_d = parse_dollars_or_cents(r, "realized_pnl_dollars", rpnl_c_raw.unwrap_or(0));
+    let rpnl_c = rpnl_c_raw.unwrap_or_else(|| (rpnl_d * 100.0).round() as i64);
+    let resting = r
+        .get("resting_orders_count")
+        .or_else(|| r.get("resting_order_count"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let fees_c = r.get("fees_paid").and_then(|v| v.as_i64()).unwrap_or(0);
+    let fees_d = parse_dollars_or_cents(r, "fees_paid_dollars", fees_c);
+    let traded_c = r.get("total_traded").and_then(|v| v.as_i64()).unwrap_or(0);
+    let traded_d = parse_dollars_or_cents(r, "total_traded_dollars", traded_c);
+    Some(KalshiPosition {
+        ticker,
+        position,
+        market_exposure_cents: exp_c,
+        market_exposure_dollars: exp_d,
+        realized_pnl_cents: rpnl_c,
+        realized_pnl_dollars: rpnl_d,
+        resting_orders_count: resting,
+        fees_paid_dollars: fees_d,
+        total_traded_dollars: traded_d,
+    })
+}
+
+pub(crate) fn parse_kalshi_order(v: &serde_json::Value) -> Option<KalshiOrder> {
     let order_id = v.get("order_id").and_then(|x| x.as_str())?.to_string();
     let ticker = v
         .get("ticker")
+        .or_else(|| v.get("market_ticker"))
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
+    let yes_price = v.get("yes_price").and_then(|x| x.as_i64()).or_else(|| {
+        v.get("yes_price_dollars")
+            .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+            .filter(|d| d.is_finite())
+            .map(|d| (d * 100.0).round() as i64)
+    });
+    let no_price = v.get("no_price").and_then(|x| x.as_i64()).or_else(|| {
+        v.get("no_price_dollars")
+            .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+            .filter(|d| d.is_finite())
+            .map(|d| (d * 100.0).round() as i64)
+    });
     Some(KalshiOrder {
         order_id,
         client_order_id: v
@@ -1783,8 +1795,8 @@ fn parse_kalshi_order(v: &serde_json::Value) -> Option<KalshiOrder> {
             .and_then(|x| x.as_str())
             .unwrap_or("limit")
             .to_string(),
-        yes_price: v.get("yes_price").and_then(|x| x.as_i64()),
-        no_price: v.get("no_price").and_then(|x| x.as_i64()),
+        yes_price,
+        no_price,
         initial_count: v
             .get("initial_count")
             .or_else(|| v.get("count"))
