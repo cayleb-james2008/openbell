@@ -11,10 +11,16 @@ import {
   timeUtcFullLabel,
   timeUtcLabel,
 } from "@/lib/desk";
+import {
+  type SpotHistoryTick,
+  formatSpotUsd,
+  formatSpotUsdCompact,
+} from "@/lib/spot";
 import { drawOnce } from "@/motionProps";
 
-const PADL = 60;
+const PADL = 52;
 const PADR = 14;
+const PADR_SPOT = 64;
 
 export function useContainerWidth(min = 180, fallback = 540) {
   const ref = useRef<HTMLDivElement>(null);
@@ -37,19 +43,28 @@ export function useContainerWidth(min = 180, fallback = 540) {
   return [ref, w] as const;
 }
 
-/** Interactive SVG Price + Spread History Chart with hover crosshair tooltip (timestamp, YES/NO bid/ask, implied prob, spread). */
+/** Interactive SVG Price + Spread History Chart with Strike threshold reference, Spot price overlay toggle & hover crosshair tooltip. */
 export function MarketHistoryChart({
   points,
   ticker,
   height = 224,
+  spotHistory,
+  liveSpotPrice,
+  floorStrike,
+  capStrike,
 }: {
   points: Market[];
   ticker: string;
   height?: number;
+  spotHistory?: SpotHistoryTick[];
+  liveSpotPrice?: number | null;
+  floorStrike?: number | null;
+  capStrike?: number | null;
 }) {
   const [ref, W] = useContainerWidth(220, 440);
   const reduce = useReducedMotion();
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const [showSpotOverlay, setShowSpotOverlay] = useState(true);
 
   const series = points
     .filter((m) => !!m && typeof m === "object")
@@ -72,22 +87,133 @@ export function MarketHistoryChart({
     );
   }
 
+  const effectiveFloorStrike = (() => {
+    if (isNum(floorStrike) && floorStrike > 0) return floorStrike;
+    for (let i = series.length - 1; i >= 0; i--) {
+      const fs = series[i].raw.floor_strike;
+      if (isNum(fs) && fs > 0) return fs;
+    }
+    return null;
+  })();
+
+  const effectiveCapStrike = (() => {
+    if (isNum(capStrike) && capStrike > 0) return capStrike;
+    for (let i = series.length - 1; i >= 0; i--) {
+      const cs = series[i].raw.cap_strike;
+      if (isNum(cs) && cs > 0) return cs;
+    }
+    return null;
+  })();
+
+  const x0 = series[0].t;
+  const x1 = series[series.length - 1].t;
+  const spanX = Math.max(1, x1 - x0);
+
+  const validSpotHistory = Array.isArray(spotHistory)
+    ? spotHistory.filter((tk) => isNum(tk.ts_ms) && tk.ts_ms > 0 && isNum(tk.price) && tk.price > 0)
+    : [];
+
+  const snapshotSpotPoints = series
+    .map((p, idx) => {
+      const sp = p.raw.spot_price;
+      return isNum(sp) && sp > 0 ? { t: p.t, idx, price: sp } : null;
+    })
+    .filter((p): p is NonNullable<typeof p> => p !== null);
+
+  const latestSpotPrice =
+    isNum(liveSpotPrice) && liveSpotPrice > 0
+      ? liveSpotPrice
+      : validSpotHistory.length > 0
+        ? validSpotHistory[validSpotHistory.length - 1].price
+        : snapshotSpotPoints.length > 0
+          ? snapshotSpotPoints[snapshotSpotPoints.length - 1].price
+          : null;
+
+  const spotValues: number[] = [];
+  for (const tk of validSpotHistory) spotValues.push(tk.price);
+  for (const sp of snapshotSpotPoints) spotValues.push(sp.price);
+  if (effectiveFloorStrike !== null) spotValues.push(effectiveFloorStrike);
+  if (effectiveCapStrike !== null) spotValues.push(effectiveCapStrike);
+  if (latestSpotPrice !== null) spotValues.push(latestSpotPrice);
+
+  const hasSpotOrStrike = spotValues.length > 0;
+  const rightPad = showSpotOverlay && hasSpotOrStrike ? PADR_SPOT : PADR;
+  const plotW = Math.max(80, W - PADL - rightPad);
+
   const H = Math.max(176, height);
   const priceTop = 12;
   const priceBot = Math.round(H * 0.56);
   const spreadTop = priceBot + 24;
   const spreadBot = H - 22;
 
-  const x0 = series[0].t;
-  const x1 = series[series.length - 1].t;
-  const spanX = Math.max(1, x1 - x0);
   const X = (t: number, idx: number) =>
     series.length === 1
-      ? (PADL + W - PADR) / 2
+      ? PADL + plotW / 2
       : spanX <= 0
-        ? PADL + (idx / Math.max(1, series.length - 1)) * (W - PADL - PADR)
-        : PADL + ((t - x0) / spanX) * (W - PADL - PADR);
+        ? PADL + (idx / Math.max(1, series.length - 1)) * plotW
+        : PADL + ((t - x0) / spanX) * plotW;
   const Yp = (v: number) => priceBot - Math.min(1, Math.max(0, v)) * (priceBot - priceTop);
+
+  const rawSpotMin = spotValues.length > 0 ? Math.min(...spotValues) : 0;
+  const rawSpotMax = spotValues.length > 0 ? Math.max(...spotValues) : 1;
+  const spotMid = (rawSpotMin + rawSpotMax) / 2;
+  const minSpotSpan = Math.max(0.0005, spotMid * 0.0015);
+  const spotSpan = Math.max(minSpotSpan, rawSpotMax - rawSpotMin);
+  const spotPad = spotSpan * 0.18;
+  const spotDomainMin = rawSpotMin - spotPad;
+  const spotDomainMax = rawSpotMax + spotPad;
+  const Yspot = (v: number) => {
+    const norm = (v - spotDomainMin) / Math.max(1e-9, spotDomainMax - spotDomainMin);
+    const clamped = Math.min(1, Math.max(0, norm));
+    return priceBot - clamped * (priceBot - priceTop);
+  };
+
+  const spotChartPoints: { x: number; y: number; price: number }[] = (() => {
+    if (!showSpotOverlay) return [];
+    if (validSpotHistory.length > 0) {
+      const inRange =
+        series.length > 1 && spanX > 1
+          ? validSpotHistory.filter((tk) => tk.ts_ms / 1000 >= x0 - 900 && tk.ts_ms / 1000 <= x1 + 900)
+          : [];
+      if (inRange.length >= 2 && series.length > 1 && spanX > 1) {
+        return inRange.map((tk) => {
+          const tsSec = tk.ts_ms / 1000;
+          const frac = Math.min(1, Math.max(0, (tsSec - x0) / spanX));
+          return { x: PADL + frac * plotW, y: Yspot(tk.price), price: tk.price };
+        });
+      }
+      if (validSpotHistory.length >= 2) {
+        return validSpotHistory.map((tk, idx) => ({
+          x: PADL + (idx / (validSpotHistory.length - 1)) * plotW,
+          y: Yspot(tk.price),
+          price: tk.price,
+        }));
+      }
+      return [
+        {
+          x: PADL + plotW / 2,
+          y: Yspot(validSpotHistory[0].price),
+          price: validSpotHistory[0].price,
+        },
+      ];
+    }
+    if (snapshotSpotPoints.length > 0) {
+      return snapshotSpotPoints.map((sp) => ({
+        x: X(sp.t, sp.idx),
+        y: Yspot(sp.price),
+        price: sp.price,
+      }));
+    }
+    if (latestSpotPrice !== null) {
+      return [{ x: W - rightPad, y: Yspot(latestSpotPrice), price: latestSpotPrice }];
+    }
+    return [];
+  })();
+
+  const spotPathD =
+    spotChartPoints.length >= 2
+      ? spotChartPoints.map((pt, i) => `${i ? "L" : "M"}${pt.x.toFixed(1)},${pt.y.toFixed(1)}`).join(" ")
+      : "";
 
   const maxSpread = Math.max(4, ...series.map((s) => s.spread));
   const Ys = (sp: number) => spreadBot - (Math.min(maxSpread, Math.max(0, sp)) / maxSpread) * (spreadBot - spreadTop);
@@ -120,7 +246,7 @@ export function MarketHistoryChart({
   })();
   const activeIdx = hoverIdx !== null && hoverIdx >= 0 && hoverIdx < series.length ? hoverIdx : defaultIdx;
   const active = series[activeIdx];
-  const barW = Math.max(3, Math.min(14, (W - PADL - PADR) / Math.max(8, series.length * 1.6)));
+  const barW = Math.max(3, Math.min(14, plotW / Math.max(8, series.length * 1.6)));
 
   const onMove = (clientX: number, rect: DOMRect) => {
     const rel = clientX - rect.left;
@@ -136,8 +262,46 @@ export function MarketHistoryChart({
     setHoverIdx(best);
   };
 
+  const activeSpotDisplay =
+    isNum(active.raw.spot_price) && active.raw.spot_price > 0 ? active.raw.spot_price : latestSpotPrice;
+  const strikeY = effectiveFloorStrike !== null ? Yspot(effectiveFloorStrike) : null;
+  const showStrikeAxisLabel =
+    strikeY !== null &&
+    Math.abs(strikeY - (priceTop + 8)) >= 20 &&
+    Math.abs(strikeY - (priceBot - 2)) >= 20;
+
   return (
     <div ref={ref} className="min-w-0" data-market-price-spread-chart>
+      <div className="mb-1.5 flex min-w-0 flex-wrap items-center justify-between gap-2 text-xs">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <button
+            type="button"
+            data-spot-overlay-toggle
+            aria-pressed={showSpotOverlay}
+            onClick={() => setShowSpotOverlay((v) => !v)}
+            className={
+              "min-h-11 cursor-pointer rounded-md border px-2.5 text-xs font-medium outline-none transition-[background-color,border-color,color] duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8 " +
+              (showSpotOverlay
+                ? "border-blue/60 bg-blue-soft text-info-foreground"
+                : "border-hairline bg-board text-ink-2 [@media(hover:hover)_and_(pointer:fine)]:hover:text-ink")
+            }
+          >
+            {showSpotOverlay ? "Spot & Strike: On" : "Spot & Strike: Off"}
+          </button>
+          <span data-chart-strike-label className="mono text-ink-2">
+            Strike <strong className="font-semibold text-ink">{formatSpotUsd(effectiveFloorStrike)}</strong>
+          </span>
+          <span data-chart-spot-label className="mono text-ink-2">
+            Spot <strong className="font-semibold text-ink">{formatSpotUsd(latestSpotPrice)}</strong>
+          </span>
+        </div>
+        {showSpotOverlay && !hasSpotOrStrike && (
+          <span data-chart-spot-offline className="text-xs text-ink-2">
+            Spot &amp; strike N/A
+          </span>
+        )}
+      </div>
+
       <div
         data-market-crosshair-tooltip
         className="mb-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded-md border border-hairline bg-board/60 px-2.5 py-1 text-xs tabular-nums"
@@ -157,6 +321,11 @@ export function MarketHistoryChart({
         <span className="text-ink-2">
           Spread {active.spread}c
         </span>
+        {showSpotOverlay && (
+          <span className="mono text-ink-2">
+            Spot {formatSpotUsd(activeSpotDisplay)}
+          </span>
+        )}
       </div>
 
       <svg
@@ -180,7 +349,7 @@ export function MarketHistoryChart({
           <g key={tick}>
             <line
               x1={PADL}
-              x2={W - PADR}
+              x2={W - rightPad}
               y1={Yp(tick)}
               y2={Yp(tick)}
               strokeDasharray={tick === 0.5 ? "3 3" : undefined}
@@ -206,7 +375,7 @@ export function MarketHistoryChart({
         ) : (
           <line
             x1={PADL}
-            x2={W - PADR}
+            x2={W - rightPad}
             y1={Yp(series[0].prob)}
             y2={Yp(series[0].prob)}
             strokeDasharray="2 3"
@@ -229,8 +398,89 @@ export function MarketHistoryChart({
           />
         )}
 
-        <line x1={PADL} x2={W - PADR} y1={spreadTop} y2={spreadTop} style={{ stroke: "var(--hairline)" }} />
-        <line x1={PADL} x2={W - PADR} y1={spreadBot} y2={spreadBot} style={{ stroke: "var(--hairline)" }} />
+        {showSpotOverlay && hasSpotOrStrike && (
+          <g data-spot-overlay-group>
+            {strikeY !== null && (
+              <line
+                data-strike-line
+                x1={PADL}
+                x2={W - rightPad}
+                y1={strikeY}
+                y2={strikeY}
+                strokeWidth={1.5}
+                strokeDasharray="4 3"
+                style={{ stroke: "var(--dot-amber)" }}
+              />
+            )}
+
+            {spotPathD ? (
+              <path
+                data-spot-overlay-path
+                d={spotPathD}
+                fill="none"
+                strokeWidth={1.75}
+                strokeLinejoin="round"
+                strokeLinecap="round"
+                style={{ stroke: "var(--dot-green)" }}
+              />
+            ) : spotChartPoints.length === 1 ? (
+              <>
+                <line
+                  data-spot-overlay-path
+                  x1={PADL}
+                  x2={W - rightPad}
+                  y1={spotChartPoints[0].y}
+                  y2={spotChartPoints[0].y}
+                  strokeWidth={1.25}
+                  strokeDasharray="2 2"
+                  style={{ stroke: "var(--dot-green)", opacity: 0.7 }}
+                />
+                <circle
+                  cx={spotChartPoints[0].x}
+                  cy={spotChartPoints[0].y}
+                  r={3.5}
+                  style={{ fill: "var(--dot-green)", stroke: "var(--surface)", strokeWidth: 1.5 }}
+                />
+              </>
+            ) : null}
+
+            <text
+              x={W - rightPad + 6}
+              y={priceTop + 8}
+              textAnchor="start"
+              fontSize={12}
+              className="font-mono tabular-nums"
+              style={{ fill: "var(--ink-2)" }}
+            >
+              {formatSpotUsdCompact(spotDomainMax)}
+            </text>
+            {showStrikeAxisLabel && (
+              <text
+                x={W - rightPad + 6}
+                y={strikeY + 4}
+                textAnchor="start"
+                fontSize={12}
+                className="font-mono"
+                style={{ fill: "var(--warning-foreground)" }}
+              >
+                Strike
+              </text>
+            )}
+            <text
+              x={W - rightPad + 6}
+              y={priceBot - 2}
+              textAnchor="start"
+              fontSize={12}
+              className="font-mono tabular-nums"
+              style={{ fill: "var(--ink-2)" }}
+            >
+              {formatSpotUsdCompact(spotDomainMin)}
+            </text>
+          </g>
+        )}
+
+        <line x1={PADL} x2={W - rightPad} y1={spreadTop} y2={spreadTop} style={{ stroke: "var(--hairline)" }} />
+        <line x1={PADL} x2={W - rightPad} y1={spreadBot} y2={spreadBot} style={{ stroke: "var(--hairline)" }} />
         <text x={PADL - 8} y={spreadTop + 8} textAnchor="end" fontSize={12} className="font-mono tabular-nums" style={{ fill: "var(--ink-3)" }}>
           {maxSpread}c
         </text>
@@ -279,7 +529,7 @@ export function MarketHistoryChart({
         <text x={PADL} y={H - 5} fontSize={12} className="font-mono" style={{ fill: "var(--ink-3)" }}>
           {isNum(series[0].raw.fetched_at) ? timeUtcLabel(series[0].raw.fetched_at) : "Start"}
         </text>
-        <text x={W - PADR} y={H - 5} textAnchor="end" fontSize={12} className="font-mono" style={{ fill: "var(--ink-3)" }}>
+        <text x={W - rightPad} y={H - 5} textAnchor="end" fontSize={12} className="font-mono" style={{ fill: "var(--ink-3)" }}>
           {series.length === 1
             ? "1 snapshot"
             : isNum(series[series.length - 1].raw.fetched_at)

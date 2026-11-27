@@ -51,6 +51,11 @@ export const V2_TICK_CONTEXT_FIELDS: TickContextFieldSpec[] = [
   { field: "slot_avg_entry_cents", type: "f64", unit: "cents", description: "Weighted average entry price in cents for open slot contracts" },
   { field: "slot_unrealized_pnl_cents", type: "f64", unit: "cents", description: "Mark-to-bid unrealized P&L in cents for open slot contracts" },
   { field: "slot_resting_cents", type: "i64", unit: "cents", description: "Current resting entry quote limit price in cents, or 0 if none" },
+  { field: "spot_price", type: "f64", unit: "USD", description: "Latest underlying asset spot price in USD, or 0.0 if offline" },
+  { field: "strike_price", type: "f64", unit: "USD", description: "Market floor strike price in USD, or 0.0 if unavailable" },
+  { field: "spot_distance_bps", type: "f64", unit: "bps", description: "Signed spot distance above or below strike in basis points" },
+  { field: "spot_delta_30s_bps", type: "f64", unit: "bps", description: "Trailing 30-second underlying spot return in basis points" },
+  { field: "spot_vol_bps", type: "f64", unit: "bps", description: "Realized underlying spot volatility in basis points" },
 ];
 
 export const DEFAULT_V2_STRATEGY_SOURCE = `// Paper-only Kalshi 15m strategy script v2
