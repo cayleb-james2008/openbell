@@ -267,41 +267,89 @@ pub fn live_executions_path(data_dir: &Path) -> PathBuf {
     data_dir.join("live_executions.jsonl")
 }
 
-/// Load persisted risk rail caps from disk (always returns disarmed state!).
-pub fn load_rails_config(data_dir: &Path) -> RiskRailsConfig {
+const MAX_RAILS_JSON_BYTES: u64 = 1024 * 1024;
+const MAX_EXEC_LINE_BYTES: usize = 64 * 1024;
+
+fn load_rails_config_checked(data_dir: &Path) -> Result<RiskRailsConfig, (RiskRailsConfig, String)> {
     let path = rails_config_path(data_dir);
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RiskRailsConfig::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RiskRailsConfig::default()),
         Err(e) => {
-            eprintln!("[openbell] WARNING: cannot stat risk_rails.json ({e}); using default caps");
-            return RiskRailsConfig::default();
+            return Err((
+                RiskRailsConfig::default(),
+                format!("cannot stat risk_rails.json ({e})"),
+            ));
         }
     };
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        eprintln!("[openbell] WARNING: risk_rails.json is not a regular non-symlink file; using default caps");
-        return RiskRailsConfig::default();
+    if meta.file_type().is_symlink()
+        || !meta.file_type().is_file()
+        || !crate::is_confined_regular_file(data_dir, &path)
+    {
+        return Err((
+            RiskRailsConfig::default(),
+            "risk_rails.json is not a confined regular non-symlink file".to_string(),
+        ));
     }
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => match serde_json::from_str::<RiskRailsConfig>(&raw) {
-            Ok(cfg) => match cfg.validate() {
-                Ok(valid) => valid,
-                Err(errs) => {
-                    eprintln!(
-                        "[openbell] WARNING: invalid risk_rails.json ({}); using default caps",
-                        errs.join("; ")
-                    );
-                    RiskRailsConfig::default()
-                }
-            },
-            Err(e) => {
-                eprintln!("[openbell] WARNING: corrupt risk_rails.json ({e}); using default caps");
-                RiskRailsConfig::default()
-            }
-        },
+    if meta.len() > MAX_RAILS_JSON_BYTES {
+        return Err((
+            RiskRailsConfig::default(),
+            "risk_rails.json exceeds maximum allowed size".to_string(),
+        ));
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
         Err(e) => {
-            eprintln!("[openbell] WARNING: unreadable risk_rails.json ({e}); using default caps");
-            RiskRailsConfig::default()
+            return Err((
+                RiskRailsConfig::default(),
+                format!("unreadable risk_rails.json ({e})"),
+            ));
+        }
+    };
+    let val: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err((
+                RiskRailsConfig::default(),
+                format!("corrupt risk_rails.json ({e})"),
+            ));
+        }
+    };
+    if val
+        .get("live_armed")
+        .and_then(|v| v.as_bool())
+        .is_some_and(|b| b)
+    {
+        return Err((
+            RiskRailsConfig::default(),
+            "tampered risk_rails.json attempted to set live_armed=true".to_string(),
+        ));
+    }
+    let cfg: RiskRailsConfig = match serde_json::from_value(val) {
+        Ok(c) => c,
+        Err(e) => {
+            return Err((
+                RiskRailsConfig::default(),
+                format!("corrupt risk_rails.json schema ({e})"),
+            ));
+        }
+    };
+    match cfg.validate() {
+        Ok(valid) => Ok(valid),
+        Err(errs) => Err((
+            RiskRailsConfig::default(),
+            format!("invalid risk_rails.json ({})", errs.join("; ")),
+        )),
+    }
+}
+
+/// Load persisted risk rail caps from disk (always returns disarmed state!).
+pub fn load_rails_config(data_dir: &Path) -> RiskRailsConfig {
+    match load_rails_config_checked(data_dir) {
+        Ok(cfg) => cfg,
+        Err((fallback, detail)) => {
+            eprintln!("[openbell] WARNING: {detail}; using default caps");
+            fallback
         }
     }
 }
@@ -333,35 +381,49 @@ impl RiskRailsState {
 
     /// Load risk rails config AND persisted runtime state from `data_dir`.
     /// ALWAYS forces `live_armed = false` and preserves `killed`/`kill_reason` fail-closed.
-    /// If an existing `risk_rails_runtime.json` is corrupt/truncated/unreadable, recovers
-    /// fail-closed (`killed = true`, `live_armed = false`, quarantined corrupt backup) so
-    /// a prior kill latch can never be silently lost.
+    /// If an existing `risk_rails.json` or `risk_rails_runtime.json` is tampered/corrupt/truncated/unreadable,
+    /// recovers fail-closed (`killed = true`, `live_armed = false`) so no cap or kill latch can be bypassed.
     /// On a new UTC day, resets daily counters while keeping `killed` latched.
     pub fn load(data_dir: &Path) -> Self {
-        let mut st = Self::new(load_rails_config(data_dir));
+        let (cfg, cfg_err) = match load_rails_config_checked(data_dir) {
+            Ok(valid) => (valid, None),
+            Err((fallback, detail)) => (fallback, Some(detail)),
+        };
+        let mut st = Self::new(cfg);
         st.data_dir = Some(data_dir.to_path_buf());
-        let rt_path = rails_runtime_path(data_dir);
-        let engage_corrupt_fail_closed = |st: &mut RiskRailsState, detail: String, quarantine_file: bool| {
-            eprintln!("[openbell] WARNING: {detail}; engaging fail-closed kill latch (live_armed=false)");
-            if quarantine_file {
-                let backup = data_dir.join(format!(
-                    "risk_rails_runtime.json.corrupt.{}",
-                    current_unix_epoch()
-                ));
-                let backup_is_symlink = std::fs::symlink_metadata(&backup)
-                    .is_ok_and(|m| m.file_type().is_symlink());
-                if !backup_is_symlink {
-                    let _ = std::fs::rename(&rt_path, &backup);
-                }
-            }
+        if let Some(detail) = cfg_err {
+            eprintln!(
+                "[openbell] WARNING: {detail}; engaging fail-closed kill latch (live_armed=false)"
+            );
             st.killed = true;
             st.kill_reason = Some(detail.clone());
             st.last_error = Some(detail);
             st.live_armed = false;
-            if quarantine_file {
-                let _ = st.save_runtime(data_dir);
-            }
-        };
+        }
+
+        let rt_path = rails_runtime_path(data_dir);
+        let engage_corrupt_fail_closed =
+            |st: &mut RiskRailsState, detail: String, quarantine_file: bool| {
+                eprintln!("[openbell] WARNING: {detail}; engaging fail-closed kill latch (live_armed=false)");
+                if quarantine_file {
+                    let backup = data_dir.join(format!(
+                        "risk_rails_runtime.json.corrupt.{}",
+                        current_unix_epoch()
+                    ));
+                    let backup_is_symlink = std::fs::symlink_metadata(&backup)
+                        .is_ok_and(|m| m.file_type().is_symlink());
+                    if !backup_is_symlink {
+                        let _ = std::fs::rename(&rt_path, &backup);
+                    }
+                }
+                st.killed = true;
+                st.kill_reason = Some(detail.clone());
+                st.last_error = Some(detail);
+                st.live_armed = false;
+                if quarantine_file {
+                    let _ = st.save_runtime(data_dir);
+                }
+            };
 
         match std::fs::symlink_metadata(&rt_path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -372,11 +434,22 @@ impl RiskRailsState {
                     false,
                 );
             }
-            Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_file() => {
+            Ok(meta)
+                if meta.file_type().is_symlink()
+                    || !meta.file_type().is_file()
+                    || !crate::is_confined_regular_file(data_dir, &rt_path) =>
+            {
                 engage_corrupt_fail_closed(
                     &mut st,
-                    "risk_rails_runtime.json is not a regular non-symlink file".to_string(),
+                    "risk_rails_runtime.json is not a confined regular non-symlink file".to_string(),
                     false,
+                );
+            }
+            Ok(meta) if meta.len() > MAX_RAILS_JSON_BYTES => {
+                engage_corrupt_fail_closed(
+                    &mut st,
+                    "risk_rails_runtime.json exceeds maximum allowed size".to_string(),
+                    true,
                 );
             }
             Ok(_) => match std::fs::read_to_string(&rt_path) {
@@ -387,38 +460,83 @@ impl RiskRailsState {
                         true,
                     );
                 }
-                Ok(raw) => match serde_json::from_str::<PersistedRiskRailsRuntime>(&raw) {
-                    Err(e) => {
-                        engage_corrupt_fail_closed(
-                            &mut st,
-                            format!("corrupt/truncated risk_rails_runtime.json ({e})"),
-                            true,
-                        );
-                    }
-                    Ok(rt) => {
-                        let today = current_utc_day();
-                        st.killed = rt.killed;
-                        st.kill_reason = rt.kill_reason.filter(|s| !s.trim().is_empty());
-                        if rt.open_exposure_dollars.is_finite() && rt.open_exposure_dollars >= 0.0 {
-                            st.open_exposure_dollars = rt.open_exposure_dollars;
+                Ok(raw) => {
+                    let live_armed_tampered = serde_json::from_str::<serde_json::Value>(&raw)
+                        .ok()
+                        .and_then(|v| v.get("live_armed").and_then(|b| b.as_bool()))
+                        .is_some_and(|b| b);
+                    match serde_json::from_str::<PersistedRiskRailsRuntime>(&raw) {
+                        Err(e) => {
+                            engage_corrupt_fail_closed(
+                                &mut st,
+                                format!("corrupt/truncated risk_rails_runtime.json ({e})"),
+                                true,
+                            );
                         }
-                        st.last_venue_sync_epoch = rt.last_venue_sync_epoch;
-                        st.utc_day_num = today;
-                        if rt.utc_day_num == today {
-                            if rt.daily_realized_loss_dollars.is_finite()
-                                && rt.daily_realized_loss_dollars >= 0.0
-                            {
-                                st.daily_realized_loss_dollars = rt.daily_realized_loss_dollars;
+                        Ok(rt) => {
+                            let today = current_utc_day();
+                            if rt.killed {
+                                st.killed = true;
                             }
-                            st.orders_placed_today = rt.orders_placed_today;
-                        } else {
-                            // UTC day rolled over while offline: reset daily loss/orders, keep killed latch!
-                            st.daily_realized_loss_dollars = 0.0;
-                            st.orders_placed_today = 0;
-                            let _ = st.save_runtime(data_dir);
+                            if let Some(reason) = rt.kill_reason.filter(|s| !s.trim().is_empty()) {
+                                if st.kill_reason.is_none() {
+                                    st.kill_reason = Some(reason);
+                                }
+                            }
+                            let bad_exp = !rt.open_exposure_dollars.is_finite()
+                                || rt.open_exposure_dollars < 0.0;
+                            let bad_loss = !rt.daily_realized_loss_dollars.is_finite()
+                                || rt.daily_realized_loss_dollars < 0.0;
+                            let future_day = rt.utc_day_num > today;
+
+                            if !bad_exp {
+                                st.open_exposure_dollars = rt.open_exposure_dollars;
+                            }
+                            st.last_venue_sync_epoch = rt.last_venue_sync_epoch;
+                            st.utc_day_num = today;
+
+                            if rt.utc_day_num == today {
+                                if !bad_loss {
+                                    st.daily_realized_loss_dollars = rt.daily_realized_loss_dollars;
+                                }
+                                st.orders_placed_today = rt.orders_placed_today;
+                            } else if rt.utc_day_num < today {
+                                // UTC day rolled over while offline: reset daily loss/orders, keep killed latch!
+                                st.daily_realized_loss_dollars = 0.0;
+                                st.orders_placed_today = 0;
+                                let _ = st.save_runtime(data_dir);
+                            } else {
+                                // Future utc_day_num tampering: preserve daily loss fail-closed!
+                                if !bad_loss {
+                                    st.daily_realized_loss_dollars = rt.daily_realized_loss_dollars;
+                                }
+                                st.orders_placed_today = rt.orders_placed_today;
+                            }
+
+                            if live_armed_tampered || bad_exp || bad_loss || future_day {
+                                let detail = if live_armed_tampered {
+                                    "tampered risk_rails_runtime.json attempted live_armed=true"
+                                        .to_string()
+                                } else if future_day {
+                                    "tampered risk_rails_runtime.json has future utc_day_num"
+                                        .to_string()
+                                } else {
+                                    "tampered risk_rails_runtime.json has invalid negative/non-finite metrics"
+                                        .to_string()
+                                };
+                                eprintln!(
+                                    "[openbell] WARNING: {detail}; engaging fail-closed kill latch (live_armed=false)"
+                                );
+                                st.killed = true;
+                                if st.kill_reason.is_none() {
+                                    st.kill_reason = Some(detail.clone());
+                                }
+                                st.last_error = Some(detail);
+                                let _ = st.save_runtime(data_dir);
+                            }
                         }
                     }
-                },
+                }
             },
         }
         st.live_armed = false;
@@ -559,6 +677,20 @@ impl RiskRailsState {
         if notional_dollars.is_finite() && notional_dollars > 0.0 {
             self.open_exposure_dollars = (self.open_exposure_dollars - notional_dollars).max(0.0);
             self.persist_if_backed();
+        }
+    }
+
+    /// Pre-reserve exposure in memory before an in-flight venue order/amend HTTP call.
+    pub fn reserve_pending_exposure(&mut self, delta_dollars: f64) {
+        if delta_dollars.is_finite() && delta_dollars > 0.0 {
+            self.open_exposure_dollars += delta_dollars;
+        }
+    }
+
+    /// Roll back an in-memory pre-reservation if an in-flight venue order/amend failed or was killed.
+    pub fn rollback_pending_exposure(&mut self, delta_dollars: f64) {
+        if delta_dollars.is_finite() && delta_dollars > 0.0 {
+            self.open_exposure_dollars = (self.open_exposure_dollars - delta_dollars).max(0.0);
         }
     }
 
@@ -1017,11 +1149,16 @@ fn append_jsonl_0600(path: &Path, line: &str) -> Result<(), String> {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create data dir: {e}"))?;
+        let dir_meta = std::fs::symlink_metadata(parent)
+            .map_err(|e| format!("stat execution ledger dir: {e}"))?;
+        if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
+            return Err("execution ledger directory must not be a symlink".to_string());
+        }
     }
     let mut needs_leading_newline = false;
     if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return Err("refusing to append to symlink execution ledger".to_string());
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            return Err("refusing to append to symlink or non-regular execution ledger".to_string());
         }
         if meta.len() > 0 {
             if let Ok(mut rf) = std::fs::File::open(path) {
@@ -1072,6 +1209,21 @@ impl LiveExecutionLedger {
         let path = live_executions_path(data_dir);
         let mut records = Vec::new();
         let mut seen = HashSet::new();
+        let Ok(dir_meta) = std::fs::symlink_metadata(data_dir) else {
+            return Self {
+                path,
+                records,
+                seen,
+            };
+        };
+        if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
+            eprintln!("[openbell] WARNING: data_dir is not a regular directory; ignoring live_executions.jsonl");
+            return Self {
+                path,
+                records,
+                seen,
+            };
+        }
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             return Self {
                 path,
@@ -1079,37 +1231,63 @@ impl LiveExecutionLedger {
                 seen,
             };
         };
-        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-            eprintln!("[openbell] WARNING: live_executions.jsonl is not a regular non-symlink file; ignoring");
+        if meta.file_type().is_symlink()
+            || !meta.file_type().is_file()
+            || !crate::is_confined_regular_file(data_dir, &path)
+        {
+            eprintln!("[openbell] WARNING: live_executions.jsonl is not a confined regular non-symlink file; ignoring");
             return Self {
                 path,
                 records,
                 seen,
             };
         }
+        let file_len = meta.len();
+        let mut pos = 0u64;
+        let mut last_good_end = 0u64;
+        let mut saw_trailing_corrupt = false;
+        let mut corrupt_lines = 0usize;
+
         if let Ok(file) = std::fs::File::open(&path) {
             let mut reader = BufReader::new(file);
             let mut buf = Vec::with_capacity(512);
-            let mut corrupt_lines = 0usize;
             loop {
                 buf.clear();
                 match reader.read_until(b'\n', &mut buf) {
                     Ok(0) => break,
-                    Ok(_) => {}
+                    Ok(n) => {
+                        pos = pos.saturating_add(n as u64);
+                    }
                     Err(_) => break,
+                }
+                if buf.len() > MAX_EXEC_LINE_BYTES {
+                    corrupt_lines += 1;
+                    saw_trailing_corrupt = true;
+                    continue;
                 }
                 let Ok(line_str) = std::str::from_utf8(&buf) else {
                     corrupt_lines += 1;
+                    saw_trailing_corrupt = true;
                     continue;
                 };
                 let trimmed = line_str.trim();
                 if trimmed.is_empty() {
+                    last_good_end = pos;
+                    saw_trailing_corrupt = false;
                     continue;
                 }
                 match serde_json::from_str::<LiveExecutionRecord>(trimmed) {
                     Ok(mut rec) => {
-                        if rec.kind.trim().is_empty() || rec.venue_id.trim().is_empty() {
+                        let invalid_fields = rec.kind.trim().is_empty()
+                            || rec.venue_id.trim().is_empty()
+                            || rec.ts < 0
+                            || rec.count < 0
+                            || rec.price_cents > 99
+                            || (rec.kind == "fill"
+                                && (rec.count <= 0 || !(1..=99).contains(&rec.price_cents)));
+                        if invalid_fields {
                             corrupt_lines += 1;
+                            saw_trailing_corrupt = true;
                             continue;
                         }
                         if !rec.fee_dollars.is_finite() || rec.fee_dollars < 0.0 {
@@ -1118,12 +1296,15 @@ impl LiveExecutionLedger {
                         if rec.realized_pnl_dollars.is_some_and(|v| !v.is_finite()) {
                             rec.realized_pnl_dollars = None;
                         }
+                        last_good_end = pos;
+                        saw_trailing_corrupt = false;
                         if seen.insert((rec.kind.clone(), rec.venue_id.clone())) {
                             records.push(rec);
                         }
                     }
                     Err(_) => {
                         corrupt_lines += 1;
+                        saw_trailing_corrupt = true;
                     }
                 }
             }
@@ -1132,6 +1313,11 @@ impl LiveExecutionLedger {
                     "[openbell] WARNING: skipped {corrupt_lines} corrupt/truncated line(s) in {}",
                     path.display()
                 );
+            }
+        }
+        if saw_trailing_corrupt && last_good_end < file_len {
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
+                let _ = f.set_len(last_good_end);
             }
         }
         Self {
@@ -1773,5 +1959,50 @@ mod tests {
 
         st.apply_amended_exposure(6.0, 8.0);
         assert!((st.open_exposure_dollars - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn h1_tampered_rails_config_and_runtime_always_boot_disarmed_and_fail_closed() {
+        let dir = std::env::temp_dir().join(format!("ob-rails-h1-tamper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. Tampered risk_rails.json with live_armed=true -> killed=true, live_armed=false, default caps
+        std::fs::write(
+            rails_config_path(&dir),
+            r#"{"max_order_contracts":5,"max_order_dollars":5.0,"max_daily_loss_dollars":10.0,"max_open_exposure_dollars":10.0,"allowed_ticker_prefix":"KX","live_armed":true}"#,
+        )
+        .unwrap();
+        let st1 = RiskRailsState::load(&dir);
+        assert!(!st1.live_armed);
+        assert!(st1.killed);
+        assert_eq!(st1.rails.max_order_contracts, default_max_order_contracts());
+
+        // 2. Corrupt risk_rails.json -> killed=true, live_armed=false
+        std::fs::write(rails_config_path(&dir), "{corrupt_json").unwrap();
+        let st2 = RiskRailsState::load(&dir);
+        assert!(!st2.live_armed);
+        assert!(st2.killed);
+
+        // 3. Clean risk_rails.json + tampered risk_rails_runtime.json (future utc_day_num + live_armed=true + killed=false)
+        save_rails_config(&dir, &RiskRailsConfig::default()).unwrap();
+        let rt_tampered = serde_json::json!({
+            "utc_day_num": current_utc_day() + 10,
+            "daily_realized_loss_dollars": 18.5,
+            "open_exposure_dollars": 4.0,
+            "orders_placed_today": 3,
+            "killed": false,
+            "live_armed": true
+        });
+        std::fs::write(rails_runtime_path(&dir), rt_tampered.to_string()).unwrap();
+        let st3 = RiskRailsState::load(&dir);
+        assert!(!st3.live_armed, "tampered runtime MUST always boot disarmed");
+        assert!(st3.killed, "tampered future-day / live_armed runtime MUST latch killed=true");
+        assert!(
+            (st3.daily_realized_loss_dollars - 18.5).abs() < 1e-6,
+            "future utc_day_num tamper must NOT wipe daily loss"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -434,16 +434,8 @@ fn state_path(data_dir: &Path) -> PathBuf {
 }
 
 fn write_atomic_json<T: Serialize>(path: &Path, val: &T) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create data dir: {e}"))?;
-    }
     let body = serde_json::to_vec_pretty(val).map_err(|e| format!("serialize state: {e}"))?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, &body).map_err(|e| format!("write temp state: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("rename state file: {e}")
-    })
+    kalshi_live::write_secret_file_0600(path, &body)
 }
 
 fn normalize_slot(slot: &RunnerSlotConfig) -> Result<RunnerSlotConfig, String> {
@@ -550,6 +542,9 @@ fn load_ledger_events(path: &Path) -> Vec<LedgerEvent> {
         let Ok(line_str) = std::str::from_utf8(&buf) else {
             continue;
         };
+        if buf.len() > 64 * 1024 {
+            continue;
+        }
         let trimmed = line_str.trim();
         if trimmed.is_empty() {
             continue;
@@ -1284,9 +1279,20 @@ impl RunnerState {
 
 impl ShadowRunner {
     pub fn load(data_dir: &Path, default_bankroll: f64) -> Self {
-        let disk_state = std::fs::read_to_string(state_path(data_dir))
-            .ok()
-            .and_then(|raw| serde_json::from_str::<PersistedRunnerState>(&raw).ok());
+        let sp = state_path(data_dir);
+        let state_meta_ok = std::fs::symlink_metadata(&sp).is_ok_and(|m| {
+            !m.file_type().is_symlink()
+                && m.file_type().is_file()
+                && m.len() <= 2 * 1024 * 1024
+                && crate::is_confined_regular_file(data_dir, &sp)
+        });
+        let disk_state = if state_meta_ok {
+            std::fs::read_to_string(&sp)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<PersistedRunnerState>(&raw).ok())
+        } else {
+            None
+        };
 
         let (mode, tick_interval_ms, cancel_before_close_secs, bankroll_dollars, slot_cfgs, persisted_slot_states) =
             match disk_state {
@@ -2112,11 +2118,25 @@ impl ShadowRunner {
             // 1. Apply any unapplied real venue fills (supports partial fills & real price/fee).
             if let Some(order_fills) = fills_by_order.get(lid.as_str()) {
                 for f in order_fills {
-                    if !f.trade_id.trim().is_empty() && !st.mark_applied_live_trade(&f.trade_id) {
-                        continue;
-                    }
                     let count_u32 = u32::try_from(f.count.max(0)).unwrap_or(0);
                     if count_u32 == 0 {
+                        continue;
+                    }
+                    let parsed_ts = f
+                        .ts
+                        .or_else(|| f.created_time.as_deref().and_then(parse_iso_z));
+                    let dedup_key = if !f.trade_id.trim().is_empty() {
+                        f.trade_id.trim().to_string()
+                    } else {
+                        format!(
+                            "anon:{}:{}:{}:{}",
+                            f.order_id,
+                            parsed_ts.unwrap_or(0),
+                            count_u32,
+                            f.yes_price.or(f.no_price).unwrap_or(0)
+                        )
+                    };
+                    if !st.mark_applied_live_trade(&dedup_key) {
                         continue;
                     }
                     let fill_c_i64 = if rq.order.side == "yes" {
@@ -2138,10 +2158,7 @@ impl ShadowRunner {
                             };
                             fee_fn(fill_c as f64 / 100.0) * (count_u32 as f64)
                         });
-                    let fill_ts = f
-                        .ts
-                        .or_else(|| f.created_time.as_deref().and_then(parse_iso_z))
-                        .unwrap_or(now);
+                    let fill_ts = parsed_ts.unwrap_or(now);
                     st.record_live_fill(&mut rq.order, fill_c, count_u32, fee_d, fill_ts);
                 }
             }
@@ -2948,6 +2965,11 @@ impl ShadowRunner {
             if self.halted.load(Ordering::SeqCst) {
                 break;
             }
+            let Some(_amend_guard) =
+                crate::InFlightKeyGuard::try_acquire(&app.in_flight_amends, &amend_info.live_order_id)
+            else {
+                continue;
+            };
             let auth_res = {
                 let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
                 if !ld.rails.live_armed || ld.rails.killed {
@@ -2964,6 +2986,13 @@ impl ShadowRunner {
                         .unwrap_or_else(|| {
                             (amend_info.contracts as f64) * (amend_info.old_limit_cents as f64 / 100.0)
                         });
+                    let new_notional = (amend_info.contracts as f64)
+                        * (amend_info.new_limit_cents as f64 / 100.0);
+                    let pre_delta = if amend_info.action.eq_ignore_ascii_case("buy") {
+                        (new_notional - old_reserved).max(0.0)
+                    } else {
+                        0.0
+                    };
                     if amend_info.new_limit_cents > amend_info.old_limit_cents {
                         let intent = risk_rails::LiveOrderIntent {
                             ticker: amend_info.ticker.clone(),
@@ -2980,18 +3009,21 @@ impl ShadowRunner {
                             ld.rails.last_error = Some(msg.clone());
                             Err(msg)
                         } else {
-                            Ok((ld.config.clone(), old_reserved))
+                            ld.rails.reserve_pending_exposure(pre_delta);
+                            Ok((ld.config.clone(), old_reserved, pre_delta))
                         }
                     } else {
-                        Ok((ld.config.clone(), old_reserved))
+                        Ok((ld.config.clone(), old_reserved, 0.0))
                     }
                 }
             };
-            let (cfg, old_reserved) = match auth_res {
+            let (cfg, old_reserved, pre_delta) = match auth_res {
                 Ok(v) => v,
                 Err(_) => continue,
             };
             let Ok(client) = kalshi_live::KalshiLiveClient::from_config(&cfg) else {
+                let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                ld.rails.rollback_pending_exposure(pre_delta);
                 continue;
             };
             match client.amend_order_with_side(
@@ -3001,40 +3033,50 @@ impl ShadowRunner {
                 None,
             ) {
                 Ok(_) => {
-                    {
+                    let aborted_mid_flight = {
                         let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
-                        ld.connected = true;
-                        ld.rails.last_error = None;
-                        if amend_info.action.eq_ignore_ascii_case("buy") {
-                            let new_reserved = (amend_info.contracts as f64)
-                                * (amend_info.new_limit_cents as f64 / 100.0);
-                            ld.rails.apply_amended_exposure(old_reserved, new_reserved);
-                            ld.reserved_order_exposure
-                                .insert(amend_info.live_order_id.clone(), new_reserved);
+                        ld.rails.rollback_pending_exposure(pre_delta);
+                        if ld.rails.killed || !ld.rails.live_armed || self.halted.load(Ordering::SeqCst) {
+                            true
+                        } else {
+                            ld.connected = true;
+                            ld.rails.last_error = None;
+                            if amend_info.action.eq_ignore_ascii_case("buy") {
+                                let new_reserved = (amend_info.contracts as f64)
+                                    * (amend_info.new_limit_cents as f64 / 100.0);
+                                ld.rails.apply_amended_exposure(old_reserved, new_reserved);
+                                ld.reserved_order_exposure
+                                    .insert(amend_info.live_order_id.clone(), new_reserved);
+                            }
+                            ld.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                                kind: "order_amended".to_string(),
+                                venue_id: format!(
+                                    "{}:{}:{}:{}",
+                                    amend_info.live_order_id,
+                                    kalshi_live::now_millis_string(),
+                                    amend_info.new_limit_cents,
+                                    amend_info.contracts
+                                ),
+                                ts: amend_info.eval_ts,
+                                order_id: amend_info.live_order_id.clone(),
+                                client_order_id: Some(amend_info.order_id.clone()),
+                                trade_id: None,
+                                ticker: amend_info.ticker.clone(),
+                                side: amend_info.side.clone(),
+                                action: amend_info.action.clone(),
+                                count: amend_info.contracts as i64,
+                                price_cents: amend_info.new_limit_cents,
+                                is_taker: None,
+                                fee_dollars: 0.0,
+                                revenue_cents: None,
+                                realized_pnl_dollars: None,
+                            });
+                            false
                         }
-                        ld.executions.append_idempotent(risk_rails::LiveExecutionRecord {
-                            kind: "order_amended".to_string(),
-                            venue_id: format!(
-                                "{}:{}:{}:{}",
-                                amend_info.live_order_id,
-                                kalshi_live::now_millis_string(),
-                                amend_info.new_limit_cents,
-                                amend_info.contracts
-                            ),
-                            ts: amend_info.eval_ts,
-                            order_id: amend_info.live_order_id.clone(),
-                            client_order_id: Some(amend_info.order_id.clone()),
-                            trade_id: None,
-                            ticker: amend_info.ticker.clone(),
-                            side: amend_info.side.clone(),
-                            action: amend_info.action.clone(),
-                            count: amend_info.contracts as i64,
-                            price_cents: amend_info.new_limit_cents,
-                            is_taker: None,
-                            fee_dollars: 0.0,
-                            revenue_cents: None,
-                            realized_pnl_dollars: None,
-                        });
+                    };
+                    if aborted_mid_flight {
+                        let _ = client.cancel_order(&amend_info.live_order_id);
+                        break;
                     }
                     let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     let mut amended_ord = None;
@@ -3060,6 +3102,7 @@ impl ShadowRunner {
                 }
                 Err(e) => {
                     let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                    ld.rails.rollback_pending_exposure(pre_delta);
                     ld.rails.last_error = Some(e);
                 }
             }
@@ -3070,6 +3113,11 @@ impl ShadowRunner {
             if self.halted.load(Ordering::SeqCst) {
                 break;
             }
+            let Some(_exit_guard) =
+                crate::InFlightKeyGuard::try_acquire(&app.in_flight_flattens, &exit_info.ticker)
+            else {
+                continue;
+            };
             let sell_intent = risk_rails::LiveOrderIntent {
                 ticker: exit_info.ticker.clone(),
                 action: "sell".to_string(),
@@ -3103,29 +3151,38 @@ impl ShadowRunner {
             };
             match client.place_order(&kalshi_req) {
                 Ok(placed) => {
-                    {
+                    let aborted_mid_flight = {
                         let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
-                        ld.connected = true;
-                        ld.rails.last_error = None;
-                        ld.rails
-                            .record_submitted_order("sell", check.order_notional_dollars);
-                        ld.executions.append_idempotent(risk_rails::LiveExecutionRecord {
-                            kind: "order_submitted".to_string(),
-                            venue_id: placed.order_id.clone(),
-                            ts: exit_info.eval_ts,
-                            order_id: placed.order_id.clone(),
-                            client_order_id: Some(exit_info.client_order_id.clone()),
-                            trade_id: None,
-                            ticker: exit_info.ticker.clone(),
-                            side: exit_info.side.clone(),
-                            action: "sell".to_string(),
-                            count: exit_info.contracts as i64,
-                            price_cents: exit_info.limit_cents,
-                            is_taker: Some(true),
-                            fee_dollars: 0.0,
-                            revenue_cents: None,
-                            realized_pnl_dollars: None,
-                        });
+                        if ld.rails.killed || !ld.rails.live_armed || self.halted.load(Ordering::SeqCst) {
+                            true
+                        } else {
+                            ld.connected = true;
+                            ld.rails.last_error = None;
+                            ld.rails
+                                .record_submitted_order("sell", check.order_notional_dollars);
+                            ld.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                                kind: "order_submitted".to_string(),
+                                venue_id: placed.order_id.clone(),
+                                ts: exit_info.eval_ts,
+                                order_id: placed.order_id.clone(),
+                                client_order_id: Some(exit_info.client_order_id.clone()),
+                                trade_id: None,
+                                ticker: exit_info.ticker.clone(),
+                                side: exit_info.side.clone(),
+                                action: "sell".to_string(),
+                                count: exit_info.contracts as i64,
+                                price_cents: exit_info.limit_cents,
+                                is_taker: Some(true),
+                                fee_dollars: 0.0,
+                                revenue_cents: None,
+                                realized_pnl_dollars: None,
+                            });
+                            false
+                        }
+                    };
+                    if aborted_mid_flight {
+                        let _ = client.cancel_order(&placed.order_id);
+                        break;
                     }
                     let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     let immediate_full = placed.status == "executed"
@@ -3218,6 +3275,8 @@ impl ShadowRunner {
                 }
                 Err(e) => {
                     let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                    ld.rails
+                        .rollback_pending_exposure(check.order_notional_dollars);
                     ld.rails.last_error = Some(e);
                 }
             }
@@ -3261,7 +3320,11 @@ impl ShadowRunner {
                                 Ok(base_req)
                             };
                             match req_res {
-                                Ok(req) => Ok((req, check, ld.config.clone())),
+                                Ok(req) => {
+                                    ld.rails
+                                        .reserve_pending_exposure(check.order_notional_dollars);
+                                    Ok((req, check, ld.config.clone()))
+                                }
                                 Err(e) => Err(e),
                             }
                         }
@@ -3274,38 +3337,55 @@ impl ShadowRunner {
                 Err(_) => continue,
             };
             if self.halted.load(Ordering::SeqCst) {
+                let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                ld.rails
+                    .rollback_pending_exposure(check.order_notional_dollars);
                 break;
             }
             let Ok(client) = kalshi_live::KalshiLiveClient::from_config(&cfg) else {
+                let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                ld.rails
+                    .rollback_pending_exposure(check.order_notional_dollars);
                 continue;
             };
             match client.place_order(&kalshi_req) {
                 Ok(placed) => {
-                    {
+                    let aborted_mid_flight = {
                         let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
-                        ld.connected = true;
-                        ld.rails.last_error = None;
                         ld.rails
-                            .record_submitted_order("buy", check.order_notional_dollars);
-                        ld.reserved_order_exposure
-                            .insert(placed.order_id.clone(), check.order_notional_dollars);
-                        ld.executions.append_idempotent(risk_rails::LiveExecutionRecord {
-                            kind: "order_submitted".to_string(),
-                            venue_id: placed.order_id.clone(),
-                            ts: intent_info.posted_at,
-                            order_id: placed.order_id.clone(),
-                            client_order_id: Some(intent_info.client_order_id.clone()),
-                            trade_id: None,
-                            ticker: intent_info.ticker.clone(),
-                            side: intent_info.side.clone(),
-                            action: "buy".to_string(),
-                            count: intent_info.contracts as i64,
-                            price_cents: intent_info.limit_cents,
-                            is_taker: Some(intent_info.execution_mode != "maker"),
-                            fee_dollars: 0.0,
-                            revenue_cents: None,
-                            realized_pnl_dollars: None,
-                        });
+                            .rollback_pending_exposure(check.order_notional_dollars);
+                        if ld.rails.killed || !ld.rails.live_armed || self.halted.load(Ordering::SeqCst) {
+                            true
+                        } else {
+                            ld.connected = true;
+                            ld.rails.last_error = None;
+                            ld.rails
+                                .record_submitted_order("buy", check.order_notional_dollars);
+                            ld.reserved_order_exposure
+                                .insert(placed.order_id.clone(), check.order_notional_dollars);
+                            ld.executions.append_idempotent(risk_rails::LiveExecutionRecord {
+                                kind: "order_submitted".to_string(),
+                                venue_id: placed.order_id.clone(),
+                                ts: intent_info.posted_at,
+                                order_id: placed.order_id.clone(),
+                                client_order_id: Some(intent_info.client_order_id.clone()),
+                                trade_id: None,
+                                ticker: intent_info.ticker.clone(),
+                                side: intent_info.side.clone(),
+                                action: "buy".to_string(),
+                                count: intent_info.contracts as i64,
+                                price_cents: intent_info.limit_cents,
+                                is_taker: Some(intent_info.execution_mode != "maker"),
+                                fee_dollars: 0.0,
+                                revenue_cents: None,
+                                realized_pnl_dollars: None,
+                            });
+                            false
+                        }
+                    };
+                    if aborted_mid_flight {
+                        let _ = client.cancel_order(&placed.order_id);
+                        break;
                     }
                     let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     if st.mode != RunnerMode::LiveAuto || self.halted.load(Ordering::SeqCst) {
@@ -3407,6 +3487,8 @@ impl ShadowRunner {
                 }
                 Err(e) => {
                     let mut ld = app.live_desk.lock().unwrap_or_else(|p| p.into_inner());
+                    ld.rails
+                        .rollback_pending_exposure(check.order_notional_dollars);
                     ld.rails.last_error = Some(e);
                 }
             }
