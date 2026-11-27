@@ -182,7 +182,14 @@ function liveExecDedupeInfo(rawData: string): { key: string; ttlMs: number } {
     if (eventId !== undefined && eventId !== null && String(eventId).trim() !== "") {
       return { key: `id:${String(eventId).trim()}`, ttlMs: 60_000 };
     }
-    const kind = typeof parsed.kind === "string" ? parsed.kind.trim() : typeof parsed.event === "string" ? parsed.event.trim() : "exec";
+    const kind =
+      typeof parsed.event_kind === "string"
+        ? parsed.event_kind.trim()
+        : typeof parsed.kind === "string"
+          ? parsed.kind.trim()
+          : typeof parsed.event === "string"
+            ? parsed.event.trim()
+            : "exec";
     const status = typeof parsed.status === "string" ? parsed.status.trim() : "";
     const ts = parsed.ts ?? parsed.ts_epoch ?? parsed.epoch ?? "";
     const tradeId = parsed.trade_id ?? parsed.fill_id;
