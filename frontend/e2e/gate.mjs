@@ -998,7 +998,7 @@ for (const m of measures) {
   await p.route('**/api/home', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.34.0'
+    j.version = '0.35.0'
     j.capabilities = ['sse', 'calibration', 'walkforward', 'montecarlo', 'sandbox', 'export', 'recalibration', 'scale_plan', 'tournament', 'auto_collector', 'live_kalshi', 'risk_rails', 'edge_audit', 'shadow_runner', 'strategy_v2', 'strategy_crud', 'synthesizer']
     j.collector = {
       ...j.collector,
@@ -2167,7 +2167,7 @@ for (const m of measures) {
   await p.route('**/api/home*', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.34.0'
+    j.version = '0.35.0'
     j.capabilities = ['sse', 'sandbox', 'live_kalshi', 'risk_rails', 'shadow_runner', 'strategy_v2', 'strategy_crud', 'synthesizer']
     return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
   })
@@ -2346,7 +2346,7 @@ for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light'
   await p.route('**/api/home*', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.34.0'
+    j.version = '0.35.0'
     j.capabilities = ['sse', 'live_kalshi', 'risk_rails', 'shadow_runner', 'live_reconcile']
     return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
   })
@@ -2460,7 +2460,7 @@ for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light'
   await p.route('**/api/home*', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.34.0'
+    j.version = '0.35.0'
     j.capabilities = ['sse', 'live_kalshi', 'risk_rails', 'shadow_runner', 'live_reconcile', 'execution_health']
     return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
   })
@@ -2679,7 +2679,7 @@ for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light'
   await p.route('**/api/home*', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.34.0'
+    j.version = '0.35.0'
     j.capabilities = ['sse', 'live_kalshi', 'risk_rails', 'shadow_runner', 'live_reconcile', 'execution_health']
     return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
   })
@@ -2909,7 +2909,7 @@ for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light'
   await p.route('**/api/home*', async r => {
     const res = await r.fetch()
     const j = await res.json()
-    j.version = '0.34.0'
+    j.version = '0.35.0'
     j.capabilities = ['sse', 'live_kalshi', 'risk_rails', 'shadow_runner', 'live_reconcile', 'execution_health']
     return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(j) })
   })
