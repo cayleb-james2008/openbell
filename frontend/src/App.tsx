@@ -54,6 +54,7 @@ import {
   moneySigned,
   setCollectorSchedule,
   subscribeLiveExecSseFrame,
+  subscribeSseReconnect,
   useDesk,
 } from "@/lib/desk";
 import {
@@ -283,6 +284,15 @@ export function App() {
     let cooldownTimer: number | null = null;
     let trailingPending = false;
 
+    const triggerLiveRefresh = () => {
+      if (cooldownTimer === null) {
+        void refreshLiveRef.current();
+        cooldownTimer = window.setTimeout(runTrailing, 150);
+      } else {
+        trailingPending = true;
+      }
+    };
+
     const runTrailing = () => {
       cooldownTimer = null;
       if (trailingPending) {
@@ -292,17 +302,12 @@ export function App() {
       }
     };
 
-    const unsubscribe = subscribeLiveExecSseFrame(() => {
-      if (cooldownTimer === null) {
-        void refreshLiveRef.current();
-        cooldownTimer = window.setTimeout(runTrailing, 150);
-      } else {
-        trailingPending = true;
-      }
-    });
+    const unsubscribeExec = subscribeLiveExecSseFrame(triggerLiveRefresh);
+    const unsubscribeReconnect = subscribeSseReconnect(triggerLiveRefresh);
 
     return () => {
-      unsubscribe();
+      unsubscribeExec();
+      unsubscribeReconnect();
       if (cooldownTimer !== null) {
         window.clearTimeout(cooldownTimer);
         cooldownTimer = null;
@@ -429,7 +434,9 @@ export function App() {
           `Order accepted (${res.orderId}, ${res.status}): ${payload.action.toUpperCase()} ${payload.side.toUpperCase()} ${payload.count}x ${payload.ticker} @ ${payload.price_cents}c.`,
         );
       } catch (e) {
-        toast.error(`Order rejected: ${e instanceof Error ? e.message : String(e)}`);
+        const msg = e instanceof Error ? e.message : String(e);
+        toast.error(`Order rejected: ${msg}`);
+        throw e instanceof Error ? e : new Error(msg);
       } finally {
         liveActionLockRef.current = false;
         setLiveBusy(false);
@@ -448,7 +455,9 @@ export function App() {
         await refreshLive();
         toast.success(`Canceled resting order ${orderId}.`);
       } catch (e) {
-        toast.error(`Cancel failed: ${e instanceof Error ? e.message : String(e)}`);
+        const msg = e instanceof Error ? e.message : String(e);
+        toast.error(`Cancel failed: ${msg}`);
+        throw e instanceof Error ? e : new Error(msg);
       } finally {
         liveActionLockRef.current = false;
         setLiveBusy(false);

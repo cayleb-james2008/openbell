@@ -345,28 +345,28 @@ export function OrderbookLadder({
 
       {/* Spread & Microprice Strip */}
       <dl className="grid grid-cols-2 gap-2 border-b border-hairline py-2.5 text-xs sm:grid-cols-4">
-        <div>
+        <div className="min-w-0">
           <dt className="text-ink-3">Best YES Bid</dt>
-          <dd className="mono mt-0.5 font-semibold text-success-foreground">
+          <dd className="mono mt-0.5 font-semibold tabular-nums text-success-foreground">
             {activeSnapshot?.best_yes_bid !== null && activeSnapshot?.best_yes_bid !== undefined
               ? `${activeSnapshot.best_yes_bid}c`
               : "-"}
           </dd>
         </div>
-        <div>
+        <div className="min-w-0">
           <dt className="text-ink-3">Best YES Ask</dt>
-          <dd className="mono mt-0.5 font-semibold text-destructive-foreground">
+          <dd className="mono mt-0.5 font-semibold tabular-nums text-destructive-foreground">
             {activeSnapshot?.best_yes_ask !== null && activeSnapshot?.best_yes_ask !== undefined
               ? `${activeSnapshot.best_yes_ask}c`
               : "-"}
           </dd>
         </div>
-        <div>
+        <div className="min-w-0">
           <dt className="text-ink-3">Spread</dt>
           <dd
             data-orderbook-spread
             className={
-              "mono mt-0.5 font-semibold " +
+              "mono mt-0.5 font-semibold tabular-nums " +
               (isCrossed ? "text-destructive-foreground" : "text-ink")
             }
           >
@@ -377,9 +377,9 @@ export function OrderbookLadder({
               : "-"}
           </dd>
         </div>
-        <div>
+        <div className="min-w-0">
           <dt className="text-ink-3">Microprice</dt>
-          <dd data-orderbook-microprice className="mono mt-0.5 font-semibold text-ink">
+          <dd data-orderbook-microprice className="mono mt-0.5 font-semibold tabular-nums text-ink">
             {microprice !== null ? `${microprice.toFixed(1)}c` : "-"}
           </dd>
         </div>
@@ -391,11 +391,11 @@ export function OrderbookLadder({
         className="my-2.5 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-hairline bg-board/60 px-3 py-2 text-xs"
       >
         <div className="flex flex-wrap items-center gap-2">
-          <Badge variant="outline" className="mono text-xs">
+          <Badge variant="outline" className="mono tabular-nums text-xs">
             {action.toUpperCase()} {side.toUpperCase()} {qty}ct
           </Badge>
           {walk.vwapCents !== null ? (
-            <span className="mono font-semibold text-ink">
+            <span className="mono tabular-nums font-semibold text-ink">
               VWAP {walk.vwapCents.toFixed(2)}c
             </span>
           ) : (
@@ -406,7 +406,7 @@ export function OrderbookLadder({
           <div className="flex flex-wrap items-center gap-2">
             <span
               className={
-                "mono font-medium " +
+                "mono tabular-nums font-medium " +
                 ((walk.slippageCents ?? 0) > 1
                   ? "text-warning-foreground"
                   : "text-ink-2")
@@ -416,7 +416,7 @@ export function OrderbookLadder({
             </span>
             <Badge
               variant={walk.fillableQty < qty ? "warning" : "secondary"}
-              className="mono text-xs"
+              className="mono tabular-nums text-xs"
             >
               {walk.fillableQty}/{qty}ct ({walk.levelsTouched} lvl{walk.levelsTouched === 1 ? "" : "s"})
             </Badge>

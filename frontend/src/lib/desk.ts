@@ -158,8 +158,12 @@ export type TapeStreamState = {
 };
 
 type SseFrameListener = (rawData: string) => void;
+type SseReconnectListener = () => void;
 const spotSseListeners = new Set<SseFrameListener>();
 const liveExecSseListeners = new Set<SseFrameListener>();
+const sseReconnectListeners = new Set<SseReconnectListener>();
+const seenLiveExecFrames = new Map<string, number>();
+const LIVE_EXEC_DEDUP_MAX = 500;
 
 function emitSseFrame(listeners: Set<SseFrameListener>, rawData: string) {
   for (const listener of listeners) {
@@ -169,6 +173,53 @@ function emitSseFrame(listeners: Set<SseFrameListener>, rawData: string) {
       /* ignore listener error */
     }
   }
+}
+
+function liveExecDedupeInfo(rawData: string): { key: string; ttlMs: number } {
+  try {
+    const parsed = JSON.parse(rawData) as Record<string, unknown>;
+    const eventId = parsed.event_id ?? parsed.exec_id ?? parsed.seq;
+    if (eventId !== undefined && eventId !== null && String(eventId).trim() !== "") {
+      return { key: `id:${String(eventId).trim()}`, ttlMs: 60_000 };
+    }
+    const kind = typeof parsed.kind === "string" ? parsed.kind.trim() : typeof parsed.event === "string" ? parsed.event.trim() : "exec";
+    const status = typeof parsed.status === "string" ? parsed.status.trim() : "";
+    const ts = parsed.ts ?? parsed.ts_epoch ?? parsed.epoch ?? "";
+    const tradeId = parsed.trade_id ?? parsed.fill_id;
+    if (typeof tradeId === "string" && tradeId.trim()) {
+      return { key: `trade:${kind}:${tradeId.trim()}:${status}:${String(ts)}`, ttlMs: 60_000 };
+    }
+    if (typeof parsed.order_id === "string" && parsed.order_id.trim()) {
+      const price = parsed.price_cents ?? "";
+      const rem = parsed.remaining_count ?? parsed.count ?? "";
+      return {
+        key: `order:${kind}:${parsed.order_id.trim()}:${status}:${String(price)}:${String(rem)}:${String(ts)}`,
+        ttlMs: 30_000,
+      };
+    }
+  } catch {
+    /* non-JSON fallback below */
+  }
+  return { key: `raw:${rawData}`, ttlMs: 1_500 };
+}
+
+function emitLiveExecFrame(rawData: string) {
+  const now = Date.now();
+  const { key, ttlMs } = liveExecDedupeInfo(rawData);
+  const prevAt = seenLiveExecFrames.get(key);
+  if (prevAt !== undefined && now - prevAt < ttlMs) {
+    return;
+  }
+  seenLiveExecFrames.set(key, now);
+  if (seenLiveExecFrames.size > LIVE_EXEC_DEDUP_MAX) {
+    for (const [k, at] of seenLiveExecFrames) {
+      if (now - at >= 60_000 || seenLiveExecFrames.size > LIVE_EXEC_DEDUP_MAX) {
+        seenLiveExecFrames.delete(k);
+        if (seenLiveExecFrames.size <= Math.floor(LIVE_EXEC_DEDUP_MAX * 0.8)) break;
+      }
+    }
+  }
+  emitSseFrame(liveExecSseListeners, rawData);
 }
 
 export function subscribeSpotSseFrame(listener: SseFrameListener): () => void {
@@ -182,6 +233,13 @@ export function subscribeLiveExecSseFrame(listener: SseFrameListener): () => voi
   liveExecSseListeners.add(listener);
   return () => {
     liveExecSseListeners.delete(listener);
+  };
+}
+
+export function subscribeSseReconnect(listener: SseReconnectListener): () => void {
+  sseReconnectListeners.add(listener);
+  return () => {
+    sseReconnectListeners.delete(listener);
   };
 }
 
@@ -452,8 +510,9 @@ export function useDesk(dataset: Dataset) {
     }
 
     let closed = false;
-    setStream((prev) => ({ ...prev, mode: "connecting" }));
-    const es = new EventSource("/api/tape/stream");
+    let attempt = 0;
+    let reconnectTimer: number | null = null;
+    let es: EventSource | null = null;
 
     const scheduleReload = () => {
       if (sseRefreshTimer.current !== null) return;
@@ -478,7 +537,7 @@ export function useDesk(dataset: Dataset) {
           snapshots_written?: number;
         };
         if (parsed.type === "live_exec") {
-          emitSseFrame(liveExecSseListeners, ev.data);
+          emitLiveExecFrame(ev.data);
           return;
         }
         if (parsed.type === "schedule" || parsed.type === "collect") {
@@ -508,39 +567,76 @@ export function useDesk(dataset: Dataset) {
       }
     };
 
-    const handleNamedFrame = (listeners: Set<SseFrameListener>) => (ev: MessageEvent<string>) => {
+    const handleNamedFrame = (emitFn: (rawData: string) => void) => (ev: MessageEvent<string>) => {
       if (closed) return;
       setStream((prev) => ({
         mode: "sse",
         eventCount: prev.eventCount + 1,
         lastEventAt: Date.now(),
       }));
-      emitSseFrame(listeners, ev.data);
+      emitFn(ev.data);
     };
 
-    es.onopen = () => {
-      if (!closed) {
-        setStream((prev) => ({ ...prev, mode: "sse" }));
-      }
-    };
-    es.onmessage = handleEvent;
-    es.addEventListener("tape", handleEvent as EventListener);
-    es.addEventListener("snapshot", handleEvent as EventListener);
-    es.addEventListener("collect", handleEvent as EventListener);
-    es.addEventListener("spot", handleNamedFrame(spotSseListeners) as EventListener);
-    es.addEventListener("live_exec", handleNamedFrame(liveExecSseListeners) as EventListener);
-
-    es.onerror = () => {
+    const connect = () => {
       if (closed) return;
-      // Clean fallback to 30s polling if the stream closes or is unavailable.
-      es.close();
-      closed = true;
-      setStream((prev) => ({ ...prev, mode: "polling" }));
+      setStream((prev) => (prev.mode === "polling" && attempt > 0 ? prev : { ...prev, mode: "connecting" }));
+      const source = new EventSource("/api/tape/stream");
+      es = source;
+
+      source.onopen = () => {
+        if (closed) return;
+        const wasReconnect = attempt > 0;
+        attempt = 0;
+        setStream((prev) => ({ ...prev, mode: "sse" }));
+        if (wasReconnect) {
+          void load();
+          for (const listener of sseReconnectListeners) {
+            try {
+              listener();
+            } catch {
+              /* ignore listener error */
+            }
+          }
+        }
+      };
+      source.onmessage = handleEvent;
+      source.addEventListener("tape", handleEvent as EventListener);
+      source.addEventListener("snapshot", handleEvent as EventListener);
+      source.addEventListener("collect", handleEvent as EventListener);
+      source.addEventListener(
+        "spot",
+        handleNamedFrame((data) => emitSseFrame(spotSseListeners, data)) as EventListener,
+      );
+      source.addEventListener("live_exec", handleNamedFrame(emitLiveExecFrame) as EventListener);
+
+      source.onerror = () => {
+        source.close();
+        if (es === source) es = null;
+        if (closed) return;
+        setStream((prev) => ({ ...prev, mode: "polling" }));
+        const baseDelay = Math.min(15000, 1000 * 2 ** Math.min(attempt, 4));
+        const jitter = Math.round(Math.random() * 350);
+        attempt += 1;
+        if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+        reconnectTimer = window.setTimeout(() => {
+          reconnectTimer = null;
+          connect();
+        }, baseDelay + jitter);
+      };
     };
+
+    connect();
 
     return () => {
       closed = true;
-      es.close();
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (es) {
+        es.close();
+        es = null;
+      }
       if (sseRefreshTimer.current !== null) {
         window.clearTimeout(sseRefreshTimer.current);
         sseRefreshTimer.current = null;

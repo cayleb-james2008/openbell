@@ -142,6 +142,15 @@ export function mergeSpotAssetUpdate(
   if ("assets" in update) {
     return update;
   }
+  const existing = prev.assets.find((a) => a.asset === update.asset);
+  if (
+    existing?.updated_ms !== null &&
+    existing?.updated_ms !== undefined &&
+    update.updated_ms !== null &&
+    update.updated_ms < existing.updated_ms
+  ) {
+    return prev;
+  }
   const byAsset = new Map<string, SpotAssetStatus>();
   for (const a of prev.assets) {
     byAsset.set(a.asset, a);
@@ -365,6 +374,7 @@ export function useSpotStatus(
   );
   const [loading, setLoading] = useState(false);
   const seqRef = useRef(0);
+  const failuresRef = useRef(0);
 
   const refresh = useCallback(async () => {
     if (!enabled) return;
@@ -372,10 +382,21 @@ export function useSpotStatus(
     try {
       const st = await fetchSpotStatus();
       if (reqId !== seqRef.current) return;
+      failuresRef.current = 0;
       setSpotStatus(st);
     } catch {
       if (reqId !== seqRef.current) return;
-      setSpotStatus(defaultOfflineSpotStatus());
+      failuresRef.current += 1;
+      setSpotStatus((prev) => {
+        const hadPrices = prev.assets.some((a) => a.price !== null);
+        if (hadPrices && failuresRef.current < 3) {
+          return {
+            offline: true,
+            assets: prev.assets.map((a) => ({ ...a, stale: true })),
+          };
+        }
+        return defaultOfflineSpotStatus();
+      });
     } finally {
       if (reqId === seqRef.current) setLoading(false);
     }
