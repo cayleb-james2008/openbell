@@ -371,7 +371,9 @@ for (const m of measures) {
       const cx = document.createElement('canvas').getContext('2d')
       cx.font = `${s.fontWeight} ${s.fontSize} ${s.fontFamily}`
       const textW = cx.measureText(el.placeholder).width
-      const availW = el.clientWidth - parseFloat(s.paddingLeft) - parseFloat(s.paddingRight)
+      // From the border box: newer Chromium (158+) reports an <input>'s clientWidth
+      // without its padding, so clientWidth - padding would count the padding twice.
+      const availW = el.getBoundingClientRect().width - parseFloat(s.borderLeftWidth) - parseFloat(s.borderRightWidth) - parseFloat(s.paddingLeft) - parseFloat(s.paddingRight)
       return { ph: el.placeholder, textW: Math.round(textW), availW: Math.round(availW), ok: textW <= availW }
     })
     phFits.push(info)
