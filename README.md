@@ -1,17 +1,17 @@
 # OpenBell
 
-![version](https://img.shields.io/badge/version-v0.33.0-0969da?style=flat-square)
+![version](https://img.shields.io/badge/version-v0.34.0-0969da?style=flat-square)
 ![stack](https://img.shields.io/badge/stack-Rust%20%2B%20React%2019-111827?style=flat-square)
-![tests](https://img.shields.io/badge/tests-173%2F173%20pass-16a34a?style=flat-square)
-![binary](https://img.shields.io/badge/release%20binary-6.51%20MiB-0969da?style=flat-square)
+![tests](https://img.shields.io/badge/tests-180%2F180%20pass-16a34a?style=flat-square)
+![binary](https://img.shields.io/badge/release%20binary-6.56%20MiB-0969da?style=flat-square)
 ![safety](https://img.shields.io/badge/live__armed-false%20on%20boot-16a34a?style=flat-square)
 
-OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction markets. It includes a Kalshi Trade API v2 client (`live_armed: false` on every boot, seven hard risk rails, fail-closed `0600` runtime persistence, resting order amendment and 1-click position flattening, closed-loop fill/settlement reconciliation, an emergency kill switch, and explicit kill latch reset), a live WebSocket and REST L2 orderbook stream (`OrderbookStore` auto-subscription up to 32 active markets, trade channel ingestion, bounded snapshot history, book-walk VWAP sizing, and DOM depth ladder), a tick-driven shadow orderbook runner (active quote repricing with cooldown and per-window replace caps, take-profit, stop-loss, and pre-close exit routing, slot inventory injection into `TickContext`, direct L2 touch/cross/trade matching, idempotent settlement logging, fail-closed stale-sync gating, persistent slot pause guards, and restart clamping), an adverse-selection markout telemetry and auto-quarantine feedback loop (`execution_audit` + `AutoAllocator` runner sync), a causal Strategy Runtime v2 with confined script library CRUD and a walk-forward BH-FDR edge synthesizer, a deduplicating public 15-minute tape collector, and a post-only maker allocator.
+OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction markets. It includes a Kalshi Trade API v2 client (`live_armed: false` on every boot, seven hard risk rails, fail-closed `0600` runtime persistence, resting order amendment and 1-click position flattening, closed-loop fill/settlement reconciliation, an emergency kill switch, and explicit kill latch reset), a live WebSocket and REST L2 orderbook stream (`OrderbookStore` auto-subscription up to 32 active markets, trade channel ingestion, bounded snapshot history, book-walk VWAP sizing, and DOM depth ladder), a real-time external crypto spot oracle (`SpotFeedStore` tracking `BTC`, `ETH`, `SOL`, `XRP`, and `DOGE`, offline by default, feeding rolling delta and volatility plus Kalshi strike threshold divergence into `TickContext` and interactive chart overlays), a tick-driven shadow orderbook runner (active quote repricing with cooldown and per-window replace caps, take-profit, stop-loss, and pre-close exit routing, slot inventory injection into `TickContext`, direct L2 touch/cross/trade matching, idempotent settlement logging, fail-closed stale-sync gating, persistent slot pause guards, and restart clamping), an adverse-selection markout telemetry and auto-quarantine feedback loop (`execution_audit` + `AutoAllocator` runner sync), a causal Strategy Runtime v2 with confined script library CRUD and a walk-forward BH-FDR edge synthesizer, a deduplicating public 15-minute tape collector, and a post-only maker allocator.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/hero-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/hero-light.png">
-  <img alt="OpenBell v0.33.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
+  <img alt="OpenBell v0.34.0 Desktop Quant Workbench" src="docs/screenshots/hero-light.png">
 </picture>
 
 ## Feature gallery
@@ -159,6 +159,18 @@ OpenBell is a local Rust trading workbench for 15-minute Kalshi prediction marke
       </picture>
     </td>
   </tr>
+  <tr>
+    <td colspan="2" valign="top">
+      <strong>External Crypto Spot Oracle and Strike Divergence Overlay (<code>v0.34.0</code>)</strong><br>
+      <sub>Tracks public unauthenticated spot ticks for <code>BTC</code>, <code>ETH</code>, <code>SOL</code>, <code>XRP</code>, and <code>DOGE</code> in <code>SpotFeedStore</code> (offline by default via <code>OPENBELL_SPOT_OFFLINE=1</code>), persists ticks with 8 MiB rotation and CWE-59 symlink checks, streams throttled SSE <code>event: spot</code> updates, parses Kalshi <code>floor_strike</code>, <code>cap_strike</code>, and <code>spot_price</code> snapshots, extends causal <code>TickContext</code> to 29 fields, and renders the Tape Spot Oracle strip alongside the right-hand USD spot and strike threshold overlay.</sub>
+      <br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/spot-oracle-c4e2-dark.png">
+        <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/spot-oracle-c4e2-light.png">
+        <img alt="OpenBell v0.34.0 External Crypto Spot Oracle and Strike Price Overlay" src="docs/screenshots/spot-oracle-c4e2-light.png">
+      </picture>
+    </td>
+  </tr>
 </table>
 
 ## Causal execution and fail-closed risk pipeline
@@ -176,16 +188,16 @@ flowchart LR
   R -- "confirm_arm = true" --> K["Kalshi Trade API v2 (RSA-PSS SHA-256)"]
 ```
 
-## Verified baseline (`v0.33.0`)
+## Verified baseline (`v0.34.0`)
 
-| Metric | `v0.10.0` Baseline | `v0.33.0` Verified | Delta |
+| Metric | `v0.10.0` Baseline | `v0.34.0` Verified | Delta |
 | --- | --- | --- | --- |
-| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`6.51 MiB`** (`6,825,320 B`) | **`-38.9%`** |
-| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`99,756 B`** (`97 kB`) / **`22,865 B`** (`22 kB`, `25` chunks) | **`-94.6%` wire bytes** |
-| Cold boot to first `HTTP 200` | `9.11 ms` | **`6.15 ms`** | Under `10 ms` |
-| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`18.92 MB`** (`19,376 KB`) | **`-84.9%`** |
-| Concurrent HTTP throughput (`16w`, `5/5` SSE) | `4,921.3 req/s` | **`4,860.1 req/s`** (`4.54 ms` p95, `0/12,158` errors) | Under `5 ms` p95 |
-| Security and test verification | `49/49` fuzz | **`173/173` Rust tests**, `25/25` raw-TCP fuzz, `gate 133/133`, `replay 18/18`, `sloplint 0/0/0`, `RAILS OK`, `EQUITY OK` | Clean |
+| Release binary size (`strip`, `lto = "fat"`) | `10.66 MB` (`11,179,360 B`) | **`6.56 MiB`** (`6,874,472 B`) | **`-38.5%`** |
+| Initial `GET /` shell (raw / gzip) | `1,152,017 B` / `423,382 B` | **`100,960 B`** (`99 kB`) / **`23,253 B`** (`23 kB`, `25` chunks) | **`-94.5%` wire bytes** |
+| Cold boot to first `HTTP 200` | `9.11 ms` | **`4.69 ms`** | Under `10 ms` |
+| Peak RSS (`VmHWM`) | `125.55 MB` (`128,560 KB`) | **`25.86 MB`** (`26,480 KB`) | **`-79.4%`** |
+| Concurrent HTTP throughput (`16w`, `5/5` SSE) | `4,921.3 req/s` | **`6,294.7 req/s`** (`3.58 ms` p95, `0/15,750` errors) | Under `4 ms` p95 |
+| Security and test verification | `49/49` fuzz | **`180/180` Rust tests**, `25/25` raw-TCP fuzz, `gate 138/138`, `replay 18/18`, `sloplint 0/0/0`, `RAILS OK`, `EQUITY OK` | Clean |
 
 ## Quick start (synthetic paper mode)
 
