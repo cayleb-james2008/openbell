@@ -196,6 +196,20 @@ async function open(w, h, theme = 'light', extra = {}) {
   p.on('pageerror', e => errs.push(`${w}-${theme}: pageerror ${e.message}`))
   p.on('console', m => { if (m.type() === 'error' && !p.__allow.test(m.text())) errs.push(`${w}-${theme}: ${m.text().slice(0, 140)} @ ${m.location().url}`) })
   await p.route('**/api/collect', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"snapshots_written":5}' }))
+  await p.route(/\/api\/spot\/status(\?.*)?$/, async r => {
+    try {
+      const res = await r.fetch()
+      if (res.status() !== 404) return r.fulfill({ response: res })
+    } catch {}
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ offline: true, assets: [] }) })
+  })
+  await p.route(/\/api\/spot\/history(\?.*)?$/, async r => {
+    try {
+      const res = await r.fetch()
+      if (res.status() !== 404) return r.fulfill({ response: res })
+    } catch {}
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, asset: 'BTC', ticks: [] }) })
+  })
   await p.route(/\/api\/live\/reconcile(\?.*)?$/, async r => {
     try {
       const res = await r.fetch()
@@ -528,11 +542,16 @@ for (const m of measures) {
     sbTxt.includes('Paper Net P&L') && sbTxt.includes('Sharpe') && sbTxt.includes('Max Drawdown') && sbTxt.includes('Brier Score'),
     sbTxt.slice(0, 120))
   const tickFieldsCount = await p.locator('#v2-tick-context-strip [data-tick-field]').count()
+  const spotFieldsPresent = await Promise.all(
+    ['spot_price', 'strike_price', 'spot_distance_bps', 'spot_delta_30s_bps', 'spot_vol_bps'].map(
+      (f) => p.locator(`#v2-tick-context-strip [data-tick-field="${f}"]`).count(),
+    ),
+  )
   await p.locator('#v2-tick-context-strip [data-tick-field="pav_ev_yes_cents"]').click(); await p.waitForTimeout(100)
   const editorWithCtx = await p.locator('#rune-editor').inputValue()
-  ok('V2 TickContext strip renders all 24 causal fields and click inserts ctx.<field> into editor',
-    tickFieldsCount === 24 && editorWithCtx.includes('ctx.pav_ev_yes_cents'),
-    `fields=${tickFieldsCount}`)
+  ok('V2 TickContext strip renders all 29 causal fields and click inserts ctx.<field> into editor',
+    tickFieldsCount === 29 && spotFieldsPresent.every((c) => c === 1) && editorWithCtx.includes('ctx.pav_ev_yes_cents'),
+    `fields=${tickFieldsCount} spot=${JSON.stringify(spotFieldsPresent)}`)
   const synthVisible = await p.locator('#strategy-synthesizer').isVisible()
   const sandboxRuneLeak = await p.evaluate(() => /\brune\b/i.test(document.body.innerText))
   ok('zero user-facing Rune jargon on Strategies + Sandbox view', !sandboxRuneLeak)
@@ -3148,6 +3167,155 @@ for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light'
   await ctx.close()
 }
 
+// 6d. Cycle 4 E2: Spot Oracle Ticker Strip, Strike Threshold Reference & Spot Overlay Chart (1440/390 Light & Dark + Offline N/A)
+for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light', 390, 844], ['dark', 390, 844]]) {
+  const { ctx, p } = await open(w, h, theme)
+  const nowSec = Math.floor(Date.now() / 1000)
+  const futureClose = new Date((nowSec + 600) * 1000).toISOString()
+  const mockMarkets = [
+    {
+      fetched_at: nowSec,
+      ticker: 'KXBTC15M-E2SPOT',
+      event_ticker: 'KXBTC15M-E2SPOT',
+      series: 'KXBTC15M',
+      close_time: futureClose,
+      status: 'open',
+      yes_bid: 0.54,
+      yes_ask: 0.56,
+      no_bid: 0.44,
+      no_ask: 0.46,
+      last_price: 0.55,
+      result: '',
+      floor_strike: 96250,
+      cap_strike: 96500,
+      spot_price: 96420.5,
+    },
+  ]
+  const mockHistory = {
+    ticker: 'KXBTC15M-E2SPOT',
+    dataset: 'fixture',
+    points: [
+      { ...mockMarkets[0], fetched_at: nowSec - 120, yes_bid: 0.50, yes_ask: 0.52, no_bid: 0.48, no_ask: 0.50, spot_price: 96280.0 },
+      { ...mockMarkets[0], fetched_at: nowSec - 60, yes_bid: 0.52, yes_ask: 0.54, no_bid: 0.46, no_ask: 0.48, spot_price: 96350.0 },
+      { ...mockMarkets[0], fetched_at: nowSec, yes_bid: 0.54, yes_ask: 0.56, no_bid: 0.44, no_ask: 0.46, spot_price: 96420.5 },
+    ],
+  }
+  await p.route('**/api/markets/history*', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(mockHistory) }))
+  await p.route('**/api/markets*', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(mockMarkets) }))
+  await p.route('**/api/spot/status*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      offline: false,
+      assets: [
+        { asset: 'BTC', price: 96420.5, delta_30s_bps: 14.2, vol_bps: 22.0, updated_ms: nowSec * 1000, source: 'coinbase', stale: false },
+        { asset: 'ETH', price: 3412.75, delta_30s_bps: -6.5, vol_bps: 19.5, updated_ms: nowSec * 1000, source: 'coinbase', stale: false },
+        { asset: 'SOL', price: 198.45, delta_30s_bps: 21.0, vol_bps: 31.2, updated_ms: nowSec * 1000, source: 'kraken', stale: false },
+        { asset: 'XRP', price: 2.415, delta_30s_bps: 0.0, vol_bps: 15.0, updated_ms: nowSec * 1000, source: 'coinbase', stale: false },
+        { asset: 'DOGE', price: 0.3842, delta_30s_bps: -11.4, vol_bps: 28.4, updated_ms: nowSec * 1000, source: 'kraken', stale: false },
+      ],
+    }),
+  }))
+  await p.route('**/api/spot/history*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ok: true,
+      asset: 'BTC',
+      ticks: [
+        { ts_ms: (nowSec - 120) * 1000, price: 96280.0, source: 'coinbase' },
+        { ts_ms: (nowSec - 60) * 1000, price: 96350.0, source: 'coinbase' },
+        { ts_ms: nowSec * 1000, price: 96420.5, source: 'coinbase' },
+      ],
+    }),
+  }))
+
+  await p.goto(FX); await ready(p); await p.waitForTimeout(300)
+  const stripTxt = await p.locator('#spot-oracle-strip').innerText()
+  const statusPillTxt = (await p.locator('#spot-oracle-status-pill').innerText()).trim()
+  const statusNonMono = await p.locator('#spot-oracle-status-pill').evaluate(el => !getComputedStyle(el).fontFamily.toLowerCase().includes('mono'))
+  const divBadgeTxt = (await p.locator('[data-spot-divergence-badge]').innerText()).trim()
+  const strikeChartLbl = (await p.locator('#tape-inline-chart [data-chart-strike-label]').innerText()).trim()
+  const spotChartLbl = (await p.locator('#tape-inline-chart [data-chart-spot-label]').innerText()).trim()
+  const strikeLineOn = (await p.locator('#tape-inline-chart [data-strike-line]').count()) === 1
+  const spotPathOn = (await p.locator('#tape-inline-chart [data-spot-overlay-path]').count()) === 1
+
+  const mOn = await p.evaluate(MEASURE)
+  await p.locator('#tape-inline-chart [data-spot-overlay-toggle]').click(); await p.waitForTimeout(150)
+  const strikeLineOff = (await p.locator('#tape-inline-chart [data-strike-line]').count()) === 0
+  const spotPathOff = (await p.locator('#tape-inline-chart [data-spot-overlay-path]').count()) === 0
+  await p.locator('#tape-inline-chart [data-spot-overlay-toggle]').click(); await p.waitForTimeout(150)
+  const strikeLineBack = (await p.locator('#tape-inline-chart [data-strike-line]').count()) === 1
+
+  const allPricesPresent =
+    stripTxt.includes('$96,420.50') &&
+    stripTxt.includes('$3,412.75') &&
+    stripTxt.includes('$198.45') &&
+    stripTxt.includes('$2.415') &&
+    stripTxt.includes('$0.3842') &&
+    stripTxt.includes('+14.2 bps') &&
+    stripTxt.includes('-6.5 bps')
+  const noBadCopy = !/\bNaN\b|\bundefined\b|\bRune\b|\bRHL\b/.test(stripTxt)
+
+  ok(
+    `C4E2 Spot Oracle strip & Strike/Spot chart overlay pass ${w}x${h} ${theme} (0px overflow, contrast, touch, SVG)`,
+    statusPillTxt === 'Spot Live' &&
+      statusNonMono &&
+      allPricesPresent &&
+      divBadgeTxt.includes('Div +') &&
+      strikeChartLbl.includes('$96,250.00') &&
+      spotChartLbl.includes('$96,420.50') &&
+      strikeLineOn && spotPathOn && strikeLineOff && spotPathOff && strikeLineBack &&
+      noBadCopy &&
+      mOn.docOverflow <= 0 && mOn.clipped.length === 0 && mOn.smallTargets === 0 && mOn.lowContrast === 0 && mOn.svgBad === 0,
+    `pill=${statusPillTxt} nonMono=${statusNonMono} prices=${allPricesPresent} div=${divBadgeTxt} lines=${strikeLineOn}/${spotPathOn}->${strikeLineOff}/${spotPathOff}->${strikeLineBack} ov=${mOn.docOverflow} small=${mOn.smallTargets}(${mOn.smallSample.join('|')}) low=${mOn.lowContrast}(${mOn.lowSample.join('|')}) svg=${mOn.svgBad}(${mOn.svgDetail.join('|')})`,
+  )
+  await ctx.close()
+}
+
+// 6e. Cycle 4 E2: Graceful Offline / Null / Absent Spot Oracle Fallback (N/A, zero NaN)
+{
+  const { ctx, p } = await open(390, 844, 'light')
+  await p.route('**/api/spot/status*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      offline: true,
+      assets: [
+        { asset: 'BTC', price: null, delta_30s_bps: null, vol_bps: null, updated_ms: null, source: 'offline', stale: true },
+      ],
+    }),
+  }))
+  await p.route('**/api/spot/history*', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ ok: true, asset: 'BTC', ticks: [] }),
+  }))
+
+  await p.goto(FX); await ready(p); await p.waitForTimeout(300)
+  const stripTxt = await p.locator('#spot-oracle-strip').innerText()
+  const chartTxt = await p.locator('#tape-inline-chart').innerText()
+  const statusPillTxt = (await p.locator('#spot-oracle-status-pill').innerText()).trim()
+  const assetCounts = await Promise.all(['BTC', 'ETH', 'SOL', 'XRP', 'DOGE'].map(a => p.locator(`#spot-oracle-strip [data-spot-asset="${a}"]`).count()))
+  const btcPriceTxt = (await p.locator('#spot-oracle-strip [data-spot-price="BTC"]').innerText()).trim()
+  const dogePriceTxt = (await p.locator('#spot-oracle-strip [data-spot-price="DOGE"]').innerText()).trim()
+  const offlineNoteVisible = await p.locator('#tape-inline-chart [data-chart-spot-offline]').isVisible()
+  const mOff = await p.evaluate(MEASURE)
+
+  ok(
+    'C4E2 Spot Oracle degrades gracefully when offline/null (N/A for all 5 assets, zero NaN, 0px overflow at 390px)',
+    statusPillTxt === 'Spot Offline' &&
+      assetCounts.every(c => c === 1) &&
+      btcPriceTxt === 'N/A' &&
+      dogePriceTxt === 'N/A' &&
+      offlineNoteVisible &&
+      !/\bNaN\b|\bundefined\b|\bInfinity\b/.test(stripTxt + ' ' + chartTxt) &&
+      mOff.docOverflow <= 0 && mOff.smallTargets === 0 && mOff.lowContrast === 0 && mOff.svgBad === 0,
+    `pill=${statusPillTxt} btc=${btcPriceTxt} doge=${dogePriceTxt} offNote=${offlineNoteVisible} ov=${mOff.docOverflow} small=${mOff.smallTargets} low=${mOff.lowContrast} svg=${mOff.svgBad}`,
+  )
+  await ctx.close()
+}
+
 // 7. Update strip (loopback + non-loopback shared host, BANNER-FIX-BRIEF)
 {
   const { ctx, p } = await open(1440, 900)
@@ -3184,6 +3352,12 @@ for (const [theme, w, h] of [['light', 1440, 900], ['dark', 1440, 900], ['light'
     const upstream = await fetch(new URL(u.pathname + u.search, BASE).href, { method: r.request().method(), headers: { Host: new URL(BASE).host } })
     if (u.pathname === '/api/live/reconcile' && upstream.status === 404) {
       return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, last_sync_epoch: null, sync_stale: false, utc_day_loss_dollars: 0, open_exposure_dollars: 0, executions: [], discrepancies: [] }) })
+    }
+    if (u.pathname === '/api/spot/status' && upstream.status === 404) {
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ offline: true, assets: [] }) })
+    }
+    if (u.pathname === '/api/spot/history' && upstream.status === 404) {
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, asset: 'BTC', ticks: [] }) })
     }
     const buf = Buffer.from(await upstream.arrayBuffer())
     return r.fulfill({ status: upstream.status, headers: Object.fromEntries(upstream.headers.entries()), body: buf })

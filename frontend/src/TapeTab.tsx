@@ -16,10 +16,16 @@ import {
   TableRow,
 } from "@/components/ui";
 import { MarketHistoryChart, ProbBar, ProvenanceTag } from "@/TapeCharts";
-import { AutoCollectorStrip } from "@/AutoCollectorStrip";
+import { AutoCollectorStrip, SpotOracleStrip } from "@/AutoCollectorStrip";
 import { OrderbookLadder } from "@/OrderbookLadder";
 import { useWide } from "@/lib/media";
 import { useOrderbook, useOrderbookStreamStatus } from "@/lib/orderbook";
+import {
+  type SpotHistoryTick,
+  type SpotStatusResponse,
+  fetchSpotHistory,
+  useSpotStatus,
+} from "@/lib/spot";
 import {
   type CollectorScheduleStatus,
   type Dataset,
@@ -73,17 +79,22 @@ function CountdownBadge({ closeTime, nowMs }: { closeTime: string | null; nowMs:
 function MarketInspector({
   market,
   dataset,
+  spotStatus,
   onClose,
 }: {
   market: Market | null;
   dataset: Dataset;
+  spotStatus: SpotStatusResponse;
   onClose: () => void;
 }) {
   const wide = useWide();
   const [history, setHistory] = useState<Market[] | null>(null);
+  const [spotHistory, setSpotHistory] = useState<SpotHistoryTick[]>([]);
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(false);
   const ticker = market ? cleanStr(market.ticker, "") : "";
+  const marketAsset = market ? seriesShort(market.series, market.ticker) : "";
+  const spotAssetStatus = spotStatus.assets.find((a) => a.asset === marketAsset) ?? null;
   const orderbook = useOrderbook(ticker, {
     enabled: Boolean(ticker),
     sseEnabled: dataset !== "fixture",
@@ -92,10 +103,12 @@ function MarketInspector({
   useEffect(() => {
     if (!ticker) {
       setHistory(null);
+      setSpotHistory([]);
       setErr("");
       return;
     }
     let alive = true;
+    const ctrl = new AbortController();
     setLoading(true);
     setErr("");
     fetchMarketHistory(ticker, dataset)
@@ -108,10 +121,22 @@ function MarketInspector({
       .finally(() => {
         if (alive) setLoading(false);
       });
+    if (marketAsset) {
+      fetchSpotHistory(marketAsset, 200, ctrl.signal)
+        .then((res) => {
+          if (alive && !ctrl.signal.aborted) setSpotHistory(res.ticks);
+        })
+        .catch(() => {
+          if (alive && !ctrl.signal.aborted) setSpotHistory([]);
+        });
+    } else {
+      setSpotHistory([]);
+    }
     return () => {
       alive = false;
+      ctrl.abort();
     };
-  }, [ticker, dataset]);
+  }, [ticker, dataset, marketAsset]);
 
   const prob = market ? impliedYesProb(market) : null;
   const open = market ? marketIsOpen(market) : false;
@@ -223,7 +248,14 @@ function MarketInspector({
                       Could not load market history: {err}
                     </p>
                   ) : (
-                    <MarketHistoryChart points={history || [market]} ticker={ticker} />
+                    <MarketHistoryChart
+                      points={history || [market]}
+                      ticker={ticker}
+                      spotHistory={spotHistory}
+                      liveSpotPrice={spotAssetStatus?.price ?? market.spot_price ?? null}
+                      floorStrike={market.floor_strike ?? null}
+                      capStrike={market.cap_strike ?? null}
+                    />
                   )}
                 </div>
 
@@ -296,6 +328,10 @@ export function TapeTab({
   const [inlineHistory, setInlineHistory] = useState<Market[] | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const { streamStatus: l2StreamStatus } = useOrderbookStreamStatus({
+    enabled: true,
+    sseEnabled: dataset !== "fixture",
+  });
+  const { spotStatus } = useSpotStatus({
     enabled: true,
     sseEnabled: dataset !== "fixture",
   });
@@ -387,6 +423,12 @@ export function TapeTab({
   }, [filtered, pinnedTicker]);
 
   const featuredTicker = featuredMarket ? cleanStr(featuredMarket.ticker, "") : "";
+  const featuredAsset = featuredMarket ? seriesShort(featuredMarket.series, featuredMarket.ticker) : "";
+  const featuredSpotAsset = useMemo(
+    () => spotStatus.assets.find((a) => a.asset === featuredAsset) ?? null,
+    [spotStatus.assets, featuredAsset],
+  );
+  const [featuredSpotHistory, setFeaturedSpotHistory] = useState<SpotHistoryTick[]>([]);
 
   useEffect(() => {
     if (!featuredTicker) {
@@ -405,6 +447,22 @@ export function TapeTab({
       alive = false;
     };
   }, [featuredTicker, dataset, featuredMarket]);
+
+  useEffect(() => {
+    if (!featuredAsset) {
+      setFeaturedSpotHistory([]);
+      return;
+    }
+    const ctrl = new AbortController();
+    fetchSpotHistory(featuredAsset, 200, ctrl.signal)
+      .then((res) => {
+        if (!ctrl.signal.aborted) setFeaturedSpotHistory(res.ticks);
+      })
+      .catch(() => {
+        if (!ctrl.signal.aborted) setFeaturedSpotHistory([]);
+      });
+    return () => ctrl.abort();
+  }, [featuredAsset]);
 
   return (
     <section id="markets-card" aria-label="Live 15-minute Kalshi market tape" className="space-y-3">
@@ -518,6 +576,17 @@ export function TapeTab({
         </div>
       </div>
 
+      {/* Compact Live Spot Oracle Strip (BTC/ETH/SOL/XRP/DOGE, 30s delta bps, Strike divergence) */}
+      <SpotOracleStrip
+        spotStatus={spotStatus}
+        featuredMarket={featuredMarket}
+        selectedAsset={seriesFilter}
+        onSelectAsset={(asset) => {
+          setSeriesFilter((prev) => (prev === asset ? "All" : asset));
+          setShowAll(false);
+        }}
+      />
+
       {/* Inline interactive SVG Price + Spread History card for leading/pinned 15m market */}
       {featuredMarket && (
         <div
@@ -563,6 +632,10 @@ export function TapeTab({
             points={inlineHistory && inlineHistory.length > 0 ? inlineHistory : [featuredMarket]}
             ticker={featuredTicker}
             height={176}
+            spotHistory={featuredSpotHistory}
+            liveSpotPrice={featuredSpotAsset?.price ?? featuredMarket.spot_price ?? null}
+            floorStrike={featuredMarket.floor_strike ?? null}
+            capStrike={featuredMarket.cap_strike ?? null}
           />
         </div>
       )}
@@ -746,7 +819,12 @@ export function TapeTab({
         variant="banner"
       />
 
-      <MarketInspector market={selected} dataset={dataset} onClose={() => setSelected(null)} />
+      <MarketInspector
+        market={selected}
+        dataset={dataset}
+        spotStatus={spotStatus}
+        onClose={() => setSelected(null)}
+      />
     </section>
   );
 }

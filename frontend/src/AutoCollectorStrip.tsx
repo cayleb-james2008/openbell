@@ -1,10 +1,16 @@
 // Public Read-Only Auto-Collector Schedule Control Strip (Off / 60s / 180s), 200-Window Readiness Gate Progress Bar,
-// and Live L2 Multi-Ticker WS/Trade Telemetry Strip.
+// Live L2 Multi-Ticker WS/Trade Telemetry Strip, and Live Spot Oracle Strip.
 // Rendered both inside Live 15m Tape and synchronized inside the Settings Vaul sheet. Strictly public GET only.
 import { Activity, AlertTriangle, Clock, ShieldCheck } from "lucide-react";
 import { StatusPill } from "@/components/ui";
-import { type CollectorScheduleStatus, ageWords, isNum } from "@/lib/desk";
+import { type CollectorScheduleStatus, type Market, ageWords, isNum, seriesShort } from "@/lib/desk";
 import type { OrderbookStreamStatus } from "@/lib/orderbook";
+import {
+  type SpotStatusResponse,
+  computeSpotKalshiDivergence,
+  formatBps,
+  formatSpotUsd,
+} from "@/lib/spot";
 
 type CadenceChoice = "off" | "60" | "180";
 
@@ -321,6 +327,106 @@ export function AutoCollectorStrip({
             </button>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+export function SpotOracleStrip({
+  spotStatus,
+  featuredMarket,
+  selectedAsset = "All",
+  onSelectAsset,
+}: {
+  spotStatus: SpotStatusResponse;
+  featuredMarket: Market | null;
+  selectedAsset?: string;
+  onSelectAsset?: (asset: string) => void;
+}) {
+  const hasLive = !spotStatus.offline && spotStatus.assets.some((a) => a.price !== null && !a.stale);
+  const hasAnyPrice = spotStatus.assets.some((a) => a.price !== null);
+  const statusTone = hasLive ? "success" : hasAnyPrice ? "warning" : "neutral";
+  const statusLabel = hasLive ? "Spot Live" : hasAnyPrice ? "Spot Stale" : "Spot Offline";
+
+  const featuredAsset = featuredMarket ? seriesShort(featuredMarket.series, featuredMarket.ticker) : "";
+  const featuredSpot = spotStatus.assets.find((a) => a.asset === featuredAsset) ?? null;
+  const divergence = computeSpotKalshiDivergence(
+    featuredSpot?.price ?? null,
+    featuredMarket,
+    featuredSpot?.vol_bps ?? null,
+  );
+
+  return (
+    <div
+      id="spot-oracle-strip"
+      data-spot-oracle-strip
+      className="min-w-0 space-y-2 rounded-[10px] border border-hairline bg-surface px-3.5 py-2.5"
+    >
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <span data-spot-status-pill className="inline-flex">
+            <StatusPill id="spot-oracle-status-pill" tone={statusTone}>
+              <span>{statusLabel}</span>
+            </StatusPill>
+          </span>
+          <span className="text-xs font-semibold text-ink">Spot Oracle</span>
+        </div>
+
+        <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs">
+          <span data-spot-strike-readout className="mono text-ink-2">
+            Strike <strong className="font-semibold text-ink">{formatSpotUsd(divergence.floorStrike)}</strong>
+          </span>
+          <span data-spot-divergence-badge className="inline-flex">
+            <StatusPill tone={divergence.tone}>
+              <span>
+                Div <span className="mono font-semibold">{divergence.label}</span>
+                {divergence.distanceBps !== null ? ` (${formatBps(divergence.distanceBps)})` : ""}
+              </span>
+            </StatusPill>
+          </span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-5">
+        {spotStatus.assets.map((a) => {
+          const active = selectedAsset === a.asset;
+          const delta = isNum(a.delta_30s_bps) ? a.delta_30s_bps : null;
+          const deltaCls =
+            delta === null || Math.abs(delta) < 0.05
+              ? "text-ink-2"
+              : delta > 0
+                ? "text-success-foreground"
+                : "text-destructive-foreground";
+          const sourceLabel = a.price === null ? "N/A" : a.stale ? "stale" : a.source;
+          return (
+            <button
+              key={a.asset}
+              type="button"
+              data-spot-asset={a.asset}
+              aria-pressed={active}
+              onClick={() => onSelectAsset?.(a.asset)}
+              className={
+                "flex min-h-11 min-w-0 cursor-pointer flex-col justify-between gap-0.5 rounded-md border px-2.5 py-1.5 text-left outline-none transition-[background-color,border-color,color] duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring " +
+                (active
+                  ? "border-blue/60 bg-blue-soft"
+                  : "border-hairline bg-board/60 [@media(hover:hover)_and_(pointer:fine)]:hover:bg-board")
+              }
+            >
+              <div className="flex w-full items-center justify-between gap-1.5">
+                <span className="mono text-xs font-semibold text-ink">{a.asset}</span>
+                <span data-spot-delta={a.asset} className={`mono text-xs font-medium tabular-nums ${deltaCls}`}>
+                  {formatBps(a.delta_30s_bps)}
+                </span>
+              </div>
+              <div className="flex w-full items-center justify-between gap-1.5">
+                <span data-spot-price={a.asset} className="mono text-xs font-semibold tabular-nums text-ink">
+                  {formatSpotUsd(a.price)}
+                </span>
+                <span className="truncate text-xs text-ink-2">{sourceLabel}</span>
+              </div>
+            </button>
+          );
+        })}
       </div>
     </div>
   );

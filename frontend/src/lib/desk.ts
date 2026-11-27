@@ -106,6 +106,9 @@ export type Market = {
   no_ask: number | null;
   last_price: number | null;
   result: string | null;
+  floor_strike?: number | null;
+  cap_strike?: number | null;
+  spot_price?: number | null;
 };
 
 export type MarketHistory = {
@@ -153,6 +156,16 @@ export type TapeStreamState = {
   eventCount: number;
   lastEventAt: number | null;
 };
+
+type SpotSseListener = (rawData: string) => void;
+const spotSseListeners = new Set<SpotSseListener>();
+
+export function subscribeSpotSseFrame(listener: SpotSseListener): () => void {
+  spotSseListeners.add(listener);
+  return () => {
+    spotSseListeners.delete(listener);
+  };
+}
 
 const SHAPES: Record<keyof Reads, (x: unknown) => boolean> = {
   home: (x) => {
@@ -482,6 +495,21 @@ export function useDesk(dataset: Dataset) {
     es.addEventListener("tape", handleEvent as EventListener);
     es.addEventListener("snapshot", handleEvent as EventListener);
     es.addEventListener("collect", handleEvent as EventListener);
+    es.addEventListener("spot", ((ev: MessageEvent<string>) => {
+      if (closed) return;
+      setStream((prev) => ({
+        mode: "sse",
+        eventCount: prev.eventCount + 1,
+        lastEventAt: Date.now(),
+      }));
+      for (const listener of spotSseListeners) {
+        try {
+          listener(ev.data);
+        } catch {
+          /* ignore listener error */
+        }
+      }
+    }) as EventListener);
 
     es.onerror = () => {
       if (closed) return;
