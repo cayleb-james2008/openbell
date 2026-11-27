@@ -53,6 +53,7 @@ import {
   money,
   moneySigned,
   setCollectorSchedule,
+  subscribeLiveExecSseFrame,
   useDesk,
 } from "@/lib/desk";
 import {
@@ -169,6 +170,7 @@ export function App() {
 
   const searchRef = useRef<HTMLInputElement>(null);
   const liveActionLockRef = useRef(false);
+  const liveRefreshSeqRef = useRef(0);
   const { reads, stream, load: reload } = useDesk(dataset);
   const upd = useUpdates();
 
@@ -262,14 +264,51 @@ export function App() {
   }, [home, settledMarketsCount]);
 
   const refreshLive = useCallback(async () => {
+    const reqId = ++liveRefreshSeqRef.current;
     const b = await fetchLiveBundle(home);
-    setLiveBundle(b);
+    if (reqId === liveRefreshSeqRef.current) {
+      setLiveBundle(b);
+    }
   }, [home]);
+
+  const refreshLiveRef = useRef(refreshLive);
+  refreshLiveRef.current = refreshLive;
 
   useEffect(() => {
     void refreshCollectorStatus();
     void refreshLive();
   }, [refreshCollectorStatus, refreshLive]);
+
+  useEffect(() => {
+    let cooldownTimer: number | null = null;
+    let trailingPending = false;
+
+    const runTrailing = () => {
+      cooldownTimer = null;
+      if (trailingPending) {
+        trailingPending = false;
+        void refreshLiveRef.current();
+        cooldownTimer = window.setTimeout(runTrailing, 150);
+      }
+    };
+
+    const unsubscribe = subscribeLiveExecSseFrame(() => {
+      if (cooldownTimer === null) {
+        void refreshLiveRef.current();
+        cooldownTimer = window.setTimeout(runTrailing, 150);
+      } else {
+        trailingPending = true;
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      if (cooldownTimer !== null) {
+        window.clearTimeout(cooldownTimer);
+        cooldownTimer = null;
+      }
+    };
+  }, []);
 
   const runCollect = useCallback(async () => {
     if (collectingNow) return;

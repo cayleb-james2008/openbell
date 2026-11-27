@@ -157,13 +157,31 @@ export type TapeStreamState = {
   lastEventAt: number | null;
 };
 
-type SpotSseListener = (rawData: string) => void;
-const spotSseListeners = new Set<SpotSseListener>();
+type SseFrameListener = (rawData: string) => void;
+const spotSseListeners = new Set<SseFrameListener>();
+const liveExecSseListeners = new Set<SseFrameListener>();
 
-export function subscribeSpotSseFrame(listener: SpotSseListener): () => void {
+function emitSseFrame(listeners: Set<SseFrameListener>, rawData: string) {
+  for (const listener of listeners) {
+    try {
+      listener(rawData);
+    } catch {
+      /* ignore listener error */
+    }
+  }
+}
+
+export function subscribeSpotSseFrame(listener: SseFrameListener): () => void {
   spotSseListeners.add(listener);
   return () => {
     spotSseListeners.delete(listener);
+  };
+}
+
+export function subscribeLiveExecSseFrame(listener: SseFrameListener): () => void {
+  liveExecSseListeners.add(listener);
+  return () => {
+    liveExecSseListeners.delete(listener);
   };
 }
 
@@ -459,6 +477,10 @@ export function useDesk(dataset: Dataset) {
           snapshot?: Market;
           snapshots_written?: number;
         };
+        if (parsed.type === "live_exec") {
+          emitSseFrame(liveExecSseListeners, ev.data);
+          return;
+        }
         if (parsed.type === "schedule" || parsed.type === "collect") {
           scheduleReload();
           return;
@@ -486,6 +508,16 @@ export function useDesk(dataset: Dataset) {
       }
     };
 
+    const handleNamedFrame = (listeners: Set<SseFrameListener>) => (ev: MessageEvent<string>) => {
+      if (closed) return;
+      setStream((prev) => ({
+        mode: "sse",
+        eventCount: prev.eventCount + 1,
+        lastEventAt: Date.now(),
+      }));
+      emitSseFrame(listeners, ev.data);
+    };
+
     es.onopen = () => {
       if (!closed) {
         setStream((prev) => ({ ...prev, mode: "sse" }));
@@ -495,21 +527,8 @@ export function useDesk(dataset: Dataset) {
     es.addEventListener("tape", handleEvent as EventListener);
     es.addEventListener("snapshot", handleEvent as EventListener);
     es.addEventListener("collect", handleEvent as EventListener);
-    es.addEventListener("spot", ((ev: MessageEvent<string>) => {
-      if (closed) return;
-      setStream((prev) => ({
-        mode: "sse",
-        eventCount: prev.eventCount + 1,
-        lastEventAt: Date.now(),
-      }));
-      for (const listener of spotSseListeners) {
-        try {
-          listener(ev.data);
-        } catch {
-          /* ignore listener error */
-        }
-      }
-    }) as EventListener);
+    es.addEventListener("spot", handleNamedFrame(spotSseListeners) as EventListener);
+    es.addEventListener("live_exec", handleNamedFrame(liveExecSseListeners) as EventListener);
 
     es.onerror = () => {
       if (closed) return;
